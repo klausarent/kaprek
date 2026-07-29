@@ -27,10 +27,17 @@ import {
   missingDocFields,
 } from '../board/store.mjs';
 import { signReceipt, verifyReceipt, InvalidAgentNameError } from '../receipt/receipt.mjs';
+import { openChats, ChatNotFoundError } from '../chats/store.mjs';
+import { runTurn } from '../orchestrator/run.mjs';
+import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
 const MAX_BOARD_BODY_BYTES = 256 * 1024;
 const TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Chat ids are crypto.randomUUID() too (see src/chats/store.mjs), same shape as task ids.
+const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DEFAULT_HARNESS_NAME = 'claude-code';
+const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -560,6 +567,198 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
   sendJson(res, 404, { error: 'not found' });
 }
 
+/** Writes one SSE `data:` frame, silently dropping it if the client is already gone. */
+function sseWrite(res, obj) {
+  if (res.writableEnded) return;
+  try {
+    res.write(`data: ${JSON.stringify(obj)}\n\n`);
+  } catch {
+    // client disconnected mid-write — best effort, nothing to recover
+  }
+}
+
+/**
+ * POST /api/chat/turn — runs one chat turn and streams it back as SSE.
+ *
+ * The chat is resolved (created if `chatId` is omitted, looked up if given)
+ * BEFORE any SSE bytes are written, so a 400/404 can still be a normal JSON
+ * response. Once resolved, its id is sent as a `{type:'chat-id'}` bootstrap
+ * frame ahead of the harness events — this is NOT one of adapter.mjs's
+ * NormalizedEvent types, it's a protocol addition of this route: a brand new
+ * chat's id is otherwise only known once the whole turn finishes (runTurn()
+ * only returns it at the very end), which would be too late for the client
+ * to ever call POST /api/chat/<id>/cancel on it mid-turn.
+ *
+ * cwd is <dataDir>/workspace, not the server process's own cwd: the agent
+ * must not read/write wherever `kaprek` happened to be launched from, and a
+ * dedicated directory under dataDir keeps every chat's file edits inside the
+ * same place the chat's own transcript already lives.
+ */
+async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDir, chatAbortControllers }) {
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const text = body.data?.text;
+  if (typeof text !== 'string' || text.trim().length === 0) {
+    sendJson(res, 400, { error: 'text is required' });
+    return;
+  }
+
+  const chats = getChats();
+  let chatId = body.data?.chatId;
+  if (chatId !== undefined) {
+    if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
+      sendJson(res, 400, { error: 'invalid chatId' });
+      return;
+    }
+    try {
+      chats.get(chatId);
+    } catch (err) {
+      if (err instanceof ChatNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      throw err;
+    }
+  } else {
+    const title = text.slice(0, 80).trim();
+    chatId = chats.createChat(title.length > 0 ? { title } : undefined).id;
+  }
+
+  const workspaceDir = path.join(dataDir, 'workspace');
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  const controller = new AbortController();
+  chatAbortControllers.set(chatId, controller);
+  const onClientClose = () => controller.abort();
+  req.on('close', onClientClose);
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  sseWrite(res, { type: 'chat-id', chatId });
+
+  try {
+    const result = await runTurn({
+      dataDir,
+      chatId,
+      text,
+      harness,
+      harnessName,
+      cwd: workspaceDir,
+      onEvent: (event) => sseWrite(res, event),
+      signal: controller.signal,
+    });
+    sseWrite(res, { type: 'turn-complete', ...result });
+  } catch (err) {
+    // A harness/orchestrator throw here is a genuine programming error (see
+    // adapter.mjs's contract note), not a normal turn failure — those are
+    // already reported via result.error above. Headers are long sent by this
+    // point, so this cannot become a 500 JSON response; report it as one
+    // more SSE frame instead of letting it surface as an unhandled rejection.
+    sseWrite(res, { type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
+  } finally {
+    req.off('close', onClientClose);
+    chatAbortControllers.delete(chatId);
+    if (!res.writableEnded) res.end();
+  }
+}
+
+/** POST /api/chat/<id>/cancel — aborts that chat's in-flight turn, if any. */
+function handleChatCancel(res, getChats, chatId, chatAbortControllers) {
+  if (!CHAT_ID_RE.test(chatId)) {
+    sendJson(res, 400, { error: 'invalid chat id' });
+    return;
+  }
+  const chats = getChats();
+  try {
+    chats.get(chatId);
+  } catch (err) {
+    if (err instanceof ChatNotFoundError) {
+      sendJson(res, 404, { error: err.message });
+      return;
+    }
+    throw err;
+  }
+  const controller = chatAbortControllers.get(chatId);
+  if (controller) {
+    controller.abort();
+    sendJson(res, 200, { cancelled: true });
+  } else {
+    sendJson(res, 200, { cancelled: false });
+  }
+}
+
+/** GET /api/chat/list — chat summaries, newest first. */
+function handleChatList(res, getChats) {
+  const list = getChats()
+    .list()
+    .slice()
+    .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : b.updatedAt < a.updatedAt ? -1 : 0));
+  sendJson(res, 200, { chats: list });
+}
+
+/** GET /api/chat/<id> — chat metadata plus its full event log. */
+function handleChatGet(res, getChats, chatId) {
+  if (!CHAT_ID_RE.test(chatId)) {
+    sendJson(res, 400, { error: 'invalid chat id' });
+    return;
+  }
+  const chats = getChats();
+  try {
+    const chat = chats.get(chatId);
+    const events = chats.events(chatId);
+    sendJson(res, 200, { chat, events });
+  } catch (err) {
+    if (err instanceof ChatNotFoundError) {
+      sendJson(res, 404, { error: err.message });
+      return;
+    }
+    throw err;
+  }
+}
+
+/** Chat routes, mounted at /api/chat/*. Checked before the blanket GET-only rule (turn/cancel are POST). */
+async function handleChatRoutes(req, res, segments, ctx) {
+  if (segments.length === 3 && segments[2] === 'turn') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    await handleChatTurn(req, res, ctx);
+    return;
+  }
+  if (segments.length === 3 && segments[2] === 'list') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    handleChatList(res, ctx.getChats);
+    return;
+  }
+  if (segments.length === 4 && segments[3] === 'cancel') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    handleChatCancel(res, ctx.getChats, segments[2], ctx.chatAbortControllers);
+    return;
+  }
+  if (segments.length === 3) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    handleChatGet(res, ctx.getChats, segments[2]);
+    return;
+  }
+  sendJson(res, 404, { error: 'not found' });
+}
+
 /** Serves static files from webDist with SPA fallback to index.html. */
 function serveStatic(res, webDist, pathname) {
   if (!webDist || !fs.existsSync(webDist)) {
@@ -594,7 +793,11 @@ function serveStatic(res, webDist, pathname) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard, tmpRoot }) {
+async function handleRequest(
+  req,
+  res,
+  { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard, tmpRoot, getChats, harness, harnessName, chatAbortControllers },
+) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
   // a hostile page could otherwise frame this loopback server in an <iframe>
   // and trick a user into clicking board/reindex/signing actions. Set via
@@ -648,6 +851,10 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
       await handleBoardRoutes(req, res, getBoard, segments, url, dataDir);
       return;
     }
+    if (segments[1] === 'chat') {
+      await handleChatRoutes(req, res, segments, { getChats, harness, harnessName, dataDir, chatAbortControllers });
+      return;
+    }
 
     if (req.method !== 'GET') {
       sendJson(res, 405, { error: 'method not allowed' });
@@ -692,6 +899,8 @@ export function startServer({
   dataDir = getAppDir(),
   importSqlite,
   tmpRoot = path.join(os.tmpdir(), 'claude'),
+  harness = DEFAULT_HARNESS,
+  harnessName = DEFAULT_HARNESS_NAME,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -708,6 +917,25 @@ export function startServer({
     return board;
   }
 
+  // Unlike getBoard() above, this deliberately does NOT cache one openChats()
+  // instance: src/orchestrator/run.mjs::runTurn() opens its OWN openChats()
+  // instance internally to append a turn's events, entirely separate from
+  // whatever instance this route handler holds. A cached instance here would
+  // hold a stale in-memory projection the moment a turn (running through
+  // runTurn's own instance) writes past it — the two would silently
+  // disagree about what a chat contains. Re-opening (a full replay of
+  // <dataDir>/chats/*/events.jsonl) on every call keeps this handler reading
+  // the same source of truth runTurn just wrote to; the local, single-user,
+  // JSONL-backed I/O involved makes that cost negligible.
+  function getChats() {
+    return openChats(dataDir);
+  }
+
+  // One AbortController per chat with an in-flight turn, keyed by chatId —
+  // lets POST /api/chat/<id>/cancel reach across requests to interrupt the
+  // SSE request currently streaming that chat's turn.
+  const chatAbortControllers = new Map();
+
   const server = http.createServer((req, res) => {
     handleRequest(req, res, {
       rootDir,
@@ -719,6 +947,10 @@ export function startServer({
       importSqlite,
       getBoard,
       tmpRoot,
+      getChats,
+      harness,
+      harnessName,
+      chatAbortControllers,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });

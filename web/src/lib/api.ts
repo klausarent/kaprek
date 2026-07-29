@@ -300,3 +300,137 @@ export type VerifyReceiptResult = { valid: boolean; reason?: string };
 export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
   return getJson<VerifyReceiptResult>(`/api/board/tasks/${encodeURIComponent(id)}/receipt/verify`);
 }
+
+// Chat (src/orchestrator/run.mjs via /api/chat/*)
+
+// Mirrors src/harness/adapter.mjs's NormalizedEvent union — what a chat turn
+// streams over SSE, plus the two protocol-level frames the route itself adds
+// (see server.mjs's handleChatTurn doc comment): 'chat-id' up front and
+// 'turn-complete' at the end. `input` on 'tool-start' is a raw object here
+// (the harness's own shape), NOT the pre-stringified `input` DigestEvent's
+// ToolEvent expects — see toDigestEvent() below, which bridges the two so
+// EventBlock.tsx can render both live and reloaded turns unchanged.
+export type ChatStreamEvent =
+  | { type: "chat-id"; chatId: string }
+  | { type: "init"; sessionId: string | null; tools: string[]; model: string | null; permissionMode: string | null }
+  | { type: "text"; text: string }
+  | { type: "thinking"; text: string }
+  | { type: "tool-start"; id: string; name: string; input: Record<string, unknown> }
+  | { type: "tool-end"; id: string; result: string; isError: boolean }
+  | { type: "rate-limit"; info: unknown }
+  | { type: "result"; sessionId: string | null; costUsd: number | null; usage: Record<string, unknown> | null; isError: boolean }
+  | { type: "error"; message: string }
+  | {
+      type: "turn-complete";
+      chatId: string;
+      cliSessionId: string | null;
+      costUsd: number | null;
+      stopReason: "result" | "aborted" | "error";
+      error: { message: string } | null;
+    };
+
+// The persisted shape of one chat-store event (src/chats/store.mjs's
+// EVENT_SHAPES) — 'tool' carries `input` as an object still, exactly like
+// the live 'tool-start' event above, for the same reason (see
+// toDigestEvent()).
+export type ChatStoredEvent =
+  | { kind: "user" | "assistant" | "thinking"; ts: string; text: string; msgId?: string | null }
+  | { kind: "tool"; ts: string; name: string | null; input: unknown; result: string | null; msgId?: string | null; resultRef?: string | null };
+
+export type ChatSummary = {
+  id: string;
+  title: string | null;
+  createdAt: string | null;
+  updatedAt: string | null;
+  eventCount: number;
+};
+
+/**
+ * Converts one ChatStoredEvent into the DigestEvent shape EventBlock.tsx
+ * already knows how to render (see parse.mjs::digestSession, whose output
+ * shape the chat store deliberately mirrors). The one field that doesn't
+ * line up as-is is a tool event's `input`: the store keeps it as the raw
+ * object the CLI produced, while digestSession's ToolEvent (and thus
+ * EventBlock's rendering) expects an already-JSON-stringified string — so
+ * that conversion happens here, once, instead of teaching EventBlock a
+ * second `input` shape.
+ */
+export function toDigestEvent(event: ChatStoredEvent): DigestEvent {
+  if (event.kind === "tool") {
+    return {
+      kind: "tool",
+      ts: event.ts,
+      msgId: event.msgId ?? null,
+      name: event.name,
+      input: event.input === null || event.input === undefined ? null : JSON.stringify(event.input, null, 2),
+      result: event.result,
+      resultRef: event.resultRef ?? null,
+    };
+  }
+  return { kind: event.kind, ts: event.ts, msgId: event.msgId ?? null, text: event.text };
+}
+
+export function fetchChatList(): Promise<ChatSummary[]> {
+  return getJson<{ chats: ChatSummary[] }>("/api/chat/list").then((r) => r.chats);
+}
+
+export function fetchChat(chatId: string): Promise<{ chat: ChatSummary; events: ChatStoredEvent[] }> {
+  return getJson<{ chat: ChatSummary; events: ChatStoredEvent[] }>(`/api/chat/${encodeURIComponent(chatId)}`);
+}
+
+export function cancelChatTurn(chatId: string): Promise<{ cancelled: boolean }> {
+  return postJson<{ cancelled: boolean }>(`/api/chat/${encodeURIComponent(chatId)}/cancel`);
+}
+
+/**
+ * Streams one chat turn. Deliberately NOT EventSource: EventSource cannot
+ * set the `x-app-request` header this server's CSRF hardening requires on
+ * every non-GET request (see server.mjs's CSRF comment), so this does its
+ * own `fetch` + `ReadableStream` + manual SSE-frame parsing instead — same
+ * `data: <json>\n\n` framing, just read by hand.
+ *
+ * Resolves once the stream ends (after a 'turn-complete' frame or a network
+ * error) — `onEvent` is the only way callers observe individual frames.
+ */
+export async function streamChatTurn({
+  chatId,
+  text,
+  onEvent,
+  signal,
+}: {
+  chatId?: string;
+  text: string;
+  onEvent: (event: ChatStreamEvent) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const res = await fetch("/api/chat/turn", {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(chatId ? { chatId, text } : { text }),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    await throwOnError(res);
+    throw new Error(`Request failed (HTTP ${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf("\n\n")) !== -1) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (!raw.startsWith("data: ")) continue;
+      try {
+        onEvent(JSON.parse(raw.slice("data: ".length)) as ChatStreamEvent);
+      } catch {
+        // A malformed frame must not kill the rest of the stream — skip it.
+      }
+    }
+  }
+}

@@ -8,12 +8,14 @@ import SessionList from "./pages/SessionList";
 import Thread from "./pages/Thread";
 import Search from "./pages/Search";
 import Board from "./pages/Board";
+import Chat from "./pages/Chat";
 
 type Route =
   | { name: "list"; project: string | null }
   | { name: "thread"; project: string; sessionId: string }
   | { name: "search"; query: string }
-  | { name: "board" };
+  | { name: "board" }
+  | { name: "chat"; chatId: string | undefined };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -36,6 +38,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "board") {
     return { name: "board" };
+  }
+  if (parts[0] === "chat") {
+    return { name: "chat", chatId: parts[1] };
   }
   if (parts[0] === "session" && parts[1] && parts[2]) {
     return { name: "thread", project: parts[1], sessionId: parts[2] };
@@ -64,6 +69,10 @@ export function navigateToSearch(query: string) {
 
 export function navigateToBoard() {
   window.location.hash = "#/board";
+}
+
+export function navigateToChat(chatId?: string) {
+  window.location.hash = chatId ? `#/chat/${encodeURIComponent(chatId)}` : "#/chat";
 }
 
 function useHashRoute(): Route {
@@ -139,6 +148,16 @@ export default function App() {
           >
             Board
           </a>
+          <a
+            href="#/chat"
+            className={route.name === "chat" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToChat();
+            }}
+          >
+            Chat
+          </a>
         </nav>
         <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
       </header>
@@ -149,6 +168,8 @@ export default function App() {
           <Search query={route.query} />
         ) : route.name === "board" ? (
           <Board />
+        ) : route.name === "chat" ? (
+          <Chat chatId={route.chatId} />
         ) : (
           <SessionList project={route.project} />
         )}

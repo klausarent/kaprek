@@ -9,6 +9,7 @@ import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
 import { startServer } from './server.mjs';
+import { createFakeHarness } from '../harness/fake.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SECRET_FIXTURE = path.join(__dirname, 'fixtures', 'session-with-secret.jsonl');
@@ -781,4 +782,248 @@ test('board: a body over the 256 KB limit is rejected with 413', async () => {
   const bigTitle = 'x'.repeat(300 * 1024);
   const res = await postJson(`${url}/api/board/tasks`, { title: bigTitle });
   expect(res.status).toBe(413);
+});
+
+// --- Chat API (SSE) ---------------------------------------------------------
+
+/**
+ * A harness like createFakeHarness(), but each scripted event is preceded
+ * by a real-time delay, checking `signal` before and after each wait — used
+ * to give the cancel test a window in which a second, concurrent request
+ * can actually reach the server before the turn finishes on its own.
+ */
+function slowFakeHarness({ script, delayMs = 20 }) {
+  return {
+    async startTurn({ sessionId: requestedSessionId, onEvent, signal } = {}) {
+      let sessionId = requestedSessionId ?? null;
+      let costUsd = null;
+      let usage = null;
+      let isError = false;
+      let sawResult = false;
+      for (const event of script) {
+        if (signal?.aborted) return { sessionId, costUsd, usage, stopReason: 'aborted', error: null };
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (signal?.aborted) return { sessionId, costUsd, usage, stopReason: 'aborted', error: null };
+        onEvent?.(event);
+        if (event.type === 'result') {
+          sawResult = true;
+          if (event.sessionId) sessionId = event.sessionId;
+          costUsd = event.costUsd ?? null;
+          usage = event.usage ?? null;
+          isError = !!event.isError;
+        }
+      }
+      if (!sawResult) return { sessionId, costUsd, usage, stopReason: 'error', error: { message: 'no result event' } };
+      return { sessionId, costUsd, usage, stopReason: isError ? 'error' : 'result', error: null };
+    },
+  };
+}
+
+/**
+ * Reads an SSE response body to completion, parsing each `data: ` frame as
+ * JSON. `onEvent` (if given) is awaited after each parsed frame — the cancel
+ * test uses this to fire a second request as soon as the `chat-id` bootstrap
+ * frame arrives, while the turn is still in flight.
+ */
+async function readSse(res, onEvent) {
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const frames = [];
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (!raw.startsWith('data: ')) continue;
+      const frame = JSON.parse(raw.slice('data: '.length));
+      frames.push(frame);
+      if (onEvent) await onEvent(frame);
+    }
+  }
+  return frames;
+}
+
+function fakeScript() {
+  return [
+    { type: 'init', sessionId: 'sess-1', tools: [], model: 'claude-opus-5', permissionMode: 'default' },
+    { type: 'text', text: 'Hello from the fake harness' },
+    { type: 'result', sessionId: 'sess-1', costUsd: 0.0123, usage: { input_tokens: 10, output_tokens: 5 }, isError: false },
+  ];
+}
+
+test('chat: POST /api/chat/turn streams the fake harness events plus a turn-complete frame', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi there' }),
+  });
+  expect(res.status).toBe(200);
+  expect(res.headers.get('content-type')).toContain('text/event-stream');
+
+  const frames = await readSse(res);
+  expect(frames[0].type).toBe('chat-id');
+  expect(typeof frames[0].chatId).toBe('string');
+
+  const types = frames.map((f) => f.type);
+  expect(types).toEqual(['chat-id', 'init', 'text', 'result', 'turn-complete']);
+
+  const complete = frames.at(-1);
+  expect(complete).toMatchObject({
+    type: 'turn-complete',
+    chatId: frames[0].chatId,
+    cliSessionId: 'sess-1',
+    costUsd: 0.0123,
+    stopReason: 'result',
+    error: null,
+  });
+
+  // The turn is persisted — a reload of the same chat sees the same events.
+  const chatRes = await fetch(`${url}/api/chat/${frames[0].chatId}`);
+  const chatBody = await chatRes.json();
+  expect(chatBody.chat.id).toBe(frames[0].chatId);
+  expect(chatBody.events.map((e) => e.kind)).toEqual(['user', 'assistant']);
+  expect(chatBody.events[0].text).toBe('hi there');
+  expect(chatBody.events[1].text).toBe('Hello from the fake harness');
+});
+
+test('chat: POST /api/chat/turn with an existing chatId resumes that chat', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  const first = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'first message' }),
+  });
+  const firstFrames = await readSse(first);
+  const chatId = firstFrames[0].chatId;
+
+  const second = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ chatId, text: 'second message' }),
+  });
+  const secondFrames = await readSse(second);
+  expect(secondFrames[0]).toEqual({ type: 'chat-id', chatId });
+
+  const chatRes = await fetch(`${url}/api/chat/${chatId}`);
+  const chatBody = await chatRes.json();
+  expect(chatBody.events.map((e) => e.text)).toEqual([
+    'first message',
+    'Hello from the fake harness',
+    'second message',
+    'Hello from the fake harness',
+  ]);
+});
+
+test('chat: POST /api/chat/turn with empty/missing text returns 400 (plain JSON, not SSE)', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
+
+  const missing = await postJson(`${url}/api/chat/turn`, {});
+  expect(missing.status).toBe(400);
+  expect(missing.headers.get('content-type')).toContain('application/json');
+
+  const blank = await postJson(`${url}/api/chat/turn`, { text: '   ' });
+  expect(blank.status).toBe(400);
+});
+
+test('chat: POST /api/chat/turn with an unknown chatId returns 404', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
+  const res = await postJson(`${url}/api/chat/turn`, { chatId: '00000000-0000-0000-0000-000000000000', text: 'hi' });
+  expect(res.status).toBe(404);
+});
+
+test('chat: GET /api/chat/turn (wrong method) returns 405', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/chat/turn`);
+  expect(res.status).toBe(405);
+});
+
+test('chat: CSRF hardening — POST /api/chat/turn without x-app-request header is rejected with 403', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: 'hi' }),
+  });
+  expect(res.status).toBe(403);
+});
+
+test('chat: GET /api/chat/list and GET /api/chat/<id> reflect store contents, newest first', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
+  const first = await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'alpha' }) }),
+  );
+  const second = await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'beta' }) }),
+  );
+
+  const listRes = await fetch(`${url}/api/chat/list`);
+  expect(listRes.status).toBe(200);
+  const listBody = await listRes.json();
+  expect(listBody.chats.map((c) => c.id)).toEqual([second[0].chatId, first[0].chatId]);
+  expect(listBody.chats[0].title).toBe('beta');
+
+  const getRes = await fetch(`${url}/api/chat/${first[0].chatId}`);
+  const getBody = await getRes.json();
+  expect(getBody.chat.title).toBe('alpha');
+  expect(getBody.events).toHaveLength(2);
+});
+
+test('chat: GET /api/chat/<unknown-id> returns 404', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/chat/00000000-0000-0000-0000-000000000000`);
+  expect(res.status).toBe(404);
+});
+
+test('chat: cancel aborts an in-flight turn, the SSE stream resolves with stopReason aborted', async () => {
+  const slowScript = [
+    { type: 'init', sessionId: 'sess-slow', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'text', text: 'partial one' },
+    { type: 'text', text: 'partial two' },
+    { type: 'result', sessionId: 'sess-slow', costUsd: 0.01, usage: {}, isError: false },
+  ];
+  const { url } = await boot({ harness: slowFakeHarness({ script: slowScript, delayMs: 25 }), harnessName: 'fake' });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'go slowly' }),
+  });
+
+  let cancelStatus = null;
+  let cancelBody = null;
+  const frames = await readSse(res, async (frame) => {
+    if (frame.type === 'chat-id' && cancelStatus === null) {
+      const cancelRes = await postJson(`${url}/api/chat/${frame.chatId}/cancel`);
+      cancelStatus = cancelRes.status;
+      cancelBody = await cancelRes.json();
+    }
+  });
+
+  expect(cancelStatus).toBe(200);
+  expect(cancelBody).toEqual({ cancelled: true });
+
+  const complete = frames.at(-1);
+  expect(complete.type).toBe('turn-complete');
+  expect(complete.stopReason).toBe('aborted');
+});
+
+test('chat: cancelling a chat with no in-flight turn returns cancelled:false, and an unknown chat 404s', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
+  const frames = await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'done already' }) }),
+  );
+  const chatId = frames[0].chatId;
+
+  const idleCancel = await postJson(`${url}/api/chat/${chatId}/cancel`);
+  expect(idleCancel.status).toBe(200);
+  expect(await idleCancel.json()).toEqual({ cancelled: false });
+
+  const unknownCancel = await postJson(`${url}/api/chat/00000000-0000-0000-0000-000000000000/cancel`);
+  expect(unknownCancel.status).toBe(404);
 });
