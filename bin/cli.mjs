@@ -20,19 +20,19 @@ Options:
   -h, --help    Show this help message
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
-  hooks install    Add the ccview Stop hook to ~/.claude/settings.json
-  hooks uninstall  Remove only the ccview Stop hook entry
+  hooks install    Add the loryme Stop hook to ~/.claude/settings.json
+  hooks uninstall  Remove only the loryme Stop hook entry
   hooks status     Show whether the hook is installed and the active policy mode
 `;
 
 const HOOKS_USAGE = `Usage: loryme hooks <install|uninstall|status>
 
-Manages the Claude Code Stop hook ccview's policy engine uses to gently
+Manages the Claude Code Stop hook loryme's policy engine uses to gently
 enforce workflow rules (e.g. requiring a linked board task for commits).
 
-  install    Adds the ccview Stop hook to ~/.claude/settings.json
+  install    Adds the loryme Stop hook to ~/.claude/settings.json
              (backs up the existing file first; leaves other hooks intact)
-  uninstall  Removes only the ccview Stop hook entry
+  uninstall  Removes only the loryme Stop hook entry
   status     Shows whether the hook is installed and the active policy mode
 `;
 
@@ -105,7 +105,7 @@ function runHooksCommand(args) {
         console.log(`Removed Stop hook from ${result.settingsPath}`);
         if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       } else {
-        console.log(`No ccview Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
+        console.log(`No loryme Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
       }
     } else if (sub === 'status') {
       const result = hookStatus();

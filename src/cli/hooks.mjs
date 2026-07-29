@@ -1,4 +1,4 @@
-// Manages ccview's Claude Code Stop hook entry in ~/.claude/settings.json.
+// Manages loryme's Claude Code Stop hook entry in ~/.claude/settings.json.
 //
 // Pure fs work, no console output — bin/cli.mjs owns printing, this module
 // only returns plain result objects so it stays easy to test against a
@@ -100,7 +100,7 @@ function hasOurHookInstalled(settings, packageName) {
 }
 
 /**
- * Idempotently adds ccview's Stop hook to `settingsPath` (default
+ * Idempotently adds loryme's Stop hook to `settingsPath` (default
  * `~/.claude/settings.json`). Backs up the file first (if it exists),
  * leaves any other hooks byte-for-byte untouched. If an entry with our
  * `--managed-by` marker already exists (even at a different path), its
@@ -127,7 +127,7 @@ export function install({ settingsPath = defaultSettingsPath(), hookScriptPath =
 }
 
 /**
- * Removes only ccview's own Stop hook entry (matched by its
+ * Removes only loryme's own Stop hook entry (matched by its
  * `--managed-by` marker, regardless of the path recorded in it) from
  * `settingsPath`. Other hooks (Stop or otherwise) are left untouched.
  * Cleans up now-empty matcher entries (`{hooks: []}`) it leaves behind.
