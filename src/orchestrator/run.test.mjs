@@ -322,3 +322,44 @@ test('SSE-Events (onEvent) enthalten keine Klartext-Secrets, auch nicht im tool-
   const toolStartEvent = seen.find((e) => e.type === 'tool-start');
   expect(JSON.stringify(toolStartEvent.input)).not.toContain(SECRET_PATTERNS.skAnt);
 });
+
+// SECURITY (P0-3): runTurn() must forward permissionMode/allowedTools to the
+// harness verbatim — the caller (src/server/server.mjs::startServer()) owns
+// the actual security-relevant default, this layer must not silently drop it.
+test('permissionMode und allowedTools werden unverändert an harness.startTurn() durchgereicht', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+
+  await runTurn({
+    dataDir: tmpDir,
+    text: 'check permission passthrough',
+    harness: fakeHarness,
+    permissionMode: 'acceptEdits',
+    allowedTools: ['Read', 'Grep'],
+  });
+
+  expect(startTurnSpy.mock.calls[0][0]).toMatchObject({
+    permissionMode: 'acceptEdits',
+    allowedTools: ['Read', 'Grep'],
+  });
+});
+
+test('permissionMode und allowedTools sind undefined, wenn runTurn() ohne sie aufgerufen wird', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+
+  await runTurn({ dataDir: tmpDir, text: 'no permission options given', harness: fakeHarness });
+
+  expect(startTurnSpy.mock.calls[0][0].permissionMode).toBeUndefined();
+  expect(startTurnSpy.mock.calls[0][0].allowedTools).toBeUndefined();
+});

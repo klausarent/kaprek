@@ -2,7 +2,7 @@
 //
 // Exercises a real server on an ephemeral port (127.0.0.1) via the Node
 // built-in fetch — no external network involved, no mocks for node:http.
-import { test, expect, beforeEach, afterEach } from 'vitest';
+import { test, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -1063,6 +1063,40 @@ test('chat: no leftover AbortController after a turn ends — cancelling that ch
   const cancelRes = await postJson(`${url}/api/chat/${chatId}/cancel`);
   expect(cancelRes.status).toBe(200);
   expect(await cancelRes.json()).toEqual({ cancelled: false });
+});
+
+// SECURITY (P0-3): startServer() must default to the CLI's own restrictive
+// permission mode and forward whatever it's given straight through to the
+// harness, never widening what the agent can do beyond the server's own
+// configured default.
+test('chat: startServer() defaults pass permissionMode "default" and allowedTools null to the harness', async () => {
+  const fakeHarness = createFakeHarness({ script: fakeScript() });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+  const { url } = await boot({ harness: fakeHarness, harnessName: 'fake' });
+
+  await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'defaults check' }) }),
+  );
+
+  expect(startTurnSpy).toHaveBeenCalledTimes(1);
+  expect(startTurnSpy.mock.calls[0][0]).toMatchObject({ permissionMode: 'default', allowedTools: null });
+});
+
+test('chat: startServer({ permissionMode, allowedTools }) options reach the harness unchanged', async () => {
+  const fakeHarness = createFakeHarness({ script: fakeScript() });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+  const { url } = await boot({
+    harness: fakeHarness,
+    harnessName: 'fake',
+    permissionMode: 'acceptEdits',
+    allowedTools: ['Read', 'Grep'],
+  });
+
+  await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'custom options check' }) }),
+  );
+
+  expect(startTurnSpy.mock.calls[0][0]).toMatchObject({ permissionMode: 'acceptEdits', allowedTools: ['Read', 'Grep'] });
 });
 
 test('chat: cancelling a chat with no in-flight turn returns cancelled:false, and an unknown chat 404s', async () => {

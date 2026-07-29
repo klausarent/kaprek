@@ -603,7 +603,7 @@ function sseWrite(res, obj) {
  * them (chats.get()/createChat()/mkdirSync() are all synchronous), so two
  * concurrent requests for the same chatId can never both pass the check.
  */
-async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDir, chatAbortControllers }) {
+async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools }) {
   const body = await readJsonBody(req);
   if (!body.ok) {
     sendJson(res, body.status, { error: body.error });
@@ -664,6 +664,8 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
       harness,
       harnessName,
       cwd: workspaceDir,
+      permissionMode,
+      allowedTools,
       onEvent: (event) => sseWrite(res, event),
       signal: controller.signal,
     });
@@ -813,7 +815,23 @@ function serveStatic(res, webDist, pathname) {
 async function handleRequest(
   req,
   res,
-  { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard, tmpRoot, getChats, harness, harnessName, chatAbortControllers },
+  {
+    rootDir,
+    redact,
+    webDist,
+    cache,
+    port,
+    dataDir,
+    importSqlite,
+    getBoard,
+    tmpRoot,
+    getChats,
+    harness,
+    harnessName,
+    chatAbortControllers,
+    permissionMode,
+    allowedTools,
+  },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
   // a hostile page could otherwise frame this loopback server in an <iframe>
@@ -869,7 +887,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'chat') {
-      await handleChatRoutes(req, res, segments, { getChats, harness, harnessName, dataDir, chatAbortControllers });
+      await handleChatRoutes(req, res, segments, { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools });
       return;
     }
 
@@ -907,6 +925,30 @@ async function handleRequest(
 /**
  * Starts the local API/static server. Binds to 127.0.0.1 only.
  * Resolves once listening, with the running http.Server and its base URL.
+ *
+ * ============================================================================
+ * SECURITY (permissionMode / allowedTools defaults — read before changing):
+ *
+ * Every chat turn (POST /api/chat/turn) runs the user's own local `claude`
+ * CLI as a subprocess (src/harness/claude-code.mjs) with the SAME rights
+ * that CLI already has on this machine: Bash, Edit, Write, network access —
+ * whatever the CLI's own permission system allows. There is NO sandbox
+ * around it here; `cwd` is a dedicated <dataDir>/workspace directory, but
+ * that only sets a starting directory, it does not fence off the rest of
+ * the filesystem, and `claude -p` (non-interactive/headless mode) skips the
+ * CLI's own workspace-trust dialog entirely.
+ *
+ * permissionMode defaults to 'default' (NOT 'bypassPermissions' or
+ * 'acceptEdits') and allowedTools defaults to null (the CLI's own default
+ * tool set, but set explicitly here rather than left implicit) so that, at
+ * minimum, this server does not itself widen what the agent can already do.
+ * That is a floor, not a fence: a real sandbox/policy layer (OS-level
+ * confinement, an allowlist enforced independent of the CLI, approval UI)
+ * is a prerequisite before this server is exposed to anyone other than the
+ * single local user who already trusts their own CLI — see the "Zwingende
+ * Sicherheitsgrenze" section of ccview-docs/codex-review-tag1.md and the
+ * P0/P1 security recommendations in ccview-docs/grok-review-tag1.md.
+ * ============================================================================
  */
 export function startServer({
   port = 0,
@@ -918,6 +960,8 @@ export function startServer({
   tmpRoot = path.join(os.tmpdir(), 'claude'),
   harness = DEFAULT_HARNESS,
   harnessName = DEFAULT_HARNESS_NAME,
+  permissionMode = 'default',
+  allowedTools = null,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -968,6 +1012,8 @@ export function startServer({
       harness,
       harnessName,
       chatAbortControllers,
+      permissionMode,
+      allowedTools,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });

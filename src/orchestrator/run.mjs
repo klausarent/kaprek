@@ -129,6 +129,13 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  *   cliSessionId and in the run log (e.g. 'claude-code', 'fake'); `harness`
  *   itself carries no name, see run.test.mjs for why this is a separate arg
  * @param {string} [options.cwd] - working directory passed through to the harness
+ * @param {string} [options.permissionMode] - passed straight through to
+ *   harness.startTurn() (see adapter.mjs's StartTurnOptions); the CALLER
+ *   (src/server/server.mjs::startServer()) owns the actual default, this
+ *   layer only forwards whatever it is given, undefined included — see the
+ *   SECURITY comment at startServer() for why that default matters
+ * @param {string[]} [options.allowedTools] - passed straight through to
+ *   harness.startTurn(), same caveat as permissionMode above
  * @param {(event: import('../harness/adapter.mjs').NormalizedEvent) => void} [options.onEvent] -
  *   called for every adapter event, in order, in addition to the chat-store writes
  *   (e.g. an SSE route forwarding the live turn to a browser); events carry
@@ -147,6 +154,8 @@ export async function runTurn({
   harness,
   harnessName = null,
   cwd,
+  permissionMode,
+  allowedTools,
   onEvent,
   signal,
   maxTextLen = DEFAULT_MAX_TEXT_LEN,
@@ -242,6 +251,8 @@ export async function runTurn({
     cwd,
     prompt: text,
     sessionId: priorSessionId,
+    permissionMode,
+    allowedTools,
     onEvent: handleEvent,
     signal,
   });
