@@ -235,7 +235,10 @@ async function handleDigest(res, rootDir, redact, cache, slug, sessionId) {
     return;
   }
 
-  const cacheKey = `${slug}/${sessionId}`;
+  // mtime+size are part of the cache key (not just slug/sessionId) so an
+  // actively-changing session never serves a stale cached digest — scanProjects()
+  // above already stat'd the file fresh for this request, so this costs nothing extra.
+  const cacheKey = `${slug}/${sessionId}/${session.mtime}/${session.sizeBytes}`;
   let digest = cache.get(cacheKey);
   if (!digest) {
     digest = await digestSession(session.file, { redact });
@@ -265,23 +268,29 @@ async function handleReindex(res, rootDir, dataDir, importSqlite) {
     sendJson(res, 200, { available: false, reason: result.reason });
     return;
   }
-  sendJson(res, 200, { available: true, indexed: result.indexed, skipped: result.skipped });
+  sendJson(res, 200, { available: true, indexed: result.indexed, skipped: result.skipped, removed: result.removed });
 }
 
 /**
  * Builds the receipt payload for a task's CURRENT state: the exact object
  * signReceipt()/verifyReceipt() hash and sign. Called both when creating a
  * receipt and when verifying one, always from a freshly re-read task — a
- * receipt seals a snapshot, so any later edit to title/project/doc/sessions
- * changes this payload and makes an existing receipt verify as invalid.
- * gitCommit/policyVersion aren't tracked yet; carried as null placeholders
- * so the payload shape is stable for future receipts that do set them.
+ * receipt seals a snapshot, so any later edit to title/project/status/doc/
+ * sessions changes this payload and makes an existing receipt verify as
+ * invalid. `status` is included so a task that was signed as 'done' and
+ * later moved back to e.g. 'backlog' also invalidates its receipt — a
+ * receipt otherwise unchanged (same doc, same sessions) must not still
+ * verify as a completed-task receipt once the task itself is no longer
+ * done. gitCommit/policyVersion aren't tracked yet; carried as null
+ * placeholders so the payload shape is stable for future receipts that do
+ * set them.
  */
 function receiptPayloadFor(task) {
   return {
     taskId: task.id,
     title: task.title,
     project: task.project,
+    status: task.status,
     doc: task.doc,
     sessionIds: task.sessions.map((s) => s.sessionId),
     gitCommit: null,
@@ -376,6 +385,10 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
       }
       if (err instanceof InvalidTitleError || err instanceof InvalidProjectError || err instanceof InvalidTagsError) {
         sendJson(res, 400, { error: err.message });
+        return;
+      }
+      if (err instanceof DocIncompleteError) {
+        sendJson(res, 409, { error: err.message, missing: err.missing });
         return;
       }
       throw err;
@@ -549,6 +562,14 @@ function serveStatic(res, webDist, pathname) {
 }
 
 async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard }) {
+  // Clickjacking hardening, applied to EVERY response (API and static alike):
+  // a hostile page could otherwise frame this loopback server in an <iframe>
+  // and trick a user into clicking board/reindex/signing actions. Set via
+  // setHeader (not writeHead) so it survives regardless of which handler
+  // eventually calls writeHead/end further down.
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
+
   // No body details on rejection — don't echo the offending Host header back.
   if (!isAllowedHost(req.headers.host, port)) {
     sendJson(res, 400, { error: 'bad request' });

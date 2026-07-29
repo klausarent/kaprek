@@ -1,5 +1,5 @@
 // Tests for ed25519 task receipts. Run: npx vitest run src/receipt
-import { test, expect, beforeEach, afterEach } from 'vitest';
+import { test, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -77,11 +77,20 @@ test('sign then verify roundtrips as valid', () => {
 });
 
 test('signReceipt is deterministic under input key order (payload field order does not change the hash)', () => {
-  const payloadA = samplePayload();
-  const payloadB = { sessionIds: payloadA.sessionIds, doc: payloadA.doc, taskId: payloadA.taskId, project: payloadA.project, title: payloadA.title, gitCommit: null, policyVersion: null };
-  const receiptA = signReceipt({ dataDir, agentName: 'agent-a', payload: payloadA });
-  const receiptB = signReceipt({ dataDir, agentName: 'agent-a', payload: payloadB });
-  expect(receiptA.payloadHash).toBe(receiptB.payloadHash);
+  // signedAt is folded into the signed bytes now (see signReceipt()), so the
+  // clock must be pinned for this comparison — otherwise the two calls would
+  // legitimately produce different hashes even with an identical payload.
+  vi.useFakeTimers();
+  vi.setSystemTime(new Date('2026-07-29T12:00:00.000Z'));
+  try {
+    const payloadA = samplePayload();
+    const payloadB = { sessionIds: payloadA.sessionIds, doc: payloadA.doc, taskId: payloadA.taskId, project: payloadA.project, title: payloadA.title, gitCommit: null, policyVersion: null };
+    const receiptA = signReceipt({ dataDir, agentName: 'agent-a', payload: payloadA });
+    const receiptB = signReceipt({ dataDir, agentName: 'agent-a', payload: payloadB });
+    expect(receiptA.payloadHash).toBe(receiptB.payloadHash);
+  } finally {
+    vi.useRealTimers();
+  }
 });
 
 test('a one-character change to the payload (e.g. the doc) makes verification fail', () => {
@@ -90,6 +99,26 @@ test('a one-character change to the payload (e.g. the doc) makes verification fa
 
   const tampered = samplePayload({ doc: { ...payload.doc, outcome: 'z' } }); // 'y' -> 'z'
   const result = verifyReceipt({ payload: tampered, receipt });
+  expect(result.valid).toBe(false);
+  expect(result.reason).toBe('payload hash mismatch');
+});
+
+test('changing signedAt on a stored receipt invalidates it (signedAt is inside the signed content)', () => {
+  const payload = samplePayload();
+  const receipt = signReceipt({ dataDir, agentName: 'agent-a', payload });
+
+  const tamperedReceipt = { ...receipt, signedAt: '2099-01-01T00:00:00.000Z' };
+  const result = verifyReceipt({ payload, receipt: tamperedReceipt });
+  expect(result.valid).toBe(false);
+  expect(result.reason).toBe('payload hash mismatch');
+});
+
+test('changing agent on a stored receipt invalidates it (agent is inside the signed content)', () => {
+  const payload = samplePayload();
+  const receipt = signReceipt({ dataDir, agentName: 'agent-a', payload });
+
+  const tamperedReceipt = { ...receipt, agent: 'agent-b' };
+  const result = verifyReceipt({ payload, receipt: tamperedReceipt });
   expect(result.valid).toBe(false);
   expect(result.reason).toBe('payload hash mismatch');
 });

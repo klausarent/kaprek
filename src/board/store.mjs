@@ -282,8 +282,17 @@ export function openBoard(dataDir) {
     },
 
     setDoc(taskId, doc) {
-      requireTask(taskId);
+      const task = requireTask(taskId);
       assertKnownDocFields(doc ?? {});
+      // preserve the done invariant: once a task is 'done', its doc must
+      // stay complete — a later setDoc() call is rejected if the resulting
+      // merged doc would no longer satisfy the 7-field rule, mirroring the
+      // exact merge applyEvent() would perform.
+      if (task.status === 'done') {
+        const mergedDoc = { ...(task.doc ?? {}), ...(doc ?? {}) };
+        const missing = missingDocFields(mergedDoc);
+        if (missing.length > 0) throw new DocIncompleteError(missing);
+      }
       commit('task.doc', taskId, { doc });
       return clone(requireTask(taskId));
     },

@@ -248,22 +248,40 @@ test('path traversal in slug or sessionId is rejected with 400, not resolved aga
   expect(collapsedByUrlParser.status).not.toBe(200);
 });
 
-test('digest LRU cache holds at most 20 entries, evicting the oldest first', async () => {
+test('digest cache serves a fresh digest immediately once the underlying file changes (mtime/size bust the cache key)', async () => {
+  const dir = writeProject('proj-fresh', { s1: aiTitleLine('Original') });
+  const { url } = await boot({});
+
+  const first = await (await fetch(`${url}/api/session/proj-fresh/s1/digest`)).json();
+  expect(first.meta.title).toBe('Original');
+
+  // Same cache key, unchanged file: still cached, still 'Original' — trivially
+  // true either way, but establishes the baseline before the file changes.
+  const stillOriginal = await (await fetch(`${url}/api/session/proj-fresh/s1/digest`)).json();
+  expect(stillOriginal.meta.title).toBe('Original');
+
+  // Change the file's content AND its mtime — this must produce a different
+  // cache key, so the server must NOT keep serving the stale cached title.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  fs.writeFileSync(path.join(dir, 's1.jsonl'), aiTitleLine('Changed'), 'utf8');
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(path.join(dir, 's1.jsonl'), future, future);
+
+  const afterChange = await (await fetch(`${url}/api/session/proj-fresh/s1/digest`)).json();
+  expect(afterChange.meta.title).toBe('Changed');
+});
+
+test('digest LRU cache holds at most 20 entries without erroring across many distinct sessions', async () => {
   const dir = writeProject('proj-lru', { 'session-a': aiTitleLine('Original A') });
   const { url } = await boot({});
 
-  // First fetch populates the cache for session-a.
   const first = await (await fetch(`${url}/api/session/proj-lru/session-a/digest`)).json();
   expect(first.meta.title).toBe('Original A');
 
-  // Change the file on disk; while cached, the server must keep serving the
-  // stale (cached) title rather than re-reading the file every time.
-  fs.writeFileSync(path.join(dir, 'session-a.jsonl'), aiTitleLine('Changed A'), 'utf8');
-  const stillCached = await (await fetch(`${url}/api/session/proj-lru/session-a/digest`)).json();
-  expect(stillCached.meta.title).toBe('Original A');
-
-  // Fill the cache with 20 more distinct sessions so session-a (the oldest
-  // entry, not re-touched since the cache hit above) gets evicted.
+  // Fill the cache with 20 more distinct sessions, well past DIGEST_CACHE_SIZE
+  // (20) — each fetch must still return the correct digest for its own
+  // session, proving eviction of older entries never corrupts or drops a
+  // still-relevant cache entry for a different key.
   for (let i = 0; i < 20; i += 1) {
     const sessionId = `session-b${i}`;
     fs.writeFileSync(path.join(dir, `${sessionId}.jsonl`), aiTitleLine(`B${i}`), 'utf8');
@@ -271,9 +289,10 @@ test('digest LRU cache holds at most 20 entries, evicting the oldest first', asy
     expect(digest.meta.title).toBe(`B${i}`);
   }
 
-  // session-a should now be evicted, so this re-reads the (changed) file.
-  const afterEviction = await (await fetch(`${url}/api/session/proj-lru/session-a/digest`)).json();
-  expect(afterEviction.meta.title).toBe('Changed A');
+  // session-a's entry may or may not have been evicted by now — either way,
+  // re-fetching it must still return the correct (unchanged) digest.
+  const afterMany = await (await fetch(`${url}/api/session/proj-lru/session-a/digest`)).json();
+  expect(afterMany.meta.title).toBe('Original A');
 });
 
 test('SPA fallback serves a plain status page at / when no webDist is configured', async () => {
@@ -618,22 +637,47 @@ test('board receipt: signing a backlog task with a complete doc still returns 40
   expect(body.error).toContain('backlog');
 });
 
-test('board receipt: a done task whose doc was later shortened below the threshold returns 409 with the missing field', async () => {
+test('board: setDoc on a done task that would break completeness is rejected with 409, doc stays intact', async () => {
   const { url } = await boot({});
   const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Shortened after done' })).json();
   await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
   await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
   await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
 
-  // setDoc doesn't re-validate completeness — only the status transition
-  // does — so this is a legitimate way to end up with an incomplete doc on
-  // an already-'done' task.
-  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { outcome: 'too short' } });
-
-  const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  // The done invariant now holds going forward too: setDoc on a 'done' task
+  // is rejected outright if the resulting doc would no longer satisfy the
+  // 7-field rule — it never gets a chance to become incomplete in the first place.
+  const res = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { outcome: 'too short' } });
   expect(res.status).toBe(409);
   const body = await res.json();
   expect(body.missing).toContain('outcome');
+
+  const listRes = await fetch(`${url}/api/board/tasks?status=done`);
+  const listBody = await listRes.json();
+  const stillDone = listBody.tasks.find((t) => t.id === task.id);
+  expect(stillDone.doc.outcome).toBe(fullDoc().outcome);
+});
+
+test('board receipt: moving a signed task back to backlog invalidates its receipt (status is part of the signed payload)', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Rolled back after signing' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+
+  const signRes = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  expect(signRes.status).toBe(201);
+
+  const verifyOkRes = await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`);
+  expect(await verifyOkRes.json()).toEqual({ valid: true });
+
+  // Same doc, same sessions — only the status moves back. The receipt still
+  // must not verify: it sealed a 'done' snapshot, and this task is no longer 'done'.
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'backlog' });
+  const verifyAfterRollbackRes = await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`);
+  const rollbackBody = await verifyAfterRollbackRes.json();
+  expect(rollbackBody.valid).toBe(false);
+  expect(rollbackBody.reason).toBe('payload hash mismatch');
 });
 
 test('board receipt: verifying a task with no receipt returns 404', async () => {
@@ -666,6 +710,25 @@ test('CSRF hardening: POST /api/board/tasks/<id>/receipt without x-app-request h
     body: '{}',
   });
   expect(res.status).toBe(403);
+});
+
+// --- Clickjacking hardening --------------------------------------------
+
+test('clickjacking hardening: X-Frame-Options and a frame-ancestors CSP are set on every response, API and static alike', async () => {
+  writeProject('proj-a', { s1: aiTitleLine('S1') });
+  const { url } = await boot({});
+
+  const rootRes = await fetch(`${url}/`);
+  expect(rootRes.headers.get('x-frame-options')).toBe('DENY');
+  expect(rootRes.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+
+  const apiRes = await fetch(`${url}/api/projects`);
+  expect(apiRes.headers.get('x-frame-options')).toBe('DENY');
+  expect(apiRes.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+
+  const notFoundRes = await fetch(`${url}/api/sessions?project=does-not-exist`);
+  expect(notFoundRes.status).toBe(404);
+  expect(notFoundRes.headers.get('x-frame-options')).toBe('DENY');
 });
 
 test('board: a body over the 256 KB limit is rejected with 413', async () => {

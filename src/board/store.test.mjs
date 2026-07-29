@@ -199,6 +199,36 @@ test('setDoc merges into the existing doc across multiple calls', () => {
   expect(saved.doc).toEqual({ trigger: 'a'.repeat(20), outcome: 'b'.repeat(20) });
 });
 
+test('setDoc on a done task that would shorten the doc below completeness is rejected (done invariant)', () => {
+  const board = openBoard(tmpDir);
+  const task = board.create({ title: 'T' });
+  board.setDoc(task.id, fullDoc());
+  board.setStatus(task.id, 'done');
+
+  let error;
+  try {
+    board.setDoc(task.id, { outcome: 'too short' });
+  } catch (err) {
+    error = err;
+  }
+  expect(error).toBeInstanceOf(DocIncompleteError);
+  expect(error.missing).toEqual(['outcome']);
+
+  // The rejected write must not have been committed — the doc stays intact.
+  expect(board.get(task.id).doc.outcome).toBe(fullDoc().outcome);
+});
+
+test('setDoc on a done task with a still-complete replacement doc is allowed', () => {
+  const board = openBoard(tmpDir);
+  const task = board.create({ title: 'T' });
+  board.setDoc(task.id, fullDoc());
+  board.setStatus(task.id, 'done');
+
+  const updated = board.setDoc(task.id, { outcome: 'Updated outcome, still long enough to pass.' });
+  expect(updated.doc.outcome).toBe('Updated outcome, still long enough to pass.');
+  expect(updated.status).toBe('done');
+});
+
 test('linkSession appends a session and dedupes on projectSlug+sessionId', () => {
   const board = openBoard(tmpDir);
   const task = board.create({ title: 'T' });

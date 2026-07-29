@@ -130,16 +130,22 @@ export function stableStringify(value) {
  * Signs `payload` (a completion snapshot, see server.mjs's receiptPayloadFor)
  * with `agentName`'s ed25519 key, creating the key on first use.
  * Returns a receipt: `{agent, pubkey, alg, payloadHash, sig, signedAt}`.
- * The signature covers the canonical payload bytes directly (not the hash);
- * `payloadHash` is carried as a cheap-to-compare metadatum for callers and
- * as a second check verifyReceipt() performs alongside signature verification.
+ * The signature covers the canonical bytes of `{...payload, agent, signedAt}`
+ * (not `payload` alone) — `agent` and `signedAt` are claims this receipt
+ * itself makes ("this key signed at this time"), so they must be inside the
+ * signed content, not just carried alongside it, or either could be edited
+ * on a stored receipt without invalidating the signature. `payloadHash` is
+ * carried as a cheap-to-compare metadatum for callers and as a second check
+ * verifyReceipt() performs alongside signature verification.
  */
 export function signReceipt({ dataDir, agentName, payload }) {
   assertValidAgentName(agentName);
   const { pubkey } = ensureKey(dataDir, agentName);
   const privateKey = crypto.createPrivateKey(fs.readFileSync(keyPathFor(dataDir, agentName), 'utf8'));
 
-  const canonicalBytes = Buffer.from(stableStringify(payload), 'utf8');
+  const signedAt = new Date().toISOString();
+  const signedPayload = { ...payload, agent: agentName, signedAt };
+  const canonicalBytes = Buffer.from(stableStringify(signedPayload), 'utf8');
   const payloadHash = crypto.createHash('sha256').update(canonicalBytes).digest('hex');
   const sig = crypto.sign(null, canonicalBytes, privateKey).toString('base64');
 
@@ -149,27 +155,37 @@ export function signReceipt({ dataDir, agentName, payload }) {
     alg: 'ed25519',
     payloadHash,
     sig,
-    signedAt: new Date().toISOString(),
+    signedAt,
   };
 }
 
 /**
- * Verifies `receipt` against `payload`: recomputes the payload hash (catches
- * tampering with `payload` itself) and checks the signature against the
- * public key carried IN the receipt (catches a receipt whose signature and
- * pubkey were both swapped for a different keypair, and lets verification
- * happen without any external key lookup). Returns `{valid: true}` or
- * `{valid: false, reason}`; never throws on malformed input.
+ * Verifies `receipt` against `payload`: reconstructs the exact bytes that
+ * were signed (`{...payload, agent: receipt.agent, signedAt: receipt.signedAt}`
+ * — see signReceipt()), recomputes the payload hash (catches tampering with
+ * `payload` itself, or with `receipt.agent`/`receipt.signedAt`) and checks
+ * the signature against the public key carried IN the receipt (catches a
+ * receipt whose signature and pubkey were both swapped for a different
+ * keypair, and lets verification happen without any external key lookup).
+ * Returns `{valid: true}` or `{valid: false, reason}`; never throws on
+ * malformed input.
  */
 export function verifyReceipt({ payload, receipt }) {
   if (!receipt || typeof receipt !== 'object') return { valid: false, reason: 'missing receipt' };
-  const { pubkey, alg, payloadHash, sig } = receipt;
+  const { agent, pubkey, alg, payloadHash, sig, signedAt } = receipt;
   if (alg !== 'ed25519') return { valid: false, reason: `unsupported algorithm: ${alg}` };
-  if (typeof pubkey !== 'string' || typeof sig !== 'string' || typeof payloadHash !== 'string') {
+  if (
+    typeof agent !== 'string' ||
+    typeof pubkey !== 'string' ||
+    typeof sig !== 'string' ||
+    typeof payloadHash !== 'string' ||
+    typeof signedAt !== 'string'
+  ) {
     return { valid: false, reason: 'malformed receipt' };
   }
 
-  const canonicalBytes = Buffer.from(stableStringify(payload), 'utf8');
+  const signedPayload = { ...payload, agent, signedAt };
+  const canonicalBytes = Buffer.from(stableStringify(signedPayload), 'utf8');
   const actualHash = crypto.createHash('sha256').update(canonicalBytes).digest('hex');
   if (actualHash !== payloadHash) {
     return { valid: false, reason: 'payload hash mismatch' };
