@@ -39,8 +39,13 @@ export function redactSecrets(str) {
   return out;
 }
 
-/** Truncates a string to `limit` characters; appends the ORIGINAL length. */
-function truncate(str, limit) {
+/**
+ * Truncates a string to `limit` characters; appends the ORIGINAL length.
+ * Exported so other persistence paths (see src/orchestrator/run.mjs) can
+ * apply the exact same truncation as a reloaded/historical digest, instead
+ * of re-implementing it.
+ */
+export function truncate(str, limit) {
   if (typeof str !== 'string' || str.length <= limit) return str;
   return `${str.slice(0, limit)} …[truncated, ${str.length} chars]`;
 }

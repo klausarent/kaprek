@@ -10,6 +10,54 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
+import { redactSecrets, truncate } from '../parser/parse.mjs';
+
+// Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
+// must never persist or stream more content, or leak a secret a reloaded
+// historical transcript would already have redacted (see
+// truncateEvent()/redactSecrets() there). Kept as separate constants (not
+// re-exported from parse.mjs) since they're runTurn()'s own defaults, only
+// coincidentally identical.
+const DEFAULT_MAX_TEXT_LEN = 4000;
+const DEFAULT_MAX_TOOL_LEN = 1500;
+
+/** Redacts (if enabled) then truncates one text field — mirrors parse.mjs::truncateEvent(). */
+function sanitizeText(str, maxLen, redact) {
+  if (typeof str !== 'string') return str;
+  return truncate(redact ? redactSecrets(str) : str, maxLen);
+}
+
+/**
+ * Redacts secrets inside a tool-call input object's own string values while
+ * leaving its shape as an object — used only for the LIVE 'tool-start' event
+ * forwarded to onEvent (see web/src/lib/api.ts's ChatStreamEvent, whose
+ * `input` stays `Record<string, unknown>`; the client JSON.stringifies it
+ * itself for display). Not truncated here: the call is still in flight, with
+ * no final persisted size yet — sanitizeToolInput() below applies the actual
+ * length limit once the matching tool-end lands.
+ */
+function redactInputObject(input, redact) {
+  if (!redact || input === null || typeof input !== 'object') return input;
+  try {
+    return JSON.parse(redactSecrets(JSON.stringify(input)));
+  } catch {
+    return input; // non-JSON-serializable input (rare) — forward unredacted rather than crash the turn
+  }
+}
+
+/**
+ * Turns a tool call's input into the shape actually persisted in the chat
+ * store — mirrors src/parser/parse.mjs::truncateEvent()'s 'tool' case
+ * exactly: JSON.stringify BEFORE redaction, redaction BEFORE truncation (a
+ * secret must never get cut in half by truncation and become "accidentally"
+ * unrecognizable — see the comment on SECRET_PATTERNS in parse.mjs). The
+ * result is a string, same as a reloaded/historical digest's tool.input —
+ * src/chats/store.mjs's EVENT_SHAPES places no type constraint on `input`.
+ */
+function sanitizeToolInput(input, maxToolLen, redact) {
+  if (input === null || input === undefined) return null;
+  return sanitizeText(JSON.stringify(input), maxToolLen, redact);
+}
 
 // Anthropic usage object field names as emitted in a Claude Code CLI
 // `result` event's `usage` (see src/harness/claude-code.mjs::mapLine). Summed
@@ -83,11 +131,28 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  * @param {string} [options.cwd] - working directory passed through to the harness
  * @param {(event: import('../harness/adapter.mjs').NormalizedEvent) => void} [options.onEvent] -
  *   called for every adapter event, in order, in addition to the chat-store writes
- *   (e.g. an SSE route forwarding the live turn to a browser)
+ *   (e.g. an SSE route forwarding the live turn to a browser); events carry
+ *   the SAME redacted/truncated content the chat store persists, see
+ *   maxTextLen/maxToolLen/redact below
  * @param {AbortSignal} [options.signal]
+ * @param {number} [options.maxTextLen] - cap on assistant/thinking/user text, see parse.mjs::digestSession()
+ * @param {number} [options.maxToolLen] - cap on tool input/result, see parse.mjs::digestSession()
+ * @param {boolean} [options.redact] - redact known secret formats before persisting/streaming (default true)
  * @returns {Promise<{chatId: string, cliSessionId: string|null, costUsd: number|null, stopReason: string, error: {message:string}|null}>}
  */
-export async function runTurn({ dataDir, chatId, text, harness, harnessName = null, cwd, onEvent, signal } = {}) {
+export async function runTurn({
+  dataDir,
+  chatId,
+  text,
+  harness,
+  harnessName = null,
+  cwd,
+  onEvent,
+  signal,
+  maxTextLen = DEFAULT_MAX_TEXT_LEN,
+  maxToolLen = DEFAULT_MAX_TOOL_LEN,
+  redact = true,
+} = {}) {
   const chats = openChats(dataDir);
   const startedAt = Date.now();
 
@@ -100,8 +165,11 @@ export async function runTurn({ dataDir, chatId, text, harness, harnessName = nu
 
   // Throws ChatNotFoundError for a caller-supplied chatId that doesn't
   // exist — a usage error on the caller's side, not an adapter-level
-  // failure, so it is not folded into the {error} result below.
-  chats.appendEvent(effectiveChatId, { kind: 'user', text });
+  // failure, so it is not folded into the {error} result below. Same
+  // redact-then-truncate pipeline as every other persisted text field below
+  // (parse.mjs::truncateEvent() treats 'user' identically to 'assistant'/
+  // 'thinking' — a pasted secret in the user's own prompt is still a secret).
+  chats.appendEvent(effectiveChatId, { kind: 'user', text: sanitizeText(text, maxTextLen, redact) });
 
   const priorMeta = readHarnessMeta(dataDir, effectiveChatId);
   const priorSessionId = priorMeta?.cliSessionId ?? undefined;
@@ -115,43 +183,59 @@ export async function runTurn({ dataDir, chatId, text, harness, harnessName = nu
   let model = null;
   let rateLimit = null;
 
+  // Every event forwarded to onEvent below (the SSE live-view path) carries
+  // the SAME sanitized content just written to the chat store — never the
+  // raw adapter event — so the live stream can never leak a secret or an
+  // oversized blob the store itself would have filtered (SECURITY).
   const handleEvent = (event) => {
     switch (event.type) {
       case 'init':
         if (event.sessionId) cliSessionId = event.sessionId;
         if (event.model) model = event.model;
+        onEvent?.(event);
         break;
-      case 'text':
-        chats.appendEvent(effectiveChatId, { kind: 'assistant', text: event.text });
+      case 'text': {
+        const sanitized = sanitizeText(event.text, maxTextLen, redact);
+        chats.appendEvent(effectiveChatId, { kind: 'assistant', text: sanitized });
+        onEvent?.({ ...event, text: sanitized });
         break;
-      case 'thinking':
-        chats.appendEvent(effectiveChatId, { kind: 'thinking', text: event.text });
+      }
+      case 'thinking': {
+        const sanitized = sanitizeText(event.text, maxTextLen, redact);
+        chats.appendEvent(effectiveChatId, { kind: 'thinking', text: sanitized });
+        onEvent?.({ ...event, text: sanitized });
         break;
+      }
       case 'tool-start':
         pendingTools.set(event.id, { name: event.name, input: event.input, ts: new Date().toISOString() });
+        onEvent?.({ ...event, input: redactInputObject(event.input, redact) });
         break;
       case 'tool-end': {
         const started = pendingTools.get(event.id);
         pendingTools.delete(event.id);
+        const sanitizedResult = sanitizeText(event.result, maxToolLen, redact);
         chats.appendEvent(effectiveChatId, {
           kind: 'tool',
           ts: started?.ts,
           name: started?.name ?? 'unknown',
-          input: started?.input ?? null,
-          result: event.result,
+          input: sanitizeToolInput(started?.input ?? null, maxToolLen, redact),
+          result: sanitizedResult,
         });
+        onEvent?.({ ...event, result: sanitizedResult });
         break;
       }
       case 'rate-limit':
         rateLimit = event.info;
+        onEvent?.(event);
         break;
       case 'result':
         if (event.sessionId) cliSessionId = event.sessionId;
+        onEvent?.(event);
         break;
       default:
-        break; // 'error' — nothing to store, still forwarded below
+        onEvent?.(event); // 'error' — nothing to store, still forwarded
+        break;
     }
-    onEvent?.(event);
   };
 
   const turnResult = await harness.startTurn({
@@ -171,7 +255,7 @@ export async function runTurn({ dataDir, chatId, text, harness, harnessName = nu
       kind: 'tool',
       ts: started.ts,
       name: started.name,
-      input: started.input,
+      input: sanitizeToolInput(started.input, maxToolLen, redact),
       result: null,
     });
   }

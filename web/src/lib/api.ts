@@ -307,9 +307,11 @@ export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
 // streams over SSE, plus the two protocol-level frames the route itself adds
 // (see server.mjs's handleChatTurn doc comment): 'chat-id' up front and
 // 'turn-complete' at the end. `input` on 'tool-start' is a raw object here
-// (the harness's own shape), NOT the pre-stringified `input` DigestEvent's
-// ToolEvent expects — see toDigestEvent() below, which bridges the two so
-// EventBlock.tsx can render both live and reloaded turns unchanged.
+// (the harness's own shape, redacted but not yet truncated — see
+// src/orchestrator/run.mjs::redactInputObject()), NOT the pre-stringified
+// `input` DigestEvent's ToolEvent expects — see toDigestEvent() below, which
+// bridges the two so EventBlock.tsx can render both live and reloaded turns
+// unchanged.
 export type ChatStreamEvent =
   | { type: "chat-id"; chatId: string }
   | { type: "init"; sessionId: string | null; tools: string[]; model: string | null; permissionMode: string | null }
@@ -330,12 +332,14 @@ export type ChatStreamEvent =
     };
 
 // The persisted shape of one chat-store event (src/chats/store.mjs's
-// EVENT_SHAPES) — 'tool' carries `input` as an object still, exactly like
-// the live 'tool-start' event above, for the same reason (see
-// toDigestEvent()).
+// EVENT_SHAPES). Unlike the live 'tool-start' event above, `input` here is
+// ALREADY the pre-stringified, redacted, truncated form — src/orchestrator/
+// run.mjs::sanitizeToolInput() mirrors src/parser/parse.mjs::truncateEvent()
+// exactly, so a persisted chat-turn tool event has the identical shape a
+// reloaded/historical digest's ToolEvent already has.
 export type ChatStoredEvent =
   | { kind: "user" | "assistant" | "thinking"; ts: string; text: string; msgId?: string | null }
-  | { kind: "tool"; ts: string; name: string | null; input: unknown; result: string | null; msgId?: string | null; resultRef?: string | null };
+  | { kind: "tool"; ts: string; name: string | null; input: string | null; result: string | null; msgId?: string | null; resultRef?: string | null };
 
 export type ChatSummary = {
   id: string;
@@ -348,12 +352,11 @@ export type ChatSummary = {
 /**
  * Converts one ChatStoredEvent into the DigestEvent shape EventBlock.tsx
  * already knows how to render (see parse.mjs::digestSession, whose output
- * shape the chat store deliberately mirrors). The one field that doesn't
- * line up as-is is a tool event's `input`: the store keeps it as the raw
- * object the CLI produced, while digestSession's ToolEvent (and thus
- * EventBlock's rendering) expects an already-JSON-stringified string — so
- * that conversion happens here, once, instead of teaching EventBlock a
- * second `input` shape.
+ * shape the chat store deliberately mirrors). A tool event's `input` is
+ * already a string in both shapes now, so this is a straight field rename,
+ * not a conversion — kept as its own function since ChatStoredEvent and
+ * DigestEvent are still two distinct types (e.g. optional vs. nullable
+ * msgId).
  */
 export function toDigestEvent(event: ChatStoredEvent): DigestEvent {
   if (event.kind === "tool") {
@@ -362,7 +365,7 @@ export function toDigestEvent(event: ChatStoredEvent): DigestEvent {
       ts: event.ts,
       msgId: event.msgId ?? null,
       name: event.name,
-      input: event.input === null || event.input === undefined ? null : JSON.stringify(event.input, null, 2),
+      input: event.input,
       result: event.result,
       resultRef: event.resultRef ?? null,
     };

@@ -57,10 +57,12 @@ test('Turn mit Tool schreibt EIN tool-Event mit input und result', async () => {
   const events = openChats(tmpDir).events(result.chatId);
   const toolEvents = events.filter((e) => e.kind === 'tool');
   expect(toolEvents).toHaveLength(1);
+  // input is stored pre-stringified, matching src/parser/parse.mjs's digest
+  // shape for a reloaded/historical tool event (see run.mjs::sanitizeToolInput()).
   expect(toolEvents[0]).toMatchObject({
     kind: 'tool',
     name: 'Bash',
-    input: { command: 'ls -la' },
+    input: JSON.stringify({ command: 'ls -la' }),
     result: 'file1\nfile2',
   });
 });
@@ -98,7 +100,7 @@ test('verwaister tool-start (kein tool-end) wird beim Turn-Ende mit result:null 
 
   const toolEvents = openChats(tmpDir).events(result.chatId).filter((e) => e.kind === 'tool');
   expect(toolEvents).toHaveLength(1);
-  expect(toolEvents[0]).toMatchObject({ name: 'Bash', input: { command: 'long-running' }, result: null });
+  expect(toolEvents[0]).toMatchObject({ name: 'Bash', input: JSON.stringify({ command: 'long-running' }), result: null });
 });
 
 test('tool-end ohne passenden tool-start wird trotzdem gespeichert statt verworfen', async () => {
@@ -238,4 +240,85 @@ test('onEvent bekommt alle Adapter-Events durchgereicht, in Reihenfolge', async 
 
   expect(seen.map((e) => e.type)).toEqual(['init', 'thinking', 'tool-start', 'tool-end', 'text', 'rate-limit', 'result']);
   expect(seen).toEqual(script);
+});
+
+// SECURITY (P0-1): secrets from a live CLI turn must be redacted and
+// oversized content truncated before landing in the chat store or on the
+// SSE wire, exactly like a reloaded/historical digest (see
+// src/parser/parse.mjs::redactSecrets/truncate and run.mjs's sanitize* helpers).
+const SECRET_PATTERNS = {
+  skAnt: 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
+  skProj: 'sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
+  ghp: 'ghp_AbCdEfGh1234567890ABCDEFGHijkl',
+  bearer: 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
+  keyValue: 'DB_PASSWORD=hunter2secretvalue',
+};
+
+test('Secrets in assistant-Text, thinking-Text, tool-input und tool-result werden im Store redigiert', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { type: 'thinking', text: `secret in thinking: ${SECRET_PATTERNS.skAnt}` },
+      { type: 'tool-start', id: 't1', name: 'Bash', input: { command: `curl -H "Authorization: ${SECRET_PATTERNS.bearer}"` } },
+      { type: 'tool-end', id: 't1', result: `leaked token ${SECRET_PATTERNS.ghp}`, isError: false },
+      { type: 'text', text: `here you go: ${SECRET_PATTERNS.skProj} and ${SECRET_PATTERNS.keyValue}` },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'leak secrets', harness: fakeHarness });
+
+  const events = openChats(tmpDir).events(result.chatId);
+  const raw = JSON.stringify(events);
+  for (const secret of Object.values(SECRET_PATTERNS)) {
+    expect(raw, `${secret} must not leak into the chat store`).not.toContain(secret);
+  }
+  expect(raw).toContain('[REDACTED]');
+
+  const thinkingEvent = events.find((e) => e.kind === 'thinking');
+  expect(thinkingEvent.text).toBe('secret in thinking: [REDACTED]');
+
+  const toolEvent = events.find((e) => e.kind === 'tool');
+  expect(toolEvent.input).not.toContain(SECRET_PATTERNS.bearer);
+  expect(toolEvent.result).toBe('leaked token [REDACTED]');
+});
+
+test('übergroßer Text wird im Store mit dem Truncation-Marker gekürzt', async () => {
+  const oversized = 'x'.repeat(5000);
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { type: 'text', text: oversized },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'truncate me', harness: fakeHarness });
+
+  const assistantEvent = openChats(tmpDir).events(result.chatId).find((e) => e.kind === 'assistant');
+  expect(assistantEvent.text.length).toBeLessThan(oversized.length);
+  expect(assistantEvent.text).toContain('…[truncated, 5000 chars]');
+});
+
+test('SSE-Events (onEvent) enthalten keine Klartext-Secrets, auch nicht im tool-start input', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { type: 'tool-start', id: 't1', name: 'Bash', input: { command: `echo ${SECRET_PATTERNS.skAnt}` } },
+      { type: 'tool-end', id: 't1', result: SECRET_PATTERNS.ghp, isError: false },
+      { type: 'text', text: `token: ${SECRET_PATTERNS.keyValue}` },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+  const seen = [];
+
+  await runTurn({ dataDir: tmpDir, text: 'sse leak check', harness: fakeHarness, onEvent: (e) => seen.push(e) });
+
+  const raw = JSON.stringify(seen);
+  for (const secret of Object.values(SECRET_PATTERNS)) {
+    if (secret === SECRET_PATTERNS.bearer || secret === SECRET_PATTERNS.skProj) continue; // not used in this script
+    expect(raw, `${secret} must not leak over onEvent/SSE`).not.toContain(secret);
+  }
+  const toolStartEvent = seen.find((e) => e.type === 'tool-start');
+  expect(JSON.stringify(toolStartEvent.input)).not.toContain(SECRET_PATTERNS.skAnt);
 });
