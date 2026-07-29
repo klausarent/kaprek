@@ -449,10 +449,10 @@ test('board: full CRUD cycle — create, list/filter, update, doc, status, sessi
   const updated = await updateRes.json();
   expect(updated.title).toBe('Ship the board UI (v2)');
 
-  const docPartialRes = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { trigger: 'Klaus asked for a board.' } });
+  const docPartialRes = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { trigger: 'A teammate asked for a board.' } });
   expect(docPartialRes.status).toBe(200);
   const docPartial = await docPartialRes.json();
-  expect(docPartial.doc.trigger).toBe('Klaus asked for a board.');
+  expect(docPartial.doc.trigger).toBe('A teammate asked for a board.');
 
   const statusRes = await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
   expect(statusRes.status).toBe(200);

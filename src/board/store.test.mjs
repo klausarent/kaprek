@@ -25,13 +25,13 @@ afterEach(() => {
 /** A doc with all 7 fields present and each >= 20 chars. */
 function fullDoc() {
   return {
-    trigger: 'Klaus wollte die Board-Ansicht fuer Tasks.',
-    outcome: 'Store implementiert, alle Tests laufen gruen.',
-    approach: 'Append-only JSONL Eventlog plus In-Memory-Projektion.',
-    course: 'TDD nach Brief, keine grossen Umwege noetig hier.',
-    verification: 'npx vitest run zeigt alle Tests bestanden.',
-    effort: 'Etwa eine Stunde fuer Implementierung und Tests.',
-    open: 'Keine offenen Punkte fuer diesen Task bekannt.',
+    trigger: 'The team wanted a board view for tasks.',
+    outcome: 'Store implemented, all tests pass.',
+    approach: 'Append-only JSONL event log plus an in-memory projection.',
+    course: 'Built to spec, no major detours needed here.',
+    verification: 'npx vitest run shows all tests passing.',
+    effort: 'About one hour for implementation and tests.',
+    open: 'No open questions for this task.',
   };
 }
 
