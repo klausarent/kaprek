@@ -1,0 +1,13 @@
+{
+  "agentType": "fast-worker",
+  "description": "Tests subagent digest",
+  "name": "test123",
+  "model": "claude-sonnet-5",
+  "spawnDepth": 1,
+  "taskKind": "in_process_teammate",
+  "teamName": "session-mini-session",
+  "color": "blue",
+  "planModeRequired": false,
+  "customAgentType": "fast-worker",
+  "permissionMode": "bypassPermissions"
+}

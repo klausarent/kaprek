@@ -1,0 +1,33 @@
+{
+  "name": "loryme",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Local viewer for Claude Code session transcripts. Read-only, redacted by default, no network.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "keywords": ["claude-code", "session-viewer", "transcripts", "local-first"],
+  "author": "Klaus Arent",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "loryme": "bin/cli.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "web/dist",
+    "LICENSE",
+    "README.md",
+    "!src/**/*.test.mjs",
+    "!src/**/fixtures/**"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "build:web": "cd web && npm run build",
+    "prepublishOnly": "npm run build:web && npm test"
+  },
+  "devDependencies": {
+    "vitest": "^3.0.0"
+  }
+}
