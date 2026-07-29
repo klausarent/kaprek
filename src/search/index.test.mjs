@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { buildSearchIndex, searchSessions } from './index.mjs';
+import { buildSearchIndex, searchSessions, openSearchDb } from './index.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MINI_FIXTURE = path.join(__dirname, '..', 'parser', 'fixtures', 'mini-session.jsonl');
@@ -202,4 +202,115 @@ test('searchSessions returns {unavailable:true, reason} instead of throwing when
   const failingImport = () => Promise.reject(new Error('no sqlite here'));
   const result = await searchSessions({ dataDir, query: 'anything', importSqlite: failingImport });
   expect(result).toEqual({ unavailable: true, reason: 'no sqlite here' });
+});
+
+/**
+ * Wraps the real node:sqlite DatabaseSync so a chosen statement's `.run()`
+ * throws once it's prepared — lets tests inject a write failure mid-way
+ * through the per-session write without touching production code, using the
+ * same `importSqlite` seam the module already exposes for availability
+ * testing.
+ */
+function makeFailingSqliteImport(RealDatabaseSync, failSqlIncludes, failureMessage) {
+  class FailingDatabaseSync {
+    #real;
+    constructor(...args) {
+      this.#real = new RealDatabaseSync(...args);
+    }
+    exec(sql) {
+      return this.#real.exec(sql);
+    }
+    close() {
+      return this.#real.close();
+    }
+    prepare(sql) {
+      if (sql.includes(failSqlIncludes)) {
+        return { run: () => { throw new Error(failureMessage); } };
+      }
+      return this.#real.prepare(sql);
+    }
+  }
+  return async () => ({ DatabaseSync: FailingDatabaseSync });
+}
+
+test('a write failure mid-transaction is rolled back: the session is re-indexed next build, not permanently skipped', async () => {
+  const filePath = seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+
+  const first = await buildSearchIndex({ rootDir, dataDir });
+  expect(first.indexed).toBe(1);
+  const originalMtimeMs = fs.statSync(filePath).mtime.getTime();
+  const originalSize = fs.statSync(filePath).size;
+
+  // Change the file so the next build sees it as needing a re-index.
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  fs.appendFileSync(filePath, '\n');
+  const future = new Date(Date.now() + 5000);
+  fs.utimesSync(filePath, future, future);
+
+  const failingImport = makeFailingSqliteImport(DatabaseSync, 'INSERT INTO indexed', 'simulated meta write failure');
+  await expect(
+    buildSearchIndex({ rootDir, dataDir, importSqlite: failingImport }),
+  ).rejects.toThrow('simulated meta write failure');
+
+  // Rolled back to the pre-attempt state: meta still shows the OLD mtime/size
+  // (so it will not falsely look "up to date"), and the FTS row is the old
+  // one too, not a half-written new one that the failed meta insert would
+  // otherwise leave orphaned/stale.
+  const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  try {
+    const metaRow = db.prepare('SELECT mtime, size FROM indexed WHERE sessionId = ?').get('mini-session');
+    expect(metaRow).toEqual({ mtime: originalMtimeMs, size: originalSize });
+    const ftsRow = db.prepare('SELECT content FROM sessions_fts WHERE sessionId = ?').get('mini-session');
+    expect(ftsRow).toBeTruthy();
+  } finally {
+    db.close();
+  }
+
+  // A normal (unpatched) build afterwards must re-index, not skip.
+  const third = await buildSearchIndex({ rootDir, dataDir });
+  expect(third.indexed).toBe(1);
+  expect(third.skipped).toBe(0);
+});
+
+test('openSearchDb applies WAL journal mode and a 5s busy_timeout on its connection', async () => {
+  const opened = await openSearchDb({ dataDir });
+  expect(opened.unavailable).toBeUndefined();
+  const { db } = opened;
+  try {
+    const journalMode = db.prepare('PRAGMA journal_mode').get();
+    expect(String(journalMode.journal_mode).toLowerCase()).toBe('wal');
+    const busyTimeout = db.prepare('PRAGMA busy_timeout').get();
+    expect(busyTimeout.timeout).toBe(5000);
+  } finally {
+    db.close();
+  }
+});
+
+test('buildSearchIndex issues the WAL + busy_timeout pragmas on open', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+
+  const execCalls = [];
+  class SpyDatabaseSync {
+    #real;
+    constructor(...args) {
+      this.#real = new DatabaseSync(...args);
+    }
+    exec(sql) {
+      execCalls.push(sql);
+      return this.#real.exec(sql);
+    }
+    prepare(sql) {
+      return this.#real.prepare(sql);
+    }
+    close() {
+      return this.#real.close();
+    }
+  }
+  const spyImport = async () => ({ DatabaseSync: SpyDatabaseSync });
+
+  await buildSearchIndex({ rootDir, dataDir, importSqlite: spyImport });
+
+  const joined = execCalls.join('\n');
+  expect(joined).toMatch(/PRAGMA journal_mode\s*=\s*WAL/i);
+  expect(joined).toMatch(/PRAGMA busy_timeout\s*=\s*5000/i);
 });

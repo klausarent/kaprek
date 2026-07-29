@@ -24,12 +24,32 @@ CREATE TABLE IF NOT EXISTS indexed (
 );
 `;
 
-/** Opens (creating if needed) the search DB at `<dataDir>/search.db` with schema applied. */
-function openDb(dataDir, DatabaseSync) {
+/** Opens (creating if needed) the search DB at `<dataDir>/search.db`, pragmas + schema applied. */
+function openDbSync(dataDir, DatabaseSync) {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  // WAL lets a concurrent reader (search) and the writer (build) coexist
+  // without blocking each other on every statement; busy_timeout makes lock
+  // contention wait and retry for up to 5s instead of failing immediately
+  // with SQLITE_BUSY. Both are connection-level pragmas, so they're applied
+  // on every open rather than once at db-creation time.
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA busy_timeout = 5000');
   db.exec(SCHEMA_SQL);
   return db;
+}
+
+/**
+ * Opens the search DB (availability-checked, pragmas + schema applied).
+ * Returns `{ db }` on success or `{ unavailable: true, reason }` instead of
+ * throwing when node:sqlite isn't available. Exported so callers/tests can
+ * open the exact connection buildSearchIndex/searchSessions use, e.g. to
+ * inspect PRAGMA state on that same connection.
+ */
+export async function openSearchDb({ dataDir, importSqlite } = {}) {
+  const { available, DatabaseSync, reason } = await getSqlite(importSqlite);
+  if (!available) return { unavailable: true, reason };
+  return { db: openDbSync(dataDir, DatabaseSync) };
 }
 
 /**
@@ -54,10 +74,9 @@ function toMatchQuery(query) {
  * its FTS5 support) is not available in this runtime.
  */
 export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSqlite } = {}) {
-  const { available, DatabaseSync, reason } = await getSqlite(importSqlite);
-  if (!available) return { unavailable: true, reason };
-
-  const db = openDb(dataDir, DatabaseSync);
+  const opened = await openSearchDb({ dataDir, importSqlite });
+  if (opened.unavailable) return opened;
+  const { db } = opened;
   try {
     const sessions = scanProjects(rootDir).flatMap((project) =>
       project.sessions.map((session) => ({ ...session, projectSlug: project.projectSlug })),
@@ -93,10 +112,22 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
         .join('\n');
       const title = digest.meta.title ?? '';
 
-      deleteFtsStmt.run(session.sessionId);
-      deleteMetaStmt.run(session.sessionId);
-      insertFtsStmt.run(session.sessionId, session.projectSlug, title, content);
-      insertMetaStmt.run(session.sessionId, mtimeMs, session.sizeBytes);
+      // Wrapped so the four writes commit atomically: a failure between the
+      // FTS delete and the meta update (crash, disk full, ...) rolls back
+      // to the PRE-attempt state, so the meta row's old (non-matching) mtime
+      // is what next build's skip check sees — not a half-written state
+      // where meta looks "current" while the FTS content is stale/missing.
+      db.exec('BEGIN');
+      try {
+        deleteFtsStmt.run(session.sessionId);
+        deleteMetaStmt.run(session.sessionId);
+        insertFtsStmt.run(session.sessionId, session.projectSlug, title, content);
+        insertMetaStmt.run(session.sessionId, mtimeMs, session.sizeBytes);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
 
       indexed += 1;
       done += 1;
@@ -116,13 +147,12 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
  * outer SQL as anything but a plain bound value.
  */
 export async function searchSessions({ dataDir, query, limit = 50, importSqlite } = {}) {
-  const { available, DatabaseSync, reason } = await getSqlite(importSqlite);
-  if (!available) return { unavailable: true, reason };
-
   const matchQuery = toMatchQuery(query);
   if (!matchQuery) return [];
 
-  const db = openDb(dataDir, DatabaseSync);
+  const opened = await openSearchDb({ dataDir, importSqlite });
+  if (opened.unavailable) return opened;
+  const { db } = opened;
   try {
     const stmt = db.prepare(`
       SELECT sessionId, projectSlug, title,
