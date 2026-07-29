@@ -75,6 +75,9 @@ async function collect(jsonlPath) {
   let firstVersion = null;
   const models = new Set();
   let title = null; // the last ai-title line wins
+  let lastPromptLeafUuid = null; // title fallback: last-prompt points at the final user prompt
+  const userPromptsByUuid = new Map();
+  let firstUserPrompt = null;
   let brokenLines = 0;
   let minTs = null;
   let maxTs = null;
@@ -100,13 +103,18 @@ async function collect(jsonlPath) {
       if (maxTs === null || obj.timestamp > maxTs) maxTs = obj.timestamp;
     }
 
-    // Marker lines without uuid/timestamp: only ai-title carries payload, the rest is skipped.
+    // Marker lines without uuid/timestamp: ai-title carries the title,
+    // last-prompt points at the final user prompt (title fallback), rest skipped.
     if (obj.type === 'ai-title') {
       title = obj.aiTitle ?? title;
       continue;
     }
+    if (obj.type === 'last-prompt') {
+      lastPromptLeafUuid = obj.leafUuid ?? lastPromptLeafUuid;
+      continue;
+    }
     if (!obj.timestamp || !obj.uuid) {
-      // last-prompt, mode, permission-mode, queue-operation,
+      // mode, permission-mode, queue-operation,
       // file-history-snapshot, file-history-delta, ...
       continue;
     }
@@ -139,7 +147,12 @@ async function collect(jsonlPath) {
         if (block.type === 'text') {
           events.push({ kind: 'assistant', ts, msgId: msg.id, text: block.text ?? '' });
         } else if (block.type === 'thinking') {
-          events.push({ kind: 'thinking', ts, msgId: msg.id, text: block.thinking ?? '' });
+          // Claude Code often persists thinking as signature-only with an empty
+          // text field — skip those instead of rendering empty accordions.
+          const thinkingText = typeof block.thinking === 'string' ? block.thinking : '';
+          if (thinkingText.trim() !== '') {
+            events.push({ kind: 'thinking', ts, msgId: msg.id, text: thinkingText });
+          }
         } else if (block.type === 'tool_use') {
           toolCalls += 1;
           if (block.name === 'Bash' && typeof block.input?.command === 'string') {
@@ -210,6 +223,8 @@ async function collect(jsonlPath) {
         }
         if (text !== null) {
           events.push({ kind: 'user', ts, text });
+          if (typeof obj.uuid === 'string') userPromptsByUuid.set(obj.uuid, text);
+          if (firstUserPrompt === null) firstUserPrompt = text;
         }
       }
       continue;
@@ -230,6 +245,17 @@ async function collect(jsonlPath) {
       result: null,
       resultRef: null,
     });
+  }
+
+  // Title fallback for sessions without an ai-title marker (Claude Code does
+  // not always generate one, e.g. headless runs): the final user prompt via
+  // last-prompt.leafUuid, else the first user prompt. Capped for list views.
+  if (title === null) {
+    const fallback = (lastPromptLeafUuid && userPromptsByUuid.get(lastPromptLeafUuid)) ?? firstUserPrompt;
+    if (typeof fallback === 'string' && fallback.trim() !== '') {
+      const oneLine = fallback.trim().replace(/\s+/g, ' ');
+      title = oneLine.length > 100 ? `${oneLine.slice(0, 100)}…` : oneLine;
+    }
   }
 
   return {

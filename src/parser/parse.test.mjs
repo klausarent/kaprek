@@ -566,3 +566,57 @@ test('a single user line with SEVERAL tool_result blocks yields one tool event e
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('empty thinking blocks (signature-only) produce NO event', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-empty-thinking-'));
+  const tmpPath = path.join(tmpDir, 'empty-thinking.jsonl');
+  const lines = [
+    {
+      parentUuid: null, isSidechain: false, type: 'assistant',
+      message: {
+        model: 'claude-fable-5', id: 'msg_T0000000000000000000001', type: 'message', role: 'assistant',
+        content: [
+          { type: 'thinking', thinking: '', signature: 'AAAA' },
+          { type: 'thinking', thinking: 'real thought survives', signature: 'BBBB' },
+          { type: 'text', text: 'answer' },
+        ],
+        stop_reason: 'end_turn', usage: { input_tokens: 1, output_tokens: 1 },
+      },
+      uuid: 'a0000000-0000-0000-0000-000000000021', timestamp: '2026-07-29T12:00:00.000Z',
+      cwd: 'C:\tmp', sessionId: 'empty-thinking', version: '2.1.212', gitBranch: 'main',
+    },
+  ];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  try {
+    const digest = await digestSession(tmpPath);
+    const thinking = digest.events.filter((e) => e.kind === 'thinking');
+    expect(thinking.length).toBe(1);
+    expect(thinking[0].text).toBe('real thought survives');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('title falls back to the last-prompt user message when no ai-title exists, capped at 100 chars', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-title-fallback-'));
+  const tmpPath = path.join(tmpDir, 'no-ai-title.jsonl');
+  const longPrompt = 'Please analyse the chronicle data and build the digest report. '.repeat(4);
+  const lines = [
+    {
+      parentUuid: null, isSidechain: false, type: 'user',
+      message: { role: 'user', content: longPrompt },
+      uuid: 'user-prompt-uuid-1', timestamp: '2026-07-29T12:00:00.000Z',
+      cwd: 'C:\tmp', sessionId: 'no-ai-title', version: '2.1.212', gitBranch: 'main',
+    },
+    { type: 'last-prompt', leafUuid: 'user-prompt-uuid-1', sessionId: 'no-ai-title' },
+  ];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+  try {
+    const digest = await digestSession(tmpPath);
+    expect(digest.meta.title).not.toBe(null);
+    expect(digest.meta.title.startsWith('Please analyse the chronicle')).toBe(true);
+    expect(digest.meta.title.length).toBeLessThanOrEqual(101);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
