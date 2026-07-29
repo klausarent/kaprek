@@ -16,6 +16,7 @@
   "files": [
     "bin",
     "src",
+    "apps",
     "web/dist",
     "LICENSE",
     "README.md",

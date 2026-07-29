@@ -1,0 +1,30 @@
+{
+  "id": "notes",
+  "version": "1.0.0",
+  "name": "Notes",
+  "description": "Write a short markdown note to your local workspace.",
+  "icon": "📝",
+  "instructions": "Use notes.write to save a short note as markdown. Give it a short, descriptive title and the note content; it is saved under notes/ in the user's local workspace.",
+  "tools": [
+    {
+      "id": "notes.write",
+      "description": "Writes a markdown note to the local workspace under notes/.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": { "type": "string", "description": "Short title for the note." },
+          "content": { "type": "string", "description": "Note body (markdown)." }
+        },
+        "required": ["title", "content"]
+      },
+      "handler": "handler.mjs"
+    }
+  ],
+  "policy": {
+    "fsWrite": true,
+    "dataEgress": false,
+    "externalAction": "never",
+    "sensitivity": "low"
+  },
+  "uiSlot": "text"
+}
