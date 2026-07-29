@@ -265,12 +265,12 @@ test('redactSecrets: Bearer <token> becomes "Bearer [REDACTED]"', () => {
 
 test('redactSecrets: KEY=VALUE/KEY: VALUE lines keep the key name, value is redacted', () => {
   expect(redactSecrets('MC_API_TOKEN=supergeheimerwert123')).toBe('MC_API_TOKEN=[REDACTED]');
-  expect(redactSecrets('ABLAGE_TOKEN: "geheimeswert12345"')).toBe('ABLAGE_TOKEN=[REDACTED]');
-  expect(redactSecrets('DB_PASSWORD=hunter2geheim')).toBe('DB_PASSWORD=[REDACTED]');
+  expect(redactSecrets('VAULT_TOKEN: "secretvalue12345"')).toBe('VAULT_TOKEN=[REDACTED]');
+  expect(redactSecrets('DB_PASSWORD=hunter2secret')).toBe('DB_PASSWORD=[REDACTED]');
 });
 
 test('redactSecrets: umlaut text stays unchanged', () => {
-  const text = 'Änderungen für Rückenwind-Eltern: ä ö ü ß Straße, Größe, Prüfung.';
+  const text = 'Änderungen für das Projekt: ä ö ü ß Straße, Größe, Prüfung.';
   expect(redactSecrets(text)).toBe(text);
 });
 
