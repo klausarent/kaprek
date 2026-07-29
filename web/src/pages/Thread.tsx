@@ -1,7 +1,17 @@
 // Session detail page: full digest as a chat thread with tool accordions and
 // nested subagent sub-threads.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { fetchDigest, fetchTasks, linkTaskSession, type Digest, type DigestEvent, type SubagentThread, type Task } from "../lib/api";
+import {
+  fetchArtifacts,
+  fetchDigest,
+  fetchTasks,
+  linkTaskSession,
+  type ArtifactManifest,
+  type Digest,
+  type DigestEvent,
+  type SubagentThread,
+  type Task,
+} from "../lib/api";
 import EventBlock from "../components/EventBlock";
 
 const PAGE_SIZE = 500;
@@ -128,6 +138,51 @@ function LinkToTaskControl({
   );
 }
 
+/**
+ * "Artifacts" section: the session's preserved scratchpad files (see
+ * src/artifacts/preserve.mjs), fetched lazily and independently of the
+ * digest itself — a slow or failed artifacts fetch must never block or
+ * break the thread view. Renders nothing at all when there is nothing to
+ * show, whether that's because the session never had a scratchpad or the
+ * fetch failed.
+ */
+function ArtifactsSection({ project, sessionId }: { project: string; sessionId: string }) {
+  const [manifest, setManifest] = useState<ArtifactManifest | null>(null);
+
+  useEffect(() => {
+    setManifest(null);
+    fetchArtifacts(project, sessionId)
+      .then(setManifest)
+      .catch(() => {
+        // Best-effort — a failed fetch just leaves the section hidden.
+      });
+  }, [project, sessionId]);
+
+  if (!manifest || manifest.files.length === 0) return null;
+
+  return (
+    <section className="thread-artifacts">
+      <h2>Artifacts ({manifest.files.length})</h2>
+      <ul className="artifact-list">
+        {manifest.files.map((f) => (
+          <li key={f.relPath} className="artifact-row">
+            <code className="artifact-relpath">{f.relPath}</code>
+            <span className="artifact-meta">
+              {f.skipped
+                ? `not preserved (${f.skipped === "too-large" ? "too large" : "session budget exceeded"}) · ${fmtBytes(f.size)}`
+                : `${fmtBytes(f.size)} · preserved ${absDate(f.preservedAt)}`}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p className="artifact-hint">
+        Preserved locally under <code>~/.kaprek/artifacts/{project}/{sessionId}/</code> (or your configured
+        KAPREK_DATA_DIR).
+      </p>
+    </section>
+  );
+}
+
 export default function Thread({ project, sessionId }: { project: string; sessionId: string }) {
   const [digest, setDigest] = useState<Digest | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -216,6 +271,8 @@ export default function Thread({ project, sessionId }: { project: string; sessio
             </div>
             <LinkToTaskControl project={project} sessionId={sessionId} machine={digest.meta.machine} />
           </header>
+
+          <ArtifactsSection project={project} sessionId={sessionId} />
 
           {hasOlder && (
             <button

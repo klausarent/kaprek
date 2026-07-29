@@ -47,11 +47,11 @@ function writeTranscript(sessionId, { withGitCommit = false } = {}) {
 }
 
 /** Spawns hook-stop.mjs with `stdinPayload` written raw to stdin, pointing it at our temp dataDir. */
-function runHook(stdinPayload) {
+function runHook(stdinPayload, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [HOOK_PATH], {
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, [DATA_DIR_ENV]: dataDir },
+      env: { ...process.env, [DATA_DIR_ENV]: dataDir, ...extraEnv },
     });
 
     let stdout = '';
@@ -141,6 +141,53 @@ test('stop_hook_active guard: block mode still exits 0 with no output when stop_
   expect(code).toBe(0);
   expect(stdout).toBe('');
   expect(stderr).toBe('');
+}, 10000);
+
+test('Stop hook preserves the ending session\'s scratchpad into dataDir/artifacts', async () => {
+  const sessionId = 'e2e-artifacts';
+  const transcriptPath = writeTranscript(sessionId);
+  // projectSlug is derived by the hook from the transcript_path's parent
+  // directory name — here that is dataDir itself, since writeTranscript()
+  // writes `${dataDir}/${sessionId}.jsonl`.
+  const projectSlug = path.basename(dataDir);
+  const tmpRootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstop-tmproot-'));
+  const scratchpadDir = path.join(tmpRootDir, projectSlug, sessionId, 'scratchpad');
+  fs.mkdirSync(scratchpadDir, { recursive: true });
+  fs.writeFileSync(path.join(scratchpadDir, 'result.txt'), 'work product', 'utf8');
+
+  try {
+    const { code } = await runHook(JSON.stringify({ transcript_path: transcriptPath, session_id: sessionId }), {
+      KAPREK_TMP_ROOT: tmpRootDir,
+    });
+    expect(code).toBe(0);
+
+    const preservedPath = path.join(dataDir, 'artifacts', projectSlug, sessionId, 'result.txt');
+    expect(fs.existsSync(preservedPath)).toBe(true);
+    expect(fs.readFileSync(preservedPath, 'utf8')).toBe('work product');
+  } finally {
+    fs.rmSync(tmpRootDir, { recursive: true, force: true });
+  }
+}, 10000);
+
+test('a broken/unusable tmpRoot never breaks the hook\'s fail-open contract (still exits 0, normal decision output)', async () => {
+  writePolicy({ mode: 'block' });
+  const sessionId = 'e2e-broken-tmproot';
+  const transcriptPath = writeTranscript(sessionId, { withGitCommit: true });
+  // A regular FILE (not a directory) as tmpRoot — any path built underneath
+  // it for artifact preservation is unreachable, but must not throw.
+  const brokenTmpRoot = path.join(dataDir, 'broken-tmproot-is-a-file');
+  fs.writeFileSync(brokenTmpRoot, 'not a directory', 'utf8');
+
+  const { code, stdout } = await runHook(
+    JSON.stringify({ transcript_path: transcriptPath, session_id: sessionId }),
+    { KAPREK_TMP_ROOT: brokenTmpRoot },
+  );
+
+  expect(code).toBe(0);
+  // Normal policy behavior (block mode + a git commit + no linked task)
+  // still fires — the broken tmpRoot only affects artifact preservation.
+  const parsed = JSON.parse(stdout);
+  expect(parsed.decision).toBe('block');
 }, 10000);
 
 test('block mode allows silently when the session is linked to a board task', async () => {

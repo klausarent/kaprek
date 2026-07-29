@@ -18,11 +18,15 @@ const APP_JSON_HEADERS = { ...APP_HEADERS, 'Content-Type': 'application/json' };
 
 let tmpDir;
 let dataDir;
+let tmpRootDir;
 let servers = [];
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-'));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-data-'));
+  // A dedicated, empty scratchpad root — startServer()'s tmpRoot default is
+  // the REAL os.tmpdir()/claude, which must never be touched by a test.
+  tmpRootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-tmproot-'));
   servers = [];
 });
 
@@ -32,12 +36,14 @@ afterEach(async () => {
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(tmpRootDir, { recursive: true, force: true });
 });
 
 /** Starts a server for this test and registers it for teardown. Always uses
- * a per-test temp dataDir — never the real ~/.kaprek app dir. */
+ * a per-test temp dataDir/tmpRoot — never the real ~/.kaprek app dir or
+ * os.tmpdir()/claude. */
 async function boot(opts) {
-  const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, ...opts });
+  const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, tmpRoot: tmpRootDir, ...opts });
   servers.push(started);
   return started;
 }
@@ -393,7 +399,46 @@ test('search routes report available:false when sqlite is unavailable, via impor
   const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
   expect(reindexRes.status).toBe(200);
   const reindexBody = await reindexRes.json();
-  expect(reindexBody).toEqual({ available: false, reason: 'no sqlite here' });
+  expect(reindexBody).toEqual({
+    available: false,
+    reason: 'no sqlite here',
+    artifacts: { copied: 0, skipped: 0 },
+  });
+});
+
+test('POST /api/search/reindex response includes an artifacts sweep summary', async () => {
+  const { url } = await boot({});
+  fs.mkdirSync(path.join(tmpRootDir, 'proj-a', 's1', 'scratchpad'), { recursive: true });
+  fs.writeFileSync(path.join(tmpRootDir, 'proj-a', 's1', 'scratchpad', 'note.txt'), 'hi', 'utf8');
+
+  const res = await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
+  const body = await res.json();
+  expect(body.artifacts).toEqual({ copied: 1, skipped: 0 });
+});
+
+test('GET /api/session/<slug>/<id>/artifacts returns the preserved-artifact manifest, defaulting to { files: [] }', async () => {
+  writeProject('proj-a', { s1: aiTitleLine('x') });
+  const { url } = await boot({});
+
+  const emptyRes = await fetch(`${url}/api/session/proj-a/s1/artifacts`);
+  expect(emptyRes.status).toBe(200);
+  expect(await emptyRes.json()).toEqual({ files: [] });
+
+  fs.mkdirSync(path.join(tmpRootDir, 'proj-a', 's1', 'scratchpad'), { recursive: true });
+  fs.writeFileSync(path.join(tmpRootDir, 'proj-a', 's1', 'scratchpad', 'note.txt'), 'hi', 'utf8');
+  await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
+
+  const res = await fetch(`${url}/api/session/proj-a/s1/artifacts`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.files.length).toBe(1);
+  expect(body.files[0].relPath).toBe('note.txt');
+});
+
+test('GET /api/session/<slug>/<id>/artifacts rejects an unsafe id with 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/session/sneaky..name/s1/artifacts`);
+  expect(res.status).toBe(400);
 });
 
 // --- CSRF hardening (custom app header) ---------------------------------

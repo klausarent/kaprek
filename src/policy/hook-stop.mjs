@@ -9,10 +9,21 @@
 // hang — either would block the user's ability to end a turn. Every path
 // is wrapped in try/catch, and a self-timeout forces a clean exit if
 // anything takes too long.
+import path from 'node:path';
+import os from 'node:os';
 import { evaluateStop } from './policy.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
+import { sweepSessionArtifacts } from '../artifacts/preserve.mjs';
 
 const SELF_TIMEOUT_MS = 3000;
+
+// Test-only override, mirroring KAPREK_DATA_DIR (see appdir.mjs): hook-stop.mjs
+// runs as a spawned child process (see hook-stop.test.mjs), so its tests need
+// a way to point artifact preservation at a scratch tmpRoot from the outside
+// rather than the real OS temp dir.
+function resolveTmpRoot() {
+  return process.env.KAPREK_TMP_ROOT || path.join(os.tmpdir(), 'claude');
+}
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -48,6 +59,30 @@ async function main() {
     transcriptPath: input?.transcript_path,
     sessionId: input?.session_id,
   });
+
+  // Best-effort scratchpad preservation for the ending session. The Stop
+  // hook is the one moment kaprek knows a session just ended, making it the
+  // best chance to catch a scratchpad before OS temp cleanup removes it —
+  // but this must never affect the hook's own fail-open contract, so every
+  // failure (bad tmpRoot, permissions, an oversized scratchpad) is swallowed
+  // completely. The small session byte budget here keeps this fast within
+  // SELF_TIMEOUT_MS; the reindex-triggered sweep (see server.mjs) is the
+  // full, unbudgeted pass that picks up anything this misses.
+  try {
+    const transcriptPath = input?.transcript_path;
+    const projectSlug = typeof transcriptPath === 'string' ? path.basename(path.dirname(transcriptPath)) : null;
+    if (projectSlug && typeof input?.session_id === 'string') {
+      sweepSessionArtifacts({
+        tmpRoot: resolveTmpRoot(),
+        dataDir,
+        projectSlug,
+        sessionId: input.session_id,
+        maxSessionBytes: 20 * 1024 * 1024,
+      });
+    }
+  } catch {
+    // fail-open: artifact preservation must never block ending the turn
+  }
 
   if (result.decision === 'block') {
     process.stdout.write(JSON.stringify({ decision: 'block', reason: result.reasons.join('; ') }));

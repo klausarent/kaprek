@@ -7,11 +7,13 @@
 // scanProjects() results, never by concatenating raw user input into a path.
 import http from 'node:http';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession } from '../parser/parse.mjs';
 import { buildSearchIndex, searchSessions } from '../search/index.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
+import { sweepArtifacts, readArtifactManifest } from '../artifacts/preserve.mjs';
 import {
   openBoard,
   STATUSES as BOARD_STATUSES,
@@ -261,14 +263,45 @@ async function handleSearch(res, dataDir, query, importSqlite) {
   sendJson(res, 200, { available: true, results });
 }
 
-/** POST /api/search/reindex — (re)builds the search index synchronously. */
-async function handleReindex(res, rootDir, dataDir, importSqlite) {
+/**
+ * POST /api/search/reindex — (re)builds the search index synchronously, and
+ * (best-effort, alongside it) sweeps scratchpad artifacts into dataDir. The
+ * two are unrelated features bundled onto the same button/route purely
+ * because both are "catch the server up on disk state since last run" —
+ * a sweep failure must never fail the reindex response itself.
+ */
+async function handleReindex(res, rootDir, dataDir, importSqlite, tmpRoot) {
   const result = await buildSearchIndex({ rootDir, dataDir, importSqlite });
+
+  let artifacts = { copied: 0, skipped: 0 };
+  try {
+    const sweep = sweepArtifacts({ tmpRoot, dataDir });
+    artifacts = { copied: sweep.copied, skipped: sweep.skipped };
+  } catch {
+    // best-effort — a sweep failure must not break the reindex response
+  }
+
   if (result && result.unavailable) {
-    sendJson(res, 200, { available: false, reason: result.reason });
+    sendJson(res, 200, { available: false, reason: result.reason, artifacts });
     return;
   }
-  sendJson(res, 200, { available: true, indexed: result.indexed, skipped: result.skipped, removed: result.removed });
+  sendJson(res, 200, {
+    available: true,
+    indexed: result.indexed,
+    skipped: result.skipped,
+    removed: result.removed,
+    artifacts,
+  });
+}
+
+/** GET /api/session/<slug>/<sessionId>/artifacts — that session's preserved-artifact manifest, or { files: [] }. */
+function handleArtifactsManifest(res, dataDir, slug, sessionId) {
+  if (!isSafeId(slug) || !isSafeId(sessionId)) {
+    sendJson(res, 400, { error: 'invalid id' });
+    return;
+  }
+  const manifest = readArtifactManifest(dataDir, slug, sessionId);
+  sendJson(res, 200, manifest);
 }
 
 /**
@@ -561,7 +594,7 @@ function serveStatic(res, webDist, pathname) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard }) {
+async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard, tmpRoot }) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
   // a hostile page could otherwise frame this loopback server in an <iframe>
   // and trick a user into clicking board/reindex/signing actions. Set via
@@ -608,7 +641,7 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleReindex(res, rootDir, dataDir, importSqlite);
+      await handleReindex(res, rootDir, dataDir, importSqlite, tmpRoot);
       return;
     }
     if (segments[1] === 'board') {
@@ -632,6 +665,10 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
       await handleDigest(res, rootDir, redact, cache, segments[2], segments[3]);
       return;
     }
+    if (segments.length === 5 && segments[1] === 'session' && segments[4] === 'artifacts') {
+      handleArtifactsManifest(res, dataDir, segments[2], segments[3]);
+      return;
+    }
     sendJson(res, 404, { error: 'not found' });
     return;
   }
@@ -647,7 +684,15 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
  * Starts the local API/static server. Binds to 127.0.0.1 only.
  * Resolves once listening, with the running http.Server and its base URL.
  */
-export function startServer({ port = 0, rootDir, redact = true, webDist, dataDir = getAppDir(), importSqlite } = {}) {
+export function startServer({
+  port = 0,
+  rootDir,
+  redact = true,
+  webDist,
+  dataDir = getAppDir(),
+  importSqlite,
+  tmpRoot = path.join(os.tmpdir(), 'claude'),
+} = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
   // ephemeral port); the Host-header check needs the actual bound port, not
@@ -664,11 +709,19 @@ export function startServer({ port = 0, rootDir, redact = true, webDist, dataDir
   }
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, { rootDir, redact, webDist, cache, port: boundPort, dataDir, importSqlite, getBoard }).catch(
-      (err) => {
-        sendJson(res, 500, { error: 'internal error', message: err.message });
-      },
-    );
+    handleRequest(req, res, {
+      rootDir,
+      redact,
+      webDist,
+      cache,
+      port: boundPort,
+      dataDir,
+      importSqlite,
+      getBoard,
+      tmpRoot,
+    }).catch((err) => {
+      sendJson(res, 500, { error: 'internal error', message: err.message });
+    });
   });
 
   return new Promise((resolve, reject) => {

@@ -138,6 +138,21 @@ export function fetchDigest(projectSlug: string, sessionId: string): Promise<Dig
   return getJson<Digest>(`/api/session/${path}/digest`);
 }
 
+// Preserved scratchpad artifacts (src/artifacts/preserve.mjs via
+// /api/session/<slug>/<id>/artifacts). A "skipped" entry never made it to
+// disk (too large, or the session's byte budget ran out) — it still shows up
+// here so the user can see what wasn't preserved, not just what was.
+export type ArtifactEntry =
+  | { relPath: string; size: number; mtimeMs: number; sha256: string; preservedAt: string; skipped?: undefined }
+  | { relPath: string; size: number; skipped: "too-large" | "session-budget" };
+
+export type ArtifactManifest = { files: ArtifactEntry[] };
+
+export function fetchArtifacts(projectSlug: string, sessionId: string): Promise<ArtifactManifest> {
+  const path = [projectSlug, sessionId].map(encodeURIComponent).join("/");
+  return getJson<ArtifactManifest>(`/api/session/${path}/artifacts`);
+}
+
 export type SearchHit = {
   sessionId: string;
   projectSlug: string;
