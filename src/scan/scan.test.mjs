@@ -148,11 +148,11 @@ test('last-prompt fallback is skipped when the referenced message is isMeta', ()
 });
 
 test('machineHint is derived from a cwd field (Windows user segment)', () => {
-  const lines = [envelope({ cwd: 'C:\\Users\\klausrig\\Documents\\Software\\klaus-os' })];
+  const lines = [envelope({ cwd: 'C:\\Users\\alicedev\\Documents\\projects\\demo-app' })];
   const filePath = writeJsonl('machine-hint.jsonl', lines);
 
   const meta = readSessionMeta(filePath, { cache: false });
-  expect(meta.machineHint).toBe('klausrig');
+  expect(meta.machineHint).toBe('alicedev');
 });
 
 test('machineHint is null when no cwd field is present in the scanned window', () => {
