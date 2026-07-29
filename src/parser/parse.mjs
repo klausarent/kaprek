@@ -258,6 +258,15 @@ function truncateEvent(event, maxTextLen, maxToolLen, redact) {
         input: event.input !== null ? truncate(applyRedact(JSON.stringify(event.input)), maxToolLen) : null,
         result: event.result !== undefined ? truncate(applyRedact(event.result), maxToolLen) : event.result,
       };
+    case 'subagent':
+      // Agent-spawn name/description come straight from tool_use input, the
+      // same untrusted source as any other tool input — must go through the
+      // same redaction as everything else that reaches the digest.
+      return {
+        ...event,
+        name: applyRedact(event.name),
+        description: applyRedact(event.description),
+      };
     default:
       return event;
   }
@@ -301,6 +310,13 @@ export async function digestSession(jsonlPath, { maxTextLen = 4000, maxToolLen =
             meta = {};
           }
         }
+        // .meta.json is written by Claude Code itself, not by this parser —
+        // name/description can carry the same kind of freeform text as any
+        // tool input, so it needs the same redaction before it reaches the digest.
+        if (redact) {
+          if (typeof meta.name === 'string') meta.name = redactSecrets(meta.name);
+          if (typeof meta.description === 'string') meta.description = redactSecrets(meta.description);
+        }
         const subDigest = await digestSession(subJsonlPath, { maxTextLen, maxToolLen, redact });
         return { agentId, meta, events: subDigest.events };
       }),
@@ -312,7 +328,11 @@ export async function digestSession(jsonlPath, { maxTextLen = 4000, maxToolLen =
       sessionId,
       projectSlug: path.basename(transcriptDir),
       cwd: raw.firstCwd,
-      title: raw.title,
+      // ai-title is a marker line from Claude Code, not something this
+      // parser already filtered — it can carry secrets in the title text
+      // just like any other free-text field, so it needs the same redaction
+      // gate before it reaches the digest (API, meta cache, search index).
+      title: redact ? redactSecrets(raw.title) : raw.title,
       startedAt,
       endedAt,
       models: [...raw.models],

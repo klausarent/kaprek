@@ -263,6 +263,17 @@ test('fallback title (derived from a user message) is redacted before it leaves 
   expect(meta.title).not.toContain('sk-test0000000000000000AAAA');
 });
 
+test('an ai-title marker carrying a secret is redacted, not just the last-prompt fallback title', () => {
+  const lines = [
+    { type: 'ai-title', aiTitle: 'Fix sk-test0000000000000000AAAA before merging', sessionId: 'ai-title-secret' },
+  ];
+  const filePath = writeJsonl('ai-title-secret.jsonl', lines);
+
+  const meta = readSessionMeta(filePath, { cache: false });
+  expect(meta.title).toContain('[REDACTED]');
+  expect(meta.title).not.toContain('sk-test0000000000000000AAAA');
+});
+
 test('evictStaleCache removes cache entries older than 30 days, keeps fresh ones', () => {
   fs.mkdirSync(CACHE_DIR, { recursive: true });
   const stalePath = path.join(CACHE_DIR, 'evict-test-stale.json');

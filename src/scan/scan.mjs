@@ -105,7 +105,10 @@ function buildMeta(objs) {
 
   for (const obj of objs) {
     if (obj.type === 'ai-title' && typeof obj.aiTitle === 'string') {
-      title = obj.aiTitle;
+      // Same redaction gate as the last-prompt fallback below — an ai-title
+      // marker is free text from Claude Code and can carry secrets, and this
+      // meta ends up in the temp cache and the session list API.
+      title = redactSecrets(obj.aiTitle);
       continue;
     }
     if (obj.type === 'last-prompt' && typeof obj.leafUuid === 'string') {

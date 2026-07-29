@@ -344,6 +344,133 @@ test('integration: digestSession redacts a secret in a tool_result before trunca
   }
 });
 
+test('integration: an ai-title marker carrying a secret is redacted in digest.meta.title', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-title-secret-'));
+  const tmpPath = path.join(tmpDir, 'title-secret-session.jsonl');
+  const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
+  const lines = [{ type: 'ai-title', aiTitle: `Fix ${fakeToken}`, sessionId: 'title-secret-session' }];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  try {
+    const digest = await digestSession(tmpPath);
+    expect(digest.meta.title).toContain('[REDACTED]');
+    expect(digest.meta.title).not.toContain(fakeToken);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('integration: digestSession({ redact: false }) leaves a secret in the ai-title in plaintext (opt-out)', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-title-secret-noredact-'));
+  const tmpPath = path.join(tmpDir, 'title-secret-session.jsonl');
+  const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
+  const lines = [{ type: 'ai-title', aiTitle: `Fix ${fakeToken}`, sessionId: 'title-secret-session' }];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  try {
+    const digest = await digestSession(tmpPath, { redact: false });
+    expect(digest.meta.title).toContain(fakeToken);
+    expect(digest.meta.title).not.toContain('[REDACTED]');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('integration: a subagent name/description carrying a secret is redacted in the event AND in subagents[].meta', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-subagent-secret-'));
+  const tmpPath = path.join(tmpDir, 'subagent-secret-session.jsonl');
+  const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
+  const lines = [
+    {
+      parentUuid: null, isSidechain: false,
+      promptId: 'p0000000-0000-0000-0000-000000000010', type: 'user',
+      message: { role: 'user', content: 'Spawn a subagent.' },
+      uuid: 'u0000000-0000-0000-0000-000000000010', timestamp: '2026-07-29T13:00:00.000Z',
+      cwd: 'C:\\tmp', sessionId: 'subagent-secret-session', version: '2.1.212', gitBranch: 'main',
+    },
+    {
+      parentUuid: 'u0000000-0000-0000-0000-000000000010', isSidechain: false, type: 'assistant',
+      message: {
+        model: 'claude-sonnet-5', id: 'msg_SA000000000000000000001', type: 'message', role: 'assistant',
+        content: [{
+          type: 'tool_use', id: 'toolu_agent_secret0000001', name: 'Agent',
+          input: { name: `agent-${fakeToken}`, subagent_type: 'fast-worker', description: `Uses key ${fakeToken}`, prompt: 'do it' },
+        }],
+        stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 },
+      },
+      uuid: 'a0000000-0000-0000-0000-000000000010', timestamp: '2026-07-29T13:00:05.000Z',
+      cwd: 'C:\\tmp', sessionId: 'subagent-secret-session', version: '2.1.212', gitBranch: 'main',
+    },
+  ];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  const subagentsDir = path.join(tmpDir, 'subagent-secret-session', 'subagents');
+  fs.mkdirSync(subagentsDir, { recursive: true });
+  fs.writeFileSync(path.join(subagentsDir, `agent-${fakeToken}.jsonl`), '', 'utf8');
+  fs.writeFileSync(
+    path.join(subagentsDir, `agent-${fakeToken}.meta.json`),
+    JSON.stringify({ agentType: 'fast-worker', description: `Uses key ${fakeToken}`, name: `agent-${fakeToken}` }),
+    'utf8',
+  );
+
+  try {
+    const digest = await digestSession(tmpPath);
+    const subagentEvent = digest.events.find((e) => e.kind === 'subagent');
+    expect(subagentEvent, 'subagent event is missing').toBeTruthy();
+    expect(subagentEvent.name).toContain('[REDACTED]');
+    expect(subagentEvent.name).not.toContain(fakeToken);
+    expect(subagentEvent.description).toContain('[REDACTED]');
+    expect(subagentEvent.description).not.toContain(fakeToken);
+
+    expect(digest.subagents.length).toBe(1);
+    const subMeta = digest.subagents[0].meta;
+    expect(subMeta.name).toContain('[REDACTED]');
+    expect(subMeta.name).not.toContain(fakeToken);
+    expect(subMeta.description).toContain('[REDACTED]');
+    expect(subMeta.description).not.toContain(fakeToken);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('integration: digestSession({ redact: false }) leaves subagent name/description in plaintext (opt-out)', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-subagent-secret-noredact-'));
+  const tmpPath = path.join(tmpDir, 'subagent-secret-session.jsonl');
+  const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
+  const lines = [
+    {
+      parentUuid: null, isSidechain: false,
+      promptId: 'p0000000-0000-0000-0000-000000000011', type: 'user',
+      message: { role: 'user', content: 'Spawn a subagent.' },
+      uuid: 'u0000000-0000-0000-0000-000000000011', timestamp: '2026-07-29T14:00:00.000Z',
+      cwd: 'C:\\tmp', sessionId: 'subagent-secret-session-2', version: '2.1.212', gitBranch: 'main',
+    },
+    {
+      parentUuid: 'u0000000-0000-0000-0000-000000000011', isSidechain: false, type: 'assistant',
+      message: {
+        model: 'claude-sonnet-5', id: 'msg_SA000000000000000000002', type: 'message', role: 'assistant',
+        content: [{
+          type: 'tool_use', id: 'toolu_agent_secret0000002', name: 'Agent',
+          input: { name: `agent-${fakeToken}`, subagent_type: 'fast-worker', description: `Uses key ${fakeToken}`, prompt: 'do it' },
+        }],
+        stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 },
+      },
+      uuid: 'a0000000-0000-0000-0000-000000000011', timestamp: '2026-07-29T14:00:05.000Z',
+      cwd: 'C:\\tmp', sessionId: 'subagent-secret-session-2', version: '2.1.212', gitBranch: 'main',
+    },
+  ];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  try {
+    const digest = await digestSession(tmpPath, { redact: false });
+    const subagentEvent = digest.events.find((e) => e.kind === 'subagent');
+    expect(subagentEvent.name).toContain(fakeToken);
+    expect(subagentEvent.description).toContain(fakeToken);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test('integration: digestSession({ redact: false }) leaves a secret in plaintext (opt-out)', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-no-redact-'));
   const tmpPath = path.join(tmpDir, 'secret-session.jsonl');
