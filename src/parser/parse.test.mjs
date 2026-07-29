@@ -521,3 +521,48 @@ test('integration: digestSession({ redact: false }) leaves a secret in plaintext
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('a single user line with SEVERAL tool_result blocks yields one tool event each (parallel calls)', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-parallel-'));
+  const tmpPath = path.join(tmpDir, 'parallel-session.jsonl');
+  const lines = [
+    {
+      parentUuid: null, isSidechain: false, type: 'assistant',
+      message: {
+        model: 'claude-sonnet-5', id: 'msg_P0000000000000000000001', type: 'message', role: 'assistant',
+        content: [
+          { type: 'tool_use', id: 'toolu_par_a', name: 'Read', input: { file_path: 'C:\tmp\a.txt' } },
+          { type: 'tool_use', id: 'toolu_par_b', name: 'Grep', input: { pattern: 'foo' } },
+        ],
+        stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 },
+      },
+      uuid: 'a0000000-0000-0000-0000-000000000010', timestamp: '2026-07-29T11:00:00.000Z',
+      cwd: 'C:\tmp', sessionId: 'parallel-session', version: '2.1.212', gitBranch: 'main',
+    },
+    {
+      parentUuid: 'a0000000-0000-0000-0000-000000000010', isSidechain: false, type: 'user',
+      message: {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 'toolu_par_a', content: 'contents of a' },
+          { type: 'tool_result', tool_use_id: 'toolu_par_b', content: 'grep match foo' },
+        ],
+      },
+      uuid: 'u0000000-0000-0000-0000-000000000010', timestamp: '2026-07-29T11:00:02.000Z',
+      cwd: 'C:\tmp', sessionId: 'parallel-session', version: '2.1.212', gitBranch: 'main',
+    },
+  ];
+  fs.writeFileSync(tmpPath, lines.map((l) => JSON.stringify(l)).join('\n') + '\n', 'utf8');
+
+  try {
+    const digest = await digestSession(tmpPath);
+    const toolEvents = digest.events.filter((e) => e.kind === 'tool');
+    expect(toolEvents.length, 'both parallel results must become events').toBe(2);
+    const names = toolEvents.map((e) => e.name).sort();
+    expect(names).toEqual(['Grep', 'Read']);
+    expect(toolEvents.find((e) => e.name === 'Read').result).toBe('contents of a');
+    expect(toolEvents.find((e) => e.name === 'Grep').result).toBe('grep match foo');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

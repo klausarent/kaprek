@@ -173,26 +173,29 @@ async function collect(jsonlPath) {
       const msg = obj.message;
       const content = msg.content;
 
-      // tool_result line?
-      const resultBlock = Array.isArray(content) ? content.find((b) => b?.type === 'tool_result') : null;
-      if (resultBlock) {
-        const pending = pendingToolUses.get(resultBlock.tool_use_id);
-        const resultText = toolResultText(resultBlock.content);
-        let resultRef = null;
-        if (resultText.includes('<persisted-output>')) {
-          const match = PERSISTED_OUTPUT_RE.exec(resultText);
-          resultRef = match ? match[1].trim() : null;
+      // tool_result line? A single user line can carry SEVERAL tool_result
+      // blocks (parallel tool calls answered in one message) — process all.
+      const resultBlocks = Array.isArray(content) ? content.filter((b) => b?.type === 'tool_result') : [];
+      if (resultBlocks.length > 0) {
+        for (const resultBlock of resultBlocks) {
+          const pending = pendingToolUses.get(resultBlock.tool_use_id);
+          const resultText = toolResultText(resultBlock.content);
+          let resultRef = null;
+          if (resultText.includes('<persisted-output>')) {
+            const match = PERSISTED_OUTPUT_RE.exec(resultText);
+            resultRef = match ? match[1].trim() : null;
+          }
+          events.push({
+            kind: 'tool',
+            ts: pending ? pending.ts : ts,
+            msgId: pending ? pending.msgId : null,
+            name: pending ? pending.name : null,
+            input: pending ? pending.input : null,
+            result: resultText,
+            resultRef,
+          });
+          if (pending) pendingToolUses.delete(resultBlock.tool_use_id);
         }
-        events.push({
-          kind: 'tool',
-          ts: pending ? pending.ts : ts,
-          msgId: pending ? pending.msgId : null,
-          name: pending ? pending.name : null,
-          input: pending ? pending.input : null,
-          result: resultText,
-          resultRef,
-        });
-        if (pending) pendingToolUses.delete(resultBlock.tool_use_id);
         continue;
       }
 
