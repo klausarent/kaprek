@@ -557,6 +557,86 @@ test('board: invalid JSON body is rejected with 400', async () => {
   expect(res.status).toBe(400);
 });
 
+// --- Board receipts --------------------------------------------------------
+
+test('board receipt: full cycle — doc, done, sign, verify ok, edit doc, verify invalid', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Receipt me' })).json();
+
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+
+  const signRes = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, { agentName: 'claude-fable-5' });
+  expect(signRes.status).toBe(201);
+  const { receipt } = await signRes.json();
+  expect(receipt.agent).toBe('claude-fable-5');
+  expect(receipt.alg).toBe('ed25519');
+
+  const verifyOkRes = await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`);
+  expect(verifyOkRes.status).toBe(200);
+  expect(await verifyOkRes.json()).toEqual({ valid: true });
+
+  // Editing the doc changes the payload the receipt sealed, so verification
+  // must now fail — the receipt is a snapshot claim, not a standing approval.
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { outcome: 'Changed after signing, on purpose.' } });
+  const verifyStaleRes = await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`);
+  expect(verifyStaleRes.status).toBe(200);
+  const staleBody = await verifyStaleRes.json();
+  expect(staleBody.valid).toBe(false);
+  expect(staleBody.reason).toBe('payload hash mismatch');
+});
+
+test('board receipt: POST without agentName defaults to "local"', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+
+  const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  expect(res.status).toBe(201);
+  expect((await res.json()).receipt.agent).toBe('local');
+});
+
+test('board receipt: signing a task with no doc at all returns 409', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'No doc yet' })).json();
+
+  const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  expect(res.status).toBe(409);
+});
+
+test('board receipt: verifying a task with no receipt returns 404', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+
+  const res = await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`);
+  expect(res.status).toBe(404);
+});
+
+test('board receipt: unknown task id returns 404 for both sign and verify', async () => {
+  const { url } = await boot({});
+  const unknownId = '00000000-0000-0000-0000-000000000000';
+
+  const signRes = await postJson(`${url}/api/board/tasks/${unknownId}/receipt`, {});
+  expect(signRes.status).toBe(404);
+
+  const verifyRes = await fetch(`${url}/api/board/tasks/${unknownId}/receipt/verify`);
+  expect(verifyRes.status).toBe(404);
+});
+
+test('CSRF hardening: POST /api/board/tasks/<id>/receipt without x-app-request header is rejected with 403', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+
+  const res = await fetch(`${url}/api/board/tasks/${task.id}/receipt`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: '{}',
+  });
+  expect(res.status).toBe(403);
+});
+
 test('board: a body over the 256 KB limit is rejected with 413', async () => {
   const { url } = await boot({});
   const bigTitle = 'x'.repeat(300 * 1024);

@@ -814,6 +814,33 @@ pre,
   opacity: 0.5;
 }
 
+.board-receipt-badge {
+  align-self: flex-start;
+  font-size: 11px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(79, 70, 229, 0.15);
+  color: var(--accent);
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.board-receipt-badge:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.board-receipt-badge.board-receipt-badge-ok {
+  background: var(--success-bg);
+  color: var(--success-text);
+}
+
+.board-receipt-badge.board-receipt-badge-invalid {
+  background: var(--danger-bg);
+  color: var(--danger-text);
+}
+
 .board-session-links {
   display: flex;
   flex-direction: column;

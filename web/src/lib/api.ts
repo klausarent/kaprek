@@ -201,6 +201,16 @@ export type TaskSession = {
   sessionId: string;
 };
 
+// Mirrors the receipt shape produced by src/receipt/receipt.mjs's signReceipt().
+export type Receipt = {
+  agent: string;
+  pubkey: string;
+  alg: "ed25519";
+  payloadHash: string;
+  sig: string;
+  signedAt: string;
+};
+
 export type Task = {
   id: string;
   title: string;
@@ -211,7 +221,7 @@ export type Task = {
   updatedAt: string;
   doc: TaskDoc | null;
   sessions: TaskSession[];
-  receipt: unknown;
+  receipt: Receipt | null;
 };
 
 export function fetchTasks(filter: { status?: BoardStatus; project?: string } = {}): Promise<Task[]> {
@@ -263,4 +273,15 @@ export async function setTaskStatus(id: string, status: BoardStatus): Promise<Ta
   }
   await throwOnError(res);
   return res.json() as Promise<Task>;
+}
+
+/** Signs a receipt for a 'done' task's current state. Server defaults agentName to 'local' when omitted. */
+export function signTaskReceipt(id: string, agentName?: string): Promise<{ receipt: Receipt }> {
+  return postJson<{ receipt: Receipt }>(`/api/board/tasks/${encodeURIComponent(id)}/receipt`, { agentName });
+}
+
+export type VerifyReceiptResult = { valid: boolean; reason?: string };
+
+export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
+  return getJson<VerifyReceiptResult>(`/api/board/tasks/${encodeURIComponent(id)}/receipt/verify`);
 }

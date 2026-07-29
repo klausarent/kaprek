@@ -21,6 +21,7 @@ import {
   UnknownDocFieldError,
   DocIncompleteError,
 } from '../board/store.mjs';
+import { signReceipt, verifyReceipt, InvalidAgentNameError } from '../receipt/receipt.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
 const MAX_BOARD_BODY_BYTES = 256 * 1024;
@@ -265,11 +266,32 @@ async function handleReindex(res, rootDir, dataDir, importSqlite) {
 }
 
 /**
+ * Builds the receipt payload for a task's CURRENT state: the exact object
+ * signReceipt()/verifyReceipt() hash and sign. Called both when creating a
+ * receipt and when verifying one, always from a freshly re-read task — a
+ * receipt seals a snapshot, so any later edit to title/project/doc/sessions
+ * changes this payload and makes an existing receipt verify as invalid.
+ * gitCommit/policyVersion aren't tracked yet; carried as null placeholders
+ * so the payload shape is stable for future receipts that do set them.
+ */
+function receiptPayloadFor(task) {
+  return {
+    taskId: task.id,
+    title: task.title,
+    project: task.project,
+    doc: task.doc,
+    sessionIds: task.sessions.map((s) => s.sessionId),
+    gitCommit: null,
+    policyVersion: null,
+  };
+}
+
+/**
  * Board routes, mounted at /api/board/*. `getBoard()` opens (or returns the
  * already-open) board for the server's configured dataDir — see
  * startServer()'s lazy board getter below.
  */
-async function handleBoardRoutes(req, res, getBoard, segments, url) {
+async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
   if (segments[2] !== 'tasks') {
     sendJson(res, 404, { error: 'not found' });
     return;
@@ -391,6 +413,87 @@ async function handleBoardRoutes(req, res, getBoard, segments, url) {
     return;
   }
 
+  // /api/board/tasks/<id>/receipt
+  if (segments.length === 5 && segments[4] === 'receipt') {
+    const taskId = segments[3];
+    if (!isValidTaskId(taskId)) {
+      sendJson(res, 400, { error: 'invalid task id' });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    let task;
+    try {
+      task = board.get(taskId);
+    } catch (err) {
+      if (err instanceof TaskNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      throw err;
+    }
+    if (!task.doc) {
+      sendJson(res, 409, { error: 'task has no documentation yet — a receipt without a doc would be meaningless' });
+      return;
+    }
+    const agentName =
+      typeof body.data?.agentName === 'string' && body.data.agentName.trim().length > 0
+        ? body.data.agentName.trim()
+        : 'local';
+    let receipt;
+    try {
+      receipt = signReceipt({ dataDir, agentName, payload: receiptPayloadFor(task) });
+    } catch (err) {
+      if (err instanceof InvalidAgentNameError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      throw err;
+    }
+    board.setReceipt(taskId, receipt);
+    sendJson(res, 201, { receipt });
+    return;
+  }
+
+  // /api/board/tasks/<id>/receipt/verify
+  if (segments.length === 6 && segments[4] === 'receipt' && segments[5] === 'verify') {
+    const taskId = segments[3];
+    if (!isValidTaskId(taskId)) {
+      sendJson(res, 400, { error: 'invalid task id' });
+      return;
+    }
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    let task;
+    try {
+      task = board.get(taskId);
+    } catch (err) {
+      if (err instanceof TaskNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      throw err;
+    }
+    if (!task.receipt) {
+      sendJson(res, 404, { error: 'no receipt for this task' });
+      return;
+    }
+    // Reconstructed from the task's CURRENT state, not a stored snapshot —
+    // see receiptPayloadFor()'s comment.
+    const result = verifyReceipt({ payload: receiptPayloadFor(task), receipt: task.receipt });
+    sendJson(res, 200, result);
+    return;
+  }
+
   sendJson(res, 404, { error: 'not found' });
 }
 
@@ -471,7 +574,7 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
       return;
     }
     if (segments[1] === 'board') {
-      await handleBoardRoutes(req, res, getBoard, segments, url);
+      await handleBoardRoutes(req, res, getBoard, segments, url, dataDir);
       return;
     }
 

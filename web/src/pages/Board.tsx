@@ -8,6 +8,8 @@ import {
   updateTask,
   setTaskDoc,
   setTaskStatus,
+  signTaskReceipt,
+  verifyTaskReceipt,
   TaskDocIncompleteError,
   BOARD_STATUSES,
   DOC_FIELD_DEFS,
@@ -15,6 +17,7 @@ import {
   type Task,
   type BoardStatus,
   type TaskDoc,
+  type VerifyReceiptResult,
 } from "../lib/api";
 import { navigateToThread } from "../App";
 
@@ -165,6 +168,9 @@ function TaskDrawer({ task, onClose, onUpdated }: { task: Task; onClose: () => v
   const [statusPending, setStatusPending] = useState<BoardStatus | null>(null);
   const [missing, setMissing] = useState<string[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [signingReceipt, setSigningReceipt] = useState(false);
+  const [verifyingReceipt, setVerifyingReceipt] = useState(false);
+  const [verifyResult, setVerifyResult] = useState<VerifyReceiptResult | null>(null);
 
   // Reset local edit state whenever the drawer is opened for a different task.
   useEffect(() => {
@@ -174,6 +180,7 @@ function TaskDrawer({ task, onClose, onUpdated }: { task: Task; onClose: () => v
     setDoc(task.doc ?? {});
     setMissing(null);
     setError(null);
+    setVerifyResult(null);
   }, [task.id]);
 
   const docComplete = isDocComplete(doc);
@@ -224,6 +231,32 @@ function TaskDrawer({ task, onClose, onUpdated }: { task: Task; onClose: () => v
       }
     } finally {
       setStatusPending(null);
+    }
+  };
+
+  const handleSignReceipt = async () => {
+    setSigningReceipt(true);
+    setError(null);
+    try {
+      const { receipt } = await signTaskReceipt(task.id);
+      onUpdated({ ...task, receipt });
+      setVerifyResult(null);
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setSigningReceipt(false);
+    }
+  };
+
+  const handleVerifyReceipt = async () => {
+    setVerifyingReceipt(true);
+    setError(null);
+    try {
+      setVerifyResult(await verifyTaskReceipt(task.id));
+    } catch (err) {
+      setError((err as Error).message);
+    } finally {
+      setVerifyingReceipt(false);
     }
   };
 
@@ -281,6 +314,35 @@ function TaskDrawer({ task, onClose, onUpdated }: { task: Task; onClose: () => v
             </div>
           )}
         </div>
+
+        {task.status === "done" && (
+          <div className="board-drawer-field">
+            <label>Receipt</label>
+            {task.receipt ? (
+              <button
+                type="button"
+                className={`board-receipt-badge${
+                  verifyResult ? (verifyResult.valid ? " board-receipt-badge-ok" : " board-receipt-badge-invalid") : ""
+                }`}
+                onClick={handleVerifyReceipt}
+                disabled={verifyingReceipt}
+                title="Click to verify against the task's current state"
+              >
+                {verifyingReceipt
+                  ? "🔏 Verifying…"
+                  : verifyResult
+                    ? verifyResult.valid
+                      ? `🔏 verified — ${task.receipt.agent}`
+                      : `🔏 invalid — ${verifyResult.reason ?? "unknown reason"}`
+                    : `🔏 ${task.receipt.agent} · ${new Date(task.receipt.signedAt).toLocaleString()}`}
+              </button>
+            ) : (
+              <button type="button" className="btn" onClick={handleSignReceipt} disabled={signingReceipt}>
+                {signingReceipt ? "Signing…" : "Sign receipt"}
+              </button>
+            )}
+          </div>
+        )}
 
         <div className="board-drawer-field">
           <label>Documentation</label>
