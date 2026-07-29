@@ -36,8 +36,18 @@
  * @property {string|null} sessionId - the CLI's session id (from the init or result event)
  * @property {number|null} costUsd - total_cost_usd from the result event, if any
  * @property {object|null} usage - usage object from the result event, if any
- * @property {'result'|'aborted'|'error'} stopReason - how the turn ended
+ * @property {'result'|'aborted'|'error'|'timeout'} stopReason - how the turn ended; 'timeout'
+ *   means the harness's own timeoutMs elapsed and the child process was killed
  * @property {{message: string}|null} error - set when stopReason is 'error', otherwise null
+ * @property {number} [droppedLines] - count of oversized CLI output lines refused before
+ *   parsing (harness-specific safety limit, see claude-code.mjs::MAX_LINE_BYTES); absent
+ *   or 0 when nothing was dropped
+ * @property {string[]} [warnings] - non-fatal problems during the turn, e.g. an onEvent
+ *   consumer that threw (see claude-code.mjs's safeEmit()) — the turn still ran to
+ *   completion despite these
+ * @property {boolean} [orphaned] - true only when stopReason is 'aborted'/'timeout' and the
+ *   harness gave up waiting for the child process to actually exit (see
+ *   claude-code.mjs::DEFAULT_KILL_GRACE_MS) — the child may still be running
  */
 
 /**
@@ -66,7 +76,7 @@ export const EVENT_TYPES = Object.freeze([
 ]);
 
 /** The full set of stopReason values a harness may resolve startTurn() with. */
-export const STOP_REASONS = Object.freeze(['result', 'aborted', 'error']);
+export const STOP_REASONS = Object.freeze(['result', 'aborted', 'error', 'timeout']);
 
 /**
  * Structural check used by harness tests: does `event` look like a

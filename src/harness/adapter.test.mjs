@@ -90,6 +90,8 @@ test('fixture parses into the expected normalized events, in order, all matching
     usage: { input_tokens: 512, output_tokens: 128 },
     stopReason: 'result',
     error: null,
+    droppedLines: 0,
+    warnings: [],
   });
 });
 
