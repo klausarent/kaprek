@@ -155,6 +155,22 @@ test('install writes atomically: no leftover temp file, and the target is always
   expect(() => readJson(settingsPath)).not.toThrow();
 });
 
+test('install preserves the existing settings.json file permission bits across the atomic rewrite', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ someOtherSetting: true }, null, 2), 'utf8');
+  fs.chmodSync(settingsPath, 0o600);
+
+  install({ settingsPath });
+
+  if (process.platform === 'win32') {
+    // No POSIX permission model on Windows — just confirm the write itself
+    // still succeeds with the chmod-preservation code path exercised.
+    expect(fs.existsSync(settingsPath)).toBe(true);
+  } else {
+    const mode = fs.statSync(settingsPath).mode & 0o777;
+    expect(mode).toBe(0o600);
+  }
+});
+
 test('uninstall also writes atomically: no leftover temp file', () => {
   install({ settingsPath });
   uninstall({ settingsPath });

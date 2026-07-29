@@ -48,6 +48,18 @@ function writeSettings(settingsPath, settings) {
   fs.mkdirSync(dir, { recursive: true });
   const tmpPath = path.join(dir, `.${path.basename(settingsPath)}.tmp-${process.pid}-${Date.now()}`);
   fs.writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+  // Preserve the existing file's permission bits across the rename — a fresh
+  // temp file otherwise gets the process's default mode (commonly 0644),
+  // which would silently widen a settings.json the user had locked down to
+  // e.g. 0600. Windows has no POSIX permission model, so statSync/chmodSync
+  // are effectively no-ops there; any error here (no prior file, unsupported
+  // platform) is swallowed on purpose — it must never block the write itself.
+  try {
+    const { mode } = fs.statSync(settingsPath);
+    fs.chmodSync(tmpPath, mode);
+  } catch {
+    // best-effort — nothing to preserve for a settingsPath that doesn't exist yet
+  }
   fs.renameSync(tmpPath, settingsPath);
 }
 

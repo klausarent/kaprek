@@ -171,7 +171,14 @@ function findLinkedTask(dataDir, sessionId) {
   }
 }
 
-/** True if a tool_use block on this transcript line ran a Bash command containing 'git commit'. */
+/**
+ * True if a tool_use block on this transcript line ran a Bash command
+ * containing 'git commit'. Scoped to name === 'Bash' with a string
+ * `input.command` (mirrors src/parser/parse.mjs's own gitCommits counting)
+ * — checking ANY tool_use's whole input (as JSON) would false-positive on
+ * e.g. a Read of a file whose path or a Write's file content merely mentions
+ * "git commit" without a commit ever actually running.
+ */
 function lineContainsGitCommitToolUse(rawLine) {
   let parsed;
   try {
@@ -182,9 +189,8 @@ function lineContainsGitCommitToolUse(rawLine) {
   const content = parsed?.message?.content;
   if (!Array.isArray(content)) return false;
   for (const block of content) {
-    if (block?.type !== 'tool_use') continue;
-    const command = typeof block.input?.command === 'string' ? block.input.command : JSON.stringify(block.input ?? '');
-    if (command.includes('git commit')) return true;
+    if (block?.type !== 'tool_use' || block.name !== 'Bash') continue;
+    if (typeof block.input?.command === 'string' && block.input.command.includes('git commit')) return true;
   }
   return false;
 }
@@ -233,6 +239,12 @@ async function transcriptContainsGitCommit(transcriptPath) {
  * requireTaskDoc (warn-only, never escalates to 'block' by itself) fires
  * when the linked task is in_progress with an empty doc.
  *
+ * 'observe' mode is log-only, NOT skip-evaluation: both rules are still
+ * checked and any violation still lands in `reasons` and in policy.log, so
+ * `loryme hooks status`/policy.log are actually useful for seeing what
+ * would happen before switching to 'warn'/'block' — but the returned
+ * `decision` is always forced back to 'allow' for this mode.
+ *
  * A session that already produced one 'block' decision gets a once-marker
  * under `<dataDir>/policy-state/`; every following call for that session
  * short-circuits to 'allow' so the hook can never block the same session
@@ -241,11 +253,6 @@ async function transcriptContainsGitCommit(transcriptPath) {
 export async function evaluateStop({ dataDir, transcriptPath, sessionId }) {
   try {
     const policy = loadPolicyFailOpen(dataDir);
-
-    if (policy.mode === 'observe') {
-      logPolicy(dataDir, { sessionId, decision: 'allow', reasons: [], mode: policy.mode });
-      return { decision: 'allow', reasons: [] };
-    }
 
     if (hasOnceMarker(dataDir, sessionId)) {
       return { decision: 'allow', reasons: [] };
@@ -270,10 +277,12 @@ export async function evaluateStop({ dataDir, transcriptPath, sessionId }) {
     }
 
     let decision = 'allow';
-    if (blockingReasons.length > 0) {
-      decision = policy.mode; // 'warn' or 'block' — 'observe' already returned above
-    } else if (warnReasons.length > 0) {
-      decision = 'warn'; // requireTaskDoc is a hint only, it never blocks by itself
+    if (policy.mode !== 'observe') {
+      if (blockingReasons.length > 0) {
+        decision = policy.mode; // 'warn' or 'block'
+      } else if (warnReasons.length > 0) {
+        decision = 'warn'; // requireTaskDoc is a hint only, it never blocks by itself
+      }
     }
 
     const reasons = [...blockingReasons, ...warnReasons];

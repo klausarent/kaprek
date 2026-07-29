@@ -110,10 +110,27 @@ test('loadPolicy throws PolicyValidationError for a non-boolean rule value', () 
 
 // -------------------------------------------------------------- evaluateStop
 
-test('observe mode always allows, even with a commit and no linked task', async () => {
+test('observe mode always allows, but still fully evaluates and surfaces violations in reasons + policy.log', async () => {
   writePolicy({ mode: 'observe' });
   const transcriptPath = writeTranscript('s-observe', { withGitCommit: true });
   const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-observe' });
+  expect(result.decision).toBe('allow');
+  expect(result.reasons.length).toBeGreaterThan(0);
+  expect(result.reasons[0]).toMatch(/git commit/);
+
+  const logPath = path.join(dataDir, 'policy.log');
+  const lines = fs.readFileSync(logPath, 'utf8').trim().split('\n');
+  const entry = JSON.parse(lines[lines.length - 1]);
+  expect(entry.sessionId).toBe('s-observe');
+  expect(entry.decision).toBe('allow');
+  expect(entry.mode).toBe('observe');
+  expect(entry.reasons.length).toBeGreaterThan(0);
+});
+
+test('observe mode allows and logs no violations when nothing is actually wrong', async () => {
+  writePolicy({ mode: 'observe' });
+  const transcriptPath = writeTranscript('s-observe-clean', { withGitCommit: false });
+  const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-observe-clean' });
   expect(result).toEqual({ decision: 'allow', reasons: [] });
 });
 
@@ -149,6 +166,25 @@ test('block mode allows when there is no commit in the transcript', async () => 
   writePolicy({ mode: 'block' });
   const transcriptPath = writeTranscript('s-nocommit', { withGitCommit: false });
   const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-nocommit' });
+  expect(result).toEqual({ decision: 'allow', reasons: [] });
+});
+
+test('commit detection is scoped to a Bash tool_use, not any tool input mentioning "git commit"', async () => {
+  writePolicy({ mode: 'block' });
+  const transcriptPath = path.join(dataDir, 's-non-bash.jsonl');
+  fs.writeFileSync(
+    transcriptPath,
+    `${JSON.stringify({
+      type: 'assistant',
+      sessionId: 's-non-bash',
+      message: {
+        role: 'assistant',
+        content: [{ type: 'tool_use', name: 'Read', input: { file_path: 'docs/how-to-git-commit.md' } }],
+      },
+    })}\n`,
+    'utf8',
+  );
+  const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-non-bash' });
   expect(result).toEqual({ decision: 'allow', reasons: [] });
 });
 
@@ -209,7 +245,11 @@ test('evaluateStop never throws, even with a corrupt policy.json (schema error i
   writePolicy({ mode: 'block', bogus: true });
   const transcriptPath = writeTranscript('s-badpolicy', { withGitCommit: true });
   const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-badpolicy' });
-  expect(result).toEqual({ decision: 'allow', reasons: [] });
+  // Falls back to DEFAULT_POLICY, whose mode is 'observe' — decision is
+  // 'allow', but (per observe's fully-evaluate-and-log behavior) the
+  // violation still surfaces in `reasons`, it just never escalates.
+  expect(result.decision).toBe('allow');
+  expect(result.reasons.length).toBeGreaterThan(0);
 });
 
 test('evaluateStop writes a JSONL entry to policy.log', async () => {
