@@ -14,10 +14,12 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SECRET_FIXTURE = path.join(__dirname, 'fixtures', 'session-with-secret.jsonl');
 
 let tmpDir;
+let dataDir;
 let servers = [];
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-'));
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-data-'));
   servers = [];
 });
 
@@ -26,11 +28,13 @@ afterEach(async () => {
     await new Promise((resolve) => server.close(resolve));
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
-/** Starts a server for this test and registers it for teardown. */
+/** Starts a server for this test and registers it for teardown. Always uses
+ * a per-test temp dataDir — never the real ~/.loryme app dir. */
 async function boot(opts) {
-  const started = await startServer({ port: 0, rootDir: tmpDir, ...opts });
+  const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, ...opts });
   servers.push(started);
   return started;
 }
@@ -269,4 +273,82 @@ test('SPA fallback serves index.html for unknown non-API routes when webDist is 
   expect(text).toContain('loryme');
 
   fs.rmSync(webDist, { recursive: true, force: true });
+});
+
+test('GET /api/search with no q returns 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search`);
+  expect(res.status).toBe(400);
+});
+
+test('GET /api/search with blank q returns 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search?q=%20%20`);
+  expect(res.status).toBe(400);
+});
+
+test('GET /api/search before any index exists returns available:true with no results', async () => {
+  writeProject('proj-a', { s1: aiTitleLine('Digest Parser Fixture') });
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search?q=parser`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.available).toBe(true);
+  expect(body.results).toEqual([]);
+});
+
+test('POST /api/search/reindex builds the index, then GET /api/search finds matches', async () => {
+  writeProject('proj-a', { s1: aiTitleLine('Digest Parser Fixture') });
+  const { url } = await boot({});
+
+  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  expect(reindexRes.status).toBe(200);
+  const reindexBody = await reindexRes.json();
+  expect(reindexBody.available).toBe(true);
+  expect(reindexBody.indexed).toBe(1);
+  expect(reindexBody.skipped).toBe(0);
+
+  const searchRes = await fetch(`${url}/api/search?q=parser`);
+  const searchBody = await searchRes.json();
+  expect(searchBody.available).toBe(true);
+  expect(searchBody.results.length).toBe(1);
+  expect(searchBody.results[0].sessionId).toBe('s1');
+  expect(searchBody.results[0].projectSlug).toBe('proj-a');
+});
+
+test('POST /api/search/reindex is idempotent: a second call re-skips unchanged sessions', async () => {
+  writeProject('proj-a', { s1: aiTitleLine('Digest Parser Fixture') });
+  const { url } = await boot({});
+
+  await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  const second = await (await fetch(`${url}/api/search/reindex`, { method: 'POST' })).json();
+  expect(second.indexed).toBe(0);
+  expect(second.skipped).toBe(1);
+});
+
+test('GET /api/search/reindex (wrong method) returns 405', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search/reindex`);
+  expect(res.status).toBe(405);
+});
+
+test('POST /api/search (wrong method) returns 405', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search?q=x`, { method: 'POST' });
+  expect(res.status).toBe(405);
+});
+
+test('search routes report available:false when sqlite is unavailable, via importSqlite injection', async () => {
+  const failingImport = () => Promise.reject(new Error('no sqlite here'));
+  const { url } = await boot({ importSqlite: failingImport });
+
+  const searchRes = await fetch(`${url}/api/search?q=anything`);
+  expect(searchRes.status).toBe(200);
+  const searchBody = await searchRes.json();
+  expect(searchBody).toEqual({ available: false, reason: 'no sqlite here' });
+
+  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  expect(reindexRes.status).toBe(200);
+  const reindexBody = await reindexRes.json();
+  expect(reindexBody).toEqual({ available: false, reason: 'no sqlite here' });
 });

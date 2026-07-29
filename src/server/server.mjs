@@ -10,6 +10,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession } from '../parser/parse.mjs';
+import { buildSearchIndex, searchSessions } from '../search/index.mjs';
+import { getAppDir } from '../lib/appdir.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
 
@@ -164,6 +166,30 @@ async function handleDigest(res, rootDir, redact, cache, slug, sessionId) {
   sendJson(res, 200, digest);
 }
 
+/** GET /api/search?q=<query> — full-text search across indexed sessions. */
+async function handleSearch(res, dataDir, query, importSqlite) {
+  if (!query || !query.trim()) {
+    sendJson(res, 400, { error: 'missing query' });
+    return;
+  }
+  const results = await searchSessions({ dataDir, query, importSqlite });
+  if (results && results.unavailable) {
+    sendJson(res, 200, { available: false, reason: results.reason });
+    return;
+  }
+  sendJson(res, 200, { available: true, results });
+}
+
+/** POST /api/search/reindex — (re)builds the search index synchronously. */
+async function handleReindex(res, rootDir, dataDir, importSqlite) {
+  const result = await buildSearchIndex({ rootDir, dataDir, importSqlite });
+  if (result && result.unavailable) {
+    sendJson(res, 200, { available: false, reason: result.reason });
+    return;
+  }
+  sendJson(res, 200, { available: true, indexed: result.indexed, skipped: result.skipped });
+}
+
 /** Serves static files from webDist with SPA fallback to index.html. */
 function serveStatic(res, webDist, pathname) {
   if (!webDist || !fs.existsSync(webDist)) {
@@ -198,15 +224,10 @@ function serveStatic(res, webDist, pathname) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleRequest(req, res, { rootDir, redact, webDist, cache, port }) {
+async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite }) {
   // No body details on rejection — don't echo the offending Host header back.
   if (!isAllowedHost(req.headers.host, port)) {
     sendJson(res, 400, { error: 'bad request' });
-    return;
-  }
-
-  if (req.method !== 'GET') {
-    sendJson(res, 405, { error: 'method not allowed' });
     return;
   }
 
@@ -214,6 +235,29 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port }
   const segments = url.pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
 
   if (segments[0] === 'api') {
+    // Search routes have their own methods (GET for lookup, POST to trigger
+    // a rebuild) and are checked before the blanket GET-only rule below.
+    if (segments.length === 2 && segments[1] === 'search') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleSearch(res, dataDir, url.searchParams.get('q'), importSqlite);
+      return;
+    }
+    if (segments.length === 3 && segments[1] === 'search' && segments[2] === 'reindex') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleReindex(res, rootDir, dataDir, importSqlite);
+      return;
+    }
+
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
     if (segments.length === 2 && segments[1] === 'projects') {
       handleProjects(res, rootDir);
       return;
@@ -230,6 +274,10 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port }
     return;
   }
 
+  if (req.method !== 'GET') {
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
   serveStatic(res, webDist, url.pathname);
 }
 
@@ -237,7 +285,7 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port }
  * Starts the local API/static server. Binds to 127.0.0.1 only.
  * Resolves once listening, with the running http.Server and its base URL.
  */
-export function startServer({ port = 0, rootDir, redact = true, webDist } = {}) {
+export function startServer({ port = 0, rootDir, redact = true, webDist, dataDir = getAppDir(), importSqlite } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
   // ephemeral port); the Host-header check needs the actual bound port, not
@@ -245,9 +293,11 @@ export function startServer({ port = 0, rootDir, redact = true, webDist } = {}) 
   let boundPort = port;
 
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, { rootDir, redact, webDist, cache, port: boundPort }).catch((err) => {
-      sendJson(res, 500, { error: 'internal error', message: err.message });
-    });
+    handleRequest(req, res, { rootDir, redact, webDist, cache, port: boundPort, dataDir, importSqlite }).catch(
+      (err) => {
+        sendJson(res, 500, { error: 'internal error', message: err.message });
+      },
+    );
   });
 
   return new Promise((resolve, reject) => {

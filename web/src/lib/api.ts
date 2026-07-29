@@ -83,18 +83,27 @@ export type Digest = {
   subagents: SubagentThread[];
 };
 
+async function throwOnError(res: Response): Promise<void> {
+  if (res.ok) return;
+  let detail = "";
+  try {
+    const body = await res.json();
+    if (body && typeof body.error === "string") detail = `: ${body.error}`;
+  } catch {
+    // Best-effort — an unparseable error body is not worth failing over.
+  }
+  throw new Error(`Request failed (HTTP ${res.status})${detail}`);
+}
+
 async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url);
-  if (!res.ok) {
-    let detail = "";
-    try {
-      const body = await res.json();
-      if (body && typeof body.error === "string") detail = `: ${body.error}`;
-    } catch {
-      // Best-effort — an unparseable error body is not worth failing over.
-    }
-    throw new Error(`Request failed (HTTP ${res.status})${detail}`);
-  }
+  await throwOnError(res);
+  return res.json() as Promise<T>;
+}
+
+async function postJson<T>(url: string): Promise<T> {
+  const res = await fetch(url, { method: "POST" });
+  await throwOnError(res);
   return res.json() as Promise<T>;
 }
 
@@ -109,4 +118,27 @@ export function fetchSessions(projectSlug: string): Promise<SessionMeta[]> {
 export function fetchDigest(projectSlug: string, sessionId: string): Promise<Digest> {
   const path = [projectSlug, sessionId].map(encodeURIComponent).join("/");
   return getJson<Digest>(`/api/session/${path}/digest`);
+}
+
+export type SearchHit = {
+  sessionId: string;
+  projectSlug: string;
+  title: string | null;
+  // Contains literal <b>…</b> markers from FTS5's snippet() — never render
+  // this as HTML; callers must parse the markers themselves.
+  snippet: string;
+};
+
+export type SearchResponse = { available: true; results: SearchHit[] } | { available: false; reason: string };
+
+export type ReindexResponse =
+  | { available: true; indexed: number; skipped: number }
+  | { available: false; reason: string };
+
+export function fetchSearch(query: string): Promise<SearchResponse> {
+  return getJson<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}`);
+}
+
+export function reindexSearch(): Promise<ReindexResponse> {
+  return postJson<ReindexResponse>("/api/search/reindex");
 }
