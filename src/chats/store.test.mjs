@@ -1,0 +1,227 @@
+import { test, expect, vi, beforeEach, afterEach } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  openChats,
+  ChatNotFoundError,
+  InvalidTitleError,
+  UnknownEventKindError,
+  InvalidEventError,
+} from './store.mjs';
+import { digestSession } from '../parser/parse.mjs';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const MINI_SESSION_FIXTURE = path.join(__dirname, '..', 'parser', 'fixtures', 'mini-session.jsonl');
+
+let tmpDir;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-chats-test-'));
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+test('createChat adds a chat with defaults and list/get return it', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'First chat' });
+
+  expect(chat.title).toBe('First chat');
+  expect(chat.eventCount).toBe(0);
+  expect(typeof chat.id).toBe('string');
+  expect(chat.id.length).toBeGreaterThan(0);
+  expect(chat.createdAt).toBe(chat.updatedAt);
+
+  expect(chats.get(chat.id)).toEqual(chat);
+  expect(chats.list()).toEqual([chat]);
+  expect(chats.events(chat.id)).toEqual([]);
+});
+
+test('createChat without a title defaults title to null', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat();
+  expect(chat.title).toBeNull();
+});
+
+test('createChat rejects a non-string/empty title when one is given', () => {
+  const chats = openChats(tmpDir);
+  expect(() => chats.createChat({ title: '' })).toThrow(InvalidTitleError);
+  expect(() => chats.createChat({ title: '   ' })).toThrow(InvalidTitleError);
+  expect(() => chats.createChat({ title: 42 })).toThrow(InvalidTitleError);
+});
+
+test('get throws ChatNotFoundError for an unknown id', () => {
+  const chats = openChats(tmpDir);
+  expect(() => chats.get('nope')).toThrow(ChatNotFoundError);
+});
+
+test('events throws ChatNotFoundError for an unknown id', () => {
+  const chats = openChats(tmpDir);
+  expect(() => chats.events('nope')).toThrow(ChatNotFoundError);
+});
+
+test('appendEvent throws ChatNotFoundError for an unknown chatId', () => {
+  const chats = openChats(tmpDir);
+  expect(() => chats.appendEvent('nope', { kind: 'user', text: 'hi' })).toThrow(ChatNotFoundError);
+});
+
+test('appendEvent folds a user event into the projection', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+
+  const stored = chats.appendEvent(chat.id, { kind: 'user', text: 'Hello there' });
+  expect(stored.kind).toBe('user');
+  expect(stored.text).toBe('Hello there');
+  expect(typeof stored.ts).toBe('string');
+
+  expect(chats.events(chat.id)).toEqual([stored]);
+  expect(chats.get(chat.id).eventCount).toBe(1);
+});
+
+test('appendEvent sets ts when not given, and keeps a caller-provided ts', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+
+  const withoutTs = chats.appendEvent(chat.id, { kind: 'user', text: 'a' });
+  expect(typeof withoutTs.ts).toBe('string');
+  expect(Number.isNaN(Date.parse(withoutTs.ts))).toBe(false);
+
+  const withTs = chats.appendEvent(chat.id, { kind: 'user', text: 'b', ts: '2026-01-01T00:00:00.000Z' });
+  expect(withTs.ts).toBe('2026-01-01T00:00:00.000Z');
+});
+
+test('appendEvent defaults optional fields to null (assistant msgId, tool msgId/resultRef)', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+
+  const assistant = chats.appendEvent(chat.id, { kind: 'assistant', text: 'reply' });
+  expect(assistant.msgId).toBeNull();
+
+  const tool = chats.appendEvent(chat.id, { kind: 'tool', name: 'Bash', input: '{"command":"ls"}', result: 'ok' });
+  expect(tool.msgId).toBeNull();
+  expect(tool.resultRef).toBeNull();
+});
+
+test('appendEvent rejects an unknown event kind', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  expect(() => chats.appendEvent(chat.id, { kind: 'bogus', text: 'x' })).toThrow(UnknownEventKindError);
+});
+
+test('appendEvent rejects events missing required fields', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+
+  expect(() => chats.appendEvent(chat.id, { kind: 'user' })).toThrow(InvalidEventError);
+  expect(() => chats.appendEvent(chat.id, { kind: 'thinking' })).toThrow(InvalidEventError);
+
+  let error;
+  try {
+    chats.appendEvent(chat.id, { kind: 'tool', name: 'Bash' });
+  } catch (err) {
+    error = err;
+  }
+  expect(error).toBeInstanceOf(InvalidEventError);
+  expect(error.missing.sort()).toEqual(['input', 'result']);
+});
+
+test('multiple chats are isolated from each other', () => {
+  const chats = openChats(tmpDir);
+  const a = chats.createChat({ title: 'A' });
+  const b = chats.createChat({ title: 'B' });
+
+  chats.appendEvent(a.id, { kind: 'user', text: 'only in A' });
+
+  expect(chats.events(a.id)).toHaveLength(1);
+  expect(chats.events(b.id)).toHaveLength(0);
+  expect(chats.list().map((c) => c.id).sort()).toEqual([a.id, b.id].sort());
+});
+
+test('the events file is append-only: line count grows monotonically and earlier lines never change', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  const eventsPath = path.join(tmpDir, 'chats', chat.id, 'events.jsonl');
+
+  const readLines = () => fs.readFileSync(eventsPath, 'utf8').split('\n').filter(Boolean);
+
+  const linesAfterCreate = readLines();
+  expect(linesAfterCreate).toHaveLength(1);
+  const firstLine = linesAfterCreate[0];
+
+  chats.appendEvent(chat.id, { kind: 'user', text: 'a' });
+  chats.appendEvent(chat.id, { kind: 'assistant', text: 'b' });
+
+  const linesAfterMore = readLines();
+  expect(linesAfterMore.length).toBe(3);
+  expect(linesAfterMore[0]).toBe(firstLine);
+});
+
+test('reload from disk reproduces the same projection', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  chats.appendEvent(chat.id, { kind: 'user', text: 'hi' });
+  chats.appendEvent(chat.id, { kind: 'assistant', text: 'hello' });
+  chats.appendEvent(chat.id, { kind: 'tool', name: 'Bash', input: '{}', result: 'ok', resultRef: null });
+
+  const reloaded = openChats(tmpDir);
+  expect(reloaded.get(chat.id)).toEqual(chats.get(chat.id));
+  expect(reloaded.list()).toEqual(chats.list());
+  expect(reloaded.events(chat.id)).toEqual(chats.events(chat.id));
+});
+
+test('a corrupt line in a chat events.jsonl is skipped with a warning, no crash', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  chats.appendEvent(chat.id, { kind: 'user', text: 'hi' });
+
+  const eventsPath = path.join(tmpDir, 'chats', chat.id, 'events.jsonl');
+  fs.appendFileSync(eventsPath, 'this is not json\n', 'utf8');
+
+  const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  let reloaded;
+  expect(() => {
+    reloaded = openChats(tmpDir);
+  }).not.toThrow();
+  expect(warnSpy).toHaveBeenCalledTimes(1);
+  warnSpy.mockRestore();
+
+  expect(reloaded.get(chat.id).title).toBe('T');
+  expect(reloaded.events(chat.id)).toHaveLength(1);
+});
+
+test('a chat directory whose log has no valid chat.created line is skipped entirely on open', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  const eventsPath = path.join(tmpDir, 'chats', chat.id, 'events.jsonl');
+  fs.writeFileSync(eventsPath, 'still not json\n', 'utf8');
+
+  const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const reloaded = openChats(tmpDir);
+  warnSpy.mockRestore();
+
+  expect(reloaded.list()).toEqual([]);
+  expect(() => reloaded.get(chat.id)).toThrow(ChatNotFoundError);
+});
+
+// Compatibility test: a stored 'tool' event must expose exactly the keys
+// src/parser/parse.mjs::digestSession() produces for a 'tool' event, since
+// that shape is what web/src/components/EventBlock.tsx renders.
+test('a stored tool event has the same keys as a digestSession tool event', async () => {
+  const digest = await digestSession(MINI_SESSION_FIXTURE);
+  const parserToolEvent = digest.events.find((e) => e.kind === 'tool');
+  expect(parserToolEvent, 'fixture must contain at least one tool event').toBeTruthy();
+
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  const storedToolEvent = chats.appendEvent(chat.id, {
+    kind: 'tool',
+    name: 'Bash',
+    input: '{"command":"ls"}',
+    result: 'ok',
+  });
+
+  expect(Object.keys(storedToolEvent).sort()).toEqual(Object.keys(parserToolEvent).sort());
+});
