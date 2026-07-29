@@ -59,24 +59,37 @@ function sanitizeToolInput(input, maxToolLen, redact) {
   return sanitizeText(JSON.stringify(input), maxToolLen, redact);
 }
 
-// Anthropic usage object field names as emitted in a Claude Code CLI
-// `result` event's `usage` (see src/harness/claude-code.mjs::mapLine). Summed
-// into runs.jsonl's `tokens` field as a single at-a-glance number; the full
-// object is still logged verbatim under `usage`.
-const USAGE_TOKEN_FIELDS = ['input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'];
-
-function computeTokens(usage) {
+/**
+ * Sums a harness-agnostic usage object into runs.jsonl's single at-a-glance
+ * `tokens` field (the full object is still logged verbatim under `usage`).
+ * Different harnesses' CLIs name their usage fields differently — Anthropic:
+ * input_tokens/output_tokens/cache_creation_input_tokens/
+ * cache_read_input_tokens; an OpenAI-style CLI: prompt_tokens/
+ * completion_tokens; some report only a pre-summed total_tokens and nothing
+ * else. Rather than hardcode one vendor's field list (which silently sums to
+ * null for every other harness), every numeric key ending in `_tokens` or
+ * otherwise containing "tokens" is summed. `total_tokens` itself is excluded
+ * from that sum and used only as a fallback when no individual field was
+ * found — summing it together with the fields it is itself the total of
+ * would double-count.
+ */
+function sumTokens(usage) {
   if (!usage || typeof usage !== 'object') return null;
   let total = 0;
   let found = false;
-  for (const field of USAGE_TOKEN_FIELDS) {
-    const value = usage[field];
-    if (typeof value === 'number') {
+  let totalTokensValue = null;
+  for (const [key, value] of Object.entries(usage)) {
+    if (typeof value !== 'number') continue;
+    if (key === 'total_tokens') {
+      totalTokensValue = value;
+      continue;
+    }
+    if (key.endsWith('_tokens') || key.includes('tokens')) {
       total += value;
       found = true;
     }
   }
-  return found ? total : null;
+  return found ? total : totalTokensValue;
 }
 
 function harnessMetaPath(dataDir, chatId) {
@@ -223,12 +236,23 @@ export async function runTurn({
         const started = pendingTools.get(event.id);
         pendingTools.delete(event.id);
         const sanitizedResult = sanitizeText(event.result, maxToolLen, redact);
+        // The chat-store 'tool' shape (src/chats/store.mjs::EVENT_SHAPES) has
+        // no isError field — it deliberately mirrors src/parser/parse.mjs's
+        // historical digest shape 1:1, and adding one there would either
+        // fail validation for every reloaded/historical tool event or (worse)
+        // silently diverge the two shapes. Rather than break that parser
+        // compatibility, an error result gets a plain-text prefix instead, so
+        // it still reads as an error in a reloaded transcript. The LIVE SSE
+        // event below is unaffected: it forwards `isError` as-is (`...event`
+        // already carries it, per adapter.mjs's tool-end contract).
+        const storedResult =
+          event.isError && typeof sanitizedResult === 'string' ? `[tool error] ${sanitizedResult}` : sanitizedResult;
         chats.appendEvent(effectiveChatId, {
           kind: 'tool',
           ts: started?.ts,
           name: started?.name ?? 'unknown',
           input: sanitizeToolInput(started?.input ?? null, maxToolLen, redact),
-          result: sanitizedResult,
+          result: storedResult,
         });
         onEvent?.({ ...event, result: sanitizedResult });
         break;
@@ -291,7 +315,7 @@ export async function runTurn({
       model,
       costUsd: turnResult.costUsd,
       usage: turnResult.usage,
-      tokens: computeTokens(turnResult.usage),
+      tokens: sumTokens(turnResult.usage),
       durationMs: Date.now() - startedAt,
       stopReason: turnResult.stopReason,
       rateLimit,

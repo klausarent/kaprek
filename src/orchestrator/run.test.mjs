@@ -363,3 +363,71 @@ test('permissionMode und allowedTools sind undefined, wenn runTurn() ohne sie au
   expect(startTurnSpy.mock.calls[0][0].permissionMode).toBeUndefined();
   expect(startTurnSpy.mock.calls[0][0].allowedTools).toBeUndefined();
 });
+
+// P1-B1: a failing tool call's isError must survive persistence, not just
+// the live SSE frame (the store has no isError field of its own — see the
+// comment on run.mjs's 'tool-end' handler for why a text prefix is used).
+test('tool-end mit isError landet im Store mit [tool error]-Präfix, im SSE-Event bleibt isError erhalten', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { type: 'tool-start', id: 't1', name: 'Bash', input: { command: 'rm /nonexistent' } },
+      { type: 'tool-end', id: 't1', result: 'rm: cannot remove: No such file', isError: true },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+  const seen = [];
+
+  const result = await runTurn({
+    dataDir: tmpDir,
+    text: 'delete a missing file',
+    harness: fakeHarness,
+    onEvent: (e) => seen.push(e),
+  });
+
+  const toolEvent = openChats(tmpDir).events(result.chatId).find((e) => e.kind === 'tool');
+  expect(toolEvent.result).toBe('[tool error] rm: cannot remove: No such file');
+
+  const sseToolEnd = seen.find((e) => e.type === 'tool-end');
+  expect(sseToolEnd.isError).toBe(true);
+  expect(sseToolEnd.result).toBe('rm: cannot remove: No such file'); // SSE frame stays unprefixed
+});
+
+test('tool-end ohne isError bekommt keinen Präfix', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { type: 'tool-start', id: 't1', name: 'Bash', input: { command: 'ls' } },
+      { type: 'tool-end', id: 't1', result: 'file1\nfile2', isError: false },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'list files', harness: fakeHarness });
+
+  const toolEvent = openChats(tmpDir).events(result.chatId).find((e) => e.kind === 'tool');
+  expect(toolEvent.result).toBe('file1\nfile2');
+});
+
+// P1-B2: runs.jsonl's `tokens` field must not go null just because a
+// non-Anthropic harness names its usage fields differently.
+test('Run-Log summiert Tokens für Anthropic-, OpenAI-artige und total_tokens-only Usage-Shapes', async () => {
+  const shapes = [
+    { usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 2, cache_read_input_tokens: 1 }, expected: 18 },
+    { usage: { prompt_tokens: 7, completion_tokens: 3 }, expected: 10 },
+    { usage: { total_tokens: 42 }, expected: 42 },
+  ];
+
+  for (const { usage, expected } of shapes) {
+    const fakeHarness = createFakeHarness({
+      script: [
+        { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+        { type: 'result', sessionId: 's1', costUsd: 0.001, usage, isError: false },
+      ],
+    });
+    const result = await runTurn({ dataDir: tmpDir, text: `usage shape ${expected}`, harness: fakeHarness, harnessName: 'fake' });
+    const runs = readRuns(tmpDir);
+    const run = runs.find((r) => r.chatId === result.chatId);
+    expect(run.tokens, `usage ${JSON.stringify(usage)} should sum to ${expected}`).toBe(expected);
+  }
+});
