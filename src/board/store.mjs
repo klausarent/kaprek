@@ -84,8 +84,12 @@ function assertKnownDocFields(doc) {
   }
 }
 
-/** Returns the DOC_FIELDS entries that are missing or shorter than DOC_FIELD_MIN_LENGTH. */
-function missingDocFields(doc) {
+/**
+ * Returns the DOC_FIELDS entries that are missing or shorter than
+ * DOC_FIELD_MIN_LENGTH. Exported so other modules (receipt signing) can
+ * reuse the exact 'done' completeness rule instead of duplicating it.
+ */
+export function missingDocFields(doc) {
   return DOC_FIELDS.filter((field) => {
     const value = doc?.[field];
     return typeof value !== 'string' || value.trim().length < DOC_FIELD_MIN_LENGTH;

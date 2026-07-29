@@ -591,6 +591,8 @@ test('board receipt: POST without agentName defaults to "local"', async () => {
   const { url } = await boot({});
   const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
   await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
 
   const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
   expect(res.status).toBe(201);
@@ -603,6 +605,35 @@ test('board receipt: signing a task with no doc at all returns 409', async () =>
 
   const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
   expect(res.status).toBe(409);
+});
+
+test('board receipt: signing a backlog task with a complete doc still returns 409 (status gate, not just doc gate)', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Not done yet' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+
+  const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  expect(res.status).toBe(409);
+  const body = await res.json();
+  expect(body.error).toContain('backlog');
+});
+
+test('board receipt: a done task whose doc was later shortened below the threshold returns 409 with the missing field', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Shortened after done' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+
+  // setDoc doesn't re-validate completeness — only the status transition
+  // does — so this is a legitimate way to end up with an incomplete doc on
+  // an already-'done' task.
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { outcome: 'too short' } });
+
+  const res = await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {});
+  expect(res.status).toBe(409);
+  const body = await res.json();
+  expect(body.missing).toContain('outcome');
 });
 
 test('board receipt: verifying a task with no receipt returns 404', async () => {

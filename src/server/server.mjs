@@ -20,6 +20,7 @@ import {
   InvalidStatusError,
   UnknownDocFieldError,
   DocIncompleteError,
+  missingDocFields,
 } from '../board/store.mjs';
 import { signReceipt, verifyReceipt, InvalidAgentNameError } from '../receipt/receipt.mjs';
 
@@ -439,8 +440,18 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
       }
       throw err;
     }
-    if (!task.doc) {
-      sendJson(res, 409, { error: 'task has no documentation yet — a receipt without a doc would be meaningless' });
+    // A receipt claims the task is actually done and fully documented, so
+    // both must hold at sign time — not just "some doc exists". Reuses the
+    // same completeness rule setStatus('done') enforces (missingDocFields),
+    // so a task can never get a receipt in a state the board itself would
+    // refuse to call 'done'.
+    if (task.status !== 'done') {
+      sendJson(res, 409, { error: `task is not done (status: ${task.status})` });
+      return;
+    }
+    const missing = missingDocFields(task.doc);
+    if (missing.length > 0) {
+      sendJson(res, 409, { error: 'doc incomplete, cannot sign a receipt', missing });
       return;
     }
     const agentName =

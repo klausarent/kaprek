@@ -49,7 +49,14 @@ function pubkeyToBase64(publicKeyObject) {
   return publicKeyObject.export({ type: 'spki', format: 'der' }).toString('base64');
 }
 
-/** Atomically updates <dataDir>/keys/registry.json's {agentName: pubkeyBase64} map via write-to-tmp + rename. */
+/**
+ * Atomically updates <dataDir>/keys/registry.json's {agentName: pubkeyBase64}
+ * map via write-to-tmp + rename. The read-modify-write itself is NOT atomic
+ * across concurrent agents (two callers can both read the same base and one
+ * write clobbers the other's addition) — accepted as out of scope for this
+ * single-user local tool; the clobbered entry self-heals the next time that
+ * agent calls ensureKey().
+ */
 function updateRegistry(dataDir, agentName, pubkeyBase64) {
   const registryPath = registryPathFor(dataDir);
   let registry = {};
@@ -85,7 +92,10 @@ export function ensureKey(dataDir, agentName) {
       privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
       publicKeyEncoding: { type: 'spki', format: 'pem' },
     });
-    fs.writeFileSync(keyPath, pem, { flag: 'wx' });
+    // mode: 0o600 restricts the private key to the owning user; Windows
+    // ignores the mode bits (no POSIX permission model), so this is a
+    // best-effort hardening that only applies on Unix.
+    fs.writeFileSync(keyPath, pem, { flag: 'wx', mode: 0o600 });
     privateKey = crypto.createPrivateKey(pem);
   } catch (err) {
     if (err.code !== 'EEXIST') throw err;
