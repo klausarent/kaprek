@@ -126,6 +126,23 @@ test('warn mode: exits 0, no stdout, but a warning is written to stderr', async 
   expect(stderr).toMatch(/policy warning/);
 }, 10000);
 
+test('stop_hook_active guard: block mode still exits 0 with no output when stop_hook_active is true', async () => {
+  writePolicy({ mode: 'block' });
+  const transcriptPath = writeTranscript('e2e-stop-hook-active', { withGitCommit: true });
+
+  const { code, stdout, stderr } = await runHook(
+    JSON.stringify({
+      transcript_path: transcriptPath,
+      session_id: 'e2e-stop-hook-active',
+      stop_hook_active: true,
+    }),
+  );
+
+  expect(code).toBe(0);
+  expect(stdout).toBe('');
+  expect(stderr).toBe('');
+}, 10000);
+
 test('block mode allows silently when the session is linked to a board task', async () => {
   writePolicy({ mode: 'block' });
   const board = openBoard(dataDir);

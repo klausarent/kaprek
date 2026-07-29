@@ -36,6 +36,12 @@ async function main() {
     return; // malformed hook input — fail open, no output
   }
 
+  // Claude Code's own loop guard; our once-marker is the fallback when this
+  // field is absent.
+  if (input?.stop_hook_active === true) {
+    return;
+  }
+
   const dataDir = getAppDir();
   const result = await evaluateStop({
     dataDir,
