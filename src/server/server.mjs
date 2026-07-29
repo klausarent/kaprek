@@ -593,6 +593,15 @@ function sseWrite(res, obj) {
  * must not read/write wherever `kaprek` happened to be launched from, and a
  * dedicated directory under dataDir keeps every chat's file edits inside the
  * same place the chat's own transcript already lives.
+ *
+ * One turn per chat at a time: a chat with an entry in chatAbortControllers
+ * already has a turn in flight, so a second POST for the SAME chatId is
+ * rejected with a plain 409 JSON response (no SSE stream opened at all) —
+ * two turns racing on one chat would otherwise both resume the CLI from the
+ * same cliSessionId and interleave their events in the chat store. The busy
+ * check and the controller registration below run with no `await` between
+ * them (chats.get()/createChat()/mkdirSync() are all synchronous), so two
+ * concurrent requests for the same chatId can never both pass the check.
  */
 async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDir, chatAbortControllers }) {
   const body = await readJsonBody(req);
@@ -625,6 +634,11 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
   } else {
     const title = text.slice(0, 80).trim();
     chatId = chats.createChat(title.length > 0 ? { title } : undefined).id;
+  }
+
+  if (chatAbortControllers.has(chatId)) {
+    sendJson(res, 409, { error: 'chat busy' });
+    return;
   }
 
   const workspaceDir = path.join(dataDir, 'workspace');
@@ -663,7 +677,10 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
     sseWrite(res, { type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
   } finally {
     req.off('close', onClientClose);
-    chatAbortControllers.delete(chatId);
+    // Only remove OUR OWN entry: blindly deleting by chatId would let a
+    // slower-finishing turn's finally-block erase a different, still-running
+    // turn's controller if the two were ever to overlap for the same key.
+    if (chatAbortControllers.get(chatId) === controller) chatAbortControllers.delete(chatId);
     if (!res.writableEnded) res.end();
   }
 }

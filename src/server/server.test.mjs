@@ -1013,6 +1013,58 @@ test('chat: cancel aborts an in-flight turn, the SSE stream resolves with stopRe
   expect(complete.stopReason).toBe('aborted');
 });
 
+test('chat: a second concurrent turn on the same chat is rejected with 409 (no SSE stream opened), a new turn works once the first ends', async () => {
+  const slowScript = [
+    { type: 'init', sessionId: 'sess-busy', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'text', text: 'partial' },
+    { type: 'result', sessionId: 'sess-busy', costUsd: 0.01, usage: {}, isError: false },
+  ];
+  const { url } = await boot({ harness: slowFakeHarness({ script: slowScript, delayMs: 25 }), harnessName: 'fake' });
+
+  const first = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'go slowly' }),
+  });
+
+  let busyStatus = null;
+  let busyBody = null;
+  let chatId = null;
+  const frames = await readSse(first, async (frame) => {
+    if (frame.type === 'chat-id' && busyStatus === null) {
+      chatId = frame.chatId;
+      const busyRes = await postJson(`${url}/api/chat/turn`, { chatId, text: 'second, while first is running' });
+      busyStatus = busyRes.status;
+      busyBody = await busyRes.json();
+    }
+  });
+
+  expect(busyStatus).toBe(409);
+  expect(busyBody).toEqual({ error: 'chat busy' });
+  // The rejected request never got an SSE stream — no chat-id/turn-complete
+  // frames from it interleaved into the first turn's own frame sequence.
+  expect(frames.map((f) => f.type)).toEqual(['chat-id', 'init', 'text', 'result', 'turn-complete']);
+  expect(frames.at(-1).stopReason).toBe('result');
+
+  // The chat is idle again once the first turn has resolved.
+  const third = await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ chatId, text: 'third, now idle' }) }),
+  );
+  expect(third.at(-1).stopReason).toBe('result');
+});
+
+test('chat: no leftover AbortController after a turn ends — cancelling that chat afterwards returns cancelled:false', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
+  const frames = await readSse(
+    await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'finish normally' }) }),
+  );
+  const chatId = frames[0].chatId;
+
+  const cancelRes = await postJson(`${url}/api/chat/${chatId}/cancel`);
+  expect(cancelRes.status).toBe(200);
+  expect(await cancelRes.json()).toEqual({ cancelled: false });
+});
+
 test('chat: cancelling a chat with no in-flight turn returns cancelled:false, and an unknown chat 404s', async () => {
   const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }) });
   const frames = await readSse(
