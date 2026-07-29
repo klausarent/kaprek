@@ -134,7 +134,32 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
       if (onProgress) onProgress(done, total);
     }
 
-    return { indexed, skipped };
+    // Orphan cleanup: a session file that no longer exists under rootDir
+    // (deleted, moved, or the whole project removed) must not stay
+    // searchable forever — without this, `indexed` never shrinks and a
+    // search result can point at a session whose digest route now 404s.
+    const currentIds = new Set(sessions.map((s) => s.sessionId));
+    const existingIds = db.prepare('SELECT sessionId FROM indexed').all().map((row) => row.sessionId);
+    const orphanIds = existingIds.filter((id) => !currentIds.has(id));
+
+    let removed = 0;
+    const CHUNK_SIZE = 500; // stay comfortably under SQLite's default 999-bound-parameter limit
+    for (let i = 0; i < orphanIds.length; i += CHUNK_SIZE) {
+      const chunk = orphanIds.slice(i, i + CHUNK_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      db.exec('BEGIN');
+      try {
+        db.prepare(`DELETE FROM sessions_fts WHERE sessionId IN (${placeholders})`).run(...chunk);
+        db.prepare(`DELETE FROM indexed WHERE sessionId IN (${placeholders})`).run(...chunk);
+        db.exec('COMMIT');
+      } catch (err) {
+        db.exec('ROLLBACK');
+        throw err;
+      }
+      removed += chunk.length;
+    }
+
+    return { indexed, skipped, removed };
   } finally {
     db.close();
   }

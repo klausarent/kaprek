@@ -67,6 +67,46 @@ test('an updated session file (new mtime/size) gets re-indexed, not skipped', as
   expect(second.skipped).toBe(0);
 });
 
+test('reindex removes a session from the index once its file is deleted (no orphaned rows, no stale search hits)', async () => {
+  const filePath = seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  const first = await buildSearchIndex({ rootDir, dataDir });
+  expect(first.indexed).toBe(1);
+
+  const preDelete = await searchSessions({ dataDir, query: 'fixture' });
+  expect(preDelete.length).toBe(1);
+
+  fs.rmSync(filePath);
+  const second = await buildSearchIndex({ rootDir, dataDir });
+  expect(second.removed).toBe(1);
+
+  const postDelete = await searchSessions({ dataDir, query: 'fixture' });
+  expect(postDelete).toEqual([]);
+
+  const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  try {
+    const metaRow = db.prepare('SELECT * FROM indexed WHERE sessionId = ?').get('mini-session');
+    expect(metaRow).toBeUndefined();
+    const ftsRow = db.prepare('SELECT * FROM sessions_fts WHERE sessionId = ?').get('mini-session');
+    expect(ftsRow).toBeUndefined();
+  } finally {
+    db.close();
+  }
+});
+
+test('reindex leaves other sessions\' rows untouched when removing an orphan', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  const secretPath = seedSession('proj-b', 'fixture-secret', SECRET_FIXTURE);
+  await buildSearchIndex({ rootDir, dataDir });
+
+  fs.rmSync(secretPath);
+  const second = await buildSearchIndex({ rootDir, dataDir });
+  expect(second.removed).toBe(1);
+
+  const results = await searchSessions({ dataDir, query: 'Digest Parser' });
+  expect(results.length).toBe(1);
+  expect(results[0].sessionId).toBe('mini-session');
+});
+
 test('onProgress is called with (done, total) for every scanned session', async () => {
   seedSession('proj-a', 'mini-session', MINI_FIXTURE);
   seedSession('proj-b', 'fixture-secret', SECRET_FIXTURE);
