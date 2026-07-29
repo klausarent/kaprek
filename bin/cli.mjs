@@ -7,8 +7,10 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
+import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 
 const USAGE = `Usage: loryme [options]
+       loryme hooks <install|uninstall|status>
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -16,6 +18,22 @@ Options:
   --no-redact   Disable secret redaction in session digests
   --no-open     Do not open the default browser automatically
   -h, --help    Show this help message
+
+Hooks subcommands (Claude Code Stop hook for the policy engine):
+  hooks install    Add the ccview Stop hook to ~/.claude/settings.json
+  hooks uninstall  Remove only the ccview Stop hook entry
+  hooks status     Show whether the hook is installed and the active policy mode
+`;
+
+const HOOKS_USAGE = `Usage: loryme hooks <install|uninstall|status>
+
+Manages the Claude Code Stop hook ccview's policy engine uses to gently
+enforce workflow rules (e.g. requiring a linked board task for commits).
+
+  install    Adds the ccview Stop hook to ~/.claude/settings.json
+             (backs up the existing file first; leaves other hooks intact)
+  uninstall  Removes only the ccview Stop hook entry
+  status     Shows whether the hook is installed and the active policy mode
 `;
 
 const MAX_PORT_ATTEMPTS = 10;
@@ -65,7 +83,57 @@ async function startWithPortRetry(basePort, serverOpts) {
   );
 }
 
+/** Handles `loryme hooks <install|uninstall|status>`. Never throws — errors are reported and turn into exitCode 1. */
+function runHooksCommand(args) {
+  const sub = args[0];
+
+  if (sub === undefined || sub === '--help' || sub === '-h') {
+    console.log(HOOKS_USAGE);
+    process.exitCode = 0;
+    return;
+  }
+
+  try {
+    if (sub === 'install') {
+      const result = installHook();
+      console.log(`Installed Stop hook -> ${result.settingsPath}`);
+      if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
+      if (result.alreadyInstalled) console.log('(already installed, left unchanged)');
+    } else if (sub === 'uninstall') {
+      const result = uninstallHook();
+      if (result.uninstalled) {
+        console.log(`Removed Stop hook from ${result.settingsPath}`);
+        if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
+      } else {
+        console.log(`No ccview Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
+      }
+    } else if (sub === 'status') {
+      const result = hookStatus();
+      console.log(`Installed: ${result.installed ? 'yes' : 'no'}`);
+      console.log(`Settings file: ${result.settingsPath}`);
+      console.log(`Policy mode: ${result.mode}${result.policyError ? ` (fallback: ${result.policyError})` : ''}`);
+      console.log(`Data dir: ${result.dataDir}`);
+    } else {
+      console.error(`Unknown hooks subcommand: ${sub}`);
+      console.error(HOOKS_USAGE);
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = 0;
+  } catch (err) {
+    console.error(`hooks ${sub} failed: ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
 async function main() {
+  const argv = process.argv.slice(2);
+
+  if (argv[0] === 'hooks') {
+    runHooksCommand(argv.slice(1));
+    return;
+  }
+
   let opts;
   try {
     opts = parseArgs(process.argv.slice(2));
