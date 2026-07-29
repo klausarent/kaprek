@@ -7,11 +7,13 @@ import { useEffect, useState } from "react";
 import SessionList from "./pages/SessionList";
 import Thread from "./pages/Thread";
 import Search from "./pages/Search";
+import Board from "./pages/Board";
 
 type Route =
   | { name: "list"; project: string | null }
   | { name: "thread"; project: string; sessionId: string }
-  | { name: "search"; query: string };
+  | { name: "search"; query: string }
+  | { name: "board" };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -31,6 +33,9 @@ function parseHash(hash: string): Route {
   if (parts[0] === "search") {
     const params = new URLSearchParams(queryPart ?? "");
     return { name: "search", query: params.get("q") ?? "" };
+  }
+  if (parts[0] === "board") {
+    return { name: "board" };
   }
   if (parts[0] === "session" && parts[1] && parts[2]) {
     return { name: "thread", project: parts[1], sessionId: parts[2] };
@@ -55,6 +60,10 @@ export function navigateToThread(project: string, sessionId: string) {
 
 export function navigateToSearch(query: string) {
   window.location.hash = `#/search?q=${encodeURIComponent(query)}`;
+}
+
+export function navigateToBoard() {
+  window.location.hash = "#/board";
 }
 
 function useHashRoute(): Route {
@@ -109,6 +118,28 @@ export default function App() {
           loryme
         </a>
         <span className="app-subtitle">local Claude Code session viewer</span>
+        <nav className="app-nav">
+          <a
+            href="#/"
+            className={route.name === "list" || route.name === "thread" || route.name === "search" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToProjects();
+            }}
+          >
+            List
+          </a>
+          <a
+            href="#/board"
+            className={route.name === "board" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToBoard();
+            }}
+          >
+            Board
+          </a>
+        </nav>
         <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
       </header>
       <main className="app-main">
@@ -116,6 +147,8 @@ export default function App() {
           <Thread project={route.project} sessionId={route.sessionId} />
         ) : route.name === "search" ? (
           <Search query={route.query} />
+        ) : route.name === "board" ? (
+          <Board />
         ) : (
           <SessionList project={route.project} />
         )}

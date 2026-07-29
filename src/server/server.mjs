@@ -12,8 +12,19 @@ import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession } from '../parser/parse.mjs';
 import { buildSearchIndex, searchSessions } from '../search/index.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
+import {
+  openBoard,
+  STATUSES as BOARD_STATUSES,
+  TaskNotFoundError,
+  InvalidTitleError,
+  InvalidStatusError,
+  UnknownDocFieldError,
+  DocIncompleteError,
+} from '../board/store.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
+const MAX_BOARD_BODY_BYTES = 256 * 1024;
+const TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -57,6 +68,69 @@ function isSafeId(id) {
   if (id.includes('/') || id.includes('\\')) return false;
   if (id.includes('..')) return false;
   return true;
+}
+
+/** Rejects task ids that aren't a well-formed UUID (board task ids are crypto.randomUUID()). */
+function isValidTaskId(id) {
+  return typeof id === 'string' && TASK_ID_RE.test(id);
+}
+
+/**
+ * Reads and JSON-parses a request body, enforcing `application/json` and a
+ * hard byte cap (checked against Content-Length up front, and again while
+ * streaming in case Content-Length is absent, wrong, or the body is
+ * chunked). Never throws — callers get { ok: false, status, error } instead,
+ * so route handlers can turn it straight into a JSON error response.
+ */
+function readJsonBody(req, maxBytes = MAX_BOARD_BODY_BYTES) {
+  return new Promise((resolve) => {
+    const contentType = req.headers['content-type'] || '';
+    if (!contentType.toLowerCase().startsWith('application/json')) {
+      req.resume();
+      resolve({ ok: false, status: 400, error: 'expected Content-Type: application/json' });
+      return;
+    }
+    const declaredLength = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBytes) {
+      req.resume();
+      resolve({ ok: false, status: 413, error: 'request body too large' });
+      return;
+    }
+
+    const chunks = [];
+    let total = 0;
+    let settled = false;
+    req.on('data', (chunk) => {
+      if (settled) return;
+      total += chunk.length;
+      if (total > maxBytes) {
+        settled = true;
+        resolve({ ok: false, status: 413, error: 'request body too large' });
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (settled) return;
+      settled = true;
+      const raw = Buffer.concat(chunks).toString('utf8');
+      if (raw.trim().length === 0) {
+        resolve({ ok: true, data: {} });
+        return;
+      }
+      try {
+        resolve({ ok: true, data: JSON.parse(raw) });
+      } catch {
+        resolve({ ok: false, status: 400, error: 'invalid JSON body' });
+      }
+    });
+    req.on('error', () => {
+      if (settled) return;
+      settled = true;
+      resolve({ ok: false, status: 400, error: 'error reading request body' });
+    });
+  });
 }
 
 /** Minimal LRU cache backed by Map insertion order (oldest = first key). */
@@ -190,6 +264,136 @@ async function handleReindex(res, rootDir, dataDir, importSqlite) {
   sendJson(res, 200, { available: true, indexed: result.indexed, skipped: result.skipped });
 }
 
+/**
+ * Board routes, mounted at /api/board/*. `getBoard()` opens (or returns the
+ * already-open) board for the server's configured dataDir — see
+ * startServer()'s lazy board getter below.
+ */
+async function handleBoardRoutes(req, res, getBoard, segments, url) {
+  if (segments[2] !== 'tasks') {
+    sendJson(res, 404, { error: 'not found' });
+    return;
+  }
+  const board = getBoard();
+
+  // /api/board/tasks
+  if (segments.length === 3) {
+    if (req.method === 'GET') {
+      const status = url.searchParams.get('status') ?? undefined;
+      const project = url.searchParams.get('project') ?? undefined;
+      if (status !== undefined && !BOARD_STATUSES.includes(status)) {
+        sendJson(res, 400, { error: `invalid status: ${status}` });
+        return;
+      }
+      sendJson(res, 200, { tasks: board.list({ status, project }) });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (!body.ok) {
+        sendJson(res, body.status, { error: body.error });
+        return;
+      }
+      try {
+        const task = board.create({ title: body.data.title, project: body.data.project, tags: body.data.tags });
+        sendJson(res, 201, task);
+      } catch (err) {
+        if (err instanceof InvalidTitleError) {
+          sendJson(res, 400, { error: err.message });
+          return;
+        }
+        throw err;
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  // /api/board/tasks/<id>
+  if (segments.length === 4) {
+    const taskId = segments[3];
+    if (!isValidTaskId(taskId)) {
+      sendJson(res, 400, { error: 'invalid task id' });
+      return;
+    }
+    if (req.method !== 'PATCH') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    const op = body.data?.op;
+    try {
+      let task;
+      if (op === 'update') {
+        task = board.update(taskId, body.data.patch ?? {});
+      } else if (op === 'setDoc') {
+        task = board.setDoc(taskId, body.data.doc ?? {});
+      } else if (op === 'linkSession') {
+        task = board.linkSession(taskId, body.data.session ?? {});
+      } else {
+        sendJson(res, 400, { error: `unknown op: ${op}` });
+        return;
+      }
+      sendJson(res, 200, task);
+    } catch (err) {
+      if (err instanceof TaskNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      if (err instanceof UnknownDocFieldError) {
+        sendJson(res, 400, { error: err.message, field: err.field });
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  // /api/board/tasks/<id>/status
+  if (segments.length === 5 && segments[4] === 'status') {
+    const taskId = segments[3];
+    if (!isValidTaskId(taskId)) {
+      sendJson(res, 400, { error: 'invalid task id' });
+      return;
+    }
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    try {
+      const task = board.setStatus(taskId, body.data.status);
+      sendJson(res, 200, task);
+    } catch (err) {
+      if (err instanceof TaskNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      if (err instanceof InvalidStatusError) {
+        sendJson(res, 400, { error: err.message });
+        return;
+      }
+      if (err instanceof DocIncompleteError) {
+        sendJson(res, 409, { error: err.message, missing: err.missing });
+        return;
+      }
+      throw err;
+    }
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
 /** Serves static files from webDist with SPA fallback to index.html. */
 function serveStatic(res, webDist, pathname) {
   if (!webDist || !fs.existsSync(webDist)) {
@@ -224,10 +428,22 @@ function serveStatic(res, webDist, pathname) {
   fs.createReadStream(filePath).pipe(res);
 }
 
-async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite }) {
+async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, dataDir, importSqlite, getBoard }) {
   // No body details on rejection — don't echo the offending Host header back.
   if (!isAllowedHost(req.headers.host, port)) {
     sendJson(res, 400, { error: 'bad request' });
+    return;
+  }
+
+  // CSRF hardening: every non-GET route requires this custom header. A
+  // cross-origin page cannot set custom headers on a simple request, so this
+  // forces the browser into a CORS preflight — and since this server sends
+  // no CORS headers at all, the preflight fails and the browser never sends
+  // the real request. This is the only line of defense against a malicious
+  // page issuing state-changing requests against this loopback server, so it
+  // applies uniformly to every write route, not just /api/board/*.
+  if (req.method !== 'GET' && req.headers['x-app-request'] !== '1') {
+    sendJson(res, 403, { error: 'missing app header' });
     return;
   }
 
@@ -235,8 +451,9 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
   const segments = url.pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
 
   if (segments[0] === 'api') {
-    // Search routes have their own methods (GET for lookup, POST to trigger
-    // a rebuild) and are checked before the blanket GET-only rule below.
+    // Search and board routes have their own methods (GET for lookup, POST
+    // to trigger a rebuild; board mixes GET/POST/PATCH) and are checked
+    // before the blanket GET-only rule below.
     if (segments.length === 2 && segments[1] === 'search') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: 'method not allowed' });
@@ -251,6 +468,10 @@ async function handleRequest(req, res, { rootDir, redact, webDist, cache, port, 
         return;
       }
       await handleReindex(res, rootDir, dataDir, importSqlite);
+      return;
+    }
+    if (segments[1] === 'board') {
+      await handleBoardRoutes(req, res, getBoard, segments, url);
       return;
     }
 
@@ -292,8 +513,17 @@ export function startServer({ port = 0, rootDir, redact = true, webDist, dataDir
   // the requested one.
   let boundPort = port;
 
+  // Board is opened lazily on first access to a board route, not eagerly at
+  // startup — most invocations of this server never touch the board, and
+  // openBoard() replays the whole events.jsonl log.
+  let board = null;
+  function getBoard() {
+    if (!board) board = openBoard(dataDir);
+    return board;
+  }
+
   const server = http.createServer((req, res) => {
-    handleRequest(req, res, { rootDir, redact, webDist, cache, port: boundPort, dataDir, importSqlite }).catch(
+    handleRequest(req, res, { rootDir, redact, webDist, cache, port: boundPort, dataDir, importSqlite, getBoard }).catch(
       (err) => {
         sendJson(res, 500, { error: 'internal error', message: err.message });
       },

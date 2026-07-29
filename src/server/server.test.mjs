@@ -13,6 +13,9 @@ import { startServer } from './server.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SECRET_FIXTURE = path.join(__dirname, 'fixtures', 'session-with-secret.jsonl');
 
+const APP_HEADERS = { 'x-app-request': '1' };
+const APP_JSON_HEADERS = { ...APP_HEADERS, 'Content-Type': 'application/json' };
+
 let tmpDir;
 let dataDir;
 let servers = [];
@@ -51,6 +54,27 @@ function writeProject(projectSlug, sessions) {
 
 function aiTitleLine(title) {
   return JSON.stringify({ type: 'ai-title', aiTitle: title, sessionId: 'x' }) + '\n';
+}
+
+function postJson(url, body, headers = APP_JSON_HEADERS) {
+  return fetch(url, { method: 'POST', headers, body: JSON.stringify(body) });
+}
+
+function patchJson(url, body, headers = APP_JSON_HEADERS) {
+  return fetch(url, { method: 'PATCH', headers, body: JSON.stringify(body) });
+}
+
+/** A doc with all 7 fields present and each >= 20 chars (see DOC_FIELD_MIN_LENGTH in board/store.mjs). */
+function fullDoc() {
+  return {
+    trigger: 'Something prompted this task to begin in the first place.',
+    outcome: 'The board API and UI shipped exactly as scoped.',
+    approach: 'Followed the existing server.mjs handler style closely.',
+    course: 'No major detours were needed along the way this time.',
+    verification: 'Ran the full server test suite and it stayed green.',
+    effort: 'About two hours end to end, including tests.',
+    open: 'No open items remain for this task right now.',
+  };
 }
 
 /**
@@ -301,7 +325,7 @@ test('POST /api/search/reindex builds the index, then GET /api/search finds matc
   writeProject('proj-a', { s1: aiTitleLine('Digest Parser Fixture') });
   const { url } = await boot({});
 
-  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
   expect(reindexRes.status).toBe(200);
   const reindexBody = await reindexRes.json();
   expect(reindexBody.available).toBe(true);
@@ -320,8 +344,8 @@ test('POST /api/search/reindex is idempotent: a second call re-skips unchanged s
   writeProject('proj-a', { s1: aiTitleLine('Digest Parser Fixture') });
   const { url } = await boot({});
 
-  await fetch(`${url}/api/search/reindex`, { method: 'POST' });
-  const second = await (await fetch(`${url}/api/search/reindex`, { method: 'POST' })).json();
+  await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
+  const second = await (await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS })).json();
   expect(second.indexed).toBe(0);
   expect(second.skipped).toBe(1);
 });
@@ -332,9 +356,9 @@ test('GET /api/search/reindex (wrong method) returns 405', async () => {
   expect(res.status).toBe(405);
 });
 
-test('POST /api/search (wrong method) returns 405', async () => {
+test('POST /api/search (wrong method) returns 405, once the CSRF app header is present', async () => {
   const { url } = await boot({});
-  const res = await fetch(`${url}/api/search?q=x`, { method: 'POST' });
+  const res = await fetch(`${url}/api/search?q=x`, { method: 'POST', headers: APP_HEADERS });
   expect(res.status).toBe(405);
 });
 
@@ -347,8 +371,195 @@ test('search routes report available:false when sqlite is unavailable, via impor
   const searchBody = await searchRes.json();
   expect(searchBody).toEqual({ available: false, reason: 'no sqlite here' });
 
-  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
   expect(reindexRes.status).toBe(200);
   const reindexBody = await reindexRes.json();
   expect(reindexBody).toEqual({ available: false, reason: 'no sqlite here' });
+});
+
+// --- CSRF hardening (custom app header) ---------------------------------
+
+test('CSRF hardening: POST /api/search/reindex without x-app-request header is rejected with 403', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/search/reindex`, { method: 'POST' });
+  expect(res.status).toBe(403);
+  const body = await res.json();
+  expect(body.error).toBe('missing app header');
+});
+
+test('CSRF hardening: POST /api/board/tasks without x-app-request header is rejected with 403', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/board/tasks`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: 'X' }),
+  });
+  expect(res.status).toBe(403);
+});
+
+test('CSRF hardening: with the x-app-request header present, writes go through normally', async () => {
+  const { url } = await boot({});
+  const res = await postJson(`${url}/api/board/tasks`, { title: 'X' });
+  expect(res.status).toBe(201);
+});
+
+test('regression: POST /api/projects (GET-only route) still returns 405, not 403, once the app header is present', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/projects`, { method: 'POST', headers: APP_HEADERS });
+  expect(res.status).toBe(405);
+});
+
+test('regression: POST /api/sessions (GET-only route) still returns 405, not 403, once the app header is present', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/sessions`, { method: 'POST', headers: APP_HEADERS });
+  expect(res.status).toBe(405);
+});
+
+// --- Board API ------------------------------------------------------------
+
+test('board: full CRUD cycle — create, list/filter, update, doc, status, session link', async () => {
+  const { url } = await boot({});
+
+  const createRes = await postJson(`${url}/api/board/tasks`, { title: 'Ship the board UI', project: 'ccview', tags: ['p1'] });
+  expect(createRes.status).toBe(201);
+  const task = await createRes.json();
+  expect(task.title).toBe('Ship the board UI');
+  expect(task.project).toBe('ccview');
+  expect(task.tags).toEqual(['p1']);
+  expect(task.status).toBe('backlog');
+
+  const listRes = await fetch(`${url}/api/board/tasks`);
+  expect(listRes.status).toBe(200);
+  const listBody = await listRes.json();
+  expect(listBody.tasks.map((t) => t.id)).toContain(task.id);
+
+  const filteredRes = await fetch(`${url}/api/board/tasks?status=backlog&project=ccview`);
+  const filteredBody = await filteredRes.json();
+  expect(filteredBody.tasks.map((t) => t.id)).toContain(task.id);
+
+  const emptyFilterRes = await fetch(`${url}/api/board/tasks?status=done`);
+  const emptyFilterBody = await emptyFilterRes.json();
+  expect(emptyFilterBody.tasks.map((t) => t.id)).not.toContain(task.id);
+
+  const updateRes = await patchJson(`${url}/api/board/tasks/${task.id}`, {
+    op: 'update',
+    patch: { title: 'Ship the board UI (v2)' },
+  });
+  expect(updateRes.status).toBe(200);
+  const updated = await updateRes.json();
+  expect(updated.title).toBe('Ship the board UI (v2)');
+
+  const docPartialRes = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { trigger: 'Klaus asked for a board.' } });
+  expect(docPartialRes.status).toBe(200);
+  const docPartial = await docPartialRes.json();
+  expect(docPartial.doc.trigger).toBe('Klaus asked for a board.');
+
+  const statusRes = await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  expect(statusRes.status).toBe(200);
+  expect((await statusRes.json()).status).toBe('in_progress');
+
+  const linkRes = await patchJson(`${url}/api/board/tasks/${task.id}`, {
+    op: 'linkSession',
+    session: { projectSlug: 'ccview', sessionId: 's1', machine: 'desktop' },
+  });
+  expect(linkRes.status).toBe(200);
+  const linked = await linkRes.json();
+  expect(linked.sessions).toEqual([{ projectSlug: 'ccview', sessionId: 's1', machine: 'desktop' }]);
+
+  const docFullRes = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  expect(docFullRes.status).toBe(200);
+
+  const doneRes = await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+  expect(doneRes.status).toBe(200);
+  expect((await doneRes.json()).status).toBe('done');
+});
+
+test('board: moving to done without a complete doc returns 409 with the missing field list', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Incomplete' })).json();
+
+  const res = await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+  expect(res.status).toBe(409);
+  const body = await res.json();
+  expect(body.missing).toEqual(['trigger', 'outcome', 'approach', 'course', 'verification', 'effort', 'open']);
+});
+
+test('board: unknown (but well-formed) task id returns 404', async () => {
+  const { url } = await boot({});
+  const res = await patchJson(`${url}/api/board/tasks/00000000-0000-0000-0000-000000000000`, { op: 'update', patch: { title: 'X' } });
+  expect(res.status).toBe(404);
+});
+
+test('board: malformed task id (not a UUID) is rejected with 400, not resolved against the store', async () => {
+  const { url } = await boot({});
+  // 'sneaky..name' contains '..' without being a pure dot-segment, so it
+  // survives URL path normalization unchanged (see the equivalent session-id
+  // traversal test above) and must be caught by isValidTaskId() instead.
+  const res = await patchJson(`${url}/api/board/tasks/sneaky..name`, { op: 'update', patch: { title: 'X' } });
+  expect(res.status).toBe(400);
+
+  const statusRes = await postJson(`${url}/api/board/tasks/not-a-uuid/status`, { status: 'done' });
+  expect(statusRes.status).toBe(400);
+});
+
+test('board: unknown op on PATCH returns 400', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+  const res = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'bogus' });
+  expect(res.status).toBe(400);
+});
+
+test('board: unknown doc field returns 400 with the offending field name', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+  const res = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: { notAField: 'x' } });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.field).toBe('notAField');
+});
+
+test('board: creating a task with an empty title returns 400', async () => {
+  const { url } = await boot({});
+  const res = await postJson(`${url}/api/board/tasks`, { title: '' });
+  expect(res.status).toBe(400);
+});
+
+test('board: PUT /api/board/tasks/<id> (wrong method) returns 405', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'X' })).json();
+  const res = await fetch(`${url}/api/board/tasks/${task.id}`, { method: 'PUT', headers: APP_JSON_HEADERS, body: '{}' });
+  expect(res.status).toBe(405);
+});
+
+test('board: PUT /api/board/tasks (wrong method) returns 405', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/board/tasks`, { method: 'PUT', headers: APP_JSON_HEADERS, body: '{}' });
+  expect(res.status).toBe(405);
+});
+
+test('board: a non-JSON content type is rejected with 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/board/tasks`, {
+    method: 'POST',
+    headers: { ...APP_HEADERS, 'Content-Type': 'text/plain' },
+    body: 'title=X',
+  });
+  expect(res.status).toBe(400);
+});
+
+test('board: invalid JSON body is rejected with 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/board/tasks`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: '{not json',
+  });
+  expect(res.status).toBe(400);
+});
+
+test('board: a body over the 256 KB limit is rejected with 413', async () => {
+  const { url } = await boot({});
+  const bigTitle = 'x'.repeat(300 * 1024);
+  const res = await postJson(`${url}/api/board/tasks`, { title: bigTitle });
+  expect(res.status).toBe(413);
 });

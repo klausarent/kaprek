@@ -1,7 +1,7 @@
 // Session detail page: full digest as a chat thread with tool accordions and
 // nested subagent sub-threads.
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { fetchDigest, type Digest, type DigestEvent, type SubagentThread } from "../lib/api";
+import { fetchDigest, fetchTasks, linkTaskSession, type Digest, type DigestEvent, type SubagentThread, type Task } from "../lib/api";
 import EventBlock from "../components/EventBlock";
 
 const PAGE_SIZE = 500;
@@ -54,6 +54,78 @@ function matchSubagentThreads(events: DigestEvent[], subagents: SubagentThread[]
 
   const unmatched = subagents.filter((_, i) => !usedIdx.has(i));
   return { matchByEvent, unmatched };
+}
+
+/** "Link to task" control: lazy-loads the task list on first open, links the current session to the chosen task. */
+function LinkToTaskControl({
+  project,
+  sessionId,
+  machine,
+}: {
+  project: string;
+  sessionId: string;
+  machine: string | null;
+}) {
+  const [open, setOpen] = useState(false);
+  const [tasks, setTasks] = useState<Task[] | null>(null);
+  const [selectedId, setSelectedId] = useState("");
+  const [linking, setLinking] = useState(false);
+  const [status, setStatus] = useState<{ kind: "ok" | "error"; message: string } | null>(null);
+
+  const handleOpen = () => {
+    setOpen(true);
+    setStatus(null);
+    if (!tasks) {
+      fetchTasks()
+        .then(setTasks)
+        .catch((e) => setStatus({ kind: "error", message: (e as Error).message }));
+    }
+  };
+
+  const handleLink = async () => {
+    if (!selectedId) return;
+    setLinking(true);
+    setStatus(null);
+    try {
+      await linkTaskSession(selectedId, { projectSlug: project, sessionId, machine });
+      setStatus({ kind: "ok", message: "Linked." });
+    } catch (e) {
+      setStatus({ kind: "error", message: (e as Error).message });
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button className="btn" onClick={handleOpen}>
+        Link to task
+      </button>
+    );
+  }
+
+  return (
+    <div className="board-new-task">
+      {!tasks ? (
+        <span className="page-subtitle">Loading tasks…</span>
+      ) : (
+        <>
+          <select value={selectedId} onChange={(e) => setSelectedId(e.target.value)}>
+            <option value="">Select a task…</option>
+            {tasks.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.title}
+              </option>
+            ))}
+          </select>
+          <button className="btn" onClick={handleLink} disabled={!selectedId || linking}>
+            {linking ? "Linking…" : "Link"}
+          </button>
+        </>
+      )}
+      {status && <span className={status.kind === "error" ? "error-box" : "page-subtitle"}>{status.message}</span>}
+    </div>
+  );
 }
 
 export default function Thread({ project, sessionId }: { project: string; sessionId: string }) {
@@ -142,6 +214,7 @@ export default function Thread({ project, sessionId }: { project: string; sessio
               <span>· {fmtBytes(digest.meta.rawBytes)}</span>
               {digest.meta.hasSubagents && <span>· subagents present</span>}
             </div>
+            <LinkToTaskControl project={project} sessionId={sessionId} machine={digest.meta.machine} />
           </header>
 
           {hasOlder && (
