@@ -73,6 +73,12 @@ test('loadPolicy fills in missing fields with DEFAULT_POLICY values', () => {
   });
 });
 
+test('loadPolicy strips a leading BOM before parsing', () => {
+  const bom = '﻿';
+  fs.writeFileSync(path.join(dataDir, 'policy.json'), `${bom}${JSON.stringify({ mode: 'warn' })}`, 'utf8');
+  expect(loadPolicy(dataDir)).toEqual({ version: 1, mode: 'warn', rules: DEFAULT_POLICY.rules });
+});
+
 test('loadPolicy falls back to observe (with a reason) for corrupt JSON, without throwing', () => {
   fs.writeFileSync(path.join(dataDir, 'policy.json'), '{ not valid json', 'utf8');
   const policy = loadPolicy(dataDir);

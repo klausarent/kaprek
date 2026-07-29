@@ -18,7 +18,7 @@ let cachedName;
  * fs.readFileSync + JSON.parse instead of a JSON import assertion, since
  * import-assertion syntax and support still differ across Node versions.
  */
-function getPackageName() {
+export function getPackageName() {
   if (cachedName) return cachedName;
   const pkg = JSON.parse(fs.readFileSync(PACKAGE_JSON_PATH, 'utf8'));
   cachedName = pkg.name;

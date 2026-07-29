@@ -85,7 +85,7 @@ export function loadPolicy(dataDir) {
 
   let raw;
   try {
-    raw = fs.readFileSync(policyPath, 'utf8');
+    raw = fs.readFileSync(policyPath, 'utf8').replace(/^﻿/, ''); // strip a leading BOM, e.g. from files saved by some Windows editors
   } catch (err) {
     return { ...clonePolicy(DEFAULT_POLICY), reason: `could not read policy.json, falling back to observe: ${err.message}` };
   }

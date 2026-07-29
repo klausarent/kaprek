@@ -131,3 +131,85 @@ test('status reports installed:true and the active policy mode after install', (
 
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+test('status reports the recorded hook script path and that it exists', () => {
+  install({ settingsPath });
+  const result = status({ settingsPath });
+  expect(result.recordedPath).toBe(HOOK_SCRIPT_PATH);
+  expect(result.recordedPathMissing).toBe(false);
+});
+
+test('status flags a recorded path that no longer exists on disk as stale', () => {
+  install({ settingsPath, hookScriptPath: path.join(tmpDir, 'no-such-hook-stop.mjs') });
+  const result = status({ settingsPath });
+  expect(result.installed).toBe(true);
+  expect(result.recordedPathMissing).toBe(true);
+});
+
+// ------------------------------------------------------------- atomic write
+
+test('install writes atomically: no leftover temp file, and the target is always valid JSON', () => {
+  install({ settingsPath });
+  const leftoverTemp = fs.readdirSync(tmpDir).find((f) => f.startsWith('.settings.json.tmp-'));
+  expect(leftoverTemp).toBeUndefined();
+  expect(() => readJson(settingsPath)).not.toThrow();
+});
+
+test('uninstall also writes atomically: no leftover temp file', () => {
+  install({ settingsPath });
+  uninstall({ settingsPath });
+  const leftoverTemp = fs.readdirSync(tmpDir).find((f) => f.startsWith('.settings.json.tmp-'));
+  expect(leftoverTemp).toBeUndefined();
+  expect(() => readJson(settingsPath)).not.toThrow();
+});
+
+// --------------------------------------------------- stable marker matching
+
+test('install replaces a stale-path entry carrying our marker instead of duplicating it (e.g. after an npx cache path change)', () => {
+  const packageName = 'loryme';
+  const staleCommand = `node "/old/npx-cache/path/hook-stop.mjs" --managed-by=${packageName}`;
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: staleCommand }] }] } }, null, 2),
+    'utf8',
+  );
+
+  const result = install({ settingsPath, packageName });
+  expect(result.alreadyInstalled).toBe(true);
+
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.Stop).toHaveLength(1);
+  expect(settings.hooks.Stop[0].hooks).toHaveLength(1);
+  expect(settings.hooks.Stop[0].hooks[0].command).toContain(HOOK_SCRIPT_PATH);
+  expect(settings.hooks.Stop[0].hooks[0].command).not.toContain('/old/npx-cache/path');
+});
+
+test('uninstall removes a marker-matched entry even at a stale path', () => {
+  const packageName = 'loryme';
+  const staleCommand = `node "/old/npx-cache/path/hook-stop.mjs" --managed-by=${packageName}`;
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: staleCommand }] }] } }, null, 2),
+    'utf8',
+  );
+
+  const result = uninstall({ settingsPath, packageName });
+  expect(result.uninstalled).toBe(true);
+
+  const after = readJson(settingsPath);
+  expect(after.hooks?.Stop).toBeUndefined();
+});
+
+// ------------------------------------------------------------------- BOM
+
+test('a settings.json with a leading BOM is read and modified correctly', () => {
+  const bom = '﻿';
+  fs.writeFileSync(settingsPath, `${bom}${JSON.stringify({ someOtherSetting: true }, null, 2)}`, 'utf8');
+
+  const result = install({ settingsPath });
+  expect(result.alreadyInstalled).toBe(false);
+
+  const settings = readJson(settingsPath);
+  expect(settings.someOtherSetting).toBe(true);
+  expect(settings.hooks.Stop).toHaveLength(1);
+});

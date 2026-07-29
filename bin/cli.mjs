@@ -111,6 +111,10 @@ function runHooksCommand(args) {
       const result = hookStatus();
       console.log(`Installed: ${result.installed ? 'yes' : 'no'}`);
       console.log(`Settings file: ${result.settingsPath}`);
+      if (result.installed) {
+        const staleNote = result.recordedPathMissing ? ' (WARNING: no file exists at this recorded path)' : '';
+        console.log(`Recorded hook script: ${result.recordedPath ?? '(could not parse recorded command)'}${staleNote}`);
+      }
       console.log(`Policy mode: ${result.mode}${result.policyError ? ` (fallback: ${result.policyError})` : ''}`);
       console.log(`Data dir: ${result.dataDir}`);
     } else {
