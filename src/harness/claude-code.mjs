@@ -5,6 +5,45 @@
 // the CLI. See adapter.mjs for the startTurn() contract this implements.
 import { spawn as nodeSpawn } from 'node:child_process';
 import readline from 'node:readline';
+import fs from 'node:fs';
+import path from 'node:path';
+
+/**
+ * Locates the Claude Code CLI and decides whether a shell is required.
+ *
+ * Installations differ: the native installer places a real `claude.exe` in
+ * `~/.local/bin`, while an npm install leaves a `claude.cmd` shim. Only the
+ * shim needs a shell; spawning an .exe through a shell fails in environments
+ * where COMSPEC is not resolvable. `KAPREK_CLAUDE_PATH` overrides detection.
+ *
+ * @returns {{command: string, useShell: boolean}}
+ */
+export function resolveCli(env = process.env) {
+  const override = env.KAPREK_CLAUDE_PATH;
+  if (override) {
+    return { command: override, useShell: /\.(cmd|bat)$/i.test(override) };
+  }
+
+  if (process.platform !== 'win32') return { command: 'claude', useShell: false };
+
+  // Walk PATH for a native executable first, shim second.
+  const dirs = (env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  const candidates = ['claude.exe', 'claude.cmd', 'claude.bat'];
+  for (const dir of dirs) {
+    for (const name of candidates) {
+      const full = path.join(dir, name);
+      try {
+        if (fs.existsSync(full)) {
+          return { command: full, useShell: /\.(cmd|bat)$/i.test(name) };
+        }
+      } catch {
+        // unreadable PATH entry — keep looking
+      }
+    }
+  }
+  // Nothing found: let spawn fail with ENOENT and report it as an error event.
+  return { command: 'claude', useShell: false };
+}
 
 const MAX_STDERR_LEN = 8192;
 
@@ -118,15 +157,16 @@ export async function startTurn({
 
   const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools });
 
+  const { command, useShell } = resolveCli();
+
   let child;
   try {
-    child = spawnFn('claude', args, {
+    child = spawnFn(command, args, {
       cwd,
-      // The npm-installed `claude` is a .cmd shim on Windows; spawn() only
-      // resolves those through a shell. Still a single argv-array process,
-      // not exec() — shell:true here just affects PATH lookup, not how the
-      // command is composed.
-      shell: process.platform === 'win32',
+      // shell is only needed for .cmd/.bat shims (npm-style installs). A native
+      // executable is spawned directly — using a shell there breaks in
+      // environments where COMSPEC cannot be resolved (e.g. some MSYS shells).
+      shell: useShell,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
   } catch (err) {
