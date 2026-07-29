@@ -820,6 +820,40 @@ function slowFakeHarness({ script, delayMs = 20 }) {
 }
 
 /**
+ * Like slowFakeHarness(), but exposes an `aborted` promise that resolves the
+ * moment startTurn() observes `signal.aborted` — lets a test prove the
+ * SERVER actually triggered the AbortController (e.g. on a client
+ * disconnect) without relying on a side channel like the cancel endpoint,
+ * which would itself abort the turn and confound the assertion.
+ */
+function observableAbortHarness({ script, delayMs = 20 }) {
+  let resolveAborted;
+  const aborted = new Promise((resolve) => {
+    resolveAborted = resolve;
+  });
+  return {
+    aborted,
+    async startTurn({ sessionId: requestedSessionId, onEvent, signal } = {}) {
+      let sessionId = requestedSessionId ?? null;
+      for (const event of script) {
+        if (signal?.aborted) {
+          resolveAborted();
+          return { sessionId, costUsd: null, usage: null, stopReason: 'aborted', error: null };
+        }
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (signal?.aborted) {
+          resolveAborted();
+          return { sessionId, costUsd: null, usage: null, stopReason: 'aborted', error: null };
+        }
+        onEvent?.(event);
+        if (event.sessionId) sessionId = event.sessionId;
+      }
+      return { sessionId, costUsd: null, usage: null, stopReason: 'error', error: { message: 'no result event' } };
+    },
+  };
+}
+
+/**
  * Reads an SSE response body to completion, parsing each `data: ` frame as
  * JSON. `onEvent` (if given) is awaited after each parsed frame — the cancel
  * test uses this to fire a second request as soon as the `chat-id` bootstrap
@@ -1011,6 +1045,55 @@ test('chat: cancel aborts an in-flight turn, the SSE stream resolves with stopRe
   const complete = frames.at(-1);
   expect(complete.type).toBe('turn-complete');
   expect(complete.stopReason).toBe('aborted');
+});
+
+test('chat: closing the SSE response (client disconnect) aborts the turn on the server side', async () => {
+  const slowScript = [
+    { type: 'init', sessionId: 'sess-disconnect', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'text', text: 'partial one' },
+    { type: 'text', text: 'partial two' },
+    { type: 'text', text: 'partial three' },
+    { type: 'result', sessionId: 'sess-disconnect', costUsd: 0.01, usage: {}, isError: false },
+  ];
+  const harness = observableAbortHarness({ script: slowScript, delayMs: 100 });
+  const { url } = await boot({ harness, harnessName: 'fake' });
+
+  const clientController = new AbortController();
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'disconnect me' }),
+    signal: clientController.signal,
+  });
+
+  // Read only up to the chat-id bootstrap frame, proving the SSE stream is
+  // actually open and mid-turn, then simulate the client going away (closed
+  // tab / killed fetch) instead of reading the stream to completion.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let chatId = null;
+  while (chatId === null) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const idx = buffer.indexOf('\n\n');
+    if (idx !== -1) {
+      chatId = JSON.parse(buffer.slice('data: '.length, idx)).chatId;
+    }
+  }
+  expect(typeof chatId).toBe('string');
+
+  clientController.abort();
+  await reader.cancel().catch(() => {});
+
+  // The harness observing signal.aborted proves the SERVER's own
+  // AbortController fired because of the closed response, not because of
+  // some other side channel (e.g. the cancel endpoint, which is never
+  // called in this test).
+  const timedOut = Symbol('timeout');
+  const outcome = await Promise.race([harness.aborted.then(() => 'aborted'), new Promise((resolve) => setTimeout(() => resolve(timedOut), 3000))]);
+  expect(outcome).toBe('aborted');
 });
 
 test('chat: a second concurrent turn on the same chat is rejected with 409 (no SSE stream opened), a new turn works once the first ends', async () => {

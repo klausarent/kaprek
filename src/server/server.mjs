@@ -646,8 +646,14 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
 
   const controller = new AbortController();
   chatAbortControllers.set(chatId, controller);
+  // Listens on `res`, not `req`: by the time this handler runs, the request
+  // body has already been fully read by readJsonBody() above, so `req`'s own
+  // 'close' event has typically already fired (or never fires again) and a
+  // closed browser tab / killed fetch would NOT reliably reach this turn —
+  // `res` is the SSE response actually still streaming to the client, so its
+  // 'close' event is what actually reflects the client going away mid-turn.
   const onClientClose = () => controller.abort();
-  req.on('close', onClientClose);
+  res.on('close', onClientClose);
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -678,7 +684,7 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
     // more SSE frame instead of letting it surface as an unhandled rejection.
     sseWrite(res, { type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
   } finally {
-    req.off('close', onClientClose);
+    res.off('close', onClientClose);
     // Only remove OUR OWN entry: blindly deleting by chatId would let a
     // slower-finishing turn's finally-block erase a different, still-running
     // turn's controller if the two were ever to overlap for the same key.
