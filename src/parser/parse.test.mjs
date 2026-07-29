@@ -10,12 +10,12 @@ import { digestSession, redactSecrets } from './parse.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, 'fixtures', 'mini-session.jsonl');
 
-test('meta.title ist der LETZTE ai-title (nicht der erste)', async () => {
+test('meta.title is the LAST ai-title (not the first)', async () => {
   const digest = await digestSession(FIXTURE);
   expect(digest.meta.title).toBe('Final title: Digest Parser Fixture');
 });
 
-test('events sind chronologisch nach timestamp sortiert', async () => {
+test('events are sorted chronologically by timestamp', async () => {
   const digest = await digestSession(FIXTURE);
   const timestamps = digest.events.map((e) => e.ts);
   const sorted = [...timestamps].sort();
@@ -24,54 +24,54 @@ test('events sind chronologisch nach timestamp sortiert', async () => {
   expect(digest.events.length).toBeGreaterThan(0);
 });
 
-test('genau 1 user-Event (tool_result und isMeta zaehlen nicht als user-Prompt)', async () => {
+test('exactly 1 user event (tool_result and isMeta do not count as user prompt)', async () => {
   const digest = await digestSession(FIXTURE);
   const userEvents = digest.events.filter((e) => e.kind === 'user');
   expect(userEvents.length).toBe(1);
   expect(userEvents[0].text).toBe('Build the digest parser for the session-viewer fixture.');
 });
 
-test('tool-Event: name Bash, resultRef null bei normalem Ergebnis, Pfad bei persisted-output', async () => {
+test('tool event: name Bash, resultRef null for a normal result, path for persisted output', async () => {
   const digest = await digestSession(FIXTURE);
   const toolEvents = digest.events.filter((e) => e.kind === 'tool');
-  expect(toolEvents.length, 'zwei Bash-tool_use in der Fixture').toBe(2);
+  expect(toolEvents.length, 'two Bash tool_use in the fixture').toBe(2);
 
   const commitTool = toolEvents.find((e) => e.msgId === 'msg_A0000000000000000000001');
-  expect(commitTool, 'Bash-Event fuer git-commit-Aufruf fehlt').toBeTruthy();
+  expect(commitTool, 'Bash event for the git commit call is missing').toBeTruthy();
   expect(commitTool.name).toBe('Bash');
   expect(commitTool.resultRef).toBe(null);
 
   const persistedTool = toolEvents.find((e) => e.msgId === 'msg_C0000000000000000000001');
-  expect(persistedTool, 'Bash-Event fuer persisted-output-Aufruf fehlt').toBeTruthy();
+  expect(persistedTool, 'Bash event for the persisted-output call is missing').toBeTruthy();
   expect(persistedTool.name).toBe('Bash');
   expect(persistedTool.resultRef).toBe(
     'C:\\Users\\testuser\\.claude\\projects\\C--Users-testuser\\mini-session\\tool-results\\toolu_bash0000000000000002.txt',
   );
 });
 
-test('thinking wird bei kleinem maxTextLen gekürzt', async () => {
+test('thinking is truncated when maxTextLen is small', async () => {
   const digest = await digestSession(FIXTURE, { maxTextLen: 10 });
   const thinkingEvents = digest.events.filter((e) => e.kind === 'thinking');
   expect(thinkingEvents.length).toBe(1);
   expect(thinkingEvents[0].text).toMatch(/^.{10} …\[truncated, \d+ chars\]$/);
 });
 
-test('meta.gitCommits zaehlt nur echte git-commit-Treffer in Bash-Inputs', async () => {
+test('meta.gitCommits counts only real git commit hits in Bash inputs', async () => {
   const digest = await digestSession(FIXTURE);
   expect(digest.meta.gitCommits).toBe(1);
 });
 
-test('Marker-Zeilen ohne uuid/timestamp und kaputte JSON-Zeilen crashen den Parser nicht', async () => {
+test('marker lines without uuid/timestamp and malformed JSON lines do not crash the parser', async () => {
   await digestSession(FIXTURE);
 });
 
-test('meta.turns zaehlt message.id-Gruppen einmal (nicht pro Content-Block)', async () => {
+test('meta.turns counts message.id groups once (not per content block)', async () => {
   const digest = await digestSession(FIXTURE);
   // msg A (text+thinking+tool_use), msg B (Agent spawn), msg C (Bash) = 3 message.id
   expect(digest.meta.turns).toBe(3);
 });
 
-test('subagent-Event hat agentId null (unbekannt zum Spawn-Zeitpunkt)', async () => {
+test('subagent event has agentId null (unknown at spawn time)', async () => {
   const digest = await digestSession(FIXTURE);
   const subagentEvents = digest.events.filter((e) => e.kind === 'subagent');
   expect(subagentEvents.length).toBe(1);
@@ -80,7 +80,7 @@ test('subagent-Event hat agentId null (unbekannt zum Spawn-Zeitpunkt)', async ()
   expect(subagentEvents[0].name).toBe('test123');
 });
 
-test('compact-Event enthaelt preTokens/postTokens', async () => {
+test('compact event contains preTokens/postTokens', async () => {
   const digest = await digestSession(FIXTURE);
   const compactEvents = digest.events.filter((e) => e.kind === 'compact');
   expect(compactEvents.length).toBe(1);
@@ -88,7 +88,7 @@ test('compact-Event enthaelt preTokens/postTokens', async () => {
   expect(compactEvents[0].postTokens).toBe(8000);
 });
 
-test('meta-Basisfelder sind plausibel befuellt', async () => {
+test('meta base fields are plausibly populated', async () => {
   const digest = await digestSession(FIXTURE);
   expect(digest.meta.sessionId).toBe('mini-session');
   expect(digest.meta.projectSlug).toBe('fixtures');
@@ -104,7 +104,7 @@ test('meta-Basisfelder sind plausibel befuellt', async () => {
   expect(typeof digest.meta.machine).toBe('string');
 });
 
-test('subagents werden rekursiv mit gleicher Event-Form gedigestet', async () => {
+test('subagents are digested recursively with the same event shape', async () => {
   const digest = await digestSession(FIXTURE);
   expect(digest.subagents.length).toBe(1);
   const sub = digest.subagents[0];
@@ -122,13 +122,13 @@ test('subagents werden rekursiv mit gleicher Event-Form gedigestet', async () =>
   expect(subTimestamps).toEqual([...subTimestamps].sort());
 });
 
-test('Kuerzung haengt Original-Zeichenzahl an, nicht die gekuerzte Länge', async () => {
+test('truncation appends the original char count, not the truncated length', async () => {
   const digest = await digestSession(FIXTURE, { maxTextLen: 10, maxToolLen: 10 });
   const commitTool = digest.events.find((e) => e.kind === 'tool' && e.name === 'Bash' && e.resultRef === null);
   expect(commitTool.input).toMatch(/…\[truncated, \d+ chars\]$/);
 });
 
-test('unterbrochener tool_use ohne tool_result wird als tool-Event mit result:null sichtbar, nicht verworfen', async () => {
+test('interrupted tool_use without tool_result shows up as a tool event with result:null, not dropped', async () => {
   // Own mini fixture: a Bash tool_use that is NEVER followed by a tool_result
   // (simulates a session interrupted mid-tool-call).
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-interrupted-'));
@@ -137,7 +137,7 @@ test('unterbrochener tool_use ohne tool_result wird als tool-Event mit result:nu
     {
       parentUuid: null, isSidechain: false,
       promptId: 'p0000000-0000-0000-0000-000000000001', type: 'user',
-      message: { role: 'user', content: 'Starte einen langen Befehl.' },
+      message: { role: 'user', content: 'Run a long command.' },
       uuid: 'u0000000-0000-0000-0000-000000000001', timestamp: '2026-07-29T10:00:00.000Z',
       cwd: 'C:\\tmp', sessionId: 'interrupted-session', version: '2.1.212', gitBranch: 'main',
     },
@@ -158,7 +158,7 @@ test('unterbrochener tool_use ohne tool_result wird als tool-Event mit result:nu
   try {
     const digest = await digestSession(tmpPath);
     const toolEvents = digest.events.filter((e) => e.kind === 'tool');
-    expect(toolEvents.length, 'der offene tool_use muss trotzdem als Event auftauchen').toBe(1);
+    expect(toolEvents.length, 'the open tool_use must still show up as an event').toBe(1);
     expect(toolEvents[0].name).toBe('Bash');
     expect(toolEvents[0].msgId).toBe('msg_X0000000000000000000001');
     expect(toolEvents[0].result).toBe(null);
@@ -171,7 +171,7 @@ test('unterbrochener tool_use ohne tool_result wird als tool-Event mit result:nu
   }
 });
 
-test('meta.gitCommits zaehlt NUR im Bash-input.command, nicht in anderen Input-Feldern (z.B. description)', async () => {
+test('meta.gitCommits counts ONLY in Bash input.command, not in other input fields (e.g. description)', async () => {
   // Own mini fixture: a Bash tool_use whose `description` mentions "git commit"
   // but whose `command` does NOT contain it -> must not count.
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-gitcommits-'));
@@ -180,7 +180,7 @@ test('meta.gitCommits zaehlt NUR im Bash-input.command, nicht in anderen Input-F
     {
       parentUuid: null, isSidechain: false,
       promptId: 'p0000000-0000-0000-0000-000000000003', type: 'user',
-      message: { role: 'user', content: 'Erklaer mir bitte git commit, aber fuehr nichts aus.' },
+      message: { role: 'user', content: 'Please explain git commit, but do not run anything.' },
       uuid: 'u0000000-0000-0000-0000-000000000004', timestamp: '2026-07-29T12:00:00.000Z',
       cwd: 'C:\\tmp', sessionId: 'gitcommits-session', version: '2.1.212', gitBranch: 'main',
     },
@@ -190,7 +190,7 @@ test('meta.gitCommits zaehlt NUR im Bash-input.command, nicht in anderen Input-F
         model: 'claude-sonnet-5', id: 'msg_G0000000000000000000001', type: 'message', role: 'assistant',
         content: [{
           type: 'tool_use', id: 'toolu_gitcommits0000000001', name: 'Bash',
-          input: { command: 'npm run build', description: 'Nicht git commit ausfuehren, nur bauen' },
+          input: { command: 'npm run build', description: 'Do not run git commit, just build' },
         }],
         stop_reason: 'tool_use', usage: { input_tokens: 5, output_tokens: 5 },
       },
@@ -211,7 +211,7 @@ test('meta.gitCommits zaehlt NUR im Bash-input.command, nicht in anderen Input-F
 
   try {
     const digest = await digestSession(tmpPath);
-    expect(digest.meta.gitCommits, 'git commit nur in description darf nicht zaehlen').toBe(0);
+    expect(digest.meta.gitCommits, 'git commit only in description must not count').toBe(0);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -222,74 +222,74 @@ test('meta.gitCommits zaehlt NUR im Bash-input.command, nicht in anderen Input-F
 // inputs/results must never show up there in plaintext.
 // ---------------------------------------------------------------------------
 
-test('redactSecrets: Anthropic/OpenAI/Stripe sk-... wird redigiert', () => {
-  const text = 'Key: sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 im Tool-Input';
-  expect(redactSecrets(text)).toBe('Key: [REDACTED] im Tool-Input');
+test('redactSecrets: Anthropic/OpenAI/Stripe sk-... is redacted', () => {
+  const text = 'Key: sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789 in tool input';
+  expect(redactSecrets(text)).toBe('Key: [REDACTED] in tool input');
 });
 
-test('redactSecrets: Stripe sk_test_/sk_live_ wird redigiert', () => {
-  expect(redactSecrets('STRIPE_KEY sk_test_4eC39HqLyjWDarjtT1zdp7dc verwendet')).toBe(
-    'STRIPE_KEY [REDACTED] verwendet',
+test('redactSecrets: Stripe sk_test_/sk_live_ is redacted', () => {
+  expect(redactSecrets('STRIPE_KEY sk_test_4eC39HqLyjWDarjtT1zdp7dc used')).toBe(
+    'STRIPE_KEY [REDACTED] used',
   );
   expect(redactSecrets('sk_live_51AbCdEfGhIjKlMnOpQrSt')).toBe('[REDACTED]');
 });
 
-test('redactSecrets: Cloudflare cfXXX_... wird redigiert', () => {
+test('redactSecrets: Cloudflare cfXXX_... is redacted', () => {
   expect(redactSecrets('Token: cfat_AbCdEfGhIjKlMnOpQrStUvWxYz0123456')).toBe('Token: [REDACTED]');
 });
 
-test('redactSecrets: Google OAuth Client Secret GOCSPX-... wird redigiert', () => {
+test('redactSecrets: Google OAuth client secret GOCSPX-... is redacted', () => {
   expect(redactSecrets('client_secret=GOCSPX-AbCdEfGhIjKlMnOpQrStUvWx')).toBe('client_secret=[REDACTED]');
 });
 
-test('redactSecrets: Google Refresh Token 1//... wird redigiert', () => {
+test('redactSecrets: Google refresh token 1//... is redacted', () => {
   expect(redactSecrets('refresh_token: 1//09FakeRefreshTokenAbCdEfGhIjKl')).toBe('refresh_token: [REDACTED]');
 });
 
-test('redactSecrets: Resend re_... wird redigiert', () => {
-  expect(redactSecrets('RESEND_API_KEY re_AbCdEfGhIjKlMnOpQrStUvWxYz gesetzt')).toBe(
-    'RESEND_API_KEY [REDACTED] gesetzt',
+test('redactSecrets: Resend re_... is redacted', () => {
+  expect(redactSecrets('RESEND_API_KEY re_AbCdEfGhIjKlMnOpQrStUvWxYz set')).toBe(
+    'RESEND_API_KEY [REDACTED] set',
   );
 });
 
-test('redactSecrets: GitHub ghp_... und github_pat_... werden redigiert', () => {
+test('redactSecrets: GitHub ghp_... and github_pat_... are redacted', () => {
   expect(redactSecrets('ghp_AbCdEfGh1234567890ABCDEFGHijkl')).toBe('[REDACTED]');
   expect(redactSecrets('github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz')).toBe('[REDACTED]');
 });
 
-test('redactSecrets: Bearer <token> wird zu "Bearer [REDACTED]"', () => {
+test('redactSecrets: Bearer <token> becomes "Bearer [REDACTED]"', () => {
   expect(redactSecrets('Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9')).toBe(
     'Authorization: Bearer [REDACTED]',
   );
 });
 
-test('redactSecrets: KEY=VALUE/KEY: VALUE-Zeilen behalten den Schlüsselnamen, Wert wird redigiert', () => {
+test('redactSecrets: KEY=VALUE/KEY: VALUE lines keep the key name, value is redacted', () => {
   expect(redactSecrets('MC_API_TOKEN=supergeheimerwert123')).toBe('MC_API_TOKEN=[REDACTED]');
   expect(redactSecrets('ABLAGE_TOKEN: "geheimeswert12345"')).toBe('ABLAGE_TOKEN=[REDACTED]');
   expect(redactSecrets('DB_PASSWORD=hunter2geheim')).toBe('DB_PASSWORD=[REDACTED]');
 });
 
-test('redactSecrets: Umlaut-Text bleibt unverändert', () => {
+test('redactSecrets: umlaut text stays unchanged', () => {
   const text = 'Änderungen für Rückenwind-Eltern: ä ö ü ß Straße, Größe, Prüfung.';
   expect(redactSecrets(text)).toBe(text);
 });
 
-test('redactSecrets: kurze/harmlose Strings werden NICHT redigiert', () => {
+test('redactSecrets: short/harmless strings are NOT redacted', () => {
   expect(redactSecrets('sk-kurz')).toBe('sk-kurz');
   expect(redactSecrets('PORT=8080')).toBe('PORT=8080');
   expect(redactSecrets('ID=12345678')).toBe('ID=12345678');
   expect(redactSecrets('re_kurz')).toBe('re_kurz');
-  expect(redactSecrets('normaler Text ohne Secrets')).toBe('normaler Text ohne Secrets');
+  expect(redactSecrets('normal text without secrets')).toBe('normal text without secrets');
 });
 
-test('redactSecrets: Nicht-Strings/leerer String bleiben unverändert (kein Crash)', () => {
+test('redactSecrets: non-strings/empty string stay unchanged (no crash)', () => {
   expect(redactSecrets(null)).toBe(null);
   expect(redactSecrets(undefined)).toBe(undefined);
   expect(redactSecrets('')).toBe('');
   expect(redactSecrets(42)).toBe(42);
 });
 
-test('Integration: digestSession redigiert ein Secret in einem tool_result, bevor gekürzt wird', async () => {
+test('integration: digestSession redacts a secret in a tool_result before truncation', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-secret-'));
   const tmpPath = path.join(tmpDir, 'secret-session.jsonl');
   const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
@@ -297,7 +297,7 @@ test('Integration: digestSession redigiert ein Secret in einem tool_result, bevo
     {
       parentUuid: null, isSidechain: false,
       promptId: 'p0000000-0000-0000-0000-000000000002', type: 'user',
-      message: { role: 'user', content: 'Lies bitte das Secret aus der .env-Datei.' },
+      message: { role: 'user', content: 'Please read the secret from the .env file.' },
       uuid: 'u0000000-0000-0000-0000-000000000002', timestamp: '2026-07-29T11:00:00.000Z',
       cwd: 'C:\\tmp', sessionId: 'secret-session', version: '2.1.212', gitBranch: 'main',
     },
@@ -332,19 +332,19 @@ test('Integration: digestSession redigiert ein Secret in einem tool_result, bevo
   try {
     const digest = await digestSession(tmpPath);
     const toolEvent = digest.events.find((e) => e.kind === 'tool');
-    expect(toolEvent, 'tool-Event fehlt').toBeTruthy();
-    expect(toolEvent.result.includes('[REDACTED]'), 'Digest muss [REDACTED] enthalten').toBe(true);
-    expect(toolEvent.result.includes(fakeToken), 'Digest darf den echten Token NICHT enthalten').toBe(false);
+    expect(toolEvent, 'tool event is missing').toBeTruthy();
+    expect(toolEvent.result.includes('[REDACTED]'), 'digest must contain [REDACTED]').toBe(true);
+    expect(toolEvent.result.includes(fakeToken), 'digest must NOT contain the real token').toBe(false);
     expect(
       toolEvent.result.includes('AbCdEfGhIjKlMnOpQrStUvWxYz'),
-      'auch keine Teilstrings des Tokens',
+      'also no substrings of the token',
     ).toBe(false);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
 
-test('Integration: digestSession({ redact: false }) lässt ein Secret im Klartext (Opt-out)', async () => {
+test('integration: digestSession({ redact: false }) leaves a secret in plaintext (opt-out)', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'digest-parser-no-redact-'));
   const tmpPath = path.join(tmpDir, 'secret-session.jsonl');
   const fakeToken = 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789FakeToken';
@@ -352,7 +352,7 @@ test('Integration: digestSession({ redact: false }) lässt ein Secret im Klartex
     {
       parentUuid: null, isSidechain: false,
       promptId: 'p0000000-0000-0000-0000-000000000003', type: 'user',
-      message: { role: 'user', content: 'Lies bitte das Secret aus der .env-Datei.' },
+      message: { role: 'user', content: 'Please read the secret from the .env file.' },
       uuid: 'u0000000-0000-0000-0000-000000000004', timestamp: '2026-07-29T12:00:00.000Z',
       cwd: 'C:\\tmp', sessionId: 'secret-session', version: '2.1.212', gitBranch: 'main',
     },
@@ -387,9 +387,9 @@ test('Integration: digestSession({ redact: false }) lässt ein Secret im Klartex
   try {
     const digest = await digestSession(tmpPath, { redact: false });
     const toolEvent = digest.events.find((e) => e.kind === 'tool');
-    expect(toolEvent, 'tool-Event fehlt').toBeTruthy();
-    expect(toolEvent.result.includes(fakeToken), 'redact:false muss den echten Token im Klartext lassen').toBe(true);
-    expect(toolEvent.result.includes('[REDACTED]'), 'redact:false darf NICHT redigieren').toBe(false);
+    expect(toolEvent, 'tool event is missing').toBeTruthy();
+    expect(toolEvent.result.includes(fakeToken), 'redact:false must leave the real token in plaintext').toBe(true);
+    expect(toolEvent.result.includes('[REDACTED]'), 'redact:false must NOT redact').toBe(false);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
