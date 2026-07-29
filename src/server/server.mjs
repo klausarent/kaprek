@@ -1,4 +1,4 @@
-// Local, dependency-free HTTP API server for the loryme transcript viewer.
+// Local, dependency-free HTTP API server for the kaprek transcript viewer.
 //
 // Binds to 127.0.0.1 only, never 0.0.0.0 — this is a single-user local tool
 // and must not become reachable from the network. Access to session files is
@@ -531,7 +531,7 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
 function serveStatic(res, webDist, pathname) {
   if (!webDist || !fs.existsSync(webDist)) {
     if (pathname === '/') {
-      sendText(res, 200, 'loryme local server is running.\nNo web build found — API only.\n');
+      sendText(res, 200, 'kaprek local server is running.\nNo web build found — API only.\n');
     } else {
       sendJson(res, 404, { error: 'not found' });
     }

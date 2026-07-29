@@ -35,7 +35,7 @@ afterEach(async () => {
 });
 
 /** Starts a server for this test and registers it for teardown. Always uses
- * a per-test temp dataDir — never the real ~/.loryme app dir. */
+ * a per-test temp dataDir — never the real ~/.kaprek app dir. */
 async function boot(opts) {
   const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, ...opts });
   servers.push(started);
@@ -301,19 +301,19 @@ test('SPA fallback serves a plain status page at / when no webDist is configured
   expect(res.status).toBe(200);
   expect(res.headers.get('content-type')).toContain('text/plain');
   const text = await res.text();
-  expect(text).toContain('loryme');
+  expect(text).toContain('kaprek');
 });
 
 test('SPA fallback serves index.html for unknown non-API routes when webDist is configured', async () => {
   const webDist = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-webdist-'));
-  fs.writeFileSync(path.join(webDist, 'index.html'), '<!doctype html><title>loryme</title>', 'utf8');
+  fs.writeFileSync(path.join(webDist, 'index.html'), '<!doctype html><title>kaprek</title>', 'utf8');
   const { url } = await boot({ webDist });
 
   const res = await fetch(`${url}/some/deep/client/route`);
   expect(res.status).toBe(200);
   expect(res.headers.get('content-type')).toContain('text/html');
   const text = await res.text();
-  expect(text).toContain('loryme');
+  expect(text).toContain('kaprek');
 
   fs.rmSync(webDist, { recursive: true, force: true });
 });
@@ -439,11 +439,11 @@ test('regression: POST /api/sessions (GET-only route) still returns 405, not 403
 test('board: full CRUD cycle — create, list/filter, update, doc, status, session link', async () => {
   const { url } = await boot({});
 
-  const createRes = await postJson(`${url}/api/board/tasks`, { title: 'Ship the board UI', project: 'loryme', tags: ['p1'] });
+  const createRes = await postJson(`${url}/api/board/tasks`, { title: 'Ship the board UI', project: 'kaprek', tags: ['p1'] });
   expect(createRes.status).toBe(201);
   const task = await createRes.json();
   expect(task.title).toBe('Ship the board UI');
-  expect(task.project).toBe('loryme');
+  expect(task.project).toBe('kaprek');
   expect(task.tags).toEqual(['p1']);
   expect(task.status).toBe('backlog');
 
@@ -452,7 +452,7 @@ test('board: full CRUD cycle — create, list/filter, update, doc, status, sessi
   const listBody = await listRes.json();
   expect(listBody.tasks.map((t) => t.id)).toContain(task.id);
 
-  const filteredRes = await fetch(`${url}/api/board/tasks?status=backlog&project=loryme`);
+  const filteredRes = await fetch(`${url}/api/board/tasks?status=backlog&project=kaprek`);
   const filteredBody = await filteredRes.json();
   expect(filteredBody.tasks.map((t) => t.id)).toContain(task.id);
 
@@ -479,11 +479,11 @@ test('board: full CRUD cycle — create, list/filter, update, doc, status, sessi
 
   const linkRes = await patchJson(`${url}/api/board/tasks/${task.id}`, {
     op: 'linkSession',
-    session: { projectSlug: 'loryme', sessionId: 's1', machine: 'desktop' },
+    session: { projectSlug: 'kaprek', sessionId: 's1', machine: 'desktop' },
   });
   expect(linkRes.status).toBe(200);
   const linked = await linkRes.json();
-  expect(linked.sessions).toEqual([{ projectSlug: 'loryme', sessionId: 's1', machine: 'desktop' }]);
+  expect(linked.sessions).toEqual([{ projectSlug: 'kaprek', sessionId: 's1', machine: 'desktop' }]);
 
   const docFullRes = await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
   expect(docFullRes.status).toBe(200);

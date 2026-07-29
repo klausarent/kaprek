@@ -1,4 +1,4 @@
-// Pure argv parser for the loryme CLI. No I/O, no process.exit — bin/cli.mjs
+// Pure argv parser for the kaprek CLI. No I/O, no process.exit — bin/cli.mjs
 // owns all side effects and decides how to react to what this returns/throws.
 import os from 'node:os';
 import path from 'node:path';

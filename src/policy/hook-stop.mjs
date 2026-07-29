@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Claude Code Stop hook entrypoint for loryme's policy engine.
+// Claude Code Stop hook entrypoint for kaprek's policy engine.
 //
 // Contract: Claude Code invokes this as `node <path>/hook-stop.mjs`, piping
 // hook input JSON (transcript_path, session_id, stop_hook_active, ...) on
@@ -57,7 +57,7 @@ async function main() {
   // is), so it is surfaced on stderr for an interactive terminal and
   // otherwise ignored. 'allow' produces no output at all.
   if (result.decision === 'warn' && result.reasons.length > 0) {
-    process.stderr.write(`loryme policy warning: ${result.reasons.join('; ')}\n`);
+    process.stderr.write(`kaprek policy warning: ${result.reasons.join('; ')}\n`);
   }
 }
 

@@ -25,7 +25,7 @@ export function getPackageName() {
   return cachedName;
 }
 
-/** Builds the override env var name for a package, e.g. `loryme` -> `LORYME_DATA_DIR`. */
+/** Builds the override env var name for a package, e.g. `kaprek` -> `KAPREK_DATA_DIR`. */
 function envVarName(name) {
   return `${name.toUpperCase().replace(/-/g, '_')}_DATA_DIR`;
 }

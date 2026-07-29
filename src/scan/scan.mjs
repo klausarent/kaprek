@@ -19,7 +19,7 @@ import { redactSecrets } from '../parser/parse.mjs';
 const FRONT_BYTES = 256 * 1024;
 const BACK_BYTES = 1024 * 1024;
 
-export const CACHE_DIR = path.join(os.tmpdir(), 'loryme-meta-cache');
+export const CACHE_DIR = path.join(os.tmpdir(), 'kaprek-meta-cache');
 const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 
 const WIN_USER_RE = /^[A-Za-z]:\\Users\\([^\\/]+)/;

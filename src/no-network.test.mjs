@@ -1,6 +1,6 @@
 // Static guard against network and subprocess code outside of tests.
 //
-// loryme is a purely local tool. The server uses http.createServer() to
+// kaprek is a purely local tool. The server uses http.createServer() to
 // RECEIVE loopback requests, but never calls an HTTP client itself to SEND
 // data, and never spawns subprocesses except for the one documented case
 // below. This test is a plain text-pattern search, not an AST scan and not

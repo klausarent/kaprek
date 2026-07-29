@@ -1,5 +1,5 @@
 {
-  "name": "loryme",
+  "name": "kaprek",
   "version": "0.0.1",
   "private": true,
   "description": "Local viewer for Claude Code session transcripts. Read-only, redacted by default, no network.",
@@ -11,7 +11,7 @@
     "node": ">=20"
   },
   "bin": {
-    "loryme": "bin/cli.mjs"
+    "kaprek": "bin/cli.mjs"
   },
   "files": [
     "bin",

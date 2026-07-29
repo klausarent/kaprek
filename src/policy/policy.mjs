@@ -241,7 +241,7 @@ async function transcriptContainsGitCommit(transcriptPath) {
  *
  * 'observe' mode is log-only, NOT skip-evaluation: both rules are still
  * checked and any violation still lands in `reasons` and in policy.log, so
- * `loryme hooks status`/policy.log are actually useful for seeing what
+ * `kaprek hooks status`/policy.log are actually useful for seeing what
  * would happen before switching to 'warn'/'block' — but the returned
  * `decision` is always forced back to 'allow' for this mode.
  *

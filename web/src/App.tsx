@@ -115,7 +115,7 @@ export default function App() {
             navigateToProjects();
           }}
         >
-          loryme
+          kaprek
         </a>
         <span className="app-subtitle">local Claude Code session viewer</span>
         <nav className="app-nav">

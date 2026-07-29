@@ -11,7 +11,7 @@ let tmpDir;
 let settingsPath;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-hooks-test-'));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-test-'));
   settingsPath = path.join(tmpDir, 'settings.json');
 });
 
@@ -114,14 +114,14 @@ test('uninstall cleans up an empty hooks.Stop / hooks object it would otherwise 
 });
 
 test('status reports installed:false when there is no settings file', () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-hooks-status-'));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
   const result = status({ settingsPath, dataDir });
   expect(result.installed).toBe(false);
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 test('status reports installed:true and the active policy mode after install', () => {
-  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-hooks-status-'));
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
   fs.writeFileSync(path.join(dataDir, 'policy.json'), JSON.stringify({ mode: 'warn' }), 'utf8');
 
   install({ settingsPath });
@@ -182,7 +182,7 @@ test('uninstall also writes atomically: no leftover temp file', () => {
 // --------------------------------------------------- stable marker matching
 
 test('install replaces a stale-path entry carrying our marker instead of duplicating it (e.g. after an npx cache path change)', () => {
-  const packageName = 'loryme';
+  const packageName = 'kaprek';
   const staleCommand = `node "/old/npx-cache/path/hook-stop.mjs" --managed-by=${packageName}`;
   fs.writeFileSync(
     settingsPath,
@@ -201,7 +201,7 @@ test('install replaces a stale-path entry carrying our marker instead of duplica
 });
 
 test('uninstall removes a marker-matched entry even at a stale path', () => {
-  const packageName = 'loryme';
+  const packageName = 'kaprek';
   const staleCommand = `node "/old/npx-cache/path/hook-stop.mjs" --managed-by=${packageName}`;
   fs.writeFileSync(
     settingsPath,

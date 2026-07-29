@@ -1,4 +1,4 @@
-// Thin fetch wrappers around loryme's local HTTP API (src/server/server.mjs).
+// Thin fetch wrappers around kaprek's local HTTP API (src/server/server.mjs).
 // The UI is served by that same server, so all requests are same-origin
 // relative paths — no base URL, no CORS handling needed.
 

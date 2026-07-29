@@ -17,7 +17,7 @@ import {
 let tmpDir;
 
 beforeEach(() => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-board-test-'));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-board-test-'));
 });
 
 afterEach(() => {
@@ -39,10 +39,10 @@ function fullDoc() {
 
 test('create adds a task with defaults and list/get return it', () => {
   const board = openBoard(tmpDir);
-  const task = board.create({ title: 'Erster Task', project: 'loryme', tags: ['p1'] });
+  const task = board.create({ title: 'Erster Task', project: 'kaprek', tags: ['p1'] });
 
   expect(task.title).toBe('Erster Task');
-  expect(task.project).toBe('loryme');
+  expect(task.project).toBe('kaprek');
   expect(task.tags).toEqual(['p1']);
   expect(task.status).toBe('backlog');
   expect(task.doc).toBeNull();
@@ -233,12 +233,12 @@ test('linkSession appends a session and dedupes on projectSlug+sessionId', () =>
   const board = openBoard(tmpDir);
   const task = board.create({ title: 'T' });
 
-  board.linkSession(task.id, { machine: 'test-machine', projectSlug: 'loryme', sessionId: 's1' });
-  const after = board.linkSession(task.id, { machine: 'test-machine', projectSlug: 'loryme', sessionId: 's1' });
+  board.linkSession(task.id, { machine: 'test-machine', projectSlug: 'kaprek', sessionId: 's1' });
+  const after = board.linkSession(task.id, { machine: 'test-machine', projectSlug: 'kaprek', sessionId: 's1' });
 
-  expect(after.sessions).toEqual([{ machine: 'test-machine', projectSlug: 'loryme', sessionId: 's1' }]);
+  expect(after.sessions).toEqual([{ machine: 'test-machine', projectSlug: 'kaprek', sessionId: 's1' }]);
 
-  const withSecond = board.linkSession(task.id, { projectSlug: 'loryme', sessionId: 's2' });
+  const withSecond = board.linkSession(task.id, { projectSlug: 'kaprek', sessionId: 's2' });
   expect(withSecond.sessions).toHaveLength(2);
 });
 

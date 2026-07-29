@@ -9,7 +9,7 @@ import { loadPolicy, evaluateStop, DEFAULT_POLICY, PolicyValidationError } from 
 let dataDir;
 
 beforeEach(() => {
-  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-policy-test-'));
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-policy-test-'));
 });
 
 afterEach(() => {

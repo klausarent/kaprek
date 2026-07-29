@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// loryme CLI entrypoint: parses flags, starts the local server, opens the
+// kaprek CLI entrypoint: parses flags, starts the local server, opens the
 // default browser, and shuts down cleanly on Ctrl+C.
 import path from 'node:path';
 import fs from 'node:fs';
@@ -9,8 +9,8 @@ import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 
-const USAGE = `Usage: loryme [options]
-       loryme hooks <install|uninstall|status>
+const USAGE = `Usage: kaprek [options]
+       kaprek hooks <install|uninstall|status>
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -20,19 +20,19 @@ Options:
   -h, --help    Show this help message
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
-  hooks install    Add the loryme Stop hook to ~/.claude/settings.json
-  hooks uninstall  Remove only the loryme Stop hook entry
+  hooks install    Add the kaprek Stop hook to ~/.claude/settings.json
+  hooks uninstall  Remove only the kaprek Stop hook entry
   hooks status     Show whether the hook is installed and the active policy mode
 `;
 
-const HOOKS_USAGE = `Usage: loryme hooks <install|uninstall|status>
+const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
 
-Manages the Claude Code Stop hook loryme's policy engine uses to gently
+Manages the Claude Code Stop hook kaprek's policy engine uses to gently
 enforce workflow rules (e.g. requiring a linked board task for commits).
 
-  install    Adds the loryme Stop hook to ~/.claude/settings.json
+  install    Adds the kaprek Stop hook to ~/.claude/settings.json
              (backs up the existing file first; leaves other hooks intact)
-  uninstall  Removes only the loryme Stop hook entry
+  uninstall  Removes only the kaprek Stop hook entry
   status     Shows whether the hook is installed and the active policy mode
 `;
 
@@ -83,7 +83,7 @@ async function startWithPortRetry(basePort, serverOpts) {
   );
 }
 
-/** Handles `loryme hooks <install|uninstall|status>`. Never throws — errors are reported and turn into exitCode 1. */
+/** Handles `kaprek hooks <install|uninstall|status>`. Never throws — errors are reported and turn into exitCode 1. */
 function runHooksCommand(args) {
   const sub = args[0];
 
@@ -105,7 +105,7 @@ function runHooksCommand(args) {
         console.log(`Removed Stop hook from ${result.settingsPath}`);
         if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       } else {
-        console.log(`No loryme Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
+        console.log(`No kaprek Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
       }
     } else if (sub === 'status') {
       const result = hookStatus();

@@ -19,7 +19,7 @@ function samplePayload(overrides = {}) {
   return {
     taskId: 'task-1',
     title: 'Ship the receipt feature',
-    project: 'loryme',
+    project: 'kaprek',
     doc: { trigger: 'x', outcome: 'y' },
     sessionIds: ['s1', 's2'],
     gitCommit: null,

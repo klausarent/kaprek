@@ -1,8 +1,8 @@
 {
-  "name": "loryme-web",
+  "name": "kaprek-web",
   "version": "0.0.1",
   "private": true,
-  "description": "Web UI for loryme, built separately and served by the local Node server as a static SPA.",
+  "description": "Web UI for kaprek, built separately and served by the local Node server as a static SPA.",
   "type": "module",
   "scripts": {
     "dev": "vite",

@@ -83,7 +83,7 @@ test('--help prints usage (including --no-redact) and exits 0', async () => {
 });
 
 test('starts a real server against an empty --dir and serves /api/projects', async () => {
-  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-cli-test-'));
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-test-'));
   const port = 20000 + Math.floor(Math.random() * 20000);
   const child = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
 

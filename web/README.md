@@ -1,6 +1,6 @@
-# loryme web UI
+# kaprek web UI
 
-Vite + React 18 + TypeScript single-page app for loryme. Built separately
+Vite + React 18 + TypeScript single-page app for kaprek. Built separately
 from the root package and served as static files by the local Node server
 (`src/server/server.mjs`) — no runtime dependency on Vite or React is added
 to the root `package.json`.

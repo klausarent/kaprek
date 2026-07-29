@@ -10,13 +10,13 @@ import { openBoard } from '../board/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_PATH = path.join(__dirname, 'hook-stop.mjs');
-const PACKAGE_NAME = 'loryme';
+const PACKAGE_NAME = 'kaprek';
 const DATA_DIR_ENV = `${PACKAGE_NAME.toUpperCase()}_DATA_DIR`;
 
 let dataDir;
 
 beforeEach(() => {
-  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'loryme-hookstop-test-'));
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstop-test-'));
 });
 
 afterEach(() => {
