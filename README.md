@@ -6,7 +6,7 @@ loryme is a local, read-only viewer for Claude Code session transcripts. It scan
 
 **Status: pre-release, not yet published.**
 
-![screenshot](docs/screenshot.png)
+<!-- TODO: add screenshot before launch (docs/screenshot.png) -->
 
 ## Quickstart
 

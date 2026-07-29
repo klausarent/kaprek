@@ -35,6 +35,20 @@ export class InvalidTitleError extends Error {
   }
 }
 
+export class InvalidProjectError extends Error {
+  constructor() {
+    super('project must be a string or null');
+    this.name = 'InvalidProjectError';
+  }
+}
+
+export class InvalidTagsError extends Error {
+  constructor() {
+    super('tags must be an array of strings');
+    this.name = 'InvalidTagsError';
+  }
+}
+
 export class InvalidStatusError extends Error {
   constructor(status) {
     super(`invalid status: ${status} (expected one of ${STATUSES.join(', ')})`);
@@ -118,7 +132,9 @@ function applyEvent(tasks, event) {
     case 'task.updated': {
       const task = tasks.get(taskId);
       if (!task) break;
-      Object.assign(task, data, { updatedAt: ts });
+      const patch = { ...data };
+      if ('tags' in patch) patch.tags = Array.isArray(patch.tags) ? patch.tags : [];
+      Object.assign(task, patch, { updatedAt: ts });
       break;
     }
     case 'task.status': {
@@ -240,7 +256,17 @@ export function openBoard(dataDir) {
 
     update(taskId, patch) {
       requireTask(taskId);
-      commit('task.updated', taskId, pickUpdatableFields(patch ?? {}));
+      const fields = pickUpdatableFields(patch ?? {});
+      if ('title' in fields && (typeof fields.title !== 'string' || fields.title.trim().length === 0)) {
+        throw new InvalidTitleError();
+      }
+      if ('project' in fields && fields.project !== null && typeof fields.project !== 'string') {
+        throw new InvalidProjectError();
+      }
+      if ('tags' in fields && (!Array.isArray(fields.tags) || !fields.tags.every((tag) => typeof tag === 'string'))) {
+        throw new InvalidTagsError();
+      }
+      commit('task.updated', taskId, fields);
       return clone(requireTask(taskId));
     },
 

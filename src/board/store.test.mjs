@@ -7,6 +7,8 @@ import {
   DOC_FIELDS,
   TaskNotFoundError,
   InvalidTitleError,
+  InvalidProjectError,
+  InvalidTagsError,
   InvalidStatusError,
   UnknownDocFieldError,
   DocIncompleteError,
@@ -90,6 +92,30 @@ test('update changes title/project/tags and bumps updatedAt', () => {
 test('update throws TaskNotFoundError for an unknown id', () => {
   const board = openBoard(tmpDir);
   expect(() => board.update('nope', { title: 'x' })).toThrow(TaskNotFoundError);
+});
+
+test('update rejects a non-string/empty title', () => {
+  const board = openBoard(tmpDir);
+  const task = board.create({ title: 'Original' });
+  expect(() => board.update(task.id, { title: 123 })).toThrow(InvalidTitleError);
+  expect(() => board.update(task.id, { title: '' })).toThrow(InvalidTitleError);
+  expect(() => board.update(task.id, { title: '   ' })).toThrow(InvalidTitleError);
+});
+
+test('update rejects a project that is not a string or null', () => {
+  const board = openBoard(tmpDir);
+  const task = board.create({ title: 'Original' });
+  expect(() => board.update(task.id, { project: 42 })).toThrow(InvalidProjectError);
+  expect(board.update(task.id, { project: null }).project).toBeNull();
+  expect(board.update(task.id, { project: 'p1' }).project).toBe('p1');
+});
+
+test('update rejects tags that are not an array of strings', () => {
+  const board = openBoard(tmpDir);
+  const task = board.create({ title: 'Original' });
+  expect(() => board.update(task.id, { tags: 'notanarray' })).toThrow(InvalidTagsError);
+  expect(() => board.update(task.id, { tags: [1, 2] })).toThrow(InvalidTagsError);
+  expect(board.update(task.id, { tags: ['a', 'b'] }).tags).toEqual(['a', 'b']);
 });
 
 test('setStatus validates the status set', () => {

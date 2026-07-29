@@ -17,6 +17,8 @@ import {
   STATUSES as BOARD_STATUSES,
   TaskNotFoundError,
   InvalidTitleError,
+  InvalidProjectError,
+  InvalidTagsError,
   InvalidStatusError,
   UnknownDocFieldError,
   DocIncompleteError,
@@ -370,6 +372,10 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
       }
       if (err instanceof UnknownDocFieldError) {
         sendJson(res, 400, { error: err.message, field: err.field });
+        return;
+      }
+      if (err instanceof InvalidTitleError || err instanceof InvalidProjectError || err instanceof InvalidTagsError) {
+        sendJson(res, 400, { error: err.message });
         return;
       }
       throw err;
