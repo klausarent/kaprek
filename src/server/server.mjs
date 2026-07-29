@@ -567,14 +567,53 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
   sendJson(res, 404, { error: 'not found' });
 }
 
-/** Writes one SSE `data:` frame, silently dropping it if the client is already gone. */
-function sseWrite(res, obj) {
-  if (res.writableEnded) return;
-  try {
-    res.write(`data: ${JSON.stringify(obj)}\n\n`);
-  } catch {
-    // client disconnected mid-write — best effort, nothing to recover
-  }
+/**
+ * Writes one SSE `data:` frame, resolving once it has actually been
+ * accepted by the underlying socket. `res.write()` returns `false` when the
+ * socket's internal buffer is full (a slow client / small highWaterMark) —
+ * writing more on top of that would just grow Node's own write buffer
+ * without bound, so this waits for 'drain' before resolving instead of
+ * firing writes as fast as events arrive. Silently resolves (does not
+ * write) if the client is already gone.
+ */
+export function writeSseFrame(res, obj) {
+  return new Promise((resolve) => {
+    if (res.writableEnded) {
+      resolve();
+      return;
+    }
+    let ok;
+    try {
+      ok = res.write(`data: ${JSON.stringify(obj)}\n\n`);
+    } catch {
+      // client disconnected mid-write — best effort, nothing to recover
+      resolve();
+      return;
+    }
+    if (ok) {
+      resolve();
+    } else {
+      res.once('drain', resolve);
+    }
+  });
+}
+
+/**
+ * Creates a per-response FIFO write queue for SSE frames. Events arrive
+ * synchronously (see runTurn()'s onEvent callback chain, all the way down
+ * to claude-code.mjs's readline 'line' handler) and must be written to the
+ * client in that exact order — chaining each writeSseFrame() call onto the
+ * previous one's promise (rather than firing them all at once) is what
+ * keeps both the ordering AND the backpressure-awaiting from writeSseFrame()
+ * meaningful: without the chain, a later frame could win the race and reach
+ * the socket before an earlier one still waiting on 'drain'.
+ */
+export function createSseQueue(res) {
+  let chain = Promise.resolve();
+  return function enqueue(obj) {
+    chain = chain.then(() => writeSseFrame(res, obj));
+    return chain;
+  };
 }
 
 /**
@@ -660,7 +699,8 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
     'Cache-Control': 'no-cache',
     Connection: 'keep-alive',
   });
-  sseWrite(res, { type: 'chat-id', chatId });
+  const enqueue = createSseQueue(res);
+  enqueue({ type: 'chat-id', chatId });
 
   try {
     const result = await runTurn({
@@ -672,17 +712,24 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
       cwd: workspaceDir,
       permissionMode,
       allowedTools,
-      onEvent: (event) => sseWrite(res, event),
+      // Not awaited here: onEvent is called synchronously from deep inside
+      // the harness (see claude-code.mjs's readline 'line' handler), so
+      // there is nothing to await into — enqueue() itself preserves both
+      // order and backpressure (see createSseQueue()'s doc comment) without
+      // the caller needing to. The 'turn-complete' write below IS awaited,
+      // so the response is only ended once every enqueued frame, including
+      // this one, has actually reached the socket.
+      onEvent: (event) => enqueue(event),
       signal: controller.signal,
     });
-    sseWrite(res, { type: 'turn-complete', ...result });
+    await enqueue({ type: 'turn-complete', ...result });
   } catch (err) {
     // A harness/orchestrator throw here is a genuine programming error (see
     // adapter.mjs's contract note), not a normal turn failure — those are
     // already reported via result.error above. Headers are long sent by this
     // point, so this cannot become a 500 JSON response; report it as one
     // more SSE frame instead of letting it surface as an unhandled rejection.
-    sseWrite(res, { type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
+    await enqueue({ type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
   } finally {
     res.off('close', onClientClose);
     // Only remove OUR OWN entry: blindly deleting by chatId would let a

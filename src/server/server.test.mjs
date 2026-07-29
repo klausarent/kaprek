@@ -8,7 +8,8 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { startServer } from './server.mjs';
+import { EventEmitter } from 'node:events';
+import { startServer, createSseQueue } from './server.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -1195,4 +1196,77 @@ test('chat: cancelling a chat with no in-flight turn returns cancelled:false, an
 
   const unknownCancel = await postJson(`${url}/api/chat/00000000-0000-0000-0000-000000000000/cancel`);
   expect(unknownCancel.status).toBe(404);
+});
+
+// P1-C1: a slow consumer (res.write() returning false) must not make
+// createSseQueue() drop or reorder frames — each write waits its turn AND
+// waits for 'drain' before the next one is even attempted.
+test('createSseQueue: writes are serialized and wait for drain before the next frame is attempted', async () => {
+  const written = [];
+  const res = new EventEmitter();
+  res.writableEnded = false;
+  let acceptWrites = false;
+  res.write = (chunk) => {
+    written.push(chunk);
+    return acceptWrites;
+  };
+
+  const enqueue = createSseQueue(res);
+  const p1 = enqueue({ type: 'a' });
+  const p2 = enqueue({ type: 'b' });
+  const p3 = enqueue({ type: 'c' });
+
+  // Let queued microtasks run: only the FIRST frame's write() should have
+  // been attempted — it returned false, so the queue is waiting on 'drain'
+  // before even calling write() for frame 'b'. (Several ticks: the chain's
+  // own .then() hops each need a turn — a fixed, generous count rather than
+  // relying on exact microtask-depth counting.)
+  for (let i = 0; i < 10; i += 1) await Promise.resolve();
+  expect(written).toEqual([`data: ${JSON.stringify({ type: 'a' })}\n\n`]);
+
+  acceptWrites = true;
+  res.emit('drain'); // unblocks frame 'a', which then attempts (and succeeds) frame 'b', then 'c'
+  await p3; // p3 only settles once p2 (and, transitively, p1) have settled — waits out the whole chain
+  expect(written).toEqual([
+    `data: ${JSON.stringify({ type: 'a' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'b' })}\n\n`,
+    `data: ${JSON.stringify({ type: 'c' })}\n\n`,
+  ]);
+  await p1;
+  await p2;
+});
+
+test('createSseQueue: a client that is already gone (writableEnded) drops writes instead of throwing', async () => {
+  const res = new EventEmitter();
+  res.writableEnded = true;
+  res.write = () => {
+    throw new Error('must never be called once writableEnded');
+  };
+
+  const enqueue = createSseQueue(res);
+  await expect(enqueue({ type: 'a' })).resolves.toBeUndefined();
+});
+
+// P1-C2's server-side half (the client-side half — IncompleteStreamError —
+// is covered directly against web/src/lib/api.ts in
+// src/server/sse-client.test.mjs): proves a response really can end without
+// a 'turn-complete' frame having been sent yet (e.g. a server crash/proxy
+// drop mid-stream), i.e. that the client-side check has something real to
+// detect — a slow harness keeps the turn from finishing before the first
+// chunk is read, so the read is guaranteed to observe only the 'chat-id'
+// bootstrap frame.
+test('chat: the first bytes of a still-running turn do not yet contain turn-complete', async () => {
+  const { url } = await boot({ harness: slowFakeHarness({ script: fakeScript(), delayMs: 200 }), harnessName: 'fake' });
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi there' }),
+  });
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const { value } = await reader.read();
+  const text = decoder.decode(value);
+  expect(text).toContain('"chat-id"');
+  expect(text).not.toContain('"turn-complete"');
+  await reader.cancel();
 });

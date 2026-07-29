@@ -41,7 +41,7 @@ function nowEvent(kind: "assistant" | "thinking" | "user", text: string): Digest
 
 type TurnSummary = {
   costUsd: number | null;
-  stopReason: "result" | "aborted" | "error";
+  stopReason: "result" | "aborted" | "error" | "timeout";
   errorMessage: string | null;
 };
 
@@ -112,7 +112,10 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
       // server-side turn still resolves (with stopReason 'aborted') and
       // reports itself via its own 'turn-complete' frame before that
       // happens, so this branch only needs to handle a genuine network/fetch
-      // failure, not the cancel path itself.
+      // failure (including IncompleteStreamError, see streamChatTurn's doc
+      // comment — a response body that ends without ever sending
+      // 'turn-complete' must surface as an error here, not be treated as a
+      // silently successful turn), not the cancel path itself.
       if ((e as Error).name !== "AbortError") {
         setStreamError((e as Error).message || "Stream failed");
       }

@@ -327,7 +327,7 @@ export type ChatStreamEvent =
       chatId: string;
       cliSessionId: string | null;
       costUsd: number | null;
-      stopReason: "result" | "aborted" | "error";
+      stopReason: "result" | "aborted" | "error" | "timeout";
       error: { message: string } | null;
     };
 
@@ -385,6 +385,37 @@ export function cancelChatTurn(chatId: string): Promise<{ cancelled: boolean }> 
   return postJson<{ cancelled: boolean }>(`/api/chat/${encodeURIComponent(chatId)}/cancel`);
 }
 
+/** Thrown by streamChatTurn() when the response body ends without ever sending a 'turn-complete' frame (see its doc comment). */
+export class IncompleteStreamError extends Error {
+  constructor() {
+    super("stream ended unexpectedly (no turn-complete frame received)");
+    this.name = "IncompleteStreamError";
+  }
+}
+
+/**
+ * Parses one buffer's worth of already-received SSE bytes into complete
+ * `data: <json>\n\n` frames, returning the parsed frames plus whatever
+ * incomplete tail remains in the buffer. Pulled out of streamChatTurn() so
+ * the framing/parsing logic itself (not the fetch/reader plumbing around it)
+ * can be unit-tested directly.
+ */
+export function parseSseChunk(buffer: string): { frames: ChatStreamEvent[]; rest: string } {
+  const frames: ChatStreamEvent[] = [];
+  let idx;
+  while ((idx = buffer.indexOf("\n\n")) !== -1) {
+    const raw = buffer.slice(0, idx);
+    buffer = buffer.slice(idx + 2);
+    if (!raw.startsWith("data: ")) continue;
+    try {
+      frames.push(JSON.parse(raw.slice("data: ".length)) as ChatStreamEvent);
+    } catch {
+      // A malformed frame must not kill the rest of the stream — skip it.
+    }
+  }
+  return { frames, rest: buffer };
+}
+
 /**
  * Streams one chat turn. Deliberately NOT EventSource: EventSource cannot
  * set the `x-app-request` header this server's CSRF hardening requires on
@@ -392,8 +423,11 @@ export function cancelChatTurn(chatId: string): Promise<{ cancelled: boolean }> 
  * own `fetch` + `ReadableStream` + manual SSE-frame parsing instead — same
  * `data: <json>\n\n` framing, just read by hand.
  *
- * Resolves once the stream ends (after a 'turn-complete' frame or a network
- * error) — `onEvent` is the only way callers observe individual frames.
+ * Resolves once the stream ends AND a 'turn-complete' frame was seen; a
+ * response body that ends (server crash, proxy/network drop, ...) without
+ * ever sending one throws IncompleteStreamError instead of resolving as if
+ * the turn had finished normally — `onEvent` is the only way callers
+ * observe individual frames.
  */
 export async function streamChatTurn({
   chatId,
@@ -420,20 +454,19 @@ export async function streamChatTurn({
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let sawTurnComplete = false;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += decoder.decode(value, { stream: true });
-    let idx;
-    while ((idx = buffer.indexOf("\n\n")) !== -1) {
-      const raw = buffer.slice(0, idx);
-      buffer = buffer.slice(idx + 2);
-      if (!raw.startsWith("data: ")) continue;
-      try {
-        onEvent(JSON.parse(raw.slice("data: ".length)) as ChatStreamEvent);
-      } catch {
-        // A malformed frame must not kill the rest of the stream — skip it.
-      }
+    const { frames, rest } = parseSseChunk(buffer);
+    buffer = rest;
+    for (const frame of frames) {
+      if (frame.type === "turn-complete") sawTurnComplete = true;
+      onEvent(frame);
     }
+  }
+  if (!sawTurnComplete) {
+    throw new IncompleteStreamError();
   }
 }
