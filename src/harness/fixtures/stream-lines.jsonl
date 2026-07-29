@@ -1,0 +1,12 @@
+{"type":"system","subtype":"init","tools":["Bash","Read","Write"],"mcp_servers":[],"session_id":"sess_test0001","permissionMode":"acceptEdits","apiKeySource":"none","model":"claude-test-model"}
+{"type":"assistant","message":{"id":"msg_0001","content":[{"type":"text","text":"Sure, let me check the demo-app repo for testuser."}]}}
+{"type":"assistant","message":{"id":"msg_0002","content":[{"type":"thinking","thinking":"I should list the directory first."}]}}
+{"type":"assistant","message":{"id":"msg_0003","content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"ls"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"file1.txt\nfile2.txt","is_error":false}]}}
+{"type":"assistant","message":{"id":"msg_0004","content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"C:\\Users\\testuser\\demo-app\\file1.txt"}},{"type":"tool_use","id":"toolu_3","name":"Write","input":{"file_path":"C:\\Users\\testuser\\demo-app\\file2.txt","content":"updated"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","content":"contents of file1","is_error":false},{"type":"tool_result","tool_use_id":"toolu_3","content":"write failed: permission denied","is_error":true}]}}
+{"type":"rate_limit_event","rate_limit_info":{"status":"allowed","resetsAt":"2026-07-30T12:00:00Z"}}
+{"type":"system","subtype":"hook_started","hook_event_name":"PreToolUse"}
+{"type":"system","subtype":"hook_response","hook_event_name":"PreToolUse","response":{"decision":"approve"}}
+this is not valid json at all {{{
+{"type":"result","subtype":"success","total_cost_usd":0.0421,"session_id":"sess_test0001","is_error":false,"usage":{"input_tokens":512,"output_tokens":128}}

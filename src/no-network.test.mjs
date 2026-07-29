@@ -2,7 +2,7 @@
 //
 // kaprek is a purely local tool. The server uses http.createServer() to
 // RECEIVE loopback requests, but never calls an HTTP client itself to SEND
-// data, and never spawns subprocesses except for the one documented case
+// data, and never spawns subprocesses except for the documented cases
 // below. This test is a plain text-pattern search, not an AST scan and not
 // a runtime proof: a call assembled via, say, string concatenation
 // ('fe' + 'tch') or dynamic property access (globalThis['fetch']) would NOT
@@ -45,12 +45,21 @@ const CHILD_PROCESS_PATTERNS = [
 
 const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 
-// The only sanctioned exception in the whole tree: bin/cli.mjs uses
-// child_process.spawn() to open the system default browser locally
-// (cmd/start, open, xdg-open) — a local process launch, not a network
-// call. Network patterns remain forbidden for this file too, only the
-// child_process patterns are allowed here.
+// Two sanctioned exceptions in the whole tree, both local process launches,
+// never a network call — network patterns remain forbidden for these files
+// too, only the child_process patterns are allowed:
+//   - bin/cli.mjs uses child_process.spawn() to open the system default
+//     browser locally (cmd/start, open, xdg-open).
+//   - src/harness/* is the harness adapter: kaprek's whole job there is
+//     spawning the user's locally installed, already-authenticated agent
+//     CLI (e.g. `claude`) and speaking stream-json over stdio — never a
+//     provider API call (fetch() stays forbidden here too).
 const ALLOWED_CHILD_PROCESS_FILE = path.join(ROOT, 'bin', 'cli.mjs');
+const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
+
+function isAllowedChildProcessSource(file) {
+  return file === ALLOWED_CHILD_PROCESS_FILE || file.startsWith(`${ALLOWED_CHILD_PROCESS_DIR}${path.sep}`);
+}
 
 /** Recursively collects all .mjs file paths under `dir`. */
 function collectMjsFiles(dir) {
@@ -70,7 +79,7 @@ function isTestFile(filePath) {
   return filePath.endsWith('.test.mjs');
 }
 
-test('static guard: no network-client or subprocess APIs outside test files (except bin/cli.mjs opening the browser)', () => {
+test('static guard: no network-client or subprocess APIs outside test files (except bin/cli.mjs opening the browser and src/harness/* spawning the agent CLI)', () => {
   const srcFiles = collectMjsFiles(path.join(ROOT, 'src'));
   const binFiles = collectMjsFiles(path.join(ROOT, 'bin'));
   const sourceFiles = [...srcFiles, ...binFiles].filter((f) => !isTestFile(f));
@@ -81,7 +90,7 @@ test('static guard: no network-client or subprocess APIs outside test files (exc
   const violations = [];
   for (const file of sourceFiles) {
     const content = fs.readFileSync(file, 'utf8');
-    const isAllowedChildProcessFile = file === ALLOWED_CHILD_PROCESS_FILE;
+    const isAllowedChildProcessFile = isAllowedChildProcessSource(file);
     for (const pattern of FORBIDDEN_PATTERNS) {
       if (isAllowedChildProcessFile && CHILD_PROCESS_PATTERNS.includes(pattern)) continue;
       if (pattern.test(content)) {
