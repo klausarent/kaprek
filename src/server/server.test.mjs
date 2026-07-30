@@ -13,6 +13,7 @@ import { EventEmitter } from 'node:events';
 import { startServer, createSseQueue } from './server.mjs';
 import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
+import { openChats } from '../chats/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SECRET_FIXTURE = path.join(__dirname, 'fixtures', 'session-with-secret.jsonl');
@@ -1852,6 +1853,35 @@ test('chat: GET /api/chat/list hides a silent heartbeat chat by default, include
   const silentChat = withSilent.chats.find((c) => c.id === chatId);
   expect(silentChat.origin).toBe('trigger');
   expect(silentChat.triggerId).toBe('heartbeat-check');
+});
+
+test('chat: GET /api/chat/list?triggerId= narrows the list to that one trigger, orthogonally to includeSilent', async () => {
+  const { url } = await boot({});
+  const chats = openChats(dataDir);
+  const userChat = chats.createChat({ title: 'a hand-written chat', origin: 'user' });
+  const nightly = chats.createChat({ title: 'nightly run', origin: 'trigger', triggerId: 'nightly-sync' });
+  const other = chats.createChat({ title: 'watcher run', origin: 'trigger', triggerId: 'watch-notes' });
+  const nightlySilent = chats.createChat({ title: 'nightly quiet run', origin: 'trigger', triggerId: 'nightly-sync', silent: true });
+
+  const filtered = await (await fetch(`${url}/api/chat/list?triggerId=nightly-sync`)).json();
+  expect(filtered.chats.map((c) => c.id)).toEqual([nightly.id]);
+  expect(filtered.chats.map((c) => c.id)).not.toContain(userChat.id);
+  expect(filtered.chats.map((c) => c.id)).not.toContain(other.id);
+
+  // includeSilent stays a separate opt-in: the trigger filter must not
+  // quietly re-admit that trigger's silent runs.
+  const filteredWithSilent = await (await fetch(`${url}/api/chat/list?triggerId=nightly-sync&includeSilent=1`)).json();
+  expect(filteredWithSilent.chats.map((c) => c.id).sort()).toEqual([nightly.id, nightlySilent.id].sort());
+
+  const unknown = await (await fetch(`${url}/api/chat/list?triggerId=no-such-trigger`)).json();
+  expect(unknown.chats).toEqual([]);
+});
+
+test('chat: GET /api/chat/list rejects a malformed triggerId with 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/chat/list?triggerId=Not%20An%20Id`);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toBe('invalid triggerId');
 });
 
 test('triggers: a saved-prompt trigger fires only through the route, and still passes the daily cap', async () => {

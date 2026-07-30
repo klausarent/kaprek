@@ -6,3 +6,4 @@ web/node_modules/
 .superpowers/
 .DS_Store
 *.local.md
+dist-zip/

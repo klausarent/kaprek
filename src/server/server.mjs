@@ -40,6 +40,10 @@ const MAX_BOARD_BODY_BYTES = 256 * 1024;
 const TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Chat ids are crypto.randomUUID() too (see src/chats/store.mjs), same shape as task ids.
 const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// Mirrors ID_RE in src/triggers/registry.mjs (not exported there) — used to
+// reject a malformed ?triggerId= filter on GET /api/chat/list before it ever
+// reaches the chat list.
+const TRIGGER_ID_RE = /^[a-z0-9-]{1,64}$/;
 const DEFAULT_HARNESS_NAME = 'claude-code';
 const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
 // Fail-closed: an approval nobody answers must not keep the CLI (and the
@@ -934,11 +938,24 @@ function handleChatCancel(res, getChats, chatId, chatAbortControllers) {
  * the caller passes `?includeSilent=1` — the whole point of a silent
  * heartbeat run is to NOT clutter this list with 48 empty-check chats a
  * day, while still keeping every one of them on disk for audit.
+ *
+ * `?triggerId=<id>` narrows the list to the chats that ONE trigger started
+ * (chat.triggerId, set at creation time by src/orchestrator/run.mjs when the
+ * runner passes origin 'trigger'), which is what the trigger page's "runs of
+ * this trigger" link needs. It stays ORTHOGONAL to includeSilent: a
+ * heartbeat's silent runs are still hidden unless the caller asks for them
+ * too, so one query parameter never quietly re-enables what the other one
+ * filters out.
  */
-function handleChatList(res, getChats, includeSilent) {
+function handleChatList(res, getChats, includeSilent, triggerId) {
+  if (triggerId !== null && !TRIGGER_ID_RE.test(triggerId)) {
+    sendJson(res, 400, { error: 'invalid triggerId' });
+    return;
+  }
   const list = getChats()
     .list()
     .filter((chat) => includeSilent || !chat.silent)
+    .filter((chat) => triggerId === null || chat.triggerId === triggerId)
     .slice()
     .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : b.updatedAt < a.updatedAt ? -1 : 0));
   sendJson(res, 200, { chats: list });
@@ -979,7 +996,7 @@ async function handleChatRoutes(req, res, segments, url, ctx) {
       sendJson(res, 405, { error: 'method not allowed' });
       return;
     }
-    handleChatList(res, ctx.getChats, url.searchParams.get('includeSilent') === '1');
+    handleChatList(res, ctx.getChats, url.searchParams.get('includeSilent') === '1', url.searchParams.get('triggerId'));
     return;
   }
   if (segments.length === 4 && segments[3] === 'cancel') {
