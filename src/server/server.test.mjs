@@ -11,6 +11,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { startServer, createSseQueue } from './server.mjs';
+import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -23,8 +24,25 @@ let tmpDir;
 let dataDir;
 let tmpRootDir;
 let servers = [];
+// The token of the server boot() started most recently — see the fetch
+// wrapper below.
+let currentToken = null;
+
+/**
+ * Every /api/* route requires the per-installation instance token (see
+ * token.mjs). Rather than thread it through ~100 call sites, this
+ * module-scoped wrapper SHADOWS the global fetch for this file only and adds
+ * the header of the server boot() started last. The guard itself is never
+ * weakened: the tests that must present a missing/wrong token call `rawFetch`
+ * (the real global) directly.
+ */
+const rawFetch = (...args) => globalThis.fetch(...args);
+function fetch(input, init = {}) {
+  return rawFetch(input, { ...init, headers: { ...(init.headers ?? {}), [TOKEN_HEADER]: currentToken ?? '' } });
+}
 
 beforeEach(() => {
+  currentToken = null;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-'));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-data-'));
   // A dedicated, empty scratchpad root — startServer()'s tmpRoot default is
@@ -48,6 +66,7 @@ afterEach(async () => {
 async function boot(opts) {
   const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, tmpRoot: tmpRootDir, ...opts });
   servers.push(started);
+  currentToken = started.token;
   return started;
 }
 
@@ -96,7 +115,15 @@ function rawGet(baseUrl, pathName, headers) {
   return new Promise((resolve, reject) => {
     const target = new URL(baseUrl);
     const req = http.request(
-      { hostname: target.hostname, port: target.port, path: pathName, method: 'GET', headers },
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: pathName,
+        method: 'GET',
+        // Carries the token like every other request in this file, so a
+        // Host-header test observes the Host check's result, not a 401.
+        headers: { [TOKEN_HEADER]: currentToken ?? '', ...headers },
+      },
       (res) => {
         res.resume();
         res.on('end', () => resolve(res.statusCode));
@@ -1809,4 +1836,173 @@ test('chat: GET /api/chat/list hides a silent heartbeat chat by default, include
   const silentChat = withSilent.chats.find((c) => c.id === chatId);
   expect(silentChat.origin).toBe('trigger');
   expect(silentChat.triggerId).toBe('heartbeat-check');
+});
+
+test('triggers: a saved-prompt trigger fires only through the route, and still passes the daily cap', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  const savedPrompt = {
+    id: 'weekly-report',
+    type: 'saved-prompt',
+    config: {},
+    promptTemplate: 'Write the weekly report.',
+    appScope: [],
+    enabled: true,
+    limits: { maxRunsPerDay: 1, maxCostPerDay: 5 },
+  };
+  await postJson(`${url}/api/triggers`, savedPrompt);
+
+  const first = await readSse(await postJson(`${url}/api/triggers/weekly-report/fire`, {}));
+  expect(first.find((f) => f.type === 'trigger-complete').fired).toBe(true);
+
+  // maxRunsPerDay is 1 and that run is now in runs.jsonl — the second fire is
+  // refused by the cap, not by anything specific to this trigger type.
+  const second = await readSse(await postJson(`${url}/api/triggers/weekly-report/fire`, {}));
+  const complete = second.find((f) => f.type === 'trigger-complete');
+  expect(complete.fired).toBe(false);
+  expect(complete.reason).toMatch(/daily run limit/);
+});
+
+test('triggers: GET /api/triggers reports supported/unsupportedReason per trigger', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, {
+    id: 'watch-clip',
+    type: 'clipboard',
+    config: { matchPattern: 'https?://' },
+    promptTemplate: 'Look at what was copied.',
+    appScope: [],
+  });
+
+  const listed = (await (await fetch(`${url}/api/triggers`)).json()).triggers[0];
+  // Platform-dependent by design (clipboard is Windows-only), so the contract
+  // asserted here is the shape, plus the rule that a false MUST come with a
+  // reason and a true never does.
+  expect(typeof listed.supported).toBe('boolean');
+  if (listed.supported) expect(listed.unsupportedReason).toBeNull();
+  else expect(typeof listed.unsupportedReason).toBe('string');
+  // A clipboard trigger is opt-in: created disabled, never armed by default.
+  expect(listed.enabled).toBe(false);
+});
+
+// ------------------------------------------------------------- instance token
+
+/** Writes a minimal web build into tmpDir and returns its path, for the static/index.html routes. */
+function writeWebDist({ indexHtml = '<!doctype html>\n<html>\n  <head>\n    <title>kaprek</title>\n  </head>\n  <body></body>\n</html>\n' } = {}) {
+  const dist = path.join(tmpDir, 'dist');
+  fs.mkdirSync(dist, { recursive: true });
+  fs.writeFileSync(path.join(dist, 'index.html'), indexHtml, 'utf8');
+  fs.writeFileSync(path.join(dist, 'app.js'), 'export const x = 1;\n', 'utf8');
+  return dist;
+}
+
+test('token: startServer resolves with a 64-hex instance token and persists it in dataDir', async () => {
+  const { token } = await boot({});
+  expect(token).toMatch(/^[0-9a-f]{64}$/);
+  expect(fs.readFileSync(path.join(dataDir, 'instance-token'), 'utf8')).toBe(token);
+});
+
+test('token: a missing token is 401 on every API route, GET included', async () => {
+  const { url } = await boot({});
+  for (const target of ['/api/projects', '/api/triggers', '/api/chat/list', '/api/search?q=x']) {
+    const res = await rawFetch(`${url}${target}`);
+    expect(res.status).toBe(401);
+    expect(await res.text()).toBe(''); // no hint about what was wrong
+  }
+});
+
+test('token: a missing token is 401 on a write route too — before the CSRF check ever runs', async () => {
+  const { url } = await boot({});
+  const res = await rawFetch(`${url}/api/board/tasks`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS, // CSRF header present and correct
+    body: JSON.stringify({ title: 'should never be created' }),
+  });
+  expect(res.status).toBe(401);
+
+  // And nothing was created behind that 401.
+  const list = await (await fetch(`${url}/api/board/tasks`)).json();
+  expect(list.tasks).toEqual([]);
+});
+
+test('token: a wrong token is 401, the right one is 200', async () => {
+  const { url, token } = await boot({});
+  const wrong = await rawFetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: 'f'.repeat(64) } });
+  expect(wrong.status).toBe(401);
+
+  // Same length, one character off — the comparison is exact, not a prefix.
+  const nearMiss = await rawFetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: `${token.slice(0, -1)}${token.endsWith('0') ? '1' : '0'}` } });
+  expect(nearMiss.status).toBe(401);
+
+  const right = await rawFetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: token } });
+  expect(right.status).toBe(200);
+});
+
+test('token: another installation\'s token (a different dataDir) is rejected', async () => {
+  const otherDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-other-'));
+  try {
+    const other = await startServer({ port: 0, rootDir: tmpDir, dataDir: otherDataDir, tmpRoot: tmpRootDir });
+    servers.push(other);
+    const { url, token } = await boot({});
+    expect(other.token).not.toBe(token);
+
+    const res = await rawFetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: other.token } });
+    expect(res.status).toBe(401);
+  } finally {
+    fs.rmSync(otherDataDir, { recursive: true, force: true });
+  }
+});
+
+test('token: index.html is served WITHOUT a token and carries it in a <meta> tag the client can read', async () => {
+  const webDist = writeWebDist();
+  const { url, token } = await boot({ webDist });
+
+  const res = await rawFetch(`${url}/`); // no token header at all
+  expect(res.status).toBe(200);
+  const html = await res.text();
+  expect(html).toContain(`<meta name="kaprek-token" content="${token}">`);
+  // Injected inside <head>, not appended after </html>.
+  expect(html.indexOf('kaprek-token')).toBeLessThan(html.indexOf('</head>'));
+
+  // The token read out of that document is the one the API accepts.
+  const fromMeta = html.match(/<meta name="kaprek-token" content="([0-9a-f]{64})">/)[1];
+  const api = await rawFetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: fromMeta } });
+  expect(api.status).toBe(200);
+});
+
+test('token: static assets (JS) are served without a token — the browser needs them before it can read the meta tag', async () => {
+  const webDist = writeWebDist();
+  const { url } = await boot({ webDist });
+  const res = await rawFetch(`${url}/app.js`);
+  expect(res.status).toBe(200);
+  expect(res.headers.get('content-type')).toContain('javascript');
+});
+
+test('token: the SPA fallback route also injects the token (it serves index.html too)', async () => {
+  const webDist = writeWebDist();
+  const { url, token } = await boot({ webDist });
+  const html = await (await rawFetch(`${url}/some/deep/client-route`)).text();
+  expect(html).toContain(`content="${token}"`);
+});
+
+test('token: a document without a <head> still gets the meta tag, at the very top', async () => {
+  const webDist = writeWebDist({ indexHtml: '<body>no head here</body>\n' });
+  const { url, token } = await boot({ webDist });
+  const html = await (await rawFetch(`${url}/`)).text();
+  expect(html.startsWith(`<meta name="kaprek-token" content="${token}">`)).toBe(true);
+});
+
+test('token: it never reaches the chat store verbatim — a turn mentioning it is persisted redacted', async () => {
+  const { url, token } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+
+  const res = await postJson(`${url}/api/chat/turn`, { text: `remember my token ${token} please` });
+  const frames = await readSse(res);
+  const chatId = frames[0].chatId;
+
+  const stored = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+  const userEvent = stored.events.find((e) => e.kind === 'user');
+  expect(userEvent.text).toContain('[REDACTED]');
+  expect(userEvent.text).not.toContain(token);
+
+  // Not just the API projection — the bytes on disk must not carry it either.
+  const eventsRaw = fs.readFileSync(path.join(dataDir, 'chats', chatId, 'events.jsonl'), 'utf8');
+  expect(eventsRaw).not.toContain(token);
 });

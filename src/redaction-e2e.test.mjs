@@ -13,13 +13,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { startServer } from './server/server.mjs';
+import { TOKEN_HEADER } from './server/token.mjs';
 
 let tmpDir;
+let dataDir;
 let servers = [];
+let currentToken = null;
+
+/** Adds the instance-token header to every request in this file (see src/server/token.mjs). */
+const rawFetch = (...args) => globalThis.fetch(...args);
+function fetch(input, init = {}) {
+  return rawFetch(input, { ...init, headers: { ...(init.headers ?? {}), [TOKEN_HEADER]: currentToken ?? '' } });
+}
 
 beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redaction-e2e-'));
+  // A per-test dataDir: startServer()'s default is the REAL app dir, which a
+  // test must not write its instance token (or anything else) into.
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'redaction-e2e-data-'));
   servers = [];
+  currentToken = null;
 });
 
 afterEach(async () => {
@@ -27,12 +40,14 @@ afterEach(async () => {
     await new Promise((resolve) => server.close(resolve));
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 /** Starts a server for this test and registers it for teardown. */
 async function boot(opts) {
-  const started = await startServer({ port: 0, rootDir: tmpDir, ...opts });
+  const started = await startServer({ port: 0, rootDir: tmpDir, dataDir, ...opts });
   servers.push(started);
+  currentToken = started.token;
   return started;
 }
 

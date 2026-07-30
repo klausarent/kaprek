@@ -11,6 +11,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startServer } from './server/server.mjs';
+import { TOKEN_HEADER } from './server/token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_SESSION = path.join(__dirname, 'parser', 'fixtures', 'mini-session.jsonl');
@@ -21,6 +22,14 @@ const APP_JSON_HEADERS = { ...APP_HEADERS, 'Content-Type': 'application/json' };
 let rootDir;
 let dataDir;
 let servers = [];
+// Set by boot(); every /api/* request must carry it (see src/server/token.mjs).
+let currentToken = null;
+
+/** Adds the instance-token header to every request in this file — same wrapper as src/server/server.test.mjs. */
+const rawFetch = (...args) => globalThis.fetch(...args);
+function fetch(input, init = {}) {
+  return rawFetch(input, { ...init, headers: { ...(init.headers ?? {}), [TOKEN_HEADER]: currentToken ?? '' } });
+}
 
 beforeEach(() => {
   rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-root-'));
@@ -39,6 +48,7 @@ afterEach(async () => {
 async function boot(opts) {
   const started = await startServer({ port: 0, rootDir, dataDir, ...opts });
   servers.push(started);
+  currentToken = started.token;
   return started;
 }
 

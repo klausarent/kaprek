@@ -6,12 +6,19 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { getPackageName } from '../lib/appdir.mjs';
+import { ensureInstanceToken, TOKEN_HEADER } from '../server/token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_PATH = path.join(__dirname, '..', '..', 'bin', 'cli.mjs');
+// Points the spawned CLI's data dir at a temp directory (see
+// src/lib/appdir.mjs) — a test must never write into the real app dir, and
+// this is also how the test gets at the child's instance token.
+const DATA_DIR_ENV = `${getPackageName().toUpperCase().replace(/-/g, '_')}_DATA_DIR`;
 
 let children = [];
 let tmpDir;
+let childDataDir;
 
 afterEach(() => {
   for (const child of children) {
@@ -22,10 +29,18 @@ afterEach(() => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     tmpDir = undefined;
   }
+  if (childDataDir) {
+    fs.rmSync(childDataDir, { recursive: true, force: true });
+    childDataDir = undefined;
+  }
 });
 
 function runCli(args) {
-  const child = spawn(process.execPath, [CLI_PATH, ...args], { stdio: ['ignore', 'pipe', 'pipe'] });
+  childDataDir = childDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-data-'));
+  const child = spawn(process.execPath, [CLI_PATH, ...args], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, [DATA_DIR_ENV]: childDataDir },
+  });
   children.push(child);
   return child;
 }
@@ -88,7 +103,11 @@ test('starts a real server against an empty --dir and serves /api/projects', asy
   const child = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
 
   const url = await waitForUrl(child);
-  const res = await fetch(`${url}/api/projects`);
+  // The child created its instance token before it printed that URL, so
+  // reading it here is a plain read, never a second generation (see
+  // src/server/token.mjs). The CLI deliberately does not print it.
+  const token = ensureInstanceToken(childDataDir);
+  const res = await fetch(`${url}/api/projects`, { headers: { [TOKEN_HEADER]: token } });
   expect(res.status).toBe(200);
   const body = await res.json();
   expect(body).toEqual([]);

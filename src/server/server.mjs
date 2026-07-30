@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
-import { digestSession } from '../parser/parse.mjs';
+import { digestSession, registerSecret } from '../parser/parse.mjs';
 import { buildSearchIndex, searchSessions } from '../search/index.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { sweepArtifacts, readArtifactManifest } from '../artifacts/preserve.mjs';
@@ -33,6 +33,7 @@ import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
+import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
 const MAX_BOARD_BODY_BYTES = 256 * 1024;
@@ -1016,7 +1017,11 @@ function handleTriggersList(res, getTriggers, getRunner, dataDir) {
     .list()
     .map((trigger) => {
       const { runsToday, costToday } = checkLimits({ dataDir, trigger, now: Date.now() });
-      return { ...trigger, runsToday, costToday, ...runner.approvalCapability(trigger) };
+      // `supported`/`unsupportedReason` (see runner.mjs::supportStatus) is the
+      // same idea as `blocked` one field over: a clipboard trigger on a
+      // non-Windows machine says so here in plain text, instead of offering a
+      // switch that silently does nothing.
+      return { ...trigger, runsToday, costToday, ...runner.approvalCapability(trigger), ...runner.supportStatus(trigger) };
     });
   sendJson(res, 200, { triggers });
 }
@@ -1192,8 +1197,25 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
   sendJson(res, 404, { error: 'not found' });
 }
 
-/** Serves static files from webDist with SPA fallback to index.html. */
-function serveStatic(res, webDist, pathname) {
+/**
+ * Injects the instance token into a served HTML document as
+ * `<meta name="kaprek-token" content="…">`, right after the opening <head>
+ * tag (or at the very top for a document without one). This is the ONE way
+ * the token reaches the browser: never a query parameter (those land in
+ * referrers, proxy logs and history), never a cookie (nothing here needs
+ * ambient credentials), never a log line. The value is 64 hex characters (see
+ * token.mjs), so it cannot break out of the attribute it sits in.
+ */
+function injectTokenMeta(html, token) {
+  const meta = `<meta name="kaprek-token" content="${token}">`;
+  const headMatch = html.match(/<head[^>]*>/i);
+  if (!headMatch) return `${meta}\n${html}`;
+  const insertAt = headMatch.index + headMatch[0].length;
+  return `${html.slice(0, insertAt)}\n    ${meta}${html.slice(insertAt)}`;
+}
+
+/** Serves static files from webDist with SPA fallback to index.html. HTML documents get the instance token injected (see injectTokenMeta); everything else is streamed as-is. */
+function serveStatic(res, webDist, pathname, instanceToken) {
   if (!webDist || !fs.existsSync(webDist)) {
     if (pathname === '/') {
       sendText(res, 200, 'kaprek local server is running.\nNo web build found — API only.\n');
@@ -1221,7 +1243,14 @@ function serveStatic(res, webDist, pathname) {
     sendJson(res, 404, { error: 'not found' });
     return;
   }
-  const contentType = MIME_TYPES[path.extname(filePath).toLowerCase()] || 'application/octet-stream';
+  const extension = path.extname(filePath).toLowerCase();
+  const contentType = MIME_TYPES[extension] || 'application/octet-stream';
+  if (extension === '.html') {
+    const html = injectTokenMeta(fs.readFileSync(filePath, 'utf8'), instanceToken);
+    res.writeHead(200, { 'Content-Type': contentType });
+    res.end(html);
+    return;
+  }
   res.writeHead(200, { 'Content-Type': contentType });
   fs.createReadStream(filePath).pipe(res);
 }
@@ -1250,6 +1279,7 @@ async function handleRequest(
     getTriggers,
     getRunner,
     chatSseQueues,
+    instanceToken,
   },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
@@ -1266,20 +1296,39 @@ async function handleRequest(
     return;
   }
 
+  const url = new URL(req.url, 'http://127.0.0.1');
+  const segments = url.pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
+
+  // Per-installation instance token (see src/server/token.mjs): required on
+  // every /api/* route, GET included — loopback plus x-app-request keeps a
+  // foreign web page out, but any LOCAL process can set that header itself,
+  // and this server starts agent turns on request. A missing or wrong token
+  // gets a bare 401: no body, no hint about which of the two it was.
+  //
+  // THE ONE EXCEPTION is static delivery (everything that is not /api/*).
+  // index.html is what HANDS the browser the token (see injectTokenMeta), so
+  // it cannot require it, and the JS/CSS it references are requested before
+  // any script has had the chance to read that meta tag — requiring the header
+  // for those would make the app unloadable. Static delivery is read-only and
+  // exposes nothing beyond the shipped web build.
+  if (segments[0] === 'api' && !timingSafeTokenEqual(req.headers[TOKEN_HEADER], instanceToken)) {
+    res.writeHead(401);
+    res.end();
+    return;
+  }
+
   // CSRF hardening: every non-GET route requires this custom header. A
   // cross-origin page cannot set custom headers on a simple request, so this
   // forces the browser into a CORS preflight — and since this server sends
   // no CORS headers at all, the preflight fails and the browser never sends
-  // the real request. This is the only line of defense against a malicious
-  // page issuing state-changing requests against this loopback server, so it
-  // applies uniformly to every write route, not just /api/board/*.
+  // the real request. Kept IN ADDITION to the token check above, not replaced
+  // by it: the two defend against different attackers (a hostile page vs. a
+  // local process), and the token could in principle leak into a page that
+  // still cannot set custom headers.
   if (req.method !== 'GET' && req.headers['x-app-request'] !== '1') {
     sendJson(res, 403, { error: 'missing app header' });
     return;
   }
-
-  const url = new URL(req.url, 'http://127.0.0.1');
-  const segments = url.pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
 
   if (segments[0] === 'api') {
     // Search and board routes have their own methods (GET for lookup, POST
@@ -1360,12 +1409,14 @@ async function handleRequest(
     sendJson(res, 405, { error: 'method not allowed' });
     return;
   }
-  serveStatic(res, webDist, url.pathname);
+  serveStatic(res, webDist, url.pathname, instanceToken);
 }
 
 /**
  * Starts the local API/static server. Binds to 127.0.0.1 only.
- * Resolves once listening, with the running http.Server and its base URL.
+ * Resolves once listening, with the running http.Server, its base URL, and
+ * this installation's instance token (see src/server/token.mjs — every /api/*
+ * request must carry it in the `x-kaprek-token` header).
  *
  * ============================================================================
  * SECURITY (permissionMode / allowedTools defaults — read before changing):
@@ -1410,6 +1461,14 @@ export function startServer({
   // ephemeral port); the Host-header check needs the actual bound port, not
   // the requested one.
   let boundPort = port;
+
+  // Read (or created on first ever start) before anything can serve a request.
+  // registerSecret() makes it redactable everywhere redactSecrets() runs — the
+  // chat store's write path included (see run.mjs::sanitizeText) — so a token
+  // that ever ends up in a prompt, a tool input or a CLI reply is stored as
+  // [REDACTED] instead of verbatim in a transcript on disk.
+  const instanceToken = ensureInstanceToken(dataDir);
+  registerSecret(instanceToken);
 
   // Board is opened lazily on first access to a board route, not eagerly at
   // startup — most invocations of this server never touch the board, and
@@ -1524,6 +1583,7 @@ export function startServer({
       getTriggers,
       getRunner,
       chatSseQueues,
+      instanceToken,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });
@@ -1543,7 +1603,10 @@ export function startServer({
       const addr = server.address();
       boundPort = addr.port;
       getRunner().start();
-      resolve({ server, url: `http://127.0.0.1:${addr.port}` });
+      // `token` is returned for the process that STARTED the server (the CLI,
+      // a test) — it is deliberately not printed anywhere by default; see
+      // token.mjs on why it never goes into a log line.
+      resolve({ server, url: `http://127.0.0.1:${addr.port}`, token: instanceToken });
     });
   });
 }
