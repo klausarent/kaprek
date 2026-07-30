@@ -27,6 +27,39 @@ function validSchedule(overrides = {}) {
   };
 }
 
+function validFileWatch(overrides = {}) {
+  return {
+    id: 'watch-inbox',
+    type: 'file-watch',
+    config: { path: 'inbox' },
+    promptTemplate: 'These files changed:\n{{files}}',
+    appScope: [],
+    ...overrides,
+  };
+}
+
+function validClipboard(overrides = {}) {
+  return {
+    id: 'watch-clipboard',
+    type: 'clipboard',
+    config: { matchPattern: 'https?://' },
+    promptTemplate: 'Summarize what was copied.',
+    appScope: [],
+    ...overrides,
+  };
+}
+
+function validSavedPrompt(overrides = {}) {
+  return {
+    id: 'weekly-report',
+    type: 'saved-prompt',
+    config: {},
+    promptTemplate: 'Write the weekly report.',
+    appScope: [],
+    ...overrides,
+  };
+}
+
 let tmpDir;
 
 beforeEach(() => {
@@ -144,6 +177,112 @@ test('schedule config: dailyAt must be a 24h "HH:MM" string', () => {
 
 test('no cron syntax accepted: a "cronExpression"-style config field is rejected as unknown', () => {
   expect(() => validateTrigger(validSchedule({ config: { cronExpression: '0 9 * * *' } }))).toThrow(InvalidTriggerError);
+});
+
+// ------------------------------------------------------------- file-watch config
+
+test('file-watch config: a minimal config fills events/debounceMs defaults and leaves maxDepth unset', () => {
+  const trigger = validateTrigger(validFileWatch());
+  expect(trigger.config).toEqual({ path: 'inbox', events: ['add', 'change', 'unlink'], debounceMs: 500 });
+});
+
+test('file-watch config: a path outside the workspace is a validation error, not a runtime surprise', () => {
+  for (const badPath of ['../outside', 'sub/../../outside', '/etc/passwd', 'C:\\Windows', './here']) {
+    expect(() => validateTrigger(validFileWatch({ config: { path: badPath } }))).toThrow(InvalidTriggerError);
+  }
+  try {
+    validateTrigger(validFileWatch({ config: { path: '../outside' } }));
+  } catch (err) {
+    expect(err.field).toBe('config.path');
+  }
+});
+
+test('file-watch config: an empty/missing path is rejected', () => {
+  expect(() => validateTrigger(validFileWatch({ config: {} }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: '   ' } }))).toThrow(InvalidTriggerError);
+});
+
+test('file-watch config: events must be a non-empty subset of add/change/unlink, and duplicates collapse', () => {
+  expect(validateTrigger(validFileWatch({ config: { path: 'inbox', events: ['add', 'add'] } })).config.events).toEqual(['add']);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', events: [] } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', events: ['moved'] } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', events: 'add' } }))).toThrow(InvalidTriggerError);
+});
+
+test('file-watch config: debounceMs below 100 or above 60000 is rejected', () => {
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', debounceMs: 99 } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', debounceMs: 60_001 } }))).toThrow(InvalidTriggerError);
+  expect(validateTrigger(validFileWatch({ config: { path: 'inbox', debounceMs: 100 } })).config.debounceMs).toBe(100);
+});
+
+test('file-watch config: maxDepth must be an integer in [1, 32] when present', () => {
+  expect(validateTrigger(validFileWatch({ config: { path: 'inbox', maxDepth: 2 } })).config.maxDepth).toBe(2);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', maxDepth: 0 } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', maxDepth: 1.5 } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', maxDepth: 33 } }))).toThrow(InvalidTriggerError);
+});
+
+test('file-watch config: an unknown config field is rejected', () => {
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'inbox', glob: '*.md' } }))).toThrow(InvalidTriggerError);
+});
+
+// ------------------------------------------------------------- clipboard config
+
+test('clipboard config: pollMs defaults to 2000 and a trigger is disabled by default (strict opt-in)', () => {
+  const trigger = validateTrigger(validClipboard());
+  expect(trigger.config.pollMs).toBe(2000);
+  expect(trigger.enabled).toBe(false);
+});
+
+test('clipboard config: pollMs below 1000 or above 60000 is rejected', () => {
+  expect(() => validateTrigger(validClipboard({ config: { pollMs: 999 } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validClipboard({ config: { pollMs: 60_001 } }))).toThrow(InvalidTriggerError);
+  expect(validateTrigger(validClipboard({ config: { pollMs: 1000 } })).config.pollMs).toBe(1000);
+});
+
+test('clipboard config: an invalid regex in matchPattern is a validation error, never a crash at poll time', () => {
+  expect(() => validateTrigger(validClipboard({ config: { matchPattern: '([unclosed' } }))).toThrow(InvalidTriggerError);
+  try {
+    validateTrigger(validClipboard({ config: { matchPattern: '([unclosed' } }));
+  } catch (err) {
+    expect(err.field).toBe('config.matchPattern');
+  }
+});
+
+test('clipboard config: a matchPattern over 200 characters is rejected', () => {
+  // 201 'a's is a perfectly valid regex — rejected purely for its length.
+  expect(() => validateTrigger(validClipboard({ config: { matchPattern: 'a'.repeat(201) } }))).toThrow(InvalidTriggerError);
+  expect(() => validateTrigger(validClipboard({ config: { matchPattern: 'a'.repeat(200) } }))).not.toThrow();
+});
+
+test('clipboard config: matchPattern is optional (a trigger without one is valid but will never fire)', () => {
+  const trigger = validateTrigger(validClipboard({ config: {} }));
+  expect(trigger.config).toEqual({ pollMs: 2000 });
+});
+
+test('clipboard config: an unknown config field is rejected', () => {
+  expect(() => validateTrigger(validClipboard({ config: { readImages: true } }))).toThrow(InvalidTriggerError);
+});
+
+// ------------------------------------------------------------- saved-prompt config
+
+test('saved-prompt config: an empty or omitted config is valid and normalizes to {}', () => {
+  expect(validateTrigger(validSavedPrompt()).config).toEqual({});
+  expect(validateTrigger(validSavedPrompt({ config: undefined })).config).toEqual({});
+});
+
+test('saved-prompt config: any config field at all is rejected', () => {
+  expect(() => validateTrigger(validSavedPrompt({ config: { everyMinutes: 5 } }))).toThrow(InvalidTriggerError);
+});
+
+test('all five trigger types round-trip through upsert/get', () => {
+  const triggers = openTriggers(tmpDir);
+  triggers.upsert(validHeartbeat());
+  triggers.upsert(validSchedule());
+  triggers.upsert(validFileWatch());
+  triggers.upsert(validClipboard());
+  triggers.upsert(validSavedPrompt());
+  expect(triggers.list().map((t) => t.type).sort()).toEqual(['clipboard', 'file-watch', 'heartbeat', 'saved-prompt', 'schedule']);
 });
 
 // ------------------------------------------------------------- openTriggers persistence

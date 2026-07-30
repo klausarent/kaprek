@@ -38,6 +38,8 @@ const CHILD_PROCESS_PATTERNS = [
   // nothing to do with child_process.exec().
   /(?<!\.)\bexecSync\(/,
   /(?<!\.)\bexec\(/,
+  /(?<!\.)\bexecFile\(/,
+  /(?<!\.)\bexecFileSync\(/,
   /(?<!\.)\bspawnSync\(/,
   /(?<!\.)\bspawn\(/,
   /(?<!\.)\bfork\(/,
@@ -45,7 +47,7 @@ const CHILD_PROCESS_PATTERNS = [
 
 const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 
-// Two sanctioned exceptions in the whole tree, both local process launches,
+// Three sanctioned exceptions in the whole tree, all local process launches,
 // never a network call — network patterns remain forbidden for these files
 // too, only the child_process patterns are allowed:
 //   - bin/cli.mjs uses child_process.spawn() to open the system default
@@ -54,11 +56,14 @@ const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 //     spawning the user's locally installed, already-authenticated agent
 //     CLI (e.g. `claude`) and speaking stream-json over stdio — never a
 //     provider API call (fetch() stays forbidden here too).
-const ALLOWED_CHILD_PROCESS_FILE = path.join(ROOT, 'bin', 'cli.mjs');
+//   - src/triggers/clipboard.mjs runs `powershell -NoProfile -Command
+//     Get-Clipboard` via execFile (no shell) for the clipboard trigger: the
+//     zero-dependency way to read the local clipboard on Windows.
+const ALLOWED_CHILD_PROCESS_FILES = [path.join(ROOT, 'bin', 'cli.mjs'), path.join(ROOT, 'src', 'triggers', 'clipboard.mjs')];
 const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
 
 function isAllowedChildProcessSource(file) {
-  return file === ALLOWED_CHILD_PROCESS_FILE || file.startsWith(`${ALLOWED_CHILD_PROCESS_DIR}${path.sep}`);
+  return ALLOWED_CHILD_PROCESS_FILES.includes(file) || file.startsWith(`${ALLOWED_CHILD_PROCESS_DIR}${path.sep}`);
 }
 
 /** Recursively collects all .mjs file paths under `dir`. */

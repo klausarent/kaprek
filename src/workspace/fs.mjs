@@ -133,6 +133,19 @@ function guard(workspaceDir, relPath, opts) {
 }
 
 /**
+ * Resolves `<workspaceDir>/<relPath>` through the exact same guard readFile()/
+ * writeFile() use (workspace root check, relPath syntax, escape check,
+ * symlink walk) and returns the absolute path — for callers that need the
+ * LOCATION rather than its content, e.g. the file-watch trigger's fs.watch
+ * target (src/triggers/runner.mjs). Throws WorkspacePathError exactly like
+ * every other function here; a caller must never hand raw user input to fs
+ * itself instead.
+ */
+export function resolveWorkspacePath({ workspaceDir, relPath }) {
+  return guard(workspaceDir, relPath);
+}
+
+/**
  * Writes `data` (string or Buffer) to `<workspaceDir>/<relPath>`, creating
  * parent directories as needed. Atomic: written to a temp file in the same
  * directory, then renamed over the target (same pattern as

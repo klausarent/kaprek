@@ -9,10 +9,11 @@
 // truly optional.
 import fs from 'node:fs';
 import path from 'node:path';
+import { assertSafeRelPath, WorkspacePathError } from '../workspace/fs.mjs';
 
 const ID_RE = /^[a-z0-9-]{1,64}$/;
 
-export const TRIGGER_TYPES = ['heartbeat', 'schedule'];
+export const TRIGGER_TYPES = ['heartbeat', 'schedule', 'file-watch', 'clipboard', 'saved-prompt'];
 export const ESCALATIONS = ['notify', 'question', 'review'];
 
 // Ceilings a trigger's own `limits` may never exceed, regardless of what a
@@ -26,9 +27,29 @@ const MAX_PROMPT_TEMPLATE_LENGTH = 4000;
 const DEFAULT_CHECKLIST_PATH = 'CHECKLIST.md';
 const DAILY_AT_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
 
+// file-watch: the debounce window exists because a single save fires several
+// fs.watch events on Windows (see runner.mjs's watcher). 100 ms is the floor
+// (below that the debounce stops collapsing anything), 60 s the ceiling (a
+// longer "wait and see" is a schedule trigger, not a file watcher).
+export const FILE_WATCH_EVENTS = ['add', 'change', 'unlink'];
+const DEFAULT_DEBOUNCE_MS = 500;
+const MIN_DEBOUNCE_MS = 100;
+const MAX_DEBOUNCE_MS = 60_000;
+const MAX_WATCH_DEPTH = 32;
+
+// clipboard: 1 s floor so a poller can never become a busy loop spawning a
+// PowerShell process; 60 s ceiling because a clipboard change nobody notices
+// for over a minute is not worth reacting to.
+const DEFAULT_POLL_MS = 2000;
+const MIN_POLL_MS = 1000;
+const MAX_POLL_MS = 60_000;
+const MAX_MATCH_PATTERN_LENGTH = 200;
+
 const KNOWN_TOP_FIELDS = ['id', 'type', 'config', 'promptTemplate', 'escalation', 'appScope', 'enabled', 'approvalRequired', 'limits'];
 const KNOWN_HEARTBEAT_CONFIG_FIELDS = ['intervalMinutes', 'checklistPath'];
 const KNOWN_SCHEDULE_CONFIG_FIELDS = ['everyMinutes', 'dailyAt'];
+const KNOWN_FILE_WATCH_CONFIG_FIELDS = ['path', 'events', 'debounceMs', 'maxDepth'];
+const KNOWN_CLIPBOARD_CONFIG_FIELDS = ['pollMs', 'matchPattern'];
 const KNOWN_LIMITS_FIELDS = ['maxRunsPerDay', 'maxCostPerDay'];
 
 export class InvalidTriggerError extends Error {
@@ -92,6 +113,103 @@ function validateScheduleConfig(config) {
   return { dailyAt: config.dailyAt };
 }
 
+/**
+ * `file-watch` config. `path` is relative to the workspace and validated with
+ * src/workspace/fs.mjs's OWN guard (assertSafeRelPath) rather than a second,
+ * subtly different rule written here — '..', an absolute path and a drive
+ * letter are all rejected there already. A path pointing outside the
+ * workspace is a validation error, never a "we'll see at watch time": the
+ * runner's setup pass applies the remaining half of the guard (resolution +
+ * symlink check, which need the actual workspace directory) before it opens a
+ * watcher.
+ */
+function validateFileWatchConfig(config) {
+  if (!isPlainObject(config)) fail('config', 'must be an object for type "file-watch"');
+  assertNoUnknownFields(config, KNOWN_FILE_WATCH_CONFIG_FIELDS, 'config');
+
+  if (typeof config.path !== 'string' || config.path.trim().length === 0) {
+    fail('config.path', 'must be a non-empty string (a path relative to the workspace)');
+  }
+  try {
+    assertSafeRelPath(config.path);
+  } catch (err) {
+    if (err instanceof WorkspacePathError) fail('config.path', `must stay inside the workspace: ${err.message}`);
+    throw err;
+  }
+
+  let events = FILE_WATCH_EVENTS;
+  if (config.events !== undefined) {
+    if (!Array.isArray(config.events) || config.events.length === 0 || !config.events.every((e) => FILE_WATCH_EVENTS.includes(e))) {
+      fail('config.events', `must be a non-empty array of ${FILE_WATCH_EVENTS.join(', ')}`);
+    }
+    events = [...new Set(config.events)];
+  }
+
+  const debounceMs = config.debounceMs ?? DEFAULT_DEBOUNCE_MS;
+  if (typeof debounceMs !== 'number' || !Number.isFinite(debounceMs) || debounceMs < MIN_DEBOUNCE_MS || debounceMs > MAX_DEBOUNCE_MS) {
+    fail('config.debounceMs', `must be a number between ${MIN_DEBOUNCE_MS} and ${MAX_DEBOUNCE_MS}`);
+  }
+
+  // No default: omitted means "no depth filter at all" (fs.watch's own
+  // recursive walk), not some invented ceiling.
+  if (config.maxDepth !== undefined) {
+    if (!Number.isInteger(config.maxDepth) || config.maxDepth < 1 || config.maxDepth > MAX_WATCH_DEPTH) {
+      fail('config.maxDepth', `must be an integer between 1 and ${MAX_WATCH_DEPTH}`);
+    }
+  }
+
+  return { path: config.path, events, debounceMs, ...(config.maxDepth === undefined ? {} : { maxDepth: config.maxDepth }) };
+}
+
+/**
+ * `clipboard` config. `matchPattern` is compiled here (in a try/catch, with a
+ * length limit) so a broken regex is a 400 at upsert time instead of a
+ * surprise throw inside a poll 2 seconds later. It stays OPTIONAL, but a
+ * clipboard trigger without one never fires and never even reads the
+ * clipboard (see runner.mjs's poller setup) — firing on every copy would turn
+ * the feature into a keylogger with extra steps.
+ */
+function validateClipboardConfig(config) {
+  if (!isPlainObject(config)) fail('config', 'must be an object for type "clipboard"');
+  assertNoUnknownFields(config, KNOWN_CLIPBOARD_CONFIG_FIELDS, 'config');
+
+  const pollMs = config.pollMs ?? DEFAULT_POLL_MS;
+  if (typeof pollMs !== 'number' || !Number.isFinite(pollMs) || pollMs < MIN_POLL_MS || pollMs > MAX_POLL_MS) {
+    fail('config.pollMs', `must be a number between ${MIN_POLL_MS} and ${MAX_POLL_MS}`);
+  }
+
+  if (config.matchPattern === undefined) return { pollMs };
+
+  if (typeof config.matchPattern !== 'string' || config.matchPattern.length === 0) {
+    fail('config.matchPattern', 'must be a non-empty string');
+  }
+  if (config.matchPattern.length > MAX_MATCH_PATTERN_LENGTH) {
+    fail('config.matchPattern', `must not exceed ${MAX_MATCH_PATTERN_LENGTH} characters`);
+  }
+  try {
+    new RegExp(config.matchPattern);
+  } catch (err) {
+    fail('config.matchPattern', `must be a valid regular expression: ${err.message}`);
+  }
+
+  return { pollMs, matchPattern: config.matchPattern };
+}
+
+/**
+ * `saved-prompt` config: empty by design. This type has no condition of its
+ * own — it fires only through POST /api/triggers/<id>/fire (the one-click
+ * action the UI needs) and still passes every cap and escalation check on the
+ * way. An omitted `config` is accepted as `{}`; anything inside it is an
+ * error, since there is nothing to configure.
+ */
+function validateSavedPromptConfig(config) {
+  if (config === undefined) return {};
+  if (!isPlainObject(config)) fail('config', 'must be an object (or omitted) for type "saved-prompt"');
+  const keys = Object.keys(config);
+  if (keys.length > 0) fail(`config.${keys[0]}`, 'unknown field (type "saved-prompt" takes no config fields)');
+  return {};
+}
+
 function validateLimits(limits) {
   if (limits === undefined) return { ...DEFAULT_LIMITS };
   if (!isPlainObject(limits)) fail('limits', 'must be an object');
@@ -114,6 +232,26 @@ function validateLimits(limits) {
   }
 
   return { maxRunsPerDay, maxCostPerDay };
+}
+
+/** Routes `config` to its type's own validator. One place to add a type, so a new TRIGGER_TYPES entry without a config rule can't slip through unvalidated. */
+function validateConfigForType(type, config) {
+  switch (type) {
+    case 'heartbeat':
+      return validateHeartbeatConfig(config);
+    case 'schedule':
+      return validateScheduleConfig(config);
+    case 'file-watch':
+      return validateFileWatchConfig(config);
+    case 'clipboard':
+      return validateClipboardConfig(config);
+    case 'saved-prompt':
+      return validateSavedPromptConfig(config);
+    default:
+      // Unreachable: validateTrigger() checks TRIGGER_TYPES first. Kept as a
+      // loud failure rather than a silent `{}` in case the two ever drift.
+      return fail('type', `no config validator for type ${type}`);
+  }
 }
 
 /**
@@ -162,7 +300,7 @@ export function validateTrigger(obj) {
     fail('approvalRequired', 'must be a boolean');
   }
 
-  const config = obj.type === 'heartbeat' ? validateHeartbeatConfig(obj.config) : validateScheduleConfig(obj.config);
+  const config = validateConfigForType(obj.type, obj.config);
   const limits = validateLimits(obj.limits);
   const escalation = obj.escalation ?? 'notify';
 

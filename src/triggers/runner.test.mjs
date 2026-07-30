@@ -60,7 +60,7 @@ function textResultScript(text, extra = {}) {
   ];
 }
 
-function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {} } = {}) {
+function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {}, ...rest } = {}) {
   const triggers = openTriggers(dataDir);
   if (trigger) triggers.upsert(trigger);
   const harness = createFakeHarness({ script: script ?? textResultScript('ok') });
@@ -74,8 +74,95 @@ function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.n
     now,
     log,
     makeUiApprovalHandler,
+    ...rest,
   });
   return { runner, triggers, harness };
+}
+
+function fileWatchTrigger(overrides = {}) {
+  return {
+    id: 'watch-1',
+    type: 'file-watch',
+    config: { path: 'inbox', debounceMs: 500 },
+    promptTemplate: 'Handle these files:\n{{files}}',
+    appScope: [],
+    enabled: true,
+    ...overrides,
+  };
+}
+
+function clipboardTrigger(overrides = {}) {
+  return {
+    id: 'clip-1',
+    type: 'clipboard',
+    config: { pollMs: 1000, matchPattern: 'https?://' },
+    promptTemplate: 'Look at this:\n{{clipboard}}',
+    appScope: [],
+    enabled: true,
+    ...overrides,
+  };
+}
+
+function savedPromptTrigger(overrides = {}) {
+  return {
+    id: 'saved-1',
+    type: 'saved-prompt',
+    config: {},
+    promptTemplate: 'Write the weekly report.',
+    appScope: [],
+    enabled: true,
+    ...overrides,
+  };
+}
+
+/**
+ * A stand-in for one fs.watch() watcher: captures the listener so a test can
+ * emit exactly the events a real watcher would (including a `null` filename
+ * and an 'error'), and records whether close() was called. No real file system
+ * event, no waiting on the OS.
+ */
+function createFakeWatchFactory() {
+  const watchers = [];
+  const factory = (absPath, options, listener) => {
+    const handlers = new Map();
+    const watcher = {
+      absPath,
+      options,
+      closed: false,
+      emitChange: (eventType, filename) => listener(eventType, filename),
+      emitError: (err) => handlers.get('error')?.(err),
+      on: (event, handler) => {
+        handlers.set(event, handler);
+        return watcher;
+      },
+      close: () => {
+        watcher.closed = true;
+      },
+    };
+    watchers.push(watcher);
+    return watcher;
+  };
+  factory.watchers = watchers;
+  factory.last = () => watchers[watchers.length - 1];
+  return factory;
+}
+
+/** A clipboard reader seam whose return value a test sets per poll. Records how often it was actually asked — a trigger that must not read the clipboard has to leave this at 0. */
+function createFakeClipboardReader(initial = '') {
+  const reader = async () => {
+    reader.reads += 1;
+    if (reader.failWith) throw reader.failWith;
+    return reader.value;
+  };
+  reader.value = initial;
+  reader.reads = 0;
+  reader.failWith = null;
+  return reader;
+}
+
+/** Lets pending promise callbacks run without advancing any clock — for the async poller, whose fire path awaits a real turn. */
+async function flushMicrotasks(times = 20) {
+  for (let i = 0; i < times; i += 1) await Promise.resolve();
 }
 
 // ------------------------------------------------------------- loop guard (Pflichttest)
@@ -401,6 +488,379 @@ test('a trigger already at its daily run cap is rejected — a limits rejection,
   expect(result.reason).toMatch(/daily run limit/);
 });
 
+// ------------------------------------------------------------- file-watch
+
+/** The single user-prompt text of the one and only chat a test expects to exist. Fails loudly if there is not exactly one. */
+function soleTurnPrompt() {
+  const chats = openChats(dataDir).list();
+  expect(chats).toHaveLength(1);
+  const events = openChats(dataDir).events(chats[0].id);
+  return events.find((e) => e.kind === 'user').text;
+}
+
+function makeInbox(...files) {
+  fs.mkdirSync(path.join(cwd, 'inbox'), { recursive: true });
+  for (const file of files) fs.writeFileSync(path.join(cwd, 'inbox', file), 'x', 'utf8');
+}
+
+test('file-watch: every event of one debounce window collapses into exactly ONE turn, with a deduped, sorted, workspace-relative {{files}} list', async () => {
+  vi.useFakeTimers();
+  makeInbox('b.md', 'a.md');
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({ trigger: fileWatchTrigger(), createWatcher: watchFactory });
+  runner.start();
+
+  const watcher = watchFactory.last();
+  expect(watcher.options).toMatchObject({ recursive: true, persistent: false });
+  // Windows reports the same save several times — the debounce is what makes
+  // that one turn instead of three.
+  watcher.emitChange('change', 'b.md');
+  watcher.emitChange('change', 'b.md');
+  watcher.emitChange('change', 'a.md');
+  expect(openChats(dataDir).list()).toHaveLength(0); // nothing yet: still inside the window
+
+  await vi.advanceTimersByTimeAsync(500);
+
+  const prompt = soleTurnPrompt();
+  expect(prompt).toContain('inbox/a.md\ninbox/b.md');
+  expect(prompt).toContain('2 watched path(s) changed');
+  runner.stop();
+});
+
+test('file-watch: an event with filename null is discarded instead of guessing a path — no turn at all', async () => {
+  vi.useFakeTimers();
+  makeInbox('a.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({ trigger: fileWatchTrigger(), createWatcher: watchFactory, log: (m) => logMessages.push(m) });
+  runner.start();
+
+  watchFactory.last().emitChange('change', null);
+  await vi.advanceTimersByTimeAsync(2000);
+
+  expect(openChats(dataDir).list()).toEqual([]);
+  expect(logMessages.some((m) => m.includes('watch event without a filename'))).toBe(true);
+  runner.stop();
+});
+
+test('file-watch: only the subscribed events fire — a "change" is ignored for an events:["unlink"] trigger', async () => {
+  vi.useFakeTimers();
+  makeInbox('a.md');
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({ trigger: fileWatchTrigger({ config: { path: 'inbox', events: ['unlink'], debounceMs: 100 } }), createWatcher: watchFactory });
+  runner.start();
+
+  watchFactory.last().emitChange('change', 'a.md');
+  await vi.advanceTimersByTimeAsync(500);
+  expect(openChats(dataDir).list()).toEqual([]);
+
+  // A 'rename' for a path that no longer exists IS an unlink, and does fire.
+  fs.rmSync(path.join(cwd, 'inbox', 'a.md'));
+  watchFactory.last().emitChange('rename', 'a.md');
+  await vi.advanceTimersByTimeAsync(500);
+  expect(soleTurnPrompt()).toContain('inbox/a.md');
+  runner.stop();
+});
+
+test('file-watch: the {{files}} list is capped at 50 paths', async () => {
+  vi.useFakeTimers();
+  fs.mkdirSync(path.join(cwd, 'inbox'), { recursive: true });
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({ trigger: fileWatchTrigger(), createWatcher: watchFactory });
+  runner.start();
+
+  for (let i = 0; i < 60; i += 1) watchFactory.last().emitChange('change', `f${String(i).padStart(3, '0')}.md`);
+  await vi.advanceTimersByTimeAsync(500);
+
+  // The prompt carries the list twice (the template's own {{files}} and the
+  // generated context block), so count DISTINCT paths.
+  const prompt = soleTurnPrompt();
+  const listed = new Set(prompt.split('\n').filter((line) => /^inbox\/f\d{3}\.md$/.test(line)));
+  expect(listed.size).toBe(50);
+  // Capped by sort order, so the highest-numbered files are the ones dropped.
+  expect(listed.has('inbox/f049.md')).toBe(true);
+  expect(listed.has('inbox/f050.md')).toBe(false);
+  runner.stop();
+});
+
+test('file-watch: maxDepth drops events below the configured depth', async () => {
+  vi.useFakeTimers();
+  fs.mkdirSync(path.join(cwd, 'inbox', 'deep'), { recursive: true });
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({ trigger: fileWatchTrigger({ config: { path: 'inbox', debounceMs: 100, maxDepth: 1 } }), createWatcher: watchFactory });
+  runner.start();
+
+  watchFactory.last().emitChange('change', path.join('deep', 'nested.md'));
+  await vi.advanceTimersByTimeAsync(500);
+  expect(openChats(dataDir).list()).toEqual([]);
+
+  watchFactory.last().emitChange('change', 'top.md');
+  await vi.advanceTimersByTimeAsync(500);
+  expect(soleTurnPrompt()).toContain('inbox/top.md');
+  runner.stop();
+});
+
+/** A harness whose turn blocks until release() is called — keeps a trigger observably "in flight" without any clock. */
+function gatedHarness() {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  return {
+    release: () => release(),
+    async startTurn({ onEvent } = {}) {
+      await gate;
+      onEvent?.({ type: 'text', text: 'done' });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('file-watch: a change arriving while this trigger\'s own turn runs is DISCARDED, not buffered for a second turn', async () => {
+  vi.useFakeTimers();
+  makeInbox('a.md', 'b.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const harness = gatedHarness();
+  const triggers = openTriggers(dataDir);
+  triggers.upsert(fileWatchTrigger({ config: { path: 'inbox', debounceMs: 100 } }));
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness,
+    harnessName: 'fake',
+    cwd,
+    now: () => Date.now(),
+    log: (m) => logMessages.push(m),
+    createWatcher: watchFactory,
+  });
+  runner.start();
+
+  watchFactory.last().emitChange('change', 'a.md');
+  await vi.advanceTimersByTimeAsync(100); // starts the turn; it now blocks on the gate
+  expect(runner.isAnyTriggerRunning()).toBe(true);
+
+  // This is the real loop: the turn itself writes into the watched folder.
+  watchFactory.last().emitChange('change', 'b.md');
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(logMessages.some((m) => m.includes('discarded (its own turn is still running)'))).toBe(true);
+
+  harness.release();
+  await flushMicrotasks(50);
+  await vi.advanceTimersByTimeAsync(1000);
+
+  // Exactly one turn, and b.md was never queued into a follow-up one.
+  const prompt = soleTurnPrompt();
+  expect(prompt).toContain('inbox/a.md');
+  expect(prompt).not.toContain('inbox/b.md');
+  runner.stop();
+});
+
+test('file-watch: a watcher error disables the trigger with a logged reason instead of going quiet', async () => {
+  makeInbox('a.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner, triggers } = makeRunner({ trigger: fileWatchTrigger(), createWatcher: watchFactory, log: (m) => logMessages.push(m) });
+  runner.start();
+
+  const watcher = watchFactory.last();
+  watcher.emitError(new Error('watch handle lost'));
+
+  expect(triggers.get('watch-1').enabled).toBe(false);
+  expect(watcher.closed).toBe(true);
+  expect(logMessages.some((m) => m.includes('DISABLED itself') && m.includes('watch handle lost'))).toBe(true);
+  runner.stop();
+});
+
+test('file-watch: a path that does not exist in the workspace disables the trigger at setup instead of pretending to watch', () => {
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner, triggers } = makeRunner({ trigger: fileWatchTrigger({ config: { path: 'not-there' } }), createWatcher: watchFactory, log: (m) => logMessages.push(m) });
+  runner.start();
+
+  expect(watchFactory.watchers).toHaveLength(0);
+  expect(triggers.get('watch-1').enabled).toBe(false);
+  expect(logMessages.some((m) => m.includes('file-watch path unusable'))).toBe(true);
+  runner.stop();
+});
+
+test('file-watch: a manual fire with no recorded changes still runs, with an empty {{files}} and a reason saying so', async () => {
+  makeInbox('a.md');
+  const { runner } = makeRunner({ trigger: fileWatchTrigger() });
+  const result = await runner.fireTrigger('watch-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(soleTurnPrompt()).toContain('manual fire (no file changes recorded)');
+});
+
+// ------------------------------------------------------------- clipboard
+
+test('clipboard: without a matchPattern nothing fires AND the clipboard is never even read', async () => {
+  vi.useFakeTimers();
+  const logMessages = [];
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const { runner } = makeRunner({
+    trigger: clipboardTrigger({ config: { pollMs: 1000 } }),
+    readClipboard: reader,
+    platform: 'win32',
+    log: (m) => logMessages.push(m),
+  });
+  runner.start();
+
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(reader.reads).toBe(0);
+  expect(openChats(dataDir).list()).toEqual([]);
+  expect(logMessages.some((m) => m.includes('no matchPattern configured'))).toBe(true);
+  runner.stop();
+});
+
+test('clipboard: the content already on the clipboard at start only primes the comparison, and unchanged content never fires', async () => {
+  vi.useFakeTimers();
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32' });
+  runner.start();
+
+  await vi.advanceTimersByTimeAsync(1000); // first read: primes only
+  await vi.advanceTimersByTimeAsync(1000); // identical content
+  expect(reader.reads).toBe(2);
+  expect(openChats(dataDir).list()).toEqual([]);
+
+  reader.value = 'https://example.test/b';
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushMicrotasks(50);
+  expect(soleTurnPrompt()).toContain('https://example.test/b');
+  runner.stop();
+});
+
+test('clipboard: content that does not match the pattern never fires', async () => {
+  vi.useFakeTimers();
+  const reader = createFakeClipboardReader('nothing interesting');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32' });
+  runner.start();
+
+  await vi.advanceTimersByTimeAsync(1000);
+  reader.value = 'still no link here';
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushMicrotasks(50);
+  expect(openChats(dataDir).list()).toEqual([]);
+  runner.stop();
+});
+
+test('clipboard: a secret in the copied text is redacted before it reaches the prompt, and never appears in the log at all', async () => {
+  vi.useFakeTimers();
+  const secret = `sk-${'a'.repeat(32)}`;
+  const logMessages = [];
+  const reader = createFakeClipboardReader('https://example.test/start');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32', log: (m) => logMessages.push(m) });
+  runner.start();
+
+  await vi.advanceTimersByTimeAsync(1000); // prime
+  reader.value = `https://example.test/api?token=${secret}`;
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushMicrotasks(50);
+
+  const prompt = soleTurnPrompt();
+  expect(prompt).toContain('[REDACTED]');
+  expect(prompt).not.toContain(secret);
+  expect(logMessages.some((m) => m.includes(secret))).toBe(false);
+  runner.stop();
+});
+
+test('clipboard: a failed read costs that poll only — the poller keeps going and still fires on the next changed value', async () => {
+  vi.useFakeTimers();
+  const logMessages = [];
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32', log: (m) => logMessages.push(m) });
+  runner.start();
+
+  await vi.advanceTimersByTimeAsync(1000); // prime
+  reader.failWith = new Error('clipboard busy');
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(logMessages.some((m) => m.includes('clipboard read failed'))).toBe(true);
+
+  reader.failWith = null;
+  reader.value = 'https://example.test/b';
+  await vi.advanceTimersByTimeAsync(1000);
+  await flushMicrotasks(50);
+  expect(soleTurnPrompt()).toContain('https://example.test/b');
+  runner.stop();
+});
+
+test('clipboard: on a non-Windows platform the trigger reports supported:false, starts no poller, and a fire is refused in plain text', async () => {
+  vi.useFakeTimers();
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const { runner, triggers } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'linux' });
+
+  const support = runner.supportStatus(triggers.get('clip-1'));
+  expect(support.supported).toBe(false);
+  expect(support.unsupportedReason).toMatch(/require Windows/);
+
+  runner.start();
+  await vi.advanceTimersByTimeAsync(10_000);
+  expect(reader.reads).toBe(0);
+
+  const result = await runner.fireTrigger('clip-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/require Windows/);
+  runner.stop();
+});
+
+test('clipboard: a manual fire is refused — only the trigger\'s own poller may read the clipboard', async () => {
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32' });
+
+  const result = await runner.fireTrigger('clip-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/only from their own poller/);
+  expect(reader.reads).toBe(0);
+});
+
+test('clipboard: activating the poller logs that clipboard contents are being read (visible consent)', () => {
+  vi.useFakeTimers();
+  const logMessages = [];
+  const reader = createFakeClipboardReader('');
+  const { runner } = makeRunner({ trigger: clipboardTrigger(), readClipboard: reader, platform: 'win32', log: (m) => logMessages.push(m) });
+  runner.start();
+  expect(logMessages.some((m) => m.includes('clipboard trigger ACTIVE') && m.includes('read every 1000ms'))).toBe(true);
+  runner.stop();
+});
+
+// ------------------------------------------------------------- saved-prompt
+
+test('saved-prompt: fires through a manual fire and runs the stored prompt', async () => {
+  const { runner } = makeRunner({ trigger: savedPromptTrigger() });
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(soleTurnPrompt()).toContain('Write the weekly report.');
+});
+
+test('saved-prompt: never fires from a tick, however often the tick runs', () => {
+  vi.useFakeTimers();
+  const { runner } = makeRunner({ trigger: savedPromptTrigger(), tickMs: 1000 });
+  runner.start();
+  vi.advanceTimersByTime(60_000);
+  expect(openChats(dataDir).list()).toEqual([]);
+  runner.stop();
+});
+
+test('saved-prompt: still respects the daily run cap', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner } = makeRunner({ trigger: savedPromptTrigger({ limits: { maxRunsPerDay: 1, maxCostPerDay: 50 } }), now: () => fixedNow });
+  appendRun(dataDir, { ts: new Date(fixedNow).toISOString(), triggerId: 'saved-1', origin: 'trigger', costUsd: 0 });
+
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/daily run limit/);
+});
+
+test('saved-prompt: escalation "review" without a UI approval handler still cannot fire (fail-closed, same gate as every other type)', async () => {
+  const { runner } = makeRunner({ trigger: savedPromptTrigger({ escalation: 'review' }) });
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/approval/);
+});
+
 // ------------------------------------------------------------- start()/stop()
 
 test('start() ticks on the injected interval and stop() stops it — no timer keeps running after stop()', () => {
@@ -461,4 +921,77 @@ test('start() is idempotent (no duplicate timers) and stop() is idempotent', () 
 
   runner.stop();
   runner.stop(); // must not throw
+});
+
+test('stop() closes every file watcher and stops every clipboard poller — nothing fires or reads afterwards', async () => {
+  vi.useFakeTimers();
+  makeInbox('a.md');
+  const watchFactory = createFakeWatchFactory();
+  const reader = createFakeClipboardReader('https://example.test/a');
+  const triggers = openTriggers(dataDir);
+  triggers.upsert(fileWatchTrigger({ config: { path: 'inbox', debounceMs: 100 } }));
+  triggers.upsert(clipboardTrigger());
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness: createFakeHarness({ script: textResultScript('ok') }),
+    harnessName: 'fake',
+    cwd,
+    now: () => Date.now(),
+    log: () => {},
+    tickMs: 1000,
+    createWatcher: watchFactory,
+    readClipboard: reader,
+    platform: 'win32',
+  });
+
+  runner.start();
+  expect(watchFactory.watchers).toHaveLength(1);
+  await vi.advanceTimersByTimeAsync(1000);
+  const readsWhileRunning = reader.reads;
+  expect(readsWhileRunning).toBeGreaterThan(0);
+
+  runner.stop();
+  expect(watchFactory.last().closed).toBe(true);
+
+  // A watch event after stop() has no state left to land in, and no poll
+  // interval remains to read the clipboard again.
+  watchFactory.last().emitChange('change', 'a.md');
+  reader.value = 'https://example.test/changed';
+  await vi.advanceTimersByTimeAsync(30_000);
+  expect(reader.reads).toBe(readsWhileRunning);
+  expect(openChats(dataDir).list()).toEqual([]);
+});
+
+test('a file-watch trigger enabled AFTER start() gets its watcher on the next tick, and loses it again when disabled', async () => {
+  vi.useFakeTimers();
+  makeInbox('a.md');
+  const watchFactory = createFakeWatchFactory();
+  const triggers = openTriggers(dataDir);
+  triggers.upsert(fileWatchTrigger({ enabled: false }));
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness: createFakeHarness({ script: textResultScript('ok') }),
+    harnessName: 'fake',
+    cwd,
+    now: () => Date.now(),
+    log: () => {},
+    tickMs: 1000,
+    createWatcher: watchFactory,
+  });
+
+  runner.start();
+  expect(watchFactory.watchers).toHaveLength(0); // disabled: nothing watches
+
+  triggers.setEnabled('watch-1', true);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(watchFactory.watchers).toHaveLength(1);
+
+  triggers.setEnabled('watch-1', false);
+  await vi.advanceTimersByTimeAsync(1000);
+  expect(watchFactory.last().closed).toBe(true);
+  runner.stop();
 });
