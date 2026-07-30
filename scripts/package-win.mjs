@@ -301,19 +301,37 @@ function waitForServerUrl(child, timeoutMs) {
       cleanup();
       resolve(match[0]);
     };
+    // stderr only feeds the diagnostic buffer, never the URL match — but a
+    // launcher that refuses to start says why THERE ("claude not found", "not
+    // recognized as a command"), and a failure report without it is useless.
+    const onErrData = (chunk) => {
+      buffer += chunk;
+    };
     const onExit = (code) => {
       cleanup();
-      reject(new Error(`server exited with code ${code} before printing a URL; output:\n${buffer}`));
+      reject(new Error(`server exited with code ${code} before printing a URL; output:\n${buffer || '(no output)'}`));
     };
     function cleanup() {
       clearTimeout(timer);
       child.stdout.off('data', onData);
+      child.stderr.off('data', onErrData);
       child.off('exit', onExit);
     }
 
     child.stdout.on('data', onData);
+    child.stderr.on('data', onErrData);
     child.once('exit', onExit);
   });
+}
+
+/** Kills a spawned process and everything it started. Best-effort: a process that already exited is not an error worth failing the build over. */
+async function killTree(child) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  try {
+    await run('taskkill', ['/pid', String(child.pid), '/t', '/f']);
+  } catch {
+    child.kill();
+  }
 }
 
 /**
@@ -322,18 +340,34 @@ function waitForServerUrl(child, timeoutMs) {
  * refuses anyone who does not have it. A dedicated temp data dir
  * (KAPREK_DATA_DIR, see src/lib/appdir.mjs) keeps the smoke test out of the
  * real %USERPROFILE%\\.kaprek.
+ *
+ * Started through `start-kaprek.cmd`, NOT `node bin/cli.mjs` directly: the
+ * launcher is the only thing a recipient ever runs, so a defect in it (a broken
+ * prerequisite check, a `call` missing in front of a .cmd shim, a wrong relative
+ * path) would otherwise ship green. That means this smoke test also exercises
+ * the `claude --version` check — a machine without the CLI on its PATH will
+ * fail here, correctly: the zip is not usable there either.
  */
 async function smokeTest(extractedDir) {
   const port = await freePort();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-smoke-data-'));
   const scanDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-smoke-scan-'));
 
-  const child = spawn(process.execPath, [path.join('bin', 'cli.mjs'), '--port', String(port), '--no-open', '--dir', scanDir], {
-    cwd: extractedDir,
-    env: { ...process.env, KAPREK_DATA_DIR: dataDir },
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
+  // cmd.exe /c, because a .cmd is not directly executable by spawn(). Still no
+  // `shell: true`: every argument stays a separate array entry. The launcher is
+  // named by ABSOLUTE path — `cmd /c start-kaprek.cmd` resolves against the
+  // PATH, not against `cwd`, and fails with "not found" even standing in the
+  // right directory.
+  const child = spawn(
+    process.env.COMSPEC || 'cmd.exe',
+    ['/c', path.join(extractedDir, 'start-kaprek.cmd'), '--port', String(port), '--no-open', '--dir', scanDir],
+    {
+      cwd: extractedDir,
+      env: { ...process.env, KAPREK_DATA_DIR: dataDir },
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+    },
+  );
 
   let childOutput = '';
   child.stdout.on('data', (chunk) => {
@@ -359,7 +393,11 @@ async function smokeTest(extractedDir) {
       failures.push(`GET /api/triggers without a token answered ${unauthorized.status}, expected 401`);
     }
   } finally {
-    child.kill();
+    // The launcher means the real server is a GRANDCHILD (cmd.exe -> node), and
+    // killing cmd.exe alone would leave that node process holding the port and
+    // the temp data dir this function is about to delete. taskkill /T takes the
+    // whole tree.
+    await killTree(child);
     await exited;
     fs.rmSync(dataDir, { recursive: true, force: true });
     fs.rmSync(scanDir, { recursive: true, force: true });
