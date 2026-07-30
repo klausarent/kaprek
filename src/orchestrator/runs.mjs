@@ -30,6 +30,15 @@ export function appendRun(dataDir, entry = {}) {
     tokens: entry.tokens ?? null,
     durationMs: entry.durationMs ?? null,
     stopReason: entry.stopReason ?? null,
+    // Which of src/harness/timeout.mjs's four clocks fired, only meaningful
+    // when stopReason is 'timeout' (see adapter.mjs's TurnResult.timeoutClock
+    // doc comment) — panel review Fix-Runde 2, important: without this,
+    // runs.jsonl could never distinguish "idle clock (model went silent)"
+    // from "absolute clock (approval chain)" from "tool-lease clock (a tool
+    // call hung)", the exact diagnosis an unattended Task-3 overnight run
+    // needs. Old lines predate this field; readRuns() returns them as-is,
+    // so a reader must treat a missing timeoutClock as unknown, not 'none'.
+    timeoutClock: entry.timeoutClock ?? null,
     rateLimit: entry.rateLimit ?? null,
     error: entry.error ?? null,
     // Who/what started this turn — 'user' for a normal chat turn, 'trigger'

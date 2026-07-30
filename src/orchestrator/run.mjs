@@ -199,7 +199,14 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  *   still learn the id early enough to bind a chatId-scoped approval handler
  *   or stream a bootstrap SSE frame, without needing to pre-create the chat
  *   itself and duplicate this function's own title/origin/triggerId/silent logic.
- * @returns {Promise<{chatId: string, cliSessionId: string|null, costUsd: number|null, stopReason: string, error: {message:string}|null}>}
+ * @returns {Promise<{chatId: string, cliSessionId: string|null, costUsd: number|null, stopReason: string, timeoutClock: string|null, error: {message:string}|null}>}
+ *   `timeoutClock` (panel review Fix-Runde 2, important — outside this
+ *   task's original file list, see task-2-report.md's Bedenken for the
+ *   minimal-footprint scope of this change) names which of
+ *   src/harness/timeout.mjs's four clocks fired when stopReason is
+ *   'timeout' (see adapter.mjs's TurnResult.timeoutClock doc comment for
+ *   the full contract); null otherwise. Passed through verbatim from the
+ *   harness's own TurnResult — this function does not itself decide it.
  */
 export async function runTurn({
   dataDir,
@@ -489,7 +496,7 @@ export async function runTurn({
     } catch {
       // best-effort — see appendRun()'s own call further down for the same caveat
     }
-    return { chatId: effectiveChatId, cliSessionId, costUsd: null, stopReason: 'error', error: { message } };
+    return { chatId: effectiveChatId, cliSessionId, costUsd: null, stopReason: 'error', timeoutClock: null, error: { message } };
   }
 
   let turnResult;
@@ -559,6 +566,10 @@ export async function runTurn({
       tokens: sumTokens(turnResult.usage),
       durationMs: Date.now() - startedAt,
       stopReason: turnResult.stopReason,
+      // Panel review Fix-Runde 2, important: see this function's own
+      // @returns doc comment above — timeoutClock (the brief step-9
+      // requirement) died at this exact boundary before this fix.
+      timeoutClock: turnResult.timeoutClock ?? null,
       rateLimit,
       error: turnResult.error,
       origin,
@@ -573,6 +584,7 @@ export async function runTurn({
     cliSessionId,
     costUsd: turnResult.costUsd,
     stopReason: turnResult.stopReason,
+    timeoutClock: turnResult.timeoutClock ?? null,
     error: turnResult.error,
   };
 }

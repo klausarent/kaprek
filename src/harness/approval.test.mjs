@@ -214,25 +214,88 @@ test('stdin is closed as soon as a result event arrives, not only once the proce
 // shorter) active-total budget would kill the process out from under a user
 // who is still deciding, long before the approval's own, intentionally more
 // generous timeout ever gets a chance to fire.
-test('a pending approval exempts the active-total clock — deciding longer than timeoutMs does not kill the turn', async () => {
+//
+// Panel review Fix-Runde 2, CRITICAL (testcausality): the ORIGINAL version
+// of this test (result written at t=200ms, after a 150ms decision) passed
+// even with clocks.onApprovalStart()/onApprovalEnd() deleted entirely from
+// claude-code.mjs — the over-budget window (t=50..200ms) never contained a
+// single check(): the control_request line returns before the per-event
+// evaluateClocks() call, the result event's own evaluateClocks() is
+// suppressed by the sawResult guard, and the first clockPollTimer tick
+// (250ms) lands AFTER the turn already resolved at ~200ms. What the old test
+// actually pinned was the sawResult race guard, not the exemption its title
+// claimed. Fixed by making the approval span at least one 250ms poll tick
+// WHILE STILL PENDING, using a synchronization promise (not a fixed sleep)
+// so the result line is written the instant the decision is made, not after
+// an independently-timed outer wait that could itself race the poll.
+test('a pending approval exempts the active-total clock — deciding across a poll tick does not kill the turn', async () => {
   const child = makeControllableChild();
+  let approvalDecided;
+  const approvalDecidedPromise = new Promise((resolve) => { approvalDecided = resolve; });
   const onApprovalRequest = vi.fn(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await new Promise((resolve) => setTimeout(resolve, 400)); // spans at least one CLOCK_POLL_INTERVAL_MS (250ms) tick while still pending
+    approvalDecided();
     return { behavior: 'allow' };
   });
 
-  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, timeoutMs: 50, spawnFn: () => child });
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, timeoutMs: 100, spawnFn: () => child });
 
   writeLine(child, { type: 'control_request', request_id: 'req-pause', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
-  // Long enough to exceed timeoutMs (50ms) while the approval is still pending.
-  await new Promise((resolve) => setTimeout(resolve, 200));
+  await approvalDecidedPromise; // the moment the decision is made, not a separately-timed guess at when it might be
   writeLine(child, RESULT_LINE);
   closeChild(child);
 
   const result = await turn;
-  expect(result.stopReason).toBe('result'); // NOT 'timeout'
+  expect(result.stopReason).toBe('result'); // NOT 'timeout' — a no-op-exemption mutant dies here (poll at t=250ms sees activeElapsed>=100ms)
   expect(child.killed).toBeFalsy();
-});
+}, 5000);
+
+// Companion to the test above (same panel finding, its own fixHint): proves
+// the previous test is actually about the approval exemption, not about
+// approvals suppressing checks in general — the identical wait WITHOUT a
+// pending approval must still time out via active-total at the first poll
+// tick.
+test('the same wait WITHOUT a pending approval times out via active-total', async () => {
+  const child = makeControllableChild();
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, timeoutMs: 100, spawnFn: () => child });
+
+  const result = await turn;
+  expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('active-total');
+}, 5000);
+
+// Panel review Fix-Runde 2, CRITICAL (testcausality) companion scenario: the
+// wiring-level exemption was only ever proven for active-total, never for
+// tool-lease — a SECOND, concurrent approval (e.g. a subagent's own tool
+// call) pending while a FIRST tool is still genuinely running must not let
+// that first tool's lease expire either, at the actual claude-code.mjs
+// wiring level (not just timeout.mjs's own unit tests, see there for the
+// pure-logic equivalent).
+test('a pending approval exempts the tool-lease clock too — an open tool call survives an approval spanning a poll tick', async () => {
+  const child = makeControllableChild();
+  let approvalDecided;
+  const approvalDecidedPromise = new Promise((resolve) => { approvalDecided = resolve; });
+  const onApprovalRequest = vi.fn(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 400)); // spans at least one poll tick while still pending
+    approvalDecided();
+    return { behavior: 'allow' };
+  });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, toolLeaseMs: 100, spawnFn: () => child });
+
+  // A tool is already running (ITS lease is what's under test)...
+  writeLine(child, { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_lease', name: 'Bash', input: {} }] } });
+  // ...while a SECOND, concurrent tool call needs a human decision.
+  writeLine(child, { type: 'control_request', request_id: 'req-concurrent', request: { subtype: 'can_use_tool', tool_name: 'Read', input: {} } });
+  await approvalDecidedPromise;
+  writeLine(child, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_lease', content: 'done' }] } });
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'/'tool-lease'
+}, 5000);
 
 test('the active-total clock keeps running once the last pending approval resolves — a turn that idles too long AFTER deciding still times out', async () => {
   const child = makeControllableChild();
@@ -287,6 +350,177 @@ test('the absolute wall-clock cap fires even while an approval is indefinitely p
   expect(result.stopReason).toBe('timeout');
   expect(result.timeoutClock).toBe('absolute');
   expect(child.killed).toBe(true);
+}, 5000);
+
+// --- Panel review Fix-Runde 2 regression tests -------------------------------
+
+// CRITICAL: the sawResult guard in evaluateClocks() (see its own doc
+// comment) fixes a real spurious-timeout race, but on its own trades a
+// BOUNDED race for an UNBOUNDED hang if 'close' never arrives at all after
+// 'result' — e.g. the CLI's own exit is fine, but a background process it
+// started as a side effect (a dev server left running) inherited its
+// stdout/stderr pipe, and Node only fires 'close' once EVERY inherited
+// stdio stream also closes. Reproduced live against this harness before the
+// fix (see task-2-report.md's Fix-Runde 2). This fake child models exactly
+// that: it never reacts to stdin.end() and never emits 'close' or 'exit' on
+// its own, unlike makeControllableChild()'s stub.
+test('a result line with no close event ever (hung grandchild inheriting stdio) still resolves as result within a bounded grace period, not hung and not timed out', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.stdin = { write: () => true, end: () => {} }; // deliberately never reacts, no 'close'/'exit' ever
+  child.kill = vi.fn();
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, killGraceMs: 30, spawnFn: () => child });
+
+  writeLine(child, RESULT_LINE);
+
+  const result = await turn;
+  expect(result.stopReason).toBe('result');
+  expect(result.orphaned).toBe(true);
+  expect(child.kill).toHaveBeenCalled();
+}, 5000);
+
+// IMPORTANT: brief step 9 required the stop reason to NAME the clock that
+// fired, not just say 'timeout' — before this fix, no NormalizedEvent ever
+// carried it (only TurnResult.timeoutClock did, which no production
+// consumer downstream of the harness ever read, see task-2-report.md's
+// Fix-Runde 2). requestKill() now emits a normalized 'error' event naming
+// the clock, BEFORE the child is killed.
+test('a clock-triggered timeout emits an error event naming which clock fired, before the child is killed', async () => {
+  const child = makeControllableChild();
+  const events = [];
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: (e) => events.push(e), timeoutMs: 50, killGraceMs: 30, spawnFn: () => child });
+
+  const result = await turn;
+  expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('active-total');
+  expect(events).toContainEqual({ type: 'error', message: 'turn timed out (active-total clock)' });
+}, 5000);
+
+// MINOR: a poll-tick requestKill() can race a result line the readline
+// interface already delivered but this handler has not run for yet
+// (killReason gets set, resolved stays false until 'close') — the line
+// handler still processes that buffered line in full (sawResult=true, a
+// normal 'result' event already emitted) before 'close' arrives. Resolving
+// as 'timeout' in that case would contradict the result event a consumer
+// already received.
+test("a timeout kill racing a result line already read from the pipe resolves as 'result', not a spurious 'timeout'", async () => {
+  const child = makeControllableChild();
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, timeoutMs: 10, spawnFn: () => child });
+
+  // Let the clockPollTimer fire requestKill('timeout', 'active-total')
+  // BEFORE the result line is even written — the exact race this test targets.
+  await new Promise((resolve) => setTimeout(resolve, 260)); // > CLOCK_POLL_INTERVAL_MS
+  writeLine(child, RESULT_LINE);
+  await new Promise((resolve) => setTimeout(resolve, 20)); // let the line handler process it before 'close'
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.stopReason).toBe('result');
+  expect(result.timeoutClock).toBeUndefined();
+  expect(child.killed).toBe(true); // the timeout kill still happened — it just didn't win the stopReason
+});
+
+// MINOR: an orphaned/duplicate tool_result (no matching open tool-start —
+// same failure class the pendingApprovals dedup above already guards
+// against for control_requests, just on the tool_result side) must not be
+// mistaken for closing a DIFFERENT, still genuinely-running tool's own
+// lease. idleMs is deliberately tiny here: under the old id-agnostic
+// counting, the orphaned tool-end alone closed the lease and handed the
+// turn to idle, which then killed it well within this test's own window.
+test('an orphaned/duplicate tool-end (no matching open tool-start) does not close a different, still-genuinely-running tool\'s lease', async () => {
+  const child = makeControllableChild();
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, idleMs: 100, toolLeaseMs: 10_000, spawnFn: () => child });
+
+  writeLine(child, { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_real', name: 'Bash', input: {} }] } });
+  writeLine(child, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_orphan', content: 'stray' }] } });
+  await new Promise((resolve) => setTimeout(resolve, 300)); // > CLOCK_POLL_INTERVAL_MS and > idleMs, well under toolLeaseMs
+  writeLine(child, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_real', content: 'done' }] } });
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'
+}, 5000);
+
+// IMPORTANT: an oversized (>MAX_LINE_BYTES) line desyncs the clocks' own
+// bookkeeping exactly as much as an oversized can_use_tool request desyncs
+// the approval channel (the existing test above this section) — the
+// size-guard's compensation covers all three affected line shapes.
+// Direction 1: a dropped tool_result must still close its own tool-lease —
+// otherwise it stays open forever and eventually kills an actively-working
+// turn. toolLeaseMs is deliberately tiny; if the lease leaks, tool-lease
+// fires well within this test's own window regardless of activity.
+test('a dropped (>8MB) tool_result line still closes its tool-lease via the size-guard\'s compensation, not left open forever', async () => {
+  const child = makeControllableChild();
+  const hugeContent = 'x'.repeat(9 * 1024 * 1024);
+  const hugeLine = JSON.stringify({
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_big', content: hugeContent }] },
+  });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, toolLeaseMs: 200, spawnFn: () => child });
+
+  writeLine(child, { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_big', name: 'Read', input: {} }] } });
+  child.stdout.write(`${hugeLine}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 300)); // > CLOCK_POLL_INTERVAL_MS and > toolLeaseMs — only survives if the compensation actually closed the lease
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.droppedLines).toBe(1);
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'/'tool-lease'
+}, 5000);
+
+// Direction 2: a dropped assistant/tool_use line must still count as
+// progress for idle, even though it never opens a (phantom) lease — a
+// silent build the CLI is still legitimately running must not be judged
+// solely by pre-drop information.
+test('a dropped (>8MB) assistant/tool_use line still counts as progress for idle — a drop right before the deadline is not silently missed', async () => {
+  const child = makeControllableChild();
+  const hugeInput = 'x'.repeat(9 * 1024 * 1024);
+  const hugeLine = JSON.stringify({
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 'toolu_huge', name: 'Write', input: { content: hugeInput } }] },
+  });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, idleMs: 200, spawnFn: () => child });
+
+  writeLine(child, { type: 'assistant', message: { content: [{ type: 'text', text: 'starting' }] } });
+  await new Promise((resolve) => setTimeout(resolve, 220)); // already past idleMs since the LAST successfully mapped event
+  child.stdout.write(`${hugeLine}\n`); // the drop itself must still count as progress, or the next poll (t~250) kills the turn on stale info
+  await new Promise((resolve) => setTimeout(resolve, 100)); // > CLOCK_POLL_INTERVAL_MS since the drop, well under idleMs since the drop
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.droppedLines).toBe(1);
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'/'idle'
+}, 5000);
+
+// Direction 3 (nebenbefund gleicher Wurzel): a dropped result line must not
+// let the turn end as a misleadingly generic 'timeout' — costUsd/usage are
+// genuinely unrecoverable, but the CLI's own eventual exit still resolves
+// the turn normally.
+test('a dropped (>8MB) result line still ends the turn via endStdin() and the normal close path, not via a misleading timeout', async () => {
+  const child = makeControllableChild();
+  const hugeResultText = 'x'.repeat(9 * 1024 * 1024);
+  const hugeLine = JSON.stringify({ type: 'result', session_id: 's1', total_cost_usd: 0.01, usage: {}, is_error: false, result: hugeResultText });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, timeoutMs: 100, spawnFn: () => child });
+
+  child.stdout.write(`${hugeLine}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.droppedLines).toBe(1);
+  expect(result.stopReason).not.toBe('timeout'); // the drop itself must not be misclassified as a clock timeout
+  expect(result.warnings.some((w) => w.includes('result'))).toBe(true);
 }, 5000);
 
 // Regression test for task-6a review Important #5: `pendingApprovals` was

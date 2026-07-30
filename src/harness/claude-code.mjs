@@ -7,6 +7,7 @@ import { spawn as nodeSpawn, execFile as nodeExecFile } from 'node:child_process
 import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { KNOWN_READONLY_TOOLS } from './settings.mjs';
 import { createTurnClocks, IDLE_MS, TOOL_LEASE_MS, ACTIVE_TOTAL_MS, ABSOLUTE_MS } from './timeout.mjs';
 
@@ -108,15 +109,18 @@ const DEFAULT_KILL_GRACE_MS = 3000;
  * cannot reach it) its descendants. `child.kill()` (SIGTERM, mapped to
  * TerminateProcess on Windows) only ever terminates the immediate process —
  * if the CLI itself shells out to Bash/etc., those grandchildren survive a
- * plain kill() and keep running detached. `detached` stays false (see
- * startTurn()'s spawn call), so there is no process-group leader to signal
- * as a whole; the two platform-specific fallbacks below are how we still
- * reach the tree:
+ * plain kill() and keep running. The two platform-specific fallbacks below
+ * are how we still reach the tree:
  *   - Windows: `taskkill /T /F` walks the process tree by PID.
- *   - POSIX: `process.kill(-pid)` targets the process GROUP id. Without
- *     `detached: true` the child was never made its own group leader, so
- *     this call is expected to fail (ESRCH) in the common case — it is kept
- *     as a harmless best-effort extra, not the primary kill path.
+ *   - POSIX: `process.kill(-pid)` targets the process GROUP id. startTurn()'s
+ *     spawn call sets `detached: true` on non-win32 SPECIFICALLY so this
+ *     targets a real group (the child becomes its own group leader, and a
+ *     shelled-out grandchild inherits that group) — panel review Fix-Runde
+ *     2, minor: before that, this call was DOCUMENTED as expected to fail
+ *     (ESRCH) in the common case, meaning a hung CLI's own tool-call
+ *     subprocess tree outlived every one of the four clocks that exist
+ *     specifically to end it; only the TURN's own resolution (orphaned:true)
+ *     was actually bounded, not the process itself.
  * Errors from either fallback are swallowed: this function's whole purpose
  * is "try harder", never to throw into the caller.
  */
@@ -138,10 +142,34 @@ function killChildTree(child) {
     }
   } else {
     try {
-      process.kill(-child.pid);
+      process.kill(-child.pid, 'SIGTERM');
     } catch {
-      // no process group under this pid (detached:false), or already gone
+      // no process group under this pid, or already gone
     }
+  }
+}
+
+/**
+ * Escalation for killChildTree(): called only once killGraceMs has already
+ * elapsed without a 'close' event, i.e. a plain SIGTERM (killChildTree()'s
+ * job) evidently was not enough — sends SIGKILL instead, group-wide on
+ * POSIX (same `detached: true` premise as killChildTree()'s own doc
+ * comment). The win32 branch is a no-op: `taskkill /T /F` (already run by
+ * killChildTree()) is unconditionally forceful, there is no softer-then-
+ * harder escalation to make on that platform. Same best-effort contract as
+ * killChildTree(): never throws into the caller.
+ */
+function killChildTreeHard(child) {
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // already exited — nothing to kill
+  }
+  if (!child.pid || process.platform === 'win32') return;
+  try {
+    process.kill(-child.pid, 'SIGKILL');
+  } catch {
+    // no process group under this pid, or already gone
   }
 }
 
@@ -381,6 +409,15 @@ export async function startTurn({
       // environments where COMSPEC cannot be resolved (e.g. some MSYS shells).
       shell: useShell,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // POSIX only (panel review Fix-Runde 2, minor) — makes the child its
+      // own process-group leader, which is what turns killChildTree()'s
+      // `process.kill(-child.pid)` from an expected-to-fail best-effort
+      // extra into the primary way a hung Bash/etc. grandchild the CLI
+      // shelled out to actually gets reached. `stdio` stays 'pipe' either
+      // way — `detached` only affects process-group membership, not stream
+      // inheritance. Left false on win32: taskkill /T /F (killChildTree()'s
+      // existing Windows path) already walks the tree by PID without it.
+      detached: process.platform !== 'win32',
     });
   } catch (err) {
     onEvent?.({ type: 'error', message: err.message });
@@ -416,12 +453,32 @@ export async function startTurn({
     // TurnResult.timeoutClock doc comment.
     let timeoutClock = null;
     let killGiveUpTimer = null;
+    // Give-up timer for the sawResult -> 'close' gap specifically — see
+    // armResultCloseGrace()'s own doc comment below for why this exists as
+    // a SEPARATE mechanism from killGiveUpTimer (that one only ever runs
+    // after requestKill(), which a well-behaved-but-hung-grandchild turn
+    // never reaches).
+    let resultCloseGraceTimer = null;
     // The four-clock turn-timeout model (task-2) — see timeout.mjs's
     // createTurnClocks() for the actual logic; this harness only feeds it
     // progress/approval events and polls check(), it owns no time math of
     // its own anymore (that used to live here as pauseTimeoutTimer()/
     // startTimeoutTimer(), now gone).
-    const clocks = createTurnClocks({ idleMs, toolLeaseMs, activeTotalMs: timeoutMs, absoluteMs: absoluteTimeoutMs, nowFn: Date.now });
+    //
+    // nowFn: performance.now() (monotonic, node:perf_hooks), NOT Date.now()
+    // (panel review Fix-Runde 2, minor) — Date.now() is a wall clock: an
+    // NTP step or manual correction can jump it, forward (instantly
+    // inflating every clock's elapsed time — killing an actively-working
+    // turn) or backward (handing every clock free extra budget, repeatedly
+    // for a host with a badly drifting clock). A long unattended Task-3
+    // overnight run is exactly the kind of multi-hour window such a step is
+    // likely to fall inside. Deliberate, documented trade-off: a monotonic
+    // clock does NOT advance during OS suspend on some platforms, so a
+    // suspended host pauses `absolute` too, same as it pauses the other
+    // three — accepted rather than giving `absolute` its own, second nowFn
+    // (which createTurnClocks() does not currently support and would be a
+    // larger interface change for a minor finding).
+    const clocks = createTurnClocks({ idleMs, toolLeaseMs, activeTotalMs: timeoutMs, absoluteMs: absoluteTimeoutMs, nowFn: () => performance.now() });
     // check()'d once per normalized event below AND from this interval — an
     // event-only check would never fire for a turn that produces NO
     // stream-json lines at all (e.g. a long-running `Bash` build mid tool
@@ -444,6 +501,14 @@ export async function startTurn({
       if (hit) requestKill('timeout', hit.clock);
     };
     const clockPollTimer = setInterval(evaluateClocks, CLOCK_POLL_INTERVAL_MS);
+    // Tool_use ids this harness itself has seen a tool-start for and not yet
+    // seen a matching tool-end for — panel review Fix-Runde 2, minor: a
+    // duplicated or orphaned tool_result (same failure class the
+    // pendingApprovals dedup below already guards against for
+    // control_requests) must not be allowed to close a DIFFERENT, still
+    // genuinely-running tool's lease — see the tool-end handling in the
+    // line handler below.
+    const openToolUseIds = new Set();
     // Number of can_use_tool requests currently awaiting a decision — the
     // clocks' approval-wait exemption is started/ended only on the 0->1/1->0
     // transition (see handleApprovalRequest()) so a SECOND, still-pending
@@ -511,8 +576,10 @@ export async function startTurn({
       pendingApprovalCount += 1;
       // Start the clocks' approval-wait exemption the MOMENT the first
       // approval becomes pending — the wait for a user decision must not
-      // count against any of the four clocks (see createTurnClocks()'s doc
-      // comment on why that now includes the absolute clock too).
+      // count against idle/tool-lease/active-total (see createTurnClocks()'s
+      // doc comment). Deliberately does NOT exempt `absolute` — that clock
+      // stays a raw wall clock on purpose (see timeout.mjs's ABSOLUTE_MS
+      // doc comment: the backstop against a CHAIN of approval round-trips).
       if (pendingApprovalCount === 1) clocks.onApprovalStart();
       safeEmit({ type: 'approval', phase: 'requested', ...request });
 
@@ -578,6 +645,7 @@ export async function startTurn({
       if (resolved) return;
       resolved = true;
       if (killGiveUpTimer) clearTimeout(killGiveUpTimer);
+      if (resultCloseGraceTimer) clearTimeout(resultCloseGraceTimer);
       clearInterval(clockPollTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
       pendingApprovals.clear();
@@ -590,6 +658,23 @@ export async function startTurn({
       finish({ sessionId: latestSessionId, costUsd, usage, stopReason: 'error', error: { message } });
     };
 
+    // Builds and applies the finish() payload for a turn that DID see a
+    // result event — shared by the normal 'close' path below and
+    // armResultCloseGrace()'s give-up path, so both agree on exactly the
+    // same stopReason/error derivation. `extra` lets the give-up path add
+    // `orphaned: true` without duplicating the rest.
+    const finishWithSeenResult = (extra = {}) => {
+      const detail = [resultSubtype, resultText].filter(Boolean).join(': ');
+      finish({
+        sessionId: latestSessionId,
+        costUsd,
+        usage,
+        stopReason: resultIsError ? 'error' : 'result',
+        error: resultIsError ? { message: `claude reported an error result${detail ? ` (${detail})` : ''}` } : null,
+        ...extra,
+      });
+    };
+
     // Requests a kill for `reason` ('aborted' | 'timeout'), tries to reach
     // the whole process tree (see killChildTree()), and gives up waiting for
     // the child's own 'close' event after killGraceMs — at that point the
@@ -600,12 +685,66 @@ export async function startTurn({
     const requestKill = (reason, clock) => {
       if (resolved || killReason) return;
       killReason = reason;
-      if (reason === 'timeout' && clock) timeoutClock = clock;
+      if (reason === 'timeout' && clock) {
+        timeoutClock = clock;
+        // Panel review Fix-Runde 2, important: without this, no
+        // NormalizedEvent ever named which clock ended the turn — a chat
+        // transcript/SSE stream showed nothing at all, and only the
+        // TurnResult (never reaching run.mjs/runs.jsonl before this fix)
+        // carried it. `resolved` is still false here, guaranteed (the guard
+        // above just returned otherwise) — reusing the existing 'error'
+        // NormalizedEvent type (not a new kind) is the minimal integration:
+        // src/orchestrator/run.mjs's handleEvent() already forwards an
+        // unrecognized/'error' type to its own onEvent via its default
+        // case, with zero further wiring needed in THIS file.
+        safeEmit({ type: 'error', message: `turn timed out (${clock} clock)` });
+      }
       killChildTree(child);
       killGiveUpTimer = setTimeout(() => {
+        killChildTreeHard(child); // panel review Fix-Runde 2, minor — escalate before giving up, see that function's own doc comment
         finish({ sessionId: latestSessionId, costUsd, usage, stopReason: reason, error: null, orphaned: true, ...(timeoutClock ? { timeoutClock } : {}) });
       }, killGraceMs);
     };
+
+    // Panel review Fix-Runde 2, CRITICAL: the sawResult guard in
+    // evaluateClocks() above fixes a real spurious-timeout race (a knee-jerk
+    // check() landing in the result->close gap), but on its own it traded a
+    // BOUNDED race for an UNBOUNDED hang if 'close' never arrives at all —
+    // e.g. the CLI's own exit is fine, but a background process it started
+    // as a side effect (a dev server left running) inherited its stdout/
+    // stderr pipe, and Node only fires 'close' once EVERY inherited stdio
+    // stream also closes, not just on process exit. Without a bound here,
+    // clockPollTimer runs into that same guard forever, killGiveUpTimer is
+    // never armed (only requestKill() does that, and requestKill() is never
+    // called), and startTurn()'s promise never settles — reproduced live
+    // against this exact harness before this fix (see task-2-report.md's
+    // Fix-Runde 2). armResultCloseGrace() is the bound: reuses killGraceMs's
+    // magnitude (not the sawResult guard's own timing) so a caller who wants
+    // fast give-up on a hung kill also gets fast give-up here, without a new
+    // startTurn() option. `child.once('exit', ...)` is registered
+    // unconditionally at spawn time (not only after a result) so an 'exit'
+    // that happens to be delivered before this function is ever called
+    // cannot leave the grace un-armed — in the OVERWHELMINGLY common case
+    // ('close' follows 'exit' within the same event-loop pass) this timer
+    // never fires at all; finish() (via the normal 'close' -> sawResult
+    // path) always clears it first.
+    let resultCloseGraceArmed = false;
+    const armResultCloseGrace = () => {
+      if (resolved || resultCloseGraceArmed) return;
+      resultCloseGraceArmed = true;
+      resultCloseGraceTimer = setTimeout(() => {
+        // reach a lingering grandchild (e.g. a dev server the CLI itself
+        // left running) even though the CLI's own exit was fine — same
+        // escalation as requestKill()'s give-up path, see killChildTreeHard()'s
+        // own doc comment.
+        killChildTree(child);
+        killChildTreeHard(child);
+        finishWithSeenResult({ orphaned: true });
+      }, killGraceMs);
+    };
+    child.once('exit', () => {
+      if (sawResult) armResultCloseGrace();
+    });
 
     const onAbort = () => requestKill('aborted');
     if (signal) signal.addEventListener('abort', onAbort);
@@ -659,6 +798,54 @@ export async function startTurn({
           } else {
             onEventErrors.push('dropped an oversized can_use_tool control_request with no readable request_id');
           }
+        }
+
+        // Panel review Fix-Runde 2, important: a dropped line desyncs the
+        // clocks' own bookkeeping exactly as much as a dropped can_use_tool
+        // request desyncs the approval channel above — it never reaches
+        // mapLine(), so it can never call clocks.onProgress(). Left
+        // uncompensated: a dropped tool_result leaves a tool-lease OPEN
+        // forever (killing an actively-working turn at TOOL_LEASE_MS
+        // instead of ACTIVE_TOTAL_MS, with a misleading timeoutClock), and a
+        // dropped result line leaves sawResult false (an actually-successful
+        // turn ends as 'timeout' or a confusing generic 'error'). `rawLine`
+        // is already fully in memory at this point — readline delivered it
+        // whole; this guard only ever prevented JSON.parse/event buffering,
+        // never the buffering readline itself already did — so a bounded
+        // string scan over the WHOLE line (not just the 4096-byte prefix
+        // above) stays memory-safe.
+        //
+        // (a) Any dropped line proves the CLI is alive and producing
+        // SOMETHING — treat it as generic progress (an idle-reset)
+        // regardless of its actual type. Harmless while a tool lease is
+        // open: idle isn't consulted then anyway (see timeout.mjs's
+        // check()).
+        clocks.onProgress('assistant-message');
+        if (prefix.includes('"type":"user"') && prefix.includes('"tool_result"')) {
+          // (b) A user line can carry SEVERAL tool_result blocks (see
+          // mapLine()'s own comment on this) — one dropped line can close
+          // MORE than one open lease; under-counting would leave one stuck
+          // open. Over-counting is harmless: timeout.mjs's open-lease count
+          // clamps at 0.
+          // No id is recoverable from a dropped line, so this compensation
+          // calls the clock directly instead of going through the
+          // id-matching gate the mapLine() path below uses (see that gate's
+          // own doc comment) — an id-less drop cannot be checked against
+          // openToolUseIds, only counted.
+          const toolResultCount = (rawLine.match(/"tool_use_id"\s*:/g) ?? []).length;
+          for (let i = 0; i < toolResultCount; i += 1) clocks.onProgress('tool-end');
+          if (toolResultCount === 0) {
+            onEventErrors.push('dropped an oversized tool_result line with no readable tool_use_id — tool-lease bookkeeping may be desynced');
+          }
+        } else if (prefix.includes('"type":"result"')) {
+          // (c) Never sets sawResult — the actual costUsd/usage/subtype are
+          // unrecoverable from a dropped line, so the turn still finishes
+          // through the normal error-on-close path below, just no longer
+          // through a MISLEADING 'timeout'. endStdin() lets a well-behaved
+          // CLI that is waiting on stdin EOF before exiting still do so (see
+          // endStdin()'s own doc comment for why that matters at all).
+          endStdin();
+          onEventErrors.push('dropped an oversized result line — costUsd/usage/subtype for this turn are unknown');
         }
         return;
       }
@@ -740,13 +927,27 @@ export async function startTurn({
             }
           }
         }
-        if (event.type === 'tool-start') clocks.onProgress('tool-start');
-        // 'tool-end' here is always mapLine()'s mapping of a real tool_result
-        // block (see mapLine()'s own doc comment) — this harness does not
-        // itself verify it matches a lease createTurnClocks currently thinks
-        // is open; timeout.mjs's own count-based tracking (see its
-        // onProgress() doc comment) tolerates that without going negative.
-        if (event.type === 'tool-end') clocks.onProgress('tool-end');
+        if (event.type === 'tool-start') {
+          openToolUseIds.add(event.id);
+          clocks.onProgress('tool-start');
+        }
+        // Panel review Fix-Runde 2, minor: only a tool-end for an id THIS
+        // harness itself opened counts as closing a lease — a duplicated or
+        // orphaned tool_result (same failure class the pendingApprovals
+        // dedup above already guards against for control_requests, just on
+        // the tool_result side) must not be allowed to prematurely close a
+        // DIFFERENT, still genuinely-running tool's lease window. Openly
+        // over-counting (id present, matches) still tolerates the count
+        // going to 0 early only when it is ACTUALLY the matching id — see
+        // timeout.mjs's own onProgress() doc comment on the open-lease
+        // COUNT itself (concurrent tool calls, unrelated to this gate).
+        if (event.type === 'tool-end') {
+          if (openToolUseIds.delete(event.id)) {
+            clocks.onProgress('tool-end');
+          } else {
+            onEventErrors.push(`ignored a tool-end for an id with no open tool-start (duplicate or orphaned tool_result): ${event.id}`);
+          }
+        }
         if (event.type === 'result') {
           clocks.onProgress('result');
           sawResult = true;
@@ -761,9 +962,13 @@ export async function startTurn({
           // comment / task-6a review Critical #1): a well-behaved CLI that
           // waits for stdin EOF before exiting would otherwise never see
           // that EOF, and this harness would wait on 'close' that never
-          // comes until DEFAULT_TIMEOUT_MS kills it — a turn that actually
-          // succeeded would incorrectly resolve as 'timeout'.
+          // comes until armResultCloseGrace()'s bound kills it — a turn
+          // that actually succeeded would incorrectly resolve as 'timeout'.
           endStdin();
+          // Bounds the sawResult -> 'close' gap — see armResultCloseGrace()'s
+          // own doc comment (defined above, near evaluateClocks()) for why
+          // this exists as a SEPARATE mechanism from the four clocks.
+          armResultCloseGrace();
         }
         safeEmit(event);
         // Checked once per normalized event, in addition to clockPollTimer
@@ -780,19 +985,24 @@ export async function startTurn({
       // still try to interpret the child's own exit and call finishError()
       // a second time once it actually closes.
       if (resolved) return;
-      if (killReason) {
+      // Panel review Fix-Runde 2, minor: a timeout-kill can race a result
+      // line that was already fully read from the pipe before requestKill()
+      // ran (killReason gets set, but resolved stays false until 'close') —
+      // the line handler above still processes that buffered line in full
+      // (sawResult=true, a normal 'result' NormalizedEvent already emitted)
+      // before this handler ever runs. Resolving as 'timeout' in that case
+      // contradicts the result-event a consumer already received; resolving
+      // as 'result' instead matches the sawResult-guard's own rationale
+      // (see evaluateClocks()'s doc comment) — a turn that already produced
+      // its result is done in every way that matters. 'aborted' always wins
+      // regardless of sawResult: an abort is an explicit caller decision,
+      // not a budget the turn merely happened to still be within.
+      if (killReason && !(sawResult && killReason === 'timeout')) {
         finish({ sessionId: latestSessionId, costUsd, usage, stopReason: killReason, error: null, ...(timeoutClock ? { timeoutClock } : {}) });
         return;
       }
       if (sawResult) {
-        const detail = [resultSubtype, resultText].filter(Boolean).join(': ');
-        finish({
-          sessionId: latestSessionId,
-          costUsd,
-          usage,
-          stopReason: resultIsError ? 'error' : 'result',
-          error: resultIsError ? { message: `claude reported an error result${detail ? ` (${detail})` : ''}` } : null,
-        });
+        finishWithSeenResult();
         return;
       }
       const detail = stderrBuf.trim();

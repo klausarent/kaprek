@@ -128,6 +128,88 @@ test('createTurnClocks: approval-wait time counts fully against the absolute clo
   // active-total' test above).
 });
 
+// Panel review Fix-Runde 2, important (finding: "the core absolute scenario
+// has no test anywhere"): the test above only ever exercises a single OPEN
+// wait, where banked pausedMs is still 0 — a mutant computing
+// `rawElapsed = now - startedAt - pausedMs` (exempting only CLOSED waits,
+// still counting the currently-open one) passes it undetected. That mutant
+// is a partial reintroduction of the exact pre-fix-round-1 defect, for the
+// case ABSOLUTE_MS's own doc comment names as the actual reason the clock
+// exists: a CHAIN of individually auto-denied (i.e. CLOSED) approval waits.
+test('createTurnClocks: a chain of individually closed approval waits still dies at absoluteMs, even though each wait on its own is fully exempt', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 10_000, activeTotalMs: 60_000, absoluteMs: 5000, nowFn: t.now });
+  for (let i = 0; i < 6; i += 1) {
+    c.onProgress('assistant-message');
+    c.onApprovalStart();
+    t.advance(900);
+    c.onApprovalEnd();
+  }
+  // raw elapsed = 6*900 = 5400ms >= absoluteMs(5000); active-total and idle
+  // both stay at 0 (every ms of it was banked, closed approval-wait time).
+  expect(c.check()).toMatchObject({ clock: 'absolute' });
+});
+
+// Panel review Fix-Runde 2, important (finding: active-total/tool-lease
+// exemption during a STILL-OPEN wait was untested at every level — every
+// existing test closes the wait via onApprovalEnd() before the decisive
+// check(), or only advances a short distance inside an open one). Mutant:
+// activeElapsed = now - startedAt - pausedMs (i.e. honoring only banked/
+// closed waits, ticking through the CURRENTLY open one) passes every
+// existing scenario; this is the distinguishing sequence.
+test('createTurnClocks: active-total stays exempt for the ENTIRE duration of a single still-open approval wait, however long', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 10_000, activeTotalMs: 5000, absoluteMs: 120_000, nowFn: t.now });
+  c.onProgress('assistant-message');
+  c.onApprovalStart();
+  t.advance(6000); // past activeTotalMs, entirely inside the still-open wait
+  expect(c.check()).toBeNull();
+});
+
+// Same finding, tool-lease side: leaseElapsed = now - toolLeaseStartedAt -
+// (pausedMs - pausedAtLeaseStart) with pausedMs (total, including the open
+// wait) instead of the banked-only amount would also pass every existing
+// scenario without this one.
+test('createTurnClocks: tool-lease stays exempt for the ENTIRE duration of a single still-open approval wait, however long', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 5000, activeTotalMs: 60_000, absoluteMs: 120_000, nowFn: t.now });
+  c.onProgress('tool-start');
+  c.onApprovalStart();
+  t.advance(6000); // past toolLeaseMs, entirely inside the still-open wait
+  expect(c.check()).toBeNull();
+});
+
+// Panel review Fix-Runde 2, minor (finding: the per-clock pause SNAPSHOT —
+// pausedAtLastProgress/pausedAtLeaseStart, subtracting only the pause time
+// since the clock's OWN reference point rather than the turn's total pause
+// to date — is unobservable by the suite). Every existing test has all
+// pause time occur AFTER the reference point, so snapshot and total pause
+// are numerically identical; a mutant subtracting the TOTAL instead of the
+// since-reference-point delta survives unnoticed. Distinguishing sequence:
+// the wait happens and CLOSES, THEN the reference point is set.
+test('createTurnClocks: idle only counts silence since its OWN last-progress reference point, not the turn\'s total approval-wait history', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 10_000, activeTotalMs: 60_000, absoluteMs: 120_000, nowFn: t.now });
+  c.onApprovalStart();
+  t.advance(60_000); // a long wait that closes BEFORE any progress resets idle's own reference point
+  c.onApprovalEnd();
+  c.onProgress('assistant-message');
+  t.advance(1500); // plain post-wait silence, well past idleMs on its own
+  expect(c.check()).toMatchObject({ clock: 'idle' });
+});
+
+// Same finding, tool-lease side.
+test('createTurnClocks: tool-lease only counts running time since its OWN open-lease reference point, not the turn\'s total approval-wait history', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 5000, activeTotalMs: 60_000, absoluteMs: 120_000, nowFn: t.now });
+  c.onApprovalStart();
+  t.advance(60_000); // a long wait that closes BEFORE the tool-lease even opens
+  c.onApprovalEnd();
+  c.onProgress('tool-start');
+  t.advance(5001); // plain post-wait running time, past toolLeaseMs on its own
+  expect(c.check()).toMatchObject({ clock: 'tool-lease' });
+});
+
 test('createTurnClocks: a non-finite or non-positive budget disables that clock entirely', () => {
   const t = fakeClock();
   const c = createTurnClocks({ idleMs: 0, toolLeaseMs: Infinity, activeTotalMs: -1, absoluteMs: Number.NaN, nowFn: t.now });
