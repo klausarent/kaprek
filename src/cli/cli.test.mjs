@@ -165,10 +165,18 @@ test('a failed startServer() releases the instance lock instead of leaving the p
     const lockPath = path.join(childDataDir, 'instance.lock');
     expect(fs.existsSync(lockPath)).toBe(false);
 
-    // What actually holds the lock is the socket, not that file (see
-    // src/lib/instance-lock.mjs), so the file being gone proves nothing on
-    // its own: the next acquire has to go through, or a failed start blocks
-    // every retry with nothing running.
+    // The file assertion above is the one that carries release(): remove the
+    // release from the catch path in bin/cli.mjs and it goes red.
+    //
+    // The re-acquire below deliberately claims less than it looks like. The
+    // child is already gone by the time collectRun() resolves, and the OS
+    // frees its handle with it — this suite proves that separately ("a pipe
+    // name is free again the moment its holder is SIGKILLed"). So this cannot
+    // detect a failure path that forgets to close the handle; after a process
+    // exit nothing can. It is an end-to-end check that a dead failed start
+    // blocks nothing, and that is all. The handle-closing case is covered
+    // where it is observable: in a live process, in instance-lock.test.mjs
+    // ("a refused start leaves the address free for whoever should have it").
     const relock = await acquireInstanceLock({ dataDir: childDataDir });
     await relock.release();
   } finally {

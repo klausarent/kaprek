@@ -9,7 +9,12 @@ import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
-import { acquireInstanceLock, InstanceLockHeldError } from '../src/lib/instance-lock.mjs';
+import {
+  acquireInstanceLock,
+  InstanceLockHeldError,
+  LOCK_PORT_BASE,
+  LOCK_PORT_RANGE,
+} from '../src/lib/instance-lock.mjs';
 
 const USAGE = `Usage: kaprek [options]
        kaprek hooks <install|uninstall|status>
@@ -159,6 +164,22 @@ async function main() {
   const webDist = resolveWebDist();
   console.log(`Scanning: ${path.resolve(opts.dir)}`);
 
+  // The server port and the lock port come from different worlds: one is
+  // chosen by the user, the other derived from the data dir path. They can
+  // land on each other, and then this instance's own HTTP server is a silent
+  // squatter on some other data dir's lock port — that data dir then refuses
+  // to start with no visible connection to this flag. Cheap to say out loud,
+  // expensive to diagnose later. Only relevant on POSIX; Windows locks a pipe
+  // name, which has no port to collide with.
+  const lockRangeEnd = LOCK_PORT_BASE + LOCK_PORT_RANGE;
+  if (process.platform !== 'win32' && opts.port >= LOCK_PORT_BASE && opts.port < lockRangeEnd) {
+    console.error(
+      `Note: --port ${opts.port} is inside the range kaprek derives instance-lock ports from ` +
+        `(${LOCK_PORT_BASE}-${lockRangeEnd - 1}). If another data directory's lock lands on this port, ` +
+        'that other instance will refuse to start while this one runs.',
+    );
+  }
+
   // Resolved (and created) once, up front, so the lock and the server agree
   // on exactly which ~/.kaprek they mean — see src/lib/appdir.mjs.
   const dataDir = ensureAppDir();
@@ -195,9 +216,10 @@ async function main() {
     started = await startWithPortRetry(opts.port, { rootDir: opts.dir, redact: opts.redact, webDist, dataDir });
   } catch (err) {
     console.error(`Failed to start server: ${err.message}`);
-    // Otherwise a start that fails here (bad --dir, no free port at all)
-    // leaves an unreleased lock behind and blocks every retry for
-    // LOCK_STALE_MS, even though nothing is actually listening.
+    // Otherwise this process keeps holding the lock handle although no server
+    // is listening. Nothing reclaims it either: the lock lives and dies with
+    // the process (see src/lib/instance-lock.mjs), so without this the only
+    // way out would be killing a process that already gave up.
     await lock.release();
     process.exitCode = 1;
     return;

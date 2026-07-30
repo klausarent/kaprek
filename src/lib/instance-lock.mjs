@@ -22,58 +22,86 @@
 // staleness clock, no heartbeat, no takeover, and nothing to clean up. The OS
 // refuses the second bind for us.
 //
-// TWO TRANSPORTS, because the right handle differs per platform:
+// ONE DATA DIR, ONE ADDRESS, NO FALLBACK. That is the whole protocol, and the
+// reason it is this short is that the fourth round of review found three
+// separate ways to end up with two holders — and all three lived in the
+// fallback walk that existed for the rare case of somebody else sitting on
+// our address: a probe that reached a different IP stack than the holder had
+// bound, a scan that stepped over a busy holder, and a time-of-check /
+// time-of-use hole where two starters landed on different ports and neither
+// looked where the other was. Every one of them was a special path for a rare
+// case, which is the same shape as the file lease's takeover dance.
+//
+// So there is no walk. The address for a data dir is derived, and it is the
+// only address that data dir ever uses:
 //
 //   Windows -> a named pipe, `\\.\pipe\kaprek-<dataDirHash>`. libuv creates
 //   the first instance with FILE_FLAG_FIRST_PIPE_INSTANCE, so a second bind
 //   of the same name gets EADDRINUSE; the name has no port, so it cannot
 //   collide with the ephemeral range (49152-65535 on Windows) where an
-//   outbound connection's source port could otherwise sit on our lock port
-//   and keep kaprek from starting. Verified on this machine, Node 22.22.0 /
-//   libuv 1.51.0: second listen EADDRINUSE, cross-process EADDRINUSE, and the
-//   name is free again immediately after the holder is SIGKILLed.
+//   outbound connection's source port could otherwise sit on our lock port.
+//   Verified on this machine, Node 22.22.0 / libuv 1.51.0: second listen
+//   EADDRINUSE in-process and cross-process, name free again immediately
+//   after the holder is SIGKILLed, unserved name answers ENOENT.
 //
 //   POSIX -> TCP on 127.0.0.1, port derived from the data dir path inside
 //   23000-31999: above the well-known ports, below the Linux ephemeral range
 //   that starts at 32768. libuv sets SO_REUSEADDR there, which still does not
 //   let two sockets listen on one address (that would need SO_REUSEPORT,
 //   which listen() below turns off explicitly rather than trusting a
-//   default).
+//   default). NOT MEASURED ON A REAL POSIX KERNEL: the TCP path is exercised
+//   on Windows through the injectable `platform` option, and libuv does not
+//   set SO_REUSEADDR there, so those green runs do not prove the POSIX
+//   semantics. The first two tests in instance-lock.test.mjs are ungated and
+//   will produce that proof on the first Linux/macOS run. Until then this
+//   paragraph is a documented assumption, not a measurement.
 //
 // Deliberately NOT a Unix domain socket with a filesystem path: the socket
 // file survives SIGKILL, which brings staleness detection — and with it the
 // whole takeover problem — straight back. Abstract sockets would avoid that
 // but exist only on Linux.
 //
-// KNOWN LIMIT, deliberately not papered over: on Windows libuv sets neither
-// SO_REUSEADDR nor SO_EXCLUSIVEADDRUSE, and a named pipe's ACL still allows a
-// same-user process to interfere. This lock stops accidental double starts —
-// a second double-click, a second launcher, a shortcut left in Autostart. It
-// is not a defence against hostile local code, which is the same boundary the
-// instance token already lives on (src/server/token.mjs). Do not promise more
-// than that in the README.
+// WHY TWO CONCURRENT STARTS CANNOT BOTH WIN. Both contend for one address.
+// The OS grants exactly one bind, and binding IS the decision — there is no
+// second step to interleave with, and no other address either of them could
+// have taken instead. The loser's bind fails, it asks who is there, and it
+// either learns it is us (already running) or refuses to start. That property
+// is what the walk destroyed: with a fallback, "is anyone else here" becomes
+// a question about a moving set of addresses, answered at a time that is
+// already in the past by the moment anybody binds.
 //
-// WHAT AN OCCUPIED ADDRESS MEANS — four cases, and the line between them is
-// whether anything was actually said:
+// WHAT AN OCCUPIED ADDRESS MEANS — three outcomes, and the line between them
+// is whether anything was actually said:
 //
 //   1. A valid greeting naming OUR dataDirHash -> that is our own instance,
 //      already running. Report it with its pid and url.
-//   2. A valid greeting naming a DIFFERENT hash -> another kaprek whose data
-//      dir landed on the same derived port. Step aside, take the next port.
-//   3. Data arrives that is not a kaprek greeting at all -> a foreign
-//      service. This is provable because the holder writes its greeting as
-//      the very first statement of its connection handler, with nothing
-//      awaited before it: a kaprek that can talk to us at all talks kaprek.
-//      Step aside, take the next port.
-//   4. NOTHING is said — a timeout, an empty close, a reset, a half line that
+//   2. Anything else that is actually SAID — another kaprek's greeting for a
+//      different data dir, an HTTP banner, a flood of bytes. Somebody else
+//      owns the address. We do not move: refuse the start and say so.
+//   3. NOTHING is said — a timeout, an empty close, a reset, a half line that
 //      never finishes — then nothing is proven. That is also exactly what a
 //      live holder looks like while its event loop is blocked, its GC is
-//      running, or a virus scanner has it pinned. Reading it as "foreign
-//      software, move along" would hand a second lock for the same data dir
-//      to a process that is merely busy, which is the failure the file leases
-//      kept producing, reached through a new door. So case 4 is re-asked a
-//      few times on the SAME address and then refuses the start. Never a
-//      fallback.
+//      running, or a virus scanner has it pinned. Re-ask a few times on the
+//      SAME address, then refuse.
+//
+// KNOWN LIMITS, deliberately not papered over:
+//   - On Windows libuv sets neither SO_REUSEADDR nor SO_EXCLUSIVEADDRUSE, and
+//     a named pipe's ACL still allows a same-user process to interfere. Any
+//     local program can also squat the derived port or pipe name and stay
+//     silent, which blocks every start for that data dir. This lock stops
+//     accidental double starts — a second double-click, a second launcher, a
+//     shortcut left in Autostart. It is not a defence against hostile local
+//     code, which is the same boundary the instance token already lives on
+//     (src/server/token.mjs). Do not promise more than that in the README.
+//   - The pipe namespace is machine-wide, not per-user. If two Windows
+//     accounts point KAPREK_DATA_DIR at the same directory, the second one's
+//     probe can be refused by the pipe ACL (EPERM); the refusal message names
+//     that possibility rather than blaming a busy holder.
+//   - Two data dirs whose paths hash to the same port block each other on
+//     POSIX (roughly 1 in LOCK_PORT_RANGE for any given pair). The second one
+//     refuses to start and says why. That is the price of having no fallback,
+//     and the remedy is the same as for any other occupied address: use a
+//     different data directory path.
 //
 // `instance.lock` is still written, but it is DISPLAY ONLY: something for a
 // human to open when they wonder what is running. No decision about
@@ -89,10 +117,6 @@ import path from 'node:path';
 export const LOCK_PORT_BASE = 23000;
 /** Width of the derived-port space. 23000+9000 stays clear of the ephemeral ranges on both platforms. */
 export const LOCK_PORT_RANGE = 9000;
-/** How many candidate ports may be proven to belong to another data dir before we give up. */
-export const LOCK_PORT_ATTEMPTS = 20;
-/** How far the walk may reach in total, including ports the OS reserved (see EACCES in tryListen). */
-export const LOCK_PORT_WINDOW = 256;
 /** Windows lock namespace. The hash goes in the name, so there is no port to collide with. */
 export const PIPE_PREFIX = '\\\\.\\pipe\\kaprek-';
 /** Read budget for one greeting. An address that accepts but never speaks must not stall a start indefinitely. */
@@ -121,26 +145,53 @@ function urlFor(port) {
 }
 
 /**
- * The identity two starts have to agree on. `path.resolve` collapses `..`,
- * relative paths and trailing separators; Windows paths are additionally
- * lowercased because `C:\Users\x` and `c:\users\x` are the same directory
- * there and must not derive two different locks.
+ * The identity two starts have to agree on.
+ *
+ * `realpathSync.native` is what makes that agreement hold for the same
+ * physical directory reached by different names: it resolves junctions,
+ * symlinks, 8.3 short names (`C:\Users\SOMEBO~1\...`, which is what
+ * os.tmpdir() hands back on some Windows setups) and `subst` drives through
+ * the OS itself, and it returns the on-disk casing. Without it, a launcher
+ * shortcut using the short name and a session using the long one derive two
+ * different locks for one directory and both start — reproduced in review.
+ *
+ * The lowercase pass is kept for win32 on top of that, because the fallback
+ * below can still return a lexical path. It is deliberately NOT applied on
+ * darwin: the default APFS volume is case-insensitive, but case-sensitive
+ * ones exist, and realpath already reports the true on-disk casing wherever
+ * the directory exists. NFC normalization is applied everywhere, because
+ * macOS hands out NFD-encoded paths that compare unequal to the NFC spelling
+ * of the same name.
+ *
+ * The ENOENT fallback covers callers asking about a directory that does not
+ * exist yet — `lockPortFor()` as a diagnostic, mostly. In production
+ * `ensureAppDir()` (src/lib/appdir.mjs) has already created it, so the
+ * canonical form is always available on the path that matters. Any other
+ * realpath failure propagates rather than silently degrading the identity.
  */
 function normalizeDataDir(dataDir) {
   const resolved = path.resolve(dataDir);
-  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  let canonical;
+  try {
+    canonical = fsSync.realpathSync.native(resolved);
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    canonical = resolved;
+  }
+  const normalized = canonical.normalize('NFC');
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
 }
 
 function digestFor(dataDir) {
   return crypto.createHash('sha256').update(normalizeDataDir(dataDir)).digest();
 }
 
-/** The first TCP port an instance on `dataDir` tries to claim. Pure — no filesystem access. */
+/** The TCP port an instance on `dataDir` claims — the only one it ever claims. */
 export function lockPortFor(dataDir) {
   return LOCK_PORT_BASE + (digestFor(dataDir).readUInt32BE(0) % LOCK_PORT_RANGE);
 }
 
-/** The Windows pipe name an instance on `dataDir` claims. Pure — no filesystem access. */
+/** The Windows pipe name an instance on `dataDir` claims. */
 export function lockPipePathFor(dataDir) {
   return `${PIPE_PREFIX}${digestFor(dataDir).toString('hex')}`;
 }
@@ -155,29 +206,22 @@ function describeTarget(target) {
   return target.path ?? `${LOCK_HOST}:${target.port}`;
 }
 
-// The four things a probe can establish, matching the four cases in the
-// module header. OURS and FOREIGN are answers; REFUSED proves nobody is
-// listening; UNCLEAR is the absence of an answer, and it is the only one that
-// refuses the start.
+// What a probe can establish. OURS and SPOKEN are answers; REFUSED proves
+// nobody is listening; SILENT is the absence of an answer.
 const PROBE_OURS = 'ours';
-const PROBE_FOREIGN = 'foreign';
+const PROBE_SPOKEN = 'spoken';
 const PROBE_REFUSED = 'refused';
-const PROBE_UNCLEAR = 'unclear';
+const PROBE_SILENT = 'silent';
 
 /**
  * Binds `server` to `target`, or reports why not.
  *
  * EADDRINUSE means someone is there and we get to ask who. EACCES usually
  * means the OS reserved the address and nobody may bind it: Windows hands
- * whole blocks of the dynamic port range to Hyper-V/WinNAT (`netsh int ipv4
- * show excludedportrange protocol=tcp` listed five such blocks, up to 100
- * ports wide, on the machine this was built on — all above 47000, so outside
- * the range used here, but the derived range is not guaranteed clear of them
- * on every machine). Such a port is neither free nor held, so the walk steps
- * over it without spending one of the LOCK_PORT_ATTEMPTS — but only after a
- * probe confirms nothing is listening there, since EACCES can also come from
- * a foreign socket bound with SO_EXCLUSIVEADDRUSE. Anything else is
- * unexpected and propagates: refusing to start beats guessing.
+ * whole blocks of the dynamic port range to Hyper-V/WinNAT, and hardened
+ * POSIX systems can raise `ip_unprivileged_port_start` or refuse binds by
+ * policy. Anything else is unexpected and propagates: refusing to start beats
+ * guessing.
  */
 function tryListen(server, target) {
   return new Promise((resolve, reject) => {
@@ -202,47 +246,57 @@ function tryListen(server, target) {
   });
 }
 
-const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
+// Not unref'd, and that is load-bearing. An unref'd timer here empties the
+// event loop while a start is still deciding: the lock server is unref'd, the
+// probe sockets are gone, and bin/cli.mjs's main() is a floating promise — so
+// the process exited 0 with no output instead of finishing its attempts and
+// refusing loudly. A silent, success-looking death is not fail-closed. This
+// timer only ever runs inside an in-flight acquire, so keeping it referenced
+// cannot hold a process open any longer than the acquire itself.
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Classifies something that was actually said (cases 1-3 in the module
- * header). Only a greeting naming our own hash is OURS; everything else that
- * arrived as data belongs to somebody else, whether it is another kaprek's
- * greeting or an HTTP banner.
+ * Classifies something that was actually said. Only a greeting naming our own
+ * hash is OURS; everything else that arrived as data belongs to somebody
+ * else, whether it is another kaprek's greeting or an HTTP banner.
  *
- * Callers must not route silence through here — "no bytes at all" is case 4
- * and stays UNCLEAR.
+ * Callers must not route silence through here — "no bytes at all" proves
+ * nothing and stays SILENT.
  */
 function classifySpokenData(raw, dataDirHash) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { kind: PROBE_FOREIGN };
+    return { kind: PROBE_SPOKEN };
   }
   if (!parsed || parsed.kaprek !== 1 || typeof parsed.dataDirHash !== 'string') {
-    return { kind: PROBE_FOREIGN };
+    return { kind: PROBE_SPOKEN };
   }
-  if (parsed.dataDirHash !== dataDirHash) return { kind: PROBE_FOREIGN };
+  if (parsed.dataDirHash !== dataDirHash) return { kind: PROBE_SPOKEN, otherDataDir: true };
   return { kind: PROBE_OURS, pid: parsed.pid, url: typeof parsed.url === 'string' ? parsed.url : null };
 }
 
 /**
  * Asks whoever holds `target` who they are, once.
  *
+ * The host is pinned to LOCK_HOST for TCP rather than left to Node's default.
+ * `net.connect({ port })` defaults to 'localhost', which resolves to ::1
+ * first on Windows and on RFC-6724-sorting glibc alike — so the probe would
+ * interview whatever sits on [::1]:port while the holder is bound to
+ * 127.0.0.1:port. Review reproduced exactly that: a healthy holder read as a
+ * stranger because an unrelated IPv6-only dev server answered instead.
+ *
  * ECONNREFUSED (TCP) and ENOENT (pipe) are the one negative answer that
  * proves something rather than merely failing to prove anything: nothing is
- * listening. That is what an OS-reserved port answers, and the walk relies on
- * it to step over reserved blocks.
- *
- * A line that arrives complete, or a peer that says something and then closes
- * cleanly, is a statement and gets classified. A timeout is not, even with
- * half a line in the buffer: an answer we cut off mid-sentence is not
+ * listening. A line that arrives complete, or a peer that says something and
+ * then closes cleanly, is a statement and gets classified. A timeout is not,
+ * even with half a line buffered: an answer cut off mid-sentence is no
  * evidence about who is speaking.
  */
 function probeOnce(target, dataDirHash, timeoutMs) {
   return new Promise((resolve) => {
-    const socket = net.connect(target);
+    const socket = net.connect(target.path ? target : { ...target, host: LOCK_HOST });
     socket.setEncoding('utf8');
     let buffer = '';
     let settled = false;
@@ -254,7 +308,7 @@ function probeOnce(target, dataDirHash, timeoutMs) {
       socket.destroy();
       resolve(value);
     };
-    const timer = setTimeout(() => finish({ kind: PROBE_UNCLEAR }), timeoutMs);
+    const timer = setTimeout(() => finish({ kind: PROBE_SILENT }), timeoutMs);
     timer.unref();
 
     socket.on('data', (chunk) => {
@@ -263,26 +317,27 @@ function probeOnce(target, dataDirHash, timeoutMs) {
       if (newline !== -1) finish(classifySpokenData(buffer.slice(0, newline), dataDirHash));
       // Our greeting is one short line. Anything still talking past this is a
       // service with something else to say.
-      else if (buffer.length > MAX_GREETING_BYTES) finish({ kind: PROBE_FOREIGN });
+      else if (buffer.length > MAX_GREETING_BYTES) finish({ kind: PROBE_SPOKEN });
     });
-    // A peer that closed after writing its line without a trailing newline
-    // still gave us everything it had. An empty close said nothing at all.
     socket.on('end', () => {
-      finish(buffer.length > 0 ? classifySpokenData(buffer, dataDirHash) : { kind: PROBE_UNCLEAR });
+      finish(buffer.length > 0 ? classifySpokenData(buffer, dataDirHash) : { kind: PROBE_SILENT });
     });
     socket.on('error', (err) => {
       const nothingThere = err.code === 'ECONNREFUSED' || err.code === 'ENOENT';
-      finish({ kind: nothingThere ? PROBE_REFUSED : PROBE_UNCLEAR });
+      // EPERM/EACCES on connect: the address exists but this account may not
+      // talk to it — see the multi-user note in the module header. The code is
+      // carried through so the refusal can name the real reason.
+      finish({ kind: nothingThere ? PROBE_REFUSED : PROBE_SILENT, code: err.code });
     });
-    socket.on('close', () => finish({ kind: PROBE_UNCLEAR }));
+    socket.on('close', () => finish({ kind: PROBE_SILENT }));
   });
 }
 
 /**
  * Acquires the single-instance lock for `dataDir`, throwing
- * InstanceLockHeldError if another kaprek already holds it. `dataDir` must
+ * InstanceLockHeldError if another kaprek already holds it. `dataDir` should
  * already exist (see src/lib/appdir.mjs) — this module neither resolves nor
- * creates it, it only normalizes the path for hashing.
+ * creates it, it only canonicalizes the path for hashing.
  *
  * `port` may be undefined at call time: bin/cli.mjs acquires the lock before
  * it knows which port startWithPortRetry() will land on, then calls
@@ -304,8 +359,11 @@ export async function acquireInstanceLock({
   const dataDirHash = digest.toString('hex');
   const lockPath = path.join(dataDir, LOCK_FILE);
   const startedAt = Date.now();
+  const target = usesPipe(platform)
+    ? { path: `${PIPE_PREFIX}${dataDirHash}` }
+    : { port: LOCK_PORT_BASE + (digest.readUInt32BE(0) % LOCK_PORT_RANGE) };
+  const address = describeTarget(target);
   let currentPort = port;
-  let boundTarget;
   let released = false;
 
   const sockets = new Set();
@@ -335,121 +393,80 @@ export async function acquireInstanceLock({
     return new Promise((resolve) => server.close(() => resolve()));
   }
 
+  function refuse(reason) {
+    return new Error(
+      `Refusing to start: ${address} is the instance lock for this data directory, and ${reason} ` +
+        'Starting a second kaprek on the same data directory would corrupt its state, so this start is ' +
+        'refused rather than moved elsewhere. Stop whatever holds the address, or start kaprek against ' +
+        'a different data directory.',
+    );
+  }
+
   /**
-   * Settles one lock address: bound, proven to belong to another data dir,
-   * reserved by the OS, or — when it stays unclear across GREETING_ATTEMPTS —
-   * a refusal to start.
+   * Claims the one address for this data dir, or explains why it could not.
    *
    * The retry re-runs listen() as well as the probe, which is what makes the
-   * one genuinely transient case self-heal: a holder that exits between our
-   * failed bind and our probe leaves EADDRINUSE followed by
-   * ECONNREFUSED/ENOENT, and the next round simply binds the address.
+   * transient cases self-heal: a holder that exits between our failed bind
+   * and our probe leaves EADDRINUSE followed by ECONNREFUSED/ENOENT, and the
+   * next round simply binds. REFUSED has its own budget for that reason —
+   * counting it against the silence budget would turn "the holder shut down
+   * while we were asking" into a refusal on an address that is free.
    */
-  async function claimTarget(target) {
-    for (let attempt = 1; attempt <= GREETING_ATTEMPTS; attempt += 1) {
+  async function claim() {
+    let silentRounds = 0;
+    let refusedRounds = 0;
+
+    while (refusedRounds < GREETING_ATTEMPTS) {
       const failure = await tryListen(server, target);
-      if (failure === null) return 'bound';
+      if (failure === null) return;
 
       const answer = await probeOnce(target, dataDirHash, greetingTimeoutMs);
+
       if (answer.kind === PROBE_OURS) throw new InstanceLockHeldError(answer);
-      if (answer.kind === PROBE_FOREIGN) return 'foreign';
-      // Nothing is listening and nobody may bind it: an OS-reserved address
-      // (see tryListen). Decisive, so no retry — and it cannot be hiding a
-      // kaprek, because a listening holder produces EADDRINUSE, not EACCES.
-      if (answer.kind === PROBE_REFUSED && failure === 'EACCES') return 'reserved';
 
-      if (attempt < GREETING_ATTEMPTS) await delay(GREETING_RETRY_DELAY_MS);
-    }
-    throw new Error(
-      `Refusing to start: something holds ${describeTarget(target)}, the instance lock for this data ` +
-        `directory, but did not answer with a valid kaprek greeting in ${GREETING_ATTEMPTS} attempts. ` +
-        'That is also what a running kaprek looks like while it is blocked or overloaded, and starting ' +
-        'a second one on the same data directory would corrupt its state. Stop whatever holds it, or ' +
-        'start kaprek against a different data directory.',
-    );
-  }
+      if (answer.kind === PROBE_SPOKEN) {
+        throw refuse(
+          answer.otherDataDir
+            ? 'another kaprek instance running on a different data directory answers there (two data ' +
+              'directory paths can derive the same port).'
+            : 'a program that is not kaprek answers there.',
+        );
+      }
 
-  /**
-   * Looks for a kaprek on OUR dataDir sitting ABOVE the port we just bound.
-   *
-   * It can happen: a kaprek on a different data dir held the base port when
-   * the first instance started, that instance settled on base+1, and by the
-   * time the second start runs the other one is gone. Without this scan the
-   * second start would bind the now-free base port and cheerfully run as a
-   * second instance on the same data dir — the exact failure this module
-   * exists to prevent, reached through the fallback that exists to avoid a
-   * false "already running". Ports below ours cannot hold one: the walk
-   * already asked each of them.
-   *
-   * Best-effort on purpose, and this is the one place that is: an unclear
-   * answer here is ignored rather than refusing the start. These are ports we
-   * have no claim to, up to 20 of them on every single start, so letting any
-   * slow-to-speak program on the machine block kaprek would trade a rare
-   * failure for a frequent one. The fail-closed rule belongs on the walk,
-   * where the address is actually ours to claim.
-   */
-  async function findHolderAbove(basePort, fromIndex) {
-    const candidates = [];
-    for (let i = fromIndex + 1; i <= fromIndex + LOCK_PORT_ATTEMPTS && i < LOCK_PORT_WINDOW; i += 1) {
-      candidates.push({ port: basePort + i });
-    }
-    // In parallel: on a healthy machine every one of these is a closed port
-    // answering ECONNREFUSED in well under a millisecond, and the start path
-    // should not pay for them one at a time.
-    const answers = await Promise.all(
-      candidates.map((candidate) => probeOnce(candidate, dataDirHash, greetingTimeoutMs)),
-    );
-    return answers.find((answer) => answer.kind === PROBE_OURS) ?? null;
-  }
-
-  /** The Windows path: one name, no fallback, because the name already carries the hash. */
-  async function claimPipe() {
-    const target = { path: lockPipePathFor(dataDir) };
-    const outcome = await claimTarget(target);
-    if (outcome === 'bound') return target;
-    // 'foreign' means a valid kaprek greeting naming a different data dir
-    // arrived on a name that is derived from OUR hash, and 'reserved' means
-    // the OS handed the name out to someone else. Neither is a state to walk
-    // around: there is no second name to try.
-    throw new Error(
-      `Refusing to start: ${describeTarget(target)} is held by something that is not this data ` +
-        "directory's kaprek. Stop whatever holds it, or start kaprek against a different data directory.",
-    );
-  }
-
-  /** The POSIX path: walk upward from the derived port. */
-  async function claimPort() {
-    const basePort = lockPortFor(dataDir);
-    let spokenFor = 0;
-
-    for (let index = 0; index < LOCK_PORT_WINDOW; index += 1) {
-      if (spokenFor >= LOCK_PORT_ATTEMPTS) break;
-      const target = { port: basePort + index };
-      const outcome = await claimTarget(target);
-
-      if (outcome === 'reserved') continue;
-      if (outcome === 'foreign') {
-        spokenFor += 1;
+      if (answer.kind === PROBE_REFUSED) {
+        // Nothing is listening. With EACCES that is the OS holding the
+        // address against everyone; without it, the holder went away between
+        // our bind attempt and our question, so try to bind again.
+        if (failure === 'EACCES') {
+          throw refuse('the operating system has reserved that address, so no process may bind it.');
+        }
+        refusedRounds += 1;
+        await delay(GREETING_RETRY_DELAY_MS);
         continue;
       }
 
-      const holderAbove = await findHolderAbove(basePort, index);
-      if (holderAbove) throw new InstanceLockHeldError(holderAbove);
-      return target;
+      silentRounds += 1;
+      if (silentRounds >= GREETING_ATTEMPTS) {
+        throw refuse(
+          answer.code === 'EPERM' || answer.code === 'EACCES'
+            ? 'something holds it that this user account may not talk to — most likely another account ' +
+              'on this machine running kaprek against the same data directory.'
+            : `something holds it that did not answer in ${GREETING_ATTEMPTS} attempts. That is what a ` +
+              'running kaprek looks like while it is blocked or overloaded, and also what another ' +
+              "kaprek's own HTTP server looks like if it was started with --port set to this port.",
+        );
+      }
+      await delay(GREETING_RETRY_DELAY_MS);
     }
 
-    throw new Error(
-      `Could not claim the kaprek instance lock: ${LOCK_PORT_ATTEMPTS} candidate ports from ` +
-        `${basePort} upwards are all answered by other software or by kaprek instances running on ` +
-        'other data directories. Stop one of them, or start kaprek against a different data directory.',
-    );
+    throw refuse('it kept flipping between occupied and free while we were asking.');
   }
 
   try {
-    boundTarget = usesPipe(platform) ? await claimPipe() : await claimPort();
+    await claim();
   } catch (err) {
-    // Covers every exit above, including the one where findHolderAbove()
-    // rejects us after our own bind already succeeded.
+    // Covers every exit above. Nothing here binds and then throws today, but
+    // a start that refuses must never leave the address claimed either way.
     await shutdownServer();
     throw err;
   }
@@ -470,7 +487,7 @@ export async function acquireInstanceLock({
       pid: process.pid,
       port: currentPort ?? null,
       url: urlFor(currentPort),
-      lockAddress: describeTarget(boundTarget),
+      lockAddress: address,
       startedAt,
       note: 'display only; exclusivity is held by the lockAddress handle, see src/lib/instance-lock.mjs',
     };
@@ -481,9 +498,9 @@ export async function acquireInstanceLock({
 
   return {
     /** The TCP port actually claimed, or null on the pipe transport. Diagnostics only. */
-    lockPort: boundTarget.port ?? null,
+    lockPort: target.port ?? null,
     /** Human-readable form of whatever handle is held. Diagnostics only, never a decision. */
-    lockAddress: describeTarget(boundTarget),
+    lockAddress: address,
 
     /** Records the real server port, which is what the greeting reports from here on. */
     async updatePort(newPort) {

@@ -128,10 +128,17 @@ test('the instance lock only ever talks to 127.0.0.1', () => {
   const content = fs.readFileSync(ALLOWED_LOOPBACK_CONNECT_FILE, 'utf8');
   const addresses = [...content.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)].map((match) => match[0]);
   expect([...new Set(addresses)]).toEqual(['127.0.0.1']);
-  expect(content).not.toMatch(/localhost/i);
-  // A quoted `::`/`::1` would be an IPv6 host argument. Bare `::` also shows
-  // up in prose (`cli.mjs::startWithPortRetry`), hence the quote.
-  expect(content).not.toMatch(/['"]::/);
+
+  // Every host this module names, named once. Grepping for the word
+  // "localhost" would hit the module's own explanation of why it must never
+  // let the host default to it (that default resolves to ::1 first, and a
+  // probe that interviews the wrong IP stack reported a healthy holder as a
+  // stranger). So pin the values instead of the prose: every `host:` must be
+  // the one constant, and that constant must be loopback.
+  expect(content).toMatch(/const LOCK_HOST = '127\.0\.0\.1';/);
+  const hosts = [...content.matchAll(/\bhost:\s*([^,\s}]+)/g)].map((match) => match[1]);
+  expect(hosts.length).toBeGreaterThan(0);
+  expect([...new Set(hosts)]).toEqual(['LOCK_HOST']);
 });
 
 test('root package.json declares no runtime dependencies', () => {

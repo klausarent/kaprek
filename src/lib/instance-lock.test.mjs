@@ -9,10 +9,8 @@ import {
   acquireInstanceLock,
   InstanceLockHeldError,
   GREETING_ATTEMPTS,
-  LOCK_PORT_ATTEMPTS,
   LOCK_PORT_BASE,
   LOCK_PORT_RANGE,
-  LOCK_PORT_WINDOW,
   MAX_GREETING_BYTES,
   PIPE_PREFIX,
   lockPipePathFor,
@@ -68,13 +66,17 @@ async function acquire(dataDir, opts = {}) {
   return lock;
 }
 
+function listenTarget(target) {
+  return typeof target === 'string' ? { path: target } : { host: '127.0.0.1', ...target };
+}
+
 /**
- * `target` is either a pipe name or `{ port }`.
+ * `target` is either a pipe name or `{ port }` (plus an optional host).
  *
  * The host goes INSIDE the options object: `listen({ port }, '127.0.0.1', cb)`
  * silently drops the host and binds the wildcard, and a wildcard bind does not
  * conflict with a 127.0.0.1 bind on Windows — which quietly turned several of
- * these tests into no-ops until they were caught.
+ * these tests into no-ops until it was caught.
  */
 function listenOnce(target) {
   return new Promise((resolve, reject) => {
@@ -82,10 +84,6 @@ function listenOnce(target) {
     server.once('error', reject);
     server.listen(listenTarget(target), () => resolve(server));
   });
-}
-
-function listenTarget(target) {
-  return typeof target === 'string' ? { path: target } : { ...target, host: '127.0.0.1' };
 }
 
 function closeServer(server) {
@@ -104,22 +102,17 @@ async function isBindable(target) {
 }
 
 /**
- * A temp data dir whose first `count` candidate ports are genuinely free.
+ * A temp data dir whose derived port is genuinely free.
  *
- * An OS can reserve blocks inside the derived range (see the module header),
- * and a busy machine may simply have something on the port a random temp name
- * derives. Retrying with a different name is cheaper and more honest than
- * teaching every test about that.
+ * There is no fallback port any more, so a busy machine (or an OS-reserved
+ * block) would otherwise make a test fail for a reason it is not about.
  */
-async function tmpDataDirWithFreePorts(count = 2) {
+async function tmpDataDirWithFreePort() {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const dir = await tmpDataDir();
-    const base = lockPortFor(dir);
-    const ports = Array.from({ length: count }, (_, i) => ({ port: base + i }));
-    const free = await Promise.all(ports.map(isBindable));
-    if (free.every(Boolean)) return dir;
+    if (await isBindable({ port: lockPortFor(dir) })) return dir;
   }
-  throw new Error('could not find a temp data dir with free candidate ports');
+  throw new Error('could not find a temp data dir with a free derived port');
 }
 
 /** Binds a server that is NOT kaprek, to stand in for whatever else may hold the address. */
@@ -173,6 +166,26 @@ function spawnChild(source) {
       clearTimeout(timer);
       reject(new Error(`child exited with ${code} before reporting ready. stderr: ${stderr}`));
     });
+  });
+}
+
+/** Runs a child to completion and collects its exit code and streams. */
+function runChild(source) {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  children.push(child);
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('exit', (code) => resolve({ code, stdout, stderr }));
   });
 }
 
@@ -312,6 +325,26 @@ for (const transport of TRANSPORTS) {
     expect(message.pid).not.toBe(process.pid);
   });
 
+  test(on('concurrent acquires on one dataDir: exactly one wins, the rest are told who holds it'), async () => {
+    const dataDir = await tmpDataDir();
+    // There is one address and binding it is the decision, so there is no
+    // interleaving to lose: whoever the OS grants the bind to is the holder,
+    // and the others find that holder at the only place it can be. The
+    // review's two-starter race lived entirely in the fallback walk, where
+    // the losers landed on a different port and never looked back down.
+    const results = await Promise.allSettled(
+      Array.from({ length: 5 }, (_, i) =>
+        acquireInstanceLock({ dataDir, port: 5000 + i, platform, greetingTimeoutMs: FAST_GREETING_MS }),
+      ),
+    );
+    const won = results.filter((r) => r.status === 'fulfilled');
+    expect(won).toHaveLength(1);
+    for (const lost of results.filter((r) => r.status === 'rejected')) {
+      expect(lost.reason).toBeInstanceOf(InstanceLockHeldError);
+    }
+    await won[0].value.release();
+  });
+
   test(on('after release() the next acquire succeeds immediately, with no waiting period'), async () => {
     const dataDir = await tmpDataDir();
     const first = await acquire(dataDir, { port: 4711, platform });
@@ -342,17 +375,14 @@ for (const transport of TRANSPORTS) {
   test(on('a live but jammed holder is never bypassed — the second start refuses'), async () => {
     const dataDir = await tmpDataDir();
     // The regression this guards: a holder whose event loop is blocked looks
-    // exactly like an unresponsive stranger. Reading that as "foreign
-    // software, move to the next port" would put two kaprek instances on one
-    // data dir, which is the whole failure this module exists to prevent.
+    // exactly like an unresponsive stranger. Reading that as "somebody else,
+    // move along" would put two kaprek instances on one data dir.
     const { message } = await spawnChild(jammedHolderSource(dataDir, 4611, platform, 5000));
     // The child reports ready, then jams on a short timer. Waiting past that
     // timer is what makes this test about a jammed holder rather than a race
     // with one that is still answering.
     await new Promise((resolve) => setTimeout(resolve, 200));
-    await expect(acquire(dataDir, { port: 4612, platform })).rejects.toThrow(
-      /did not answer with a valid kaprek greeting|is held by something that is not/i,
-    );
+    await expect(acquire(dataDir, { port: 4612, platform })).rejects.toThrow(/Refusing to start/);
     if (transport === TCP) {
       // And it did not quietly settle one port over.
       expect(await isBindable({ port: message.lockPort + 1 })).toBe(true);
@@ -405,167 +435,183 @@ for (const transport of TRANSPORTS) {
     await acquire(dataDir, { port: 4711, platform });
     await expect(acquire(dataDir, { port: 4712, platform })).rejects.toBeInstanceOf(InstanceLockHeldError);
   });
+
+  test(on('a refused start leaves the address free for whoever should have it'), async () => {
+    const dataDir = await tmpDataDir();
+    const target = transport === PIPE ? lockPipePathFor(dataDir) : { port: lockPortFor(dataDir) };
+    const squatter = await listenForeign(target, () => {});
+    await expect(acquire(dataDir, { port: 4711, platform })).rejects.toThrow(/Refusing to start/);
+
+    // In the CLI the process exit hides this, but a library caller (or a test
+    // like this one) would be left with the refusing process holding the very
+    // address it just said it could not have.
+    servers = servers.filter((s) => s !== squatter);
+    await closeServer(squatter);
+    expect(await isBindable(target)).toBe(true);
+  });
 }
 
 // ---------------------------------------------------------------------------
-// What an occupied address means — one test per case, plus the line between
-// case 3 and case 4, which is whether anything was actually said.
+// Who is on the address, and what that licenses. There is no next address, so
+// every answer other than "our own instance" ends the start.
 // ---------------------------------------------------------------------------
 
-test('case 2: a greeting naming another data dir moves us to the next port', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Two data dirs whose hashes collide on one port: the other instance proves
-  // ownership by naming its own hash, so stepping aside is safe.
-  await listenForeign({ port: basePort }, (socket) => socket.end(foreignGreeting()));
-  const lock = await acquire(dataDir, { port: 4711 });
-  expect(lock.lockPort).toBe(basePort + 1);
-});
+test('the probe talks to the same IP stack the holder bound, not to whatever answers on ::1', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  let ipv6;
+  try {
+    ipv6 = await listenForeign({ port, host: '::1' }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n'));
+  } catch {
+    return; // no IPv6 loopback on this machine, nothing to prove
+  }
+  expect(ipv6.address().address).toBe('::1');
 
-test('case 3: a service that says something other than a greeting moves us to the next port', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Provable because a kaprek writes its greeting as the first statement of
-  // its connection handler: whatever can talk to us at all talks kaprek.
-  await listenForeign({ port: basePort }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
-  const lock = await acquire(dataDir, { port: 4711 });
-  expect(lock.lockPort).toBe(basePort + 1);
-});
+  const holder = await acquire(dataDir, { port: 4711 });
+  expect(holder.lockPort).toBe(port);
 
-test('case 3: a peer that will not stop talking is a service too', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Our greeting is one short line; a flood is somebody else's protocol.
-  await listenForeign({ port: basePort }, (socket) => socket.write('x'.repeat(MAX_GREETING_BYTES + 100)));
-  const lock = await acquire(dataDir, { port: 4711 });
-  expect(lock.lockPort).toBe(basePort + 1);
-});
-
-test('case 4: something that accepts but never speaks refuses the start', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Silence is exactly what a blocked kaprek holder produces, so it proves
-  // nothing and must never read as "someone else's port".
-  await listenForeign({ port: basePort }, () => {});
-  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
-  // And it did not settle one port over.
-  expect(await isBindable({ port: basePort + 1 })).toBe(true);
-});
-
-test('case 4: a greeting that arrives too late refuses the start, it does not count as a stranger', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // The holder answers correctly, just later than the read budget — the shape
-  // of a real instance under load. Reading that as "foreign" is precisely the
-  // two-holder bug this rule exists to prevent.
-  await listenForeign({ port: basePort }, (socket) => {
-    const timer = setTimeout(() => socket.end(foreignGreeting()), FAST_GREETING_MS * 20);
-    socket.on('close', () => clearTimeout(timer));
-  });
-  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
-  expect(await isBindable({ port: basePort + 1 })).toBe(true);
-});
-
-test('case 4: an answer cut off mid-line is not evidence about who is speaking', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Half a line and then silence: the peer never finished its sentence, so
-  // there is nothing to classify. Note the difference to case 3, where the
-  // peer said its piece and closed.
-  await listenForeign({ port: basePort }, (socket) => socket.write('{"kaprek":1,"dataDirHa'));
-  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
-});
-
-test('case 4 is re-asked on the same address before the start is refused', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  let connections = 0;
-  // Silent until the last permitted attempt, then answers — the shape of a
-  // holder that was blocked and got its turn back. The retry has to actually
-  // re-ask, or this stays a refusal.
-  await listenForeign({ port: basePort }, (socket) => {
-    connections += 1;
-    if (connections >= GREETING_ATTEMPTS) socket.end(foreignGreeting());
-  });
-  const lock = await acquire(dataDir, { port: 4711 });
-  expect(connections).toBe(GREETING_ATTEMPTS);
-  expect(lock.lockPort).toBe(basePort + 1);
-});
-
-test('an already-running kaprek on a fallback port is found even when its base port has since freed up', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  const blocker = await listenForeign({ port: basePort }, (socket) => socket.end(foreignGreeting()));
-  const first = await acquire(dataDir, { port: 4711 });
-  expect(first.lockPort).toBe(basePort + 1);
-
-  // The other data dir's instance goes away. A naive "bind the base port,
-  // done" would now hand out a second lock for the same data dir.
-  await closeServer(blocker);
-  servers = servers.filter((s) => s !== blocker);
-
+  // net.connect({ port }) without a host defaults to 'localhost', which
+  // resolves ::1 first — the probe would have interviewed the stranger above
+  // and declared our own healthy holder a foreign service.
   await expect(acquire(dataDir, { port: 4712 })).rejects.toMatchObject({
     name: 'InstanceLockHeldError',
     url: 'http://127.0.0.1:4711',
   });
 });
 
-test('every candidate port owned by other data dirs: acquire fails loudly', async () => {
-  const dataDir = await tmpDataDir();
-  const basePort = lockPortFor(dataDir);
-  const blocked = [];
-  for (let offset = 0; blocked.length < LOCK_PORT_ATTEMPTS && offset < LOCK_PORT_WINDOW; offset += 1) {
-    try {
-      blocked.push(await listenForeign({ port: basePort + offset }, (socket) => socket.end(foreignGreeting())));
-    } catch (err) {
-      // A port reserved by the OS (EACCES, see the module header) cannot be
-      // occupied here, and acquire() steps over it without spending one of
-      // its attempts. So this loop must not count it either, or a base port
-      // near a reserved block leaves acquire() a free port above the ones
-      // this test blocked.
-      if (err.code !== 'EACCES') throw err;
-    }
-  }
-  expect(blocked).toHaveLength(LOCK_PORT_ATTEMPTS);
-  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/could not claim/i);
+test('a greeting naming another data dir ends the start, it does not move the lock', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  // Two data dir paths deriving one port used to send this start to port+1.
+  // That fallback is what the two-holder races lived in, so a hash collision
+  // is now a refusal with an explanation instead.
+  await listenForeign({ port }, (socket) => socket.end(foreignGreeting()));
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/different data directory/);
+  expect(await isBindable({ port: port + 1 })).toBe(true);
+});
+
+test('a service that says something other than a greeting ends the start', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  await listenForeign({ port }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/not kaprek answers there/);
+  expect(await isBindable({ port: port + 1 })).toBe(true);
+});
+
+test('a peer that will not stop talking is a service too', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  // Our greeting is one short line; a flood is somebody else's protocol.
+  await listenForeign({ port }, (socket) => socket.write('x'.repeat(MAX_GREETING_BYTES + 100)));
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/not kaprek answers there/);
+});
+
+test('something that accepts but never speaks ends the start after its retries', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  let connections = 0;
+  // Silence is exactly what a blocked kaprek holder produces, so it proves
+  // nothing — and the retries have to actually happen before refusing.
+  await listenForeign({ port }, () => {
+    connections += 1;
+  });
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer in/);
+  expect(connections).toBe(GREETING_ATTEMPTS);
+});
+
+test('a greeting that arrives too late ends the start, it is not read as a stranger', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  await listenForeign({ port }, (socket) => {
+    const timer = setTimeout(() => socket.end(foreignGreeting()), FAST_GREETING_MS * 20);
+    socket.on('close', () => clearTimeout(timer));
+  });
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer in/);
+});
+
+test('an answer cut off mid-line is not evidence about who is speaking', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  // Half a line and then silence: the peer never finished its sentence, so
+  // there is nothing to classify. Note the difference to the service tests
+  // above, where the peer said its piece and closed.
+  await listenForeign({ port }, (socket) => socket.write('{"kaprek":1,"dataDirHa'));
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer in/);
+});
+
+test('a squatter that goes away mid-question does not cost the start', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  const squatter = await listenForeign({ port }, () => {});
+  // Frees the address while the first round is still asking. The retry
+  // re-runs listen(), so "the holder shut down while we were asking" ends in
+  // a successful bind instead of a refusal on a free address.
+  setTimeout(() => {
+    servers = servers.filter((s) => s !== squatter);
+    squatter.close();
+  }, FAST_GREETING_MS);
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(port);
 });
 
 test.skipIf(process.platform !== 'win32')(
-  'the pipe transport has no fallback name: a silent stranger on the name refuses the start',
+  'the pipe transport refuses the same way, with no second name to try',
   async () => {
     const dataDir = await tmpDataDir();
-    await listenForeign(lockPipePathFor(dataDir), () => {});
-    await expect(acquire(dataDir, { port: 4711, platform: PIPE.platform })).rejects.toThrow(
-      /did not answer with a valid kaprek greeting/,
-    );
-  },
-);
-
-test.skipIf(process.platform !== 'win32')(
-  'on the pipe there is no next name, so even a provable stranger refuses the start',
-  async () => {
-    const dataDir = await tmpDataDir();
-    // The same answer that would mean "take the next port" on TCP has nowhere
-    // to go here: the name is derived from our own hash.
     await listenForeign(lockPipePathFor(dataDir), (socket) => socket.end(foreignGreeting()));
     await expect(acquire(dataDir, { port: 4711, platform: PIPE.platform })).rejects.toThrow(
-      /is held by something that is not this data directory's kaprek/,
+      /different data directory/,
     );
   },
 );
 
 // ---------------------------------------------------------------------------
-// Port derivation.
+// A refusal has to be loud. The CLI runs without a test runner holding its
+// event loop open, so this one needs a real child process.
+// ---------------------------------------------------------------------------
+
+test('a refused acquire exits non-zero with its message instead of dying silently', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const port = lockPortFor(dataDir);
+  // Everything the acquire owns is unref'd — the lock server, the probe
+  // sockets — so an unref'd retry timer used to empty the event loop between
+  // attempts. The process then exited 0 with no output, in the middle of a
+  // fail-closed decision. Under vitest the runner's own loop hides that,
+  // hence a real child.
+  const source = `
+import net from 'node:net';
+import { acquireInstanceLock } from ${JSON.stringify(MODULE_URL)};
+const squatter = net.createServer((socket) => socket.unref());
+squatter.unref();
+squatter.listen({ port: ${port}, host: '127.0.0.1' }, async () => {
+  try {
+    await acquireInstanceLock({ dataDir: ${JSON.stringify(dataDir)}, platform: 'linux' });
+    process.stdout.write('ACQUIRED\\n');
+  } catch (err) {
+    process.stderr.write('REFUSED: ' + err.message + '\\n');
+    process.exitCode = 1;
+  }
+});
+`;
+  const { code, stderr } = await runChild(source);
+  expect(stderr).toContain('Refusing to start');
+  expect(code).toBe(1);
+});
+
+// ---------------------------------------------------------------------------
+// Address derivation and path identity.
 // ---------------------------------------------------------------------------
 
 test('the derived port stays inside the documented range, clear of both ephemeral ranges', async () => {
-  for (let i = 0; i < 200; i += 1) {
-    const port = lockPortFor(path.join(os.tmpdir(), `kaprek-port-spread-${i}`));
+  const parent = await tmpDataDir();
+  for (let i = 0; i < 100; i += 1) {
+    const dir = path.join(parent, `spread-${i}`);
+    await fs.mkdir(dir);
+    const port = lockPortFor(dir);
     expect(port).toBeGreaterThanOrEqual(LOCK_PORT_BASE);
-    expect(port).toBeLessThan(LOCK_PORT_BASE + LOCK_PORT_RANGE);
     // Below Linux's ephemeral floor (32768) and far below Windows' (49152),
     // so an outbound connection's source port can never land on a lock port.
-    expect(port + LOCK_PORT_WINDOW + LOCK_PORT_ATTEMPTS).toBeLessThan(32768);
+    expect(port).toBeLessThan(Math.min(LOCK_PORT_BASE + LOCK_PORT_RANGE, 32768));
   }
 });
 
@@ -579,10 +625,34 @@ test('the pipe name carries the hash, not the path', async () => {
   expect(name).not.toContain(path.basename(dataDir));
 });
 
+test.skipIf(process.platform !== 'win32')(
+  'a junction to the same directory derives the same lock and blocks it',
+  async () => {
+    const dataDir = await tmpDataDir();
+    const link = path.join(await tmpDataDir(), 'link');
+    try {
+      execFileSync('cmd', ['/c', 'mklink', '/J', link, dataDir], { stdio: 'ignore' });
+    } catch {
+      return; // junctions not creatable here, nothing to prove
+    }
+    // Two names for one physical directory used to derive two locks and let
+    // both start — a launcher shortcut using the short name is enough.
+    expect(lockPortFor(link)).toBe(lockPortFor(dataDir));
+    expect(lockPipePathFor(link)).toBe(lockPipePathFor(dataDir));
+    await acquire(dataDir, { port: 4711 });
+    await expect(acquire(link, { port: 4712 })).rejects.toBeInstanceOf(InstanceLockHeldError);
+  },
+);
+
+// 8.3 short names and `subst` drives are deliberately NOT tested separately:
+// both are resolved by the same realpathSync.native call the junction test
+// above exercises, and every way of producing one in a test either depends on
+// per-volume 8.3 generation being enabled or leaves machine state behind. A
+// test that quietly skips itself is worse than an honest note here.
+
 // ---------------------------------------------------------------------------
-// OS-reserved port ranges (Hyper-V/WinNAT on Windows), read from the machine
-// this runs on. The derived range was moved to 23000-31999 partly to get away
-// from them, so on many machines this finds nothing and skips.
+// OS-reserved addresses. With no fallback, a reserved port is a refusal with
+// its own reason rather than something to step over.
 // ---------------------------------------------------------------------------
 
 /** First reserved TCP range inside the derived range that this process genuinely cannot bind, or undefined. */
@@ -609,29 +679,23 @@ async function reservedRange() {
   return undefined;
 }
 
-test('a base port inside an OS-reserved range is stepped over, not treated as a holder', async () => {
+test('a lock port the OS has reserved is refused with that as the reason', async () => {
   const range = await reservedRange();
   if (!range) {
-    // No reserved range inside the derived range on this machine (or not
-    // Windows) — nothing to prove here.
+    // No reserved range inside 23000-31999 on this machine (the range was
+    // chosen partly to avoid them), so there is nothing to exercise here.
     return;
   }
-  // Find a directory name whose derived port lands exactly on the reserved
-  // range's first port. Hashing is pure, so this costs no filesystem work.
   const parent = await tmpDataDir();
   let dataDir;
   for (let i = 0; i < 2_000_000 && !dataDir; i += 1) {
     const candidate = path.join(parent, `d${i}`);
+    await fs.mkdir(candidate);
     if (lockPortFor(candidate) === range.start) dataDir = candidate;
+    else await fs.rm(candidate, { recursive: true, force: true });
   }
   expect(dataDir, 'no directory name hashed onto the reserved port').toBeDefined();
-  await fs.mkdir(dataDir, { recursive: true });
-
-  const lock = await acquire(dataDir, { port: 4711 });
-  // listen() on a reserved port fails with EACCES, which is neither "free"
-  // nor "someone else holds the lock" — the walk has to keep going past the
-  // whole reserved block, which can be 100 ports wide.
-  expect(lock.lockPort).toBeGreaterThan(range.end);
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/operating system has reserved/);
 });
 
 // ---------------------------------------------------------------------------
@@ -650,7 +714,7 @@ test('the lock file is written for humans to read, and removed on release', asyn
 });
 
 test('a stale lock file left behind by a crash does not block acquiring', async () => {
-  const dataDir = await tmpDataDirWithFreePorts(1);
+  const dataDir = await tmpDataDirWithFreePort();
   // The file is display only. Whatever it says, only the handle decides.
   await fs.writeFile(
     path.join(dataDir, 'instance.lock'),
@@ -661,7 +725,7 @@ test('a stale lock file left behind by a crash does not block acquiring', async 
 });
 
 test('a corrupt lock file does not block acquiring either', async () => {
-  const dataDir = await tmpDataDirWithFreePorts(1);
+  const dataDir = await tmpDataDirWithFreePort();
   await fs.writeFile(path.join(dataDir, 'instance.lock'), '{not json');
   const lock = await acquire(dataDir, { port: 4712 });
   expect(lock.lockPort).toBe(lockPortFor(dataDir));
