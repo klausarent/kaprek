@@ -52,6 +52,44 @@ function urlFor(port) {
 }
 
 /**
+ * Best-effort cleanup of `.steal-<nonce>` files left behind by a process
+ * that died between its own rename-away (see the steal branch below) and
+ * the readback/unlink that normally clears it again. These are never read
+ * back as a lock — lockPathFor() only ever names LOCK_FILE, no code path
+ * globs for the `.steal-` pattern — so a leftover one cannot produce a
+ * second holder; this is pure litter removal, not part of the exclusivity
+ * logic. Only files older than LOCK_STALE_MS are touched, so a steal that
+ * is still genuinely in flight is left alone. Every failure here (readdir,
+ * stat, unlink — gone already, still fresh, a transient error) is
+ * swallowed: worst case, today's leftover waits for the next acquire to
+ * try again.
+ */
+async function sweepStaleStealFiles(dataDir, nowFn) {
+  let entries;
+  try {
+    entries = await fs.readdir(dataDir);
+  } catch {
+    return;
+  }
+  const prefix = `${LOCK_FILE}.steal-`;
+  await Promise.all(
+    entries
+      .filter((name) => name.startsWith(prefix))
+      .map(async (name) => {
+        const full = path.join(dataDir, name);
+        try {
+          const stat = await fs.stat(full);
+          if (nowFn() - stat.mtimeMs > LOCK_STALE_MS) {
+            await fs.unlink(full);
+          }
+        } catch {
+          // best-effort, see doc comment above
+        }
+      }),
+  );
+}
+
+/**
  * process.kill(pid, 0) sends no signal, it only probes existence. ESRCH means
  * "no such process" (dead). EPERM means it exists but belongs to another
  * user (alive). Anything else is treated as alive too — fail toward refusing
@@ -224,11 +262,48 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
       }
 
       if (stolenState?.nonce !== state.nonce) {
-        // Wrong file — hand it back and report the holder we actually
-        // grabbed (accurate and current), not the stale one we originally
-        // read.
-        await fs.rename(stealPath, lockPath);
-        throw holderError(stolenState ?? state);
+        // Wrong file — we accidentally renamed away a FRESH, legitimately
+        // held lock (a different starter must have won its own create race
+        // and written to lockPath between our read and our rename). It has
+        // to go back, but NOT via fs.rename(stealPath, lockPath): rename
+        // clobbers an existing destination silently, on POSIX and on
+        // Windows alike. lockPath is empty for the moment (we just swept
+        // it), so a FOURTH process could legitimately `wx`-acquire it right
+        // now; a clobbering rename would silently erase that acquisition
+        // and hand two processes the belief that they hold the lock — the
+        // exact failure this module exists to prevent, through a different
+        // door. Restore with the same exclusive primitive the original
+        // acquire uses instead.
+        let restored = false;
+        try {
+          const handle = await fs.open(lockPath, 'wx');
+          try {
+            await handle.writeFile(stolenRaw);
+          } finally {
+            await handle.close();
+          }
+          restored = true;
+        } catch (err) {
+          if (err.code !== 'EEXIST') throw err;
+        }
+
+        await fs.unlink(stealPath).catch((err) => {
+          if (err.code !== 'ENOENT') throw err;
+        });
+
+        if (restored) {
+          // Original bytes, same nonce: the real holder's heartbeat
+          // (mtime-only, see touch()) and release() (nonce-checked) keep
+          // working exactly as if this detour never happened.
+          throw holderError(stolenState ?? state);
+        }
+
+        // EEXIST: a fourth process won lockPath in the gap while we were
+        // restoring. Our steal copy is discarded litter now, not something
+        // to write back — report whoever actually holds lockPath now
+        // rather than the one we almost clobbered.
+        const freshHolder = await readHolder(lockPath);
+        throw holderError(freshHolder ? freshHolder.state : (stolenState ?? state));
       }
 
       await fs.unlink(stealPath).catch((err) => {
@@ -240,13 +315,19 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
     throw holderError(state);
   }
 
+  await sweepStaleStealFiles(dataDir, nowFn);
   await attempt(true, MAX_VANISH_RETRIES);
 
   const timer = setInterval(() => {
     // Best-effort: a transient failure self-heals on the next tick, and a
     // permanent one (e.g. dataDir removed) surfaces as an orphaned lock to
     // the next starter, which is the correct fail-open-to-recovery outcome
-    // rather than crashing an otherwise-healthy running server.
+    // rather than crashing an otherwise-healthy running server. This is also
+    // what makes the mismatch-recovery detour above safe for whichever OTHER
+    // process's lock we hold: lockPath is briefly empty between its own
+    // rename-away and its restore, and if a heartbeat tick lands exactly in
+    // that gap, `fs.utimes` there throws ENOENT — swallowed here like any
+    // other transient failure, never surfaced, never crashes.
     touch().catch(() => {});
   }, heartbeatMs);
   timer.unref();
@@ -254,10 +335,36 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
   let released = false;
 
   return {
-    /** Rewrites the lock with the now-known real port. See the doc comment above on why port starts undefined. */
+    /**
+     * Rewrites the lock with the now-known real port. See the doc comment
+     * above on why port starts undefined.
+     *
+     * Nonce-checked before writing, same as release() below: a handle whose
+     * underlying file was swept by another starter's steal-and-restore race
+     * and never restored (see the mismatch branch above — the restore can
+     * lose to a fourth, legitimate acquirer) still resolves normally from
+     * this handle's own point of view. Writing unconditionally here would
+     * silently clobber that fourth process's real lock with stale content —
+     * "two holders", arrived at through a third path after the mismatch
+     * branch already closed the first two.
+     */
     async updatePort(newPort) {
       if (released) return;
       currentPort = newPort;
+      let raw;
+      try {
+        raw = await fs.readFile(lockPath, 'utf8');
+      } catch (err) {
+        if (err.code === 'ENOENT') return;
+        throw err;
+      }
+      let state;
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (state.nonce !== nonce) return;
       await writeOwn();
     },
     /**

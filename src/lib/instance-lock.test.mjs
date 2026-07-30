@@ -1,4 +1,4 @@
-import { test, expect, afterEach } from 'vitest';
+import { test, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -165,6 +165,129 @@ test('acquireInstanceLock: two concurrent acquires racing the same orphaned lock
   expect(JSON.parse(raw).pid).toBe(process.pid);
 
   await fulfilled[0].value.release();
+});
+
+test('acquireInstanceLock: updatePort() only writes if the lock still holds our nonce', async () => {
+  const dataDir = await tmpDataDir();
+  const lock = await acquireInstanceLock({ dataDir, port: 4711 });
+  // Simulates the outcome of the three-party race below without paying for
+  // its full setup: our handle is live, but the file on disk now belongs to
+  // someone else (e.g. restored-and-then-re-taken-over by a third party).
+  await writeLockFile(dataDir, { pid: process.pid, port: 9999, nonce: 'someone-else', startedAt: 0 });
+  await lock.updatePort(4712);
+  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
+  expect(JSON.parse(raw)).toMatchObject({ port: 9999, nonce: 'someone-else' });
+});
+
+test('acquireInstanceLock: heartbeat survives a transient ENOENT on the lock file without throwing', async () => {
+  const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
+  const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
+  // Simulates the gap in the mismatch-restore branch above, where lockPath
+  // is briefly empty between another process's rename-away and its
+  // restore. A heartbeat tick landing exactly there must not throw or leave
+  // an unhandled rejection — touch().catch(() => {}) swallows it and
+  // self-heals the moment the file exists again.
+  await fs.unlink(lockPath);
+  await new Promise((resolve) => setTimeout(resolve, 60)); // a couple of ticks while the file is gone
+  // Recreated with a foreign nonce on purpose: this test is only about the
+  // heartbeat surviving the gap, not about who it belongs to afterward —
+  // release() below must still no-op safely rather than throw.
+  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, port: 4711, nonce: 'unrelated', startedAt: 0 }));
+  await new Promise((resolve) => setTimeout(resolve, 60)); // heartbeat resumes once the file exists again
+  const stat = await fs.stat(lockPath);
+  expect(Date.now() - stat.mtimeMs).toBeLessThan(1000);
+  await lock.release();
+});
+
+test('acquireInstanceLock: three-party race — a mismatched restore never clobbers a fourth, legitimate acquirer', async () => {
+  const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
+  const deadHolderPid = await deadPid();
+  await writeLockFile(dataDir, { pid: deadHolderPid, port: 4711, nonce: 'orphan', startedAt: 0 });
+  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
+
+  // Forces the exact interleaving the re-review flagged, deterministically,
+  // instead of hoping a real race lands on it (a plain concurrent
+  // Promise.allSettled, like the two-party test above, has only two racers
+  // and structurally cannot produce this shape):
+  //
+  //   A  = the outer acquireInstanceLock() call below. Reads the orphaned
+  //        lock, then is about to steal-rename it away.
+  //   B  = a full, real acquireInstanceLock() completed BETWEEN A's read and
+  //        A's rename — B legitimately steals the SAME orphaned lock first
+  //        and installs its own fresh, live lock at lockPath.
+  //   C  = a full, real acquireInstanceLock() that fills the gap exactly
+  //        where A is about to restore the fresh lock it accidentally swept
+  //        away from B (lockPath is briefly empty right there).
+  //
+  // A must end up rejected, naming C — never overwriting C's real lock with
+  // B's stale, swept-away content.
+  const originalRename = fs.rename.bind(fs);
+  const originalOpen = fs.open.bind(fs);
+  let bLock;
+  let cLock;
+  let injectedB = false;
+  let readyForCInjection = false;
+  let injectedC = false;
+
+  const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (...args) => {
+    const isOuterCall = !injectedB;
+    if (isOuterCall) {
+      injectedB = true;
+      // B's own internal fs.rename call (inside this same acquire) passes
+      // straight through this mock below, since injectedB is already true
+      // by the time B makes it — B runs for real, not simulated.
+      bLock = await acquireInstanceLock({ dataDir, port: 6002 });
+    }
+    const result = await originalRename(...args);
+    if (isOuterCall) {
+      // A's real steal-rename just executed. lockPath is empty now — B's
+      // FRESH lock (not the original orphan) just got swept into A's own
+      // steal file, because B replaced the orphan before A's rename ran.
+      readyForCInjection = true;
+    }
+    return result;
+  });
+
+  const openSpy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    if (readyForCInjection && !injectedC) {
+      injectedC = true;
+      // C's plain wx-create succeeds for real: lockPath is genuinely empty
+      // at this exact point, no orphan handling needed on C's side.
+      cLock = await acquireInstanceLock({ dataDir, port: 6003 });
+    }
+    return originalOpen(...args);
+  });
+
+  try {
+    await expect(acquireInstanceLock({ dataDir, port: 6001 })).rejects.toMatchObject({
+      name: 'InstanceLockHeldError',
+      port: 6003, // C, the fourth acquirer — not B, whose lock got swept
+    });
+
+    // The one file left on disk is C's, byte for byte.
+    const onDisk = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+    expect(onDisk.port).toBe(6003);
+
+    // A's failed restore attempt cleaned up its own steal file even though
+    // it lost — no litter left behind by the failure path itself.
+    const entries = await fs.readdir(dataDir);
+    expect(entries.filter((name) => name.includes('.steal-'))).toHaveLength(0);
+
+    // B's handle never threw — from B's own point of view it's still "the
+    // holder" — but its file is gone, replaced by C's. Both updatePort()
+    // and release() must still refuse to touch C's real lock.
+    await bLock.updatePort(9999);
+    expect(JSON.parse(await fs.readFile(lockPath, 'utf8')).port).toBe(6003);
+    await bLock.release();
+    expect(JSON.parse(await fs.readFile(lockPath, 'utf8')).port).toBe(6003);
+  } finally {
+    renameSpy.mockRestore();
+    openSpy.mockRestore();
+    await bLock?.release();
+    await cLock?.release();
+  }
 });
 
 test('acquireInstanceLock: updatePort() after release() does not resurrect the lock file', async () => {
