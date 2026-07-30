@@ -53,12 +53,21 @@ export class InvalidEventError extends Error {
 // Required/optional fields per event kind, matching the shapes
 // src/parser/parse.mjs::digestSession() produces for 'user' | 'assistant'
 // | 'thinking' | 'tool' events (see its events.push(...) call sites and the
-// DigestEvent union in web/src/lib/api.ts).
+// DigestEvent union in web/src/lib/api.ts). 'approval' has no historical
+// digest counterpart (a live-turn-only concept, see
+// src/orchestrator/run.mjs's onApprovalRequest wrapping) — one shape covers
+// both lifecycle points of an approval (phase 'requested': displayName/
+// input/description/... ; phase 'resolved': behavior/message), all fields
+// beyond requestId/toolName/phase optional so either phase validates.
 const EVENT_SHAPES = {
   user: { required: ['text'], optional: [] },
   assistant: { required: ['text'], optional: ['msgId'] },
   thinking: { required: ['text'], optional: ['msgId'] },
   tool: { required: ['name', 'input', 'result'], optional: ['msgId', 'resultRef'] },
+  approval: {
+    required: ['requestId', 'toolName', 'phase'],
+    optional: ['displayName', 'input', 'description', 'agentId', 'toolUseId', 'reasonType', 'reason', 'behavior', 'message'],
+  },
 };
 export const EVENT_KINDS = Object.keys(EVENT_SHAPES);
 

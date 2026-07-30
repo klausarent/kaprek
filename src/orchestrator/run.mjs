@@ -8,9 +8,12 @@
 // runs.jsonl (see runs.mjs).
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
+import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
+import { writeHarnessSettings } from '../harness/settings.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -20,6 +23,14 @@ import { redactSecrets, truncate } from '../parser/parse.mjs';
 // coincidentally identical.
 const DEFAULT_MAX_TEXT_LEN = 4000;
 const DEFAULT_MAX_TOOL_LEN = 1500;
+
+// This file lives at <packageRoot>/src/orchestrator/run.mjs — derived here
+// (not passed in) so callers that already know dataDir don't also have to
+// pass packageRoot/the MCP server's own script path just to get the apps
+// MCP server wired up (see writeMcpConfig()'s call below).
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
+const MCP_SERVER_SCRIPT_PATH = path.join(PACKAGE_ROOT, 'src', 'apps', 'mcp-server.mjs');
 
 /** Redacts (if enabled) then truncates one text field — mirrors parse.mjs::truncateEvent(). */
 function sanitizeText(str, maxLen, redact) {
@@ -154,6 +165,18 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  *   (e.g. an SSE route forwarding the live turn to a browser); events carry
  *   the SAME redacted/truncated content the chat store persists, see
  *   maxTextLen/maxToolLen/redact below
+ * @param {(request: import('../harness/adapter.mjs').ApprovalRequest) => Promise<import('../harness/adapter.mjs').ApprovalDecision>} [options.onApprovalRequest] -
+ *   answers a tool-use approval prompt (see src/server/server.mjs's SSE
+ *   question/answer route). NOT forwarded to the harness as-is: this layer
+ *   wraps it to persist BOTH the request and the decision as 'approval' chat
+ *   events first — redaction-before-truncation, same chain as tool input/
+ *   result (SECURITY: an approval request carries the proposed tool input,
+ *   which can itself contain a secret) — then calls the caller's handler
+ *   with the SANITIZED request (never the raw one), so a caller that also
+ *   streams the request out over SSE (as server.mjs does) can never leak an
+ *   unredacted secret to the browser either. Omitted entirely means no
+ *   onApprovalRequest option reaches the harness at all, which is itself
+ *   fail-closed (see adapter.mjs/claude-code.mjs: no handler configured -> deny).
  * @param {AbortSignal} [options.signal]
  * @param {number} [options.maxTextLen] - cap on assistant/thinking/user text, see parse.mjs::digestSession()
  * @param {number} [options.maxToolLen] - cap on tool input/result, see parse.mjs::digestSession()
@@ -170,6 +193,7 @@ export async function runTurn({
   permissionMode,
   allowedTools,
   onEvent,
+  onApprovalRequest,
   signal,
   maxTextLen = DEFAULT_MAX_TEXT_LEN,
   maxToolLen = DEFAULT_MAX_TOOL_LEN,
@@ -271,15 +295,122 @@ export async function runTurn({
     }
   };
 
-  const turnResult = await harness.startTurn({
-    cwd,
-    prompt: text,
-    sessionId: priorSessionId,
-    permissionMode,
-    allowedTools,
-    onEvent: handleEvent,
-    signal,
-  });
+  // Wraps the caller's onApprovalRequest (if any) so every request/decision
+  // is persisted as an 'approval' chat event BEFORE the caller ever sees it
+  // — see the SECURITY note on the onApprovalRequest param above. Passed to
+  // harness.startTurn() only when the caller actually configured a handler:
+  // an always-present-but-no-op wrapper would make claude-code.mjs think a
+  // handler exists (it decides `--permission-prompt-tool stdio` from
+  // presence alone) and start a control-channel nobody answers.
+  const wrappedOnApprovalRequest = onApprovalRequest
+    ? async (request) => {
+        const sanitizedInput = sanitizeToolInput(request.input, maxToolLen, redact);
+        const sanitizedDescription = sanitizeText(request.description, maxToolLen, redact);
+        const sanitizedReason = sanitizeText(request.reason, maxToolLen, redact);
+
+        chats.appendEvent(effectiveChatId, {
+          kind: 'approval',
+          phase: 'requested',
+          requestId: request.id,
+          toolName: request.toolName,
+          displayName: request.displayName,
+          input: sanitizedInput,
+          description: sanitizedDescription,
+          agentId: request.agentId,
+          toolUseId: request.toolUseId,
+          reasonType: request.reasonType,
+          reason: sanitizedReason,
+        });
+
+        // The caller (e.g. server.mjs, streaming this over SSE) gets the
+        // SANITIZED request, never `request` itself — redaction must happen
+        // before the data reaches ANY new write site, SSE included.
+        const sanitizedRequest = {
+          ...request,
+          input: redactInputObject(request.input, redact),
+          description: sanitizedDescription,
+          reason: sanitizedReason,
+        };
+
+        let decision;
+        try {
+          decision = await onApprovalRequest(sanitizedRequest);
+        } catch (err) {
+          chats.appendEvent(effectiveChatId, {
+            kind: 'approval',
+            phase: 'resolved',
+            requestId: request.id,
+            toolName: request.toolName,
+            behavior: 'error',
+            message: sanitizeText(err?.message ?? String(err), maxToolLen, redact),
+          });
+          // Re-thrown so the harness's own onApprovalRequest catch (see
+          // adapter.mjs's contract) still turns this into a control-channel
+          // 'error' response instead of silently allowing/denying the tool.
+          throw err;
+        }
+
+        chats.appendEvent(effectiveChatId, {
+          kind: 'approval',
+          phase: 'resolved',
+          requestId: request.id,
+          toolName: request.toolName,
+          behavior: decision?.behavior ?? 'deny',
+          message: sanitizeText(decision?.message, maxToolLen, redact),
+        });
+
+        return decision;
+      }
+    : undefined;
+
+  // Wired up once per turn: --mcp-config points the CLI at kaprek's own apps
+  // MCP server (see mcp-config.mjs), --settings neutralizes the user's own
+  // hooks for a deterministic headless turn (see settings.mjs). Both are
+  // written under dataDir (mcpConfigPath under a dedicated 'mcp' tmpDir, not
+  // the real OS temp dir) so a test's own tmpDir cleanup also removes them —
+  // see mcpConfigPath's cleanupMcpConfig() call below for the mcp-config
+  // file specifically (settings.json is overwritten in place, nothing to
+  // remove).
+  //
+  // Best-effort, same as appendRun()'s own try/catch further down: a turn
+  // must still run (with a slightly less deterministic/tooled CLI, same as
+  // omitting these options entirely) if this ONE auxiliary write hiccups —
+  // a transient fs error here (e.g. a Windows AV scanner briefly locking a
+  // just-written file) must not fail the user-visible turn itself.
+  let mcpConfigPath;
+  let settingsPath;
+  try {
+    const mcpConfigDir = path.join(dataDir, 'mcp');
+    fs.mkdirSync(mcpConfigDir, { recursive: true }); // writeMcpConfig() itself does not create tmpDir
+    mcpConfigPath = writeMcpConfig({
+      dataDir,
+      packageRoot: PACKAGE_ROOT,
+      serverScriptPath: MCP_SERVER_SCRIPT_PATH,
+      tmpDir: mcpConfigDir,
+    });
+    settingsPath = writeHarnessSettings({ dataDir });
+  } catch {
+    mcpConfigPath = undefined;
+    settingsPath = undefined;
+  }
+
+  let turnResult;
+  try {
+    turnResult = await harness.startTurn({
+      cwd,
+      prompt: text,
+      sessionId: priorSessionId,
+      permissionMode,
+      allowedTools,
+      mcpConfigPath,
+      settingsPath,
+      onEvent: handleEvent,
+      onApprovalRequest: wrappedOnApprovalRequest,
+      signal,
+    });
+  } finally {
+    if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath);
+  }
 
   // Robustness (Goose's conversation/mod.rs::fix_conversation): a tool-start
   // whose tool-end never arrived (turn aborted or errored mid-call) must not

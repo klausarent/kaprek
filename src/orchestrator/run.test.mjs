@@ -431,3 +431,118 @@ test('Run-Log summiert Tokens für Anthropic-, OpenAI-artige und total_tokens-on
     expect(run.tokens, `usage ${JSON.stringify(usage)} should sum to ${expected}`).toBe(expected);
   }
 });
+
+// --- Approval chain (Task 6a) -------------------------------------------------
+
+test('onApprovalRequest: request/decision are persisted as approval chat events; secrets in the tool input are redacted', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      {
+        approval: {
+          toolName: 'Bash',
+          displayName: 'Bash',
+          input: { command: `curl -H "Authorization: ${SECRET_PATTERNS.bearer}"` },
+          description: 'run a curl command',
+          agentId: 'agent-1',
+          toolUseId: 'toolu_1',
+          reasonType: 'rule',
+          reason: 'ask',
+        },
+      },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+
+  const seenByCaller = [];
+  const onApprovalRequest = vi.fn(async (request) => {
+    seenByCaller.push(request);
+    return { behavior: 'allow' };
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'approve me', harness: fakeHarness, onApprovalRequest });
+
+  // The caller only ever sees the SANITIZED request — never the raw secret
+  // (see run.mjs's onApprovalRequest wrapping doc comment: redaction before
+  // ANY new write site, SSE included).
+  expect(JSON.stringify(seenByCaller)).not.toContain(SECRET_PATTERNS.bearer);
+  expect(seenByCaller[0]).toMatchObject({ toolName: 'Bash', agentId: 'agent-1', toolUseId: 'toolu_1' });
+
+  const events = openChats(tmpDir).events(result.chatId);
+  const approvalEvents = events.filter((e) => e.kind === 'approval');
+  expect(approvalEvents.map((e) => e.phase)).toEqual(['requested', 'resolved']);
+  expect(approvalEvents[0].toolName).toBe('Bash');
+  expect(approvalEvents[0].input).not.toContain(SECRET_PATTERNS.bearer);
+  expect(approvalEvents[0].input).toContain('[REDACTED]');
+  expect(approvalEvents[1]).toMatchObject({ phase: 'resolved', behavior: 'allow' });
+});
+
+test('onApprovalRequest: a deny decision is persisted with its message', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Write', input: { path: 'x' } } },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ],
+  });
+  const onApprovalRequest = vi.fn(async () => ({ behavior: 'deny', message: 'not allowed right now' }));
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'deny me', harness: fakeHarness, onApprovalRequest });
+
+  const approvalEvents = openChats(tmpDir).events(result.chatId).filter((e) => e.kind === 'approval');
+  expect(approvalEvents[1]).toMatchObject({ phase: 'resolved', behavior: 'deny', message: 'not allowed right now' });
+});
+
+test('onApprovalRequest: a throwing caller handler is persisted as an "error" resolution and does not kill the turn', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Bash', input: {} } },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ],
+  });
+  const onApprovalRequest = vi.fn(async () => {
+    throw new Error('handler boom');
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'boom', harness: fakeHarness, onApprovalRequest });
+
+  expect(result.stopReason).toBe('result'); // fake.mjs's own catch keeps playback going, same as claude-code.mjs
+  const approvalEvents = openChats(tmpDir).events(result.chatId).filter((e) => e.kind === 'approval');
+  expect(approvalEvents[1]).toMatchObject({ phase: 'resolved', behavior: 'error', message: 'handler boom' });
+});
+
+test('runTurn passes onApprovalRequest:undefined to the harness when the caller configured none (never a silent no-op wrapper)', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }],
+  });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+
+  await runTurn({ dataDir: tmpDir, text: 'no approvals configured', harness: fakeHarness });
+
+  expect(startTurnSpy.mock.calls[0][0].onApprovalRequest).toBeUndefined();
+});
+
+test('runTurn wires mcpConfigPath (kaprek apps MCP server) and settingsPath (neutralized hooks) to the harness, then cleans the mcp-config file up', async () => {
+  let mcpConfigPathUsed;
+  let capturedMcpConfig;
+  let capturedSettings;
+  const harness = {
+    async startTurn(options) {
+      mcpConfigPathUsed = options.mcpConfigPath;
+      capturedMcpConfig = JSON.parse(fs.readFileSync(options.mcpConfigPath, 'utf8'));
+      capturedSettings = JSON.parse(fs.readFileSync(options.settingsPath, 'utf8'));
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'wire it up', harness });
+
+  expect(result.stopReason).toBe('result');
+  expect(capturedSettings).toEqual({ hooks: {}, permissions: { defaultMode: 'default', allow: [], deny: [] } });
+  expect(capturedMcpConfig.mcpServers['kaprek-apps'].command).toBe(process.execPath);
+  expect(capturedMcpConfig.mcpServers['kaprek-apps'].env.KAPREK_DATA_DIR).toBe(tmpDir);
+
+  // The mcp-config file is a per-turn temp file — must not accumulate.
+  expect(fs.existsSync(mcpConfigPathUsed)).toBe(false);
+});
