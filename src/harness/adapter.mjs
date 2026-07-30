@@ -98,9 +98,21 @@
  * @property {string[]} [warnings] - non-fatal problems during the turn, e.g. an onEvent
  *   consumer that threw (see claude-code.mjs's safeEmit()) — the turn still ran to
  *   completion despite these
- * @property {boolean} [orphaned] - true only when stopReason is 'aborted'/'timeout' and the
- *   harness gave up waiting for the child process to actually exit (see
- *   claude-code.mjs::DEFAULT_KILL_GRACE_MS) — the child may still be running
+ * @property {boolean} [orphaned] - true when the harness gave up waiting for the child
+ *   process to actually exit within its own grace period (see
+ *   claude-code.mjs::DEFAULT_KILL_GRACE_MS) after already trying to kill the whole process
+ *   tree (see claude-code.mjs::killChildTree()/killChildTreeHard()) — despite the name, this
+ *   is NOT only "the child may still be running": by the time this is set the harness has
+ *   already sent SIGKILL (POSIX: process-group-wide), so it usually means "reaping the tree
+ *   itself may still be in flight", not that no kill was attempted. Can occur with ANY
+ *   stopReason, not only 'aborted'/'timeout' (panel review Fix-Runde 3, minor, correcting
+ *   this doc comment's own pre-task-2 claim) — e.g. a well-behaved CLI whose stdout/stderr
+ *   pipe stayed open past 'result' because it left an unrelated background process (a dev
+ *   server) running that inherited it: the turn itself succeeded (stopReason 'result', or
+ *   'error' if the result itself was one) and is finished in every way that matters, but
+ *   'close' never came within the same grace period, so the leftover process tree is killed
+ *   and orphaned is set anyway — see claude-code.mjs::armResultCloseGrace() and its own
+ *   regression test (approval.test.mjs) for the concrete scenario
  */
 
 /**

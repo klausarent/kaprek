@@ -417,6 +417,24 @@ export async function startTurn({
       // way — `detached` only affects process-group membership, not stream
       // inheritance. Left false on win32: taskkill /T /F (killChildTree()'s
       // existing Windows path) already walks the tree by PID without it.
+      //
+      // Deliberate trade-off (panel review Fix-Runde 3, minor, not measured
+      // on this Windows worktree — see task-2-report.md's Bedenken): on
+      // POSIX this ALSO removes the CLI's tool-call tree from the
+      // foreground process group, so a terminal SIGINT (Ctrl+C on this
+      // server's own process) no longer reaches it the way it did before
+      // this fix — the server itself has no shutdown hook that explicitly
+      // aborts in-flight turns (only a per-request client-close abort, see
+      // server.mjs), so an operator's Ctrl+C now leaves an active turn's
+      // process tree running unsupervised until one of its own four clocks
+      // (or the CLI's own stdin-EOF exit, once the server's own process is
+      // gone) eventually ends it. Kept `detached: true` anyway: it is what
+      // makes killChildTree()'s POSIX group-kill (the fix Fund 8 itself
+      // demanded) actually reach the tree at all — reverting it would
+      // reopen Fund 8 to close this one. A proper fix (a server-level
+      // shutdown hook that aborts running turns, or an explicit
+      // process.kill(-pid) on exit) touches bin/cli.mjs/server.mjs, outside
+      // this task's file list — tracked as a follow-up, not built here.
       detached: process.platform !== 'win32',
     });
   } catch (err) {
@@ -702,6 +720,23 @@ export async function startTurn({
       killChildTree(child);
       killGiveUpTimer = setTimeout(() => {
         killChildTreeHard(child); // panel review Fix-Runde 2, minor — escalate before giving up, see that function's own doc comment
+        // Panel review Fix-Runde 3, minor: this is the THIRD path that can
+        // resolve the turn (besides the 'close' handler and
+        // armResultCloseGrace()'s own give-up) — a buffered result line
+        // fully processed AFTER this kill was already requested (sawResult
+        // becomes true, a normal 'result' event already emitted) but BEFORE
+        // 'close' arrives must still win here too, for exactly the same
+        // reason the 'close' handler's own mirror-race fix exists (see its
+        // doc comment) — without this, a slow-to-close child could resolve
+        // as 'timeout' here even though the consumer already received a
+        // 'result' event. Deliberately excludes reason 'aborted': an abort
+        // is an explicit caller decision and must win regardless of
+        // sawResult (see armResultCloseGrace()'s own doc comment on the
+        // matching fix for the reverse race).
+        if (reason === 'timeout' && sawResult) {
+          finishWithSeenResult({ orphaned: true });
+          return;
+        }
         finish({ sessionId: latestSessionId, costUsd, usage, stopReason: reason, error: null, orphaned: true, ...(timeoutClock ? { timeoutClock } : {}) });
       }, killGraceMs);
     };
@@ -739,6 +774,20 @@ export async function startTurn({
         // own doc comment.
         killChildTree(child);
         killChildTreeHard(child);
+        // Panel review Fix-Runde 3, minor: the close handler documents
+        // 'aborted' as ALWAYS winning, regardless of sawResult (see its own
+        // doc comment) — this give-up path is a second, independent timer
+        // and did not know that. Sequence this closes: a result arrives and
+        // arms this grace; the caller then aborts (requestKill('aborted')
+        // arms its OWN, later-firing killGiveUpTimer); if 'close' never
+        // comes, THIS timer — armed earlier, so it fires first — used to
+        // win and resolve as 'result', silently overriding the caller's
+        // explicit abort. Checking killReason here makes 'aborted' win
+        // regardless of which give-up timer happens to fire first.
+        if (killReason === 'aborted') {
+          finish({ sessionId: latestSessionId, costUsd, usage, stopReason: 'aborted', error: null, orphaned: true });
+          return;
+        }
         finishWithSeenResult({ orphaned: true });
       }, killGraceMs);
     };
@@ -800,20 +849,23 @@ export async function startTurn({
           }
         }
 
-        // Panel review Fix-Runde 2, important: a dropped line desyncs the
+        // Panel review Fix-Runde 2+3, important: a dropped line desyncs the
         // clocks' own bookkeeping exactly as much as a dropped can_use_tool
         // request desyncs the approval channel above — it never reaches
         // mapLine(), so it can never call clocks.onProgress(). Left
-        // uncompensated: a dropped tool_result leaves a tool-lease OPEN
-        // forever (killing an actively-working turn at TOOL_LEASE_MS
-        // instead of ACTIVE_TOTAL_MS, with a misleading timeoutClock), and a
-        // dropped result line leaves sawResult false (an actually-successful
-        // turn ends as 'timeout' or a confusing generic 'error'). `rawLine`
-        // is already fully in memory at this point — readline delivered it
-        // whole; this guard only ever prevented JSON.parse/event buffering,
-        // never the buffering readline itself already did — so a bounded
-        // string scan over the WHOLE line (not just the 4096-byte prefix
-        // above) stays memory-safe.
+        // uncompensated in EITHER direction: a dropped tool_use never opens
+        // a lease (an actively-running tool judged by idle, 120s, instead of
+        // its own 25-minute tool-lease), a dropped tool_result leaves a
+        // lease OPEN forever (killing an actively-working turn at
+        // TOOL_LEASE_MS instead of ACTIVE_TOTAL_MS, with a misleading
+        // timeoutClock), and a dropped result line leaves sawResult false
+        // (an actually-successful turn ends as 'timeout' or a confusing
+        // generic 'error'). `rawLine` is already fully in memory at this
+        // point — readline delivered it whole; this guard only ever
+        // prevented JSON.parse/event buffering, never the buffering
+        // readline itself already did — so a bounded string scan over the
+        // WHOLE line (not just the 4096-byte prefix above) stays
+        // memory-safe.
         //
         // (a) Any dropped line proves the CLI is alive and producing
         // SOMETHING — treat it as generic progress (an idle-reset)
@@ -821,24 +873,50 @@ export async function startTurn({
         // open: idle isn't consulted then anyway (see timeout.mjs's
         // check()).
         clocks.onProgress('assistant-message');
-        if (prefix.includes('"type":"user"') && prefix.includes('"tool_result"')) {
-          // (b) A user line can carry SEVERAL tool_result blocks (see
+        if (prefix.includes('"type":"assistant"') && prefix.includes('"tool_use"')) {
+          // (b) Panel review Fix-Runde 3, important: the mirror image of
+          // (c) below, and the exact same class of bug — an oversized
+          // tool_use (e.g. an 8MB Write/Bash payload, PRE-allowed via
+          // --allowedTools/acceptEdits so no can_use_tool round-trip's own
+          // sniff would ever catch it) never opened a lease at all, so the
+          // real, still-running tool call was judged by idle (120s) instead
+          // of its own 25-minute tool-lease — an actively-working turn
+          // killed as a false 'idle' timeout. Ids are recoverable the same
+          // way (a)'s can_use_tool sniff recovers request_id: Anthropic's
+          // content-block JSON always orders `type` before `id` within one
+          // tool_use block.
+          const toolUseIds = [...rawLine.matchAll(/"type"\s*:\s*"tool_use"\s*,\s*"id"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
+          for (const id of toolUseIds) {
+            openToolUseIds.add(id);
+            clocks.onProgress('tool-start');
+          }
+          if (toolUseIds.length === 0) {
+            onEventErrors.push('dropped an oversized assistant/tool_use line with no readable id — tool-lease bookkeeping may be desynced');
+          }
+        } else if (prefix.includes('"type":"user"') && prefix.includes('"tool_result"')) {
+          // (c) A user line can carry SEVERAL tool_result blocks (see
           // mapLine()'s own comment on this) — one dropped line can close
-          // MORE than one open lease; under-counting would leave one stuck
-          // open. Over-counting is harmless: timeout.mjs's open-lease count
-          // clamps at 0.
-          // No id is recoverable from a dropped line, so this compensation
-          // calls the clock directly instead of going through the
-          // id-matching gate the mapLine() path below uses (see that gate's
-          // own doc comment) — an id-less drop cannot be checked against
-          // openToolUseIds, only counted.
-          const toolResultCount = (rawLine.match(/"tool_use_id"\s*:/g) ?? []).length;
-          for (let i = 0; i < toolResultCount; i += 1) clocks.onProgress('tool-end');
-          if (toolResultCount === 0) {
+          // MORE than one open lease. Ids are recovered via regex (same
+          // technique as (b) above) and run through the SAME id-matching
+          // gate the mapLine() path below uses, instead of blindly counting
+          // occurrences — panel review Fix-Runde 3, minor: id-less counting
+          // left a stale, never-removed entry in openToolUseIds behind,
+          // which a LATER genuine duplicate/orphaned tool_result for that
+          // same id could then use to close a different tool's still-open
+          // lease (exactly the bug the id-gate itself exists to prevent).
+          const toolResultIds = [...rawLine.matchAll(/"tool_use_id"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);
+          for (const id of toolResultIds) {
+            if (openToolUseIds.delete(id)) {
+              clocks.onProgress('tool-end');
+            } else {
+              onEventErrors.push(`ignored a dropped tool-end for an id with no open tool-start (duplicate or orphaned tool_result): ${id}`);
+            }
+          }
+          if (toolResultIds.length === 0) {
             onEventErrors.push('dropped an oversized tool_result line with no readable tool_use_id — tool-lease bookkeeping may be desynced');
           }
         } else if (prefix.includes('"type":"result"')) {
-          // (c) Never sets sawResult — the actual costUsd/usage/subtype are
+          // (d) Never sets sawResult — the actual costUsd/usage/subtype are
           // unrecoverable from a dropped line, so the turn still finishes
           // through the normal error-on-close path below, just no longer
           // through a MISLEADING 'timeout'. endStdin() lets a well-behaved

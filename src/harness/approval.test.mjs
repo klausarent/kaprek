@@ -246,7 +246,16 @@ test('a pending approval exempts the active-total clock — deciding across a po
   closeChild(child);
 
   const result = await turn;
-  expect(result.stopReason).toBe('result'); // NOT 'timeout' — a no-op-exemption mutant dies here (poll at t=250ms sees activeElapsed>=100ms)
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'
+  // Panel review Fix-Runde 3, minor (corrects this comment's own prior,
+  // factually wrong claim): a no-op-exemption mutant does NOT die at the
+  // stopReason assertion above — the close handler's own mirror-race fix
+  // (claude-code.mjs, see its doc comment) resolves a turn that already saw
+  // a 'result' event as 'result' even if a clock fired and killed the child
+  // first, so `stopReason` alone stays 'result' either way. It dies HERE:
+  // under the mutant, the poll at t=250ms (activeElapsed>=100ms) requests a
+  // kill and sets `child.killed = true`; with the exemption in place, no
+  // kill is ever requested at all.
   expect(child.killed).toBeFalsy();
 }, 5000);
 
@@ -295,6 +304,13 @@ test('a pending approval exempts the tool-lease clock too — an open tool call 
 
   const result = await turn;
   expect(result.stopReason).toBe('result'); // NOT 'timeout'/'tool-lease'
+  // Panel review Fix-Runde 3, important: the stopReason assertion alone is
+  // a tautology — under a mutant with clocks.onApprovalStart()/onApprovalEnd()
+  // removed, tool-lease still fires at the 250ms poll and requests a kill,
+  // but the close handler's own mirror-race fix resolves the turn as
+  // 'result' anyway once the later result/close arrive, masking the kill.
+  // This is the actual causal signal.
+  expect(child.killed).toBeFalsy();
 }, 5000);
 
 test('the active-total clock keeps running once the last pending approval resolves — a turn that idles too long AFTER deciding still times out', async () => {
@@ -445,12 +461,21 @@ test('an orphaned/duplicate tool-end (no matching open tool-start) does not clos
 
   const result = await turn;
   expect(result.stopReason).toBe('result'); // NOT 'timeout'
+  // Panel review Fix-Runde 3, important: the stopReason assertion alone is
+  // a tautology — under a mutant with the openToolUseIds id-gate removed
+  // (id-agnostic counting, the exact pre-Fund-3-fix state), the orphaned
+  // tool-end DOES prematurely close the lease, idle fires at the 250ms
+  // poll and requests a kill, but the close handler's own mirror-race fix
+  // resolves the turn as 'result' anyway once the later result/close
+  // arrive, masking the kill. This is the actual causal signal.
+  expect(child.killed).toBeFalsy();
 }, 5000);
 
 // IMPORTANT: an oversized (>MAX_LINE_BYTES) line desyncs the clocks' own
 // bookkeeping exactly as much as an oversized can_use_tool request desyncs
 // the approval channel (the existing test above this section) — the
-// size-guard's compensation covers all three affected line shapes.
+// size-guard's compensation covers all four affected line shapes (a fifth
+// test for the tool_use direction follows this block, see its own comment).
 // Direction 1: a dropped tool_result must still close its own tool-lease —
 // otherwise it stays open forever and eventually kills an actively-working
 // turn. toolLeaseMs is deliberately tiny; if the lease leaks, tool-lease
@@ -474,19 +499,53 @@ test('a dropped (>8MB) tool_result line still closes its tool-lease via the size
   const result = await turn;
   expect(result.droppedLines).toBe(1);
   expect(result.stopReason).toBe('result'); // NOT 'timeout'/'tool-lease'
+  // Panel review Fix-Runde 3, important: the stopReason assertion alone is
+  // a tautology — remove the drop-path's clock compensation entirely (its
+  // pre-fix state) and the lease leaks, tool-lease fires at the 250ms poll
+  // and requests a kill, but the close handler's own mirror-race fix
+  // resolves the turn as 'result' anyway once the later result/close
+  // arrive, masking the kill. This is the actual causal signal.
+  expect(child.killed).toBeFalsy();
 }, 5000);
 
-// Direction 2: a dropped assistant/tool_use line must still count as
-// progress for idle, even though it never opens a (phantom) lease — a
-// silent build the CLI is still legitimately running must not be judged
-// solely by pre-drop information.
-test('a dropped (>8MB) assistant/tool_use line still counts as progress for idle — a drop right before the deadline is not silently missed', async () => {
+// Direction 2: a dropped tool_use must still open its own lease — a
+// still-genuinely-running tool must not be judged by idle instead of its
+// own (25-minute) tool-lease just because its own opening line was too big
+// to parse. idleMs is deliberately tiny and toolLeaseMs left at its huge
+// default; if the lease never opens, idle fires well within this test's
+// own window regardless of activity.
+test('a dropped (>8MB) assistant/tool_use line still opens its own tool-lease — a real, still-running tool is not judged by idle', async () => {
   const child = makeControllableChild();
   const hugeInput = 'x'.repeat(9 * 1024 * 1024);
   const hugeLine = JSON.stringify({
     type: 'assistant',
-    message: { content: [{ type: 'tool_use', id: 'toolu_huge', name: 'Write', input: { content: hugeInput } }] },
+    message: { content: [{ type: 'tool_use', id: 'toolu_dropped_start', name: 'Write', input: { content: hugeInput } }] },
   });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, idleMs: 100, toolLeaseMs: 10_000, spawnFn: () => child });
+
+  child.stdout.write(`${hugeLine}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 300)); // > CLOCK_POLL_INTERVAL_MS and > idleMs, well under toolLeaseMs — only survives if the drop actually opened the lease
+  writeLine(child, { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_dropped_start', content: 'done' }] } });
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.droppedLines).toBe(1);
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'/'idle'
+  // Same masking risk as the sibling tests in this section — assert the
+  // actual causal signal, not just the mirror-race-reachable stopReason.
+  expect(child.killed).toBeFalsy();
+}, 5000);
+
+// Direction 3: a dropped line that is neither a tool_use nor a tool_result
+// (here: an oversized plain-text assistant message) must still count as
+// generic progress for idle — the (a) compensation the other two directions
+// build on, isolated from lease-opening/closing so it is tested on its own.
+test('a dropped (>8MB) assistant/text line (no tool_use) still counts as progress for idle', async () => {
+  const child = makeControllableChild();
+  const hugeText = 'x'.repeat(9 * 1024 * 1024);
+  const hugeLine = JSON.stringify({ type: 'assistant', message: { content: [{ type: 'text', text: hugeText }] } });
 
   const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, idleMs: 200, spawnFn: () => child });
 
@@ -500,12 +559,13 @@ test('a dropped (>8MB) assistant/tool_use line still counts as progress for idle
   const result = await turn;
   expect(result.droppedLines).toBe(1);
   expect(result.stopReason).toBe('result'); // NOT 'timeout'/'idle'
+  expect(child.killed).toBeFalsy();
 }, 5000);
 
-// Direction 3 (nebenbefund gleicher Wurzel): a dropped result line must not
+// Direction 4 (nebenbefund gleicher Wurzel): a dropped result line must not
 // let the turn end as a misleadingly generic 'timeout' — costUsd/usage are
-// genuinely unrecoverable, but the CLI's own eventual exit still resolves
-// the turn normally.
+// genuinely unrecoverable, but endStdin() still lets the CLI's own eventual
+// exit resolve the turn normally.
 test('a dropped (>8MB) result line still ends the turn via endStdin() and the normal close path, not via a misleading timeout', async () => {
   const child = makeControllableChild();
   const hugeResultText = 'x'.repeat(9 * 1024 * 1024);
@@ -515,6 +575,13 @@ test('a dropped (>8MB) result line still ends the turn via endStdin() and the no
 
   child.stdout.write(`${hugeLine}\n`);
   await new Promise((resolve) => setTimeout(resolve, 20));
+  // Panel review Fix-Runde 3, minor: the stopReason/warnings assertions
+  // below stay identical with or without the drop path's endStdin() call
+  // (this test's own timing closes the child itself well before the first
+  // poll could ever turn a missing sawResult into a 'timeout' anyway) — the
+  // ONLY signal that the compensation's endStdin() branch actually ran is
+  // this flag.
+  expect(child.stdinEnded).toBe(true);
   closeChild(child);
 
   const result = await turn;
