@@ -110,7 +110,7 @@ Their **network access is not restricted at all.** Node's permission model has n
   - `<dataDir>` (default `~/.kaprek`, override with `KAPREK_DATA_DIR`): board events (`board/events.jsonl`), the search index (`search.db`, redacted content only), signing keys (`keys/`), policy state and logs (`policy.json`, `policy-state/`, `policy.log`), and preserved scratchpad artifacts (`artifacts/<projectSlug>/<sessionId>/`, **not** redacted — see [Artifact preservation](#artifact-preservation)).
   - Your OS temp directory: a small metadata cache (titles + timestamps + a `machineHint`, a username heuristic parsed out of a session's `cwd`, all redacted, auto-evicted after 30 days). Written with default file permissions (unlike the signing keys under `keys/`, which are created `0600`).
   - `~/.claude/settings.json`: only if you run `kaprek hooks install` (backed up first, removed again with `kaprek hooks uninstall`).
-- **Single-process assumption.** kaprek expects one server instance per data dir. Running two instances against the same `<dataDir>` at once is an unsupported, documented limitation — not something the code guards against.
+- **One server per data dir, enforced.** A second start against the same `<dataDir>` refuses to run rather than silently landing on another port — see `<dataDir>/instance.lock` and `src/lib/instance-lock.mjs`.
 
 These are not just claims in prose — each one is enforced by a test in `src/`. Read the tests if you want to verify it yourself instead of trusting this README.
 
@@ -122,7 +122,6 @@ Things this version does not do, listed here because each one is a limit you can
 - **An open tab is not a person.** The check above counts live connections, nothing more. A forgotten tab in another window is enough to let a `question` trigger start; whether anyone is actually looking, kaprek cannot tell. If the question then goes unanswered for ten minutes it is denied, so the failure direction is safe, but the trigger did run.
 - **The instance token does not stop local programs.** See [What leaves your machine](#what-leaves-your-machine). A desktop shell that never puts the token on HTTP is the fix.
 - **Third-party apps are off, and app handlers can reach the network.** Both come from the same missing piece: apps share one process and are unfenced on the network side. Worker isolation is the fix; until then only bundled apps load (`KAPREK_ALLOW_USER_APPS=1` overrides it).
-- **One server per data dir.** Two instances against the same `<dataDir>` is unsupported; a trigger's daily caps assume it is the only one counting.
 
 ## FAQ
 

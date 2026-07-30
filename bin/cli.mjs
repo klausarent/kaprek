@@ -8,6 +8,8 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
+import { ensureAppDir } from '../src/lib/appdir.mjs';
+import { acquireInstanceLock, InstanceLockHeldError } from '../src/lib/instance-lock.mjs';
 
 const USAGE = `Usage: kaprek [options]
        kaprek hooks <install|uninstall|status>
@@ -157,16 +159,44 @@ async function main() {
   const webDist = resolveWebDist();
   console.log(`Scanning: ${path.resolve(opts.dir)}`);
 
+  // Resolved (and created) once, up front, so the lock and the server agree
+  // on exactly which ~/.kaprek they mean — see src/lib/appdir.mjs.
+  const dataDir = ensureAppDir();
+
+  // Acquired BEFORE startWithPortRetry(), while the real port is still
+  // unknown: that retry loop is exactly the silent EADDRINUSE fallback this
+  // lock exists to stop (see src/lib/instance-lock.mjs header comment), so a
+  // second instance must be refused here, before it ever gets a chance to
+  // wander onto basePort+1. The port gets filled in below once startServer()
+  // actually has one.
+  let lock;
+  try {
+    lock = await acquireInstanceLock({ dataDir, port: undefined });
+  } catch (err) {
+    if (err instanceof InstanceLockHeldError) {
+      console.error(`kaprek is already running at ${err.url} (pid ${err.pid})`);
+    } else {
+      console.error(`Failed to acquire instance lock: ${err.message}`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
   let started;
   try {
-    started = await startWithPortRetry(opts.port, { rootDir: opts.dir, redact: opts.redact, webDist });
+    started = await startWithPortRetry(opts.port, { rootDir: opts.dir, redact: opts.redact, webDist, dataDir });
   } catch (err) {
     console.error(`Failed to start server: ${err.message}`);
+    // Otherwise a start that fails here (bad --dir, no free port at all)
+    // leaves an unreleased lock behind and blocks every retry for
+    // LOCK_STALE_MS, even though nothing is actually listening.
+    await lock.release();
     process.exitCode = 1;
     return;
   }
 
   const { server, url } = started;
+  await lock.updatePort(Number(new URL(url).port));
   console.log(url);
 
   if (opts.open) {
@@ -175,7 +205,7 @@ async function main() {
 
   process.on('SIGINT', () => {
     server.close(() => {
-      process.exit(0);
+      lock.release().finally(() => process.exit(0));
     });
   });
 }

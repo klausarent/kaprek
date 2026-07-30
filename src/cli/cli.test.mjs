@@ -114,3 +114,25 @@ test('starts a real server against an empty --dir and serves /api/projects', asy
 
   child.kill();
 });
+
+test('a second start on the same dataDir refuses instead of silently falling back to basePort+1', async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-test-'));
+  const port = 20000 + Math.floor(Math.random() * 20000);
+
+  // Both calls share childDataDir: runCli() only mkdtemp's it once per test
+  // (see the `childDataDir = childDataDir ?? ...` guard above).
+  const first = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
+  const firstUrl = await waitForUrl(first);
+
+  const second = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
+  const { code, stderr } = await collectRun(second);
+
+  expect(code).not.toBe(0);
+  expect(stderr).toContain(firstUrl);
+
+  // The pre-lock behavior (startWithPortRetry silently trying basePort+1 on
+  // EADDRINUSE) must not have kicked in: nothing should be listening there.
+  await expect(fetch(`http://127.0.0.1:${port + 1}/api/projects`)).rejects.toThrow();
+
+  first.kill();
+});
