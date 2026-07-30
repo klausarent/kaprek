@@ -91,9 +91,11 @@ A trigger that runs every 30 minutes is 48 requests a day to Anthropic that you 
 
 It does **not** protect against other programs on this machine. Any local process can request `GET /` and read the token out of the HTML, then use the API exactly as you would — including starting agent turns. The fix is a desktop shell that keeps the token out of HTTP entirely; that is on the backlog and not built. Until then, the security boundary is "you trust the software running under your own user account".
 
-**What apps may do.** Bundled apps and apps you put under `<dataDir>/apps/` are loaded and their tools become callable in a turn. Their file access is genuinely enforced: the MCP server runs under Node's `--permission` model with a narrow allowlist (write only inside the workspace, read only the app directories and the workspace — see `src/apps/mcp-config.mjs`).
+**What apps may do.** Only the apps bundled with kaprek are loaded. Anything you drop into `<dataDir>/apps/` is found, listed on the Apps page as not loaded, and skipped — because every app's tools run inside one shared Node process, so a third-party app could patch `JSON.stringify` or `process.stdout.write` and read or rewrite another app's results, and a synchronous loop in one would wedge them all. That stays shut until app handlers run isolated. `KAPREK_ALLOW_USER_APPS=1` loads them anyway; setting it is a decision to open exactly that gap.
 
-Their **network access is not restricted at all.** Node's permission model has no network scope, so an app handler can open any connection it likes. The `policy.dataEgress` and `policy.externalAction` fields in a manifest are display metadata for the Apps page; nothing enforces them. Install an app only if you would run its code directly. Sandboxing app handlers in an isolated worker is on the backlog.
+For the apps that do load, file access is genuinely enforced: the MCP server runs under Node's `--permission` model with a narrow allowlist (write only inside the workspace, read only the app directories and the workspace — see `src/apps/mcp-config.mjs`).
+
+Their **network access is not restricted at all.** Node's permission model has no network scope, so an app handler can open any connection it likes. The `policy.dataEgress` and `policy.externalAction` fields in a manifest are display metadata for the Apps page; nothing enforces them. This is why bundled apps are reviewed with kaprek and third-party ones are off by default.
 
 **The tool list heals itself, and the first run after a CLI update may fail.** kaprek asks the `claude` CLI which tools it has and keeps a learned list, so that a tool the CLI added is covered by the approval rules instead of slipping past them. When the CLI gains a tool kaprek has never seen, the next trigger run stops fail-closed rather than proceeding with an unverified list — and records what it learned. The run after that generally succeeds; on our own machine it took two. This is deliberate: the safe direction for an unknown tool is to stop, not to allow.
 
@@ -117,8 +119,9 @@ These are not just claims in prose — each one is enforced by a test in `src/`.
 Things this version does not do, listed here because each one is a limit you can run into rather than a feature nobody got to.
 
 - **Approvals need an open browser tab.** A `question` or `review` trigger that fires on its own only runs while some kaprek page has a live connection. With none open it refuses to start and says so on the trigger page (`needs an open UI to ask for approval`), rather than raising a question nobody can answer and being auto-denied ten minutes later. A persistent approval inbox — questions that outlive the connection and wait for you — is the fix and is not built.
+- **An open tab is not a person.** The check above counts live connections, nothing more. A forgotten tab in another window is enough to let a `question` trigger start; whether anyone is actually looking, kaprek cannot tell. If the question then goes unanswered for ten minutes it is denied, so the failure direction is safe, but the trigger did run.
 - **The instance token does not stop local programs.** See [What leaves your machine](#what-leaves-your-machine). A desktop shell that never puts the token on HTTP is the fix.
-- **App handlers can reach the network.** File access is enforced, network access is not. Worker isolation is the fix.
+- **Third-party apps are off, and app handlers can reach the network.** Both come from the same missing piece: apps share one process and are unfenced on the network side. Worker isolation is the fix; until then only bundled apps load (`KAPREK_ALLOW_USER_APPS=1` overrides it).
 - **One server per data dir.** Two instances against the same `<dataDir>` is unsupported; a trigger's daily caps assume it is the only one counting.
 
 ## FAQ
