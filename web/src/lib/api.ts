@@ -1,6 +1,7 @@
 // Thin fetch wrappers around kaprek's local HTTP API (src/server/server.mjs).
 // The UI is served by that same server, so all requests are same-origin
 // relative paths — no base URL, no CORS handling needed.
+import { setStatus } from "./status";
 
 export type ProjectSummary = {
   projectSlug: string;
@@ -52,7 +53,25 @@ export type CompactEvent = {
   postTokens: number | null;
 };
 
-export type DigestEvent = ToolEvent | TextEvent | SubagentEvent | CompactEvent;
+export type DigestEvent = ToolEvent | TextEvent | SubagentEvent | CompactEvent | ApprovalEvent;
+
+// One persisted approval, either lifecycle half (see src/chats/store.mjs's
+// EVENT_SHAPES 'approval' entry — 'requested' carries the proposed call,
+// 'resolved' the decision). Rendered by EventBlock.tsx as a single line.
+export type ApprovalEvent = {
+  kind: "approval";
+  ts: string;
+  phase: "requested" | "resolved";
+  requestId: string;
+  toolName: string | null;
+  displayName?: string | null;
+  input?: string | null;
+  description?: string | null;
+  agentId?: string | null;
+  reason?: string | null;
+  behavior?: "allow" | "deny" | "error" | null;
+  message?: string | null;
+};
 
 export type SubagentThread = {
   agentId: string | null;
@@ -83,6 +102,73 @@ export type Digest = {
   subagents: SubagentThread[];
 };
 
+// ---------------------------------------------------------------------------
+// Instance token (src/server/token.mjs)
+//
+// Every /api/* route — GET included — is a 401 without the `x-kaprek-token`
+// header. The server hands the token to the browser by injecting
+// `<meta name="kaprek-token" content="…">` into the index.html it serves (see
+// server.mjs::injectTokenMeta), so it is read from the DOM once here and
+// attached to every request below, including the SSE fetches.
+//
+// A missing meta tag means this page was NOT served by a kaprek server that
+// knows its own token (a stale cached document, a `vite dev` page, a
+// hand-saved copy). There is nothing the UI can do about that on its own, so
+// every call fails fast with MissingTokenError and App.tsx shows the
+// restart-the-server page instead of a wall of 401s.
+// ---------------------------------------------------------------------------
+
+const TOKEN_HEADER = "x-kaprek-token";
+const TOKEN_META_NAME = "kaprek-token";
+
+/** Thrown by every request helper when index.html carried no instance-token meta tag. */
+export class MissingTokenError extends Error {
+  constructor() {
+    super("no instance token in this page — restart the kaprek server and reload");
+    this.name = "MissingTokenError";
+  }
+}
+
+function readTokenMeta(): string | null {
+  if (typeof document === "undefined") return null;
+  const meta = document.querySelector(`meta[name="${TOKEN_META_NAME}"]`);
+  const content = meta?.getAttribute("content")?.trim() ?? "";
+  return content.length > 0 ? content : null;
+}
+
+// Read once, at module load: the token never changes for the lifetime of a
+// served page, and re-querying the DOM per request would only invite a
+// mid-session read of a token some other script had replaced.
+const instanceToken = readTokenMeta();
+
+/** False when index.html carried no token meta tag — see MissingTokenError. */
+export function hasInstanceToken(): boolean {
+  return instanceToken !== null;
+}
+
+function tokenHeader(): Record<string, string> {
+  if (instanceToken === null) throw new MissingTokenError();
+  return { [TOKEN_HEADER]: instanceToken };
+}
+
+/**
+ * `fetch` plus the instance token and the reachability bookkeeping the header
+ * status dot reads (see lib/status.ts). Only a fetch that REJECTS counts as
+ * unreachable — a 401/404/500 is still a server that answered. An aborted
+ * request (user pressed Stop, component unmounted) is neither.
+ */
+async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = { ...(init.headers as Record<string, string> | undefined), ...tokenHeader() };
+  try {
+    const res = await fetch(url, { ...init, headers });
+    setStatus({ serverReachable: true });
+    return res;
+  } catch (err) {
+    if ((err as Error).name !== "AbortError") setStatus({ serverReachable: false });
+    throw err;
+  }
+}
+
 async function throwOnError(res: Response): Promise<void> {
   if (res.ok) return;
   let detail = "";
@@ -96,7 +182,7 @@ async function throwOnError(res: Response): Promise<void> {
 }
 
 async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
+  const res = await apiFetch(url);
   await throwOnError(res);
   return res.json() as Promise<T>;
 }
@@ -108,7 +194,7 @@ async function getJson<T>(url: string): Promise<T> {
 const APP_HEADERS = { "x-app-request": "1" } as const;
 
 async function writeJson<T>(url: string, method: string, body?: unknown): Promise<T> {
-  const res = await fetch(url, {
+  const res = await apiFetch(url, {
     method,
     headers: body === undefined ? APP_HEADERS : { ...APP_HEADERS, "Content-Type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -277,7 +363,7 @@ export class TaskDocIncompleteError extends Error {
 }
 
 export async function setTaskStatus(id: string, status: BoardStatus): Promise<Task> {
-  const res = await fetch(`/api/board/tasks/${encodeURIComponent(id)}/status`, {
+  const res = await apiFetch(`/api/board/tasks/${encodeURIComponent(id)}/status`, {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
     body: JSON.stringify({ status }),
@@ -312,6 +398,34 @@ export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
 // `input` DigestEvent's ToolEvent expects — see toDigestEvent() below, which
 // bridges the two so EventBlock.tsx can render both live and reloaded turns
 // unchanged.
+/**
+ * A live tool-use approval question, streamed mid-turn (see
+ * server.mjs::makeApprovalHandler). `chatId` is added by the route and is
+ * REQUIRED back in the answer's body — POST /api/approvals/<id> cannot look
+ * an entry up without it (see server.mjs::approvalKey). `input` is a plain
+ * object here (already redacted by run.mjs, NOT pre-stringified like a
+ * persisted ApprovalEvent's `input`).
+ *
+ * There is no matching 'resolved' frame on the wire: the client learns the
+ * outcome from its own answerApproval() response, and a request the server
+ * decides on its own (10-minute auto-deny, turn ended) is cleaned up client-
+ * side by the countdown / 'turn-complete' — see lib/approvals.ts.
+ */
+export type ApprovalFrame = {
+  type: "approval";
+  chatId: string;
+  id: string;
+  toolName: string | null;
+  displayName: string | null;
+  input: Record<string, unknown> | null;
+  description: string | null;
+  reason: string | null;
+  agentId: string | null;
+  toolUseId?: string | null;
+  reasonType?: string | null;
+  suggestions?: unknown;
+};
+
 export type ChatStreamEvent =
   | { type: "chat-id"; chatId: string }
   | { type: "init"; sessionId: string | null; tools: string[]; model: string | null; permissionMode: string | null }
@@ -322,6 +436,7 @@ export type ChatStreamEvent =
   | { type: "rate-limit"; info: unknown }
   | { type: "result"; sessionId: string | null; costUsd: number | null; usage: Record<string, unknown> | null; isError: boolean }
   | { type: "error"; message: string }
+  | ApprovalFrame
   | {
       type: "turn-complete";
       chatId: string;
@@ -339,11 +454,15 @@ export type ChatStreamEvent =
 // reloaded/historical digest's ToolEvent already has.
 export type ChatStoredEvent =
   | { kind: "user" | "assistant" | "thinking"; ts: string; text: string; msgId?: string | null }
-  | { kind: "tool"; ts: string; name: string | null; input: string | null; result: string | null; msgId?: string | null; resultRef?: string | null };
+  | { kind: "tool"; ts: string; name: string | null; input: string | null; result: string | null; msgId?: string | null; resultRef?: string | null }
+  | Omit<ApprovalEvent, "kind"> & { kind: "approval" };
 
 export type ChatSummary = {
   id: string;
   title: string | null;
+  origin?: "user" | "trigger";
+  triggerId?: string | null;
+  silent?: boolean;
   createdAt: string | null;
   updatedAt: string | null;
   eventCount: number;
@@ -357,6 +476,11 @@ export type ChatSummary = {
  * not a conversion — kept as its own function since ChatStoredEvent and
  * DigestEvent are still two distinct types (e.g. optional vs. nullable
  * msgId).
+ *
+ * An 'approval' event has no digest counterpart at all (it is a live-turn-only
+ * concept), so it is passed through as its own DigestEvent variant — that is
+ * what keeps a reloaded chat containing approvals from rendering as
+ * "Unknown event type: approval".
  */
 export function toDigestEvent(event: ChatStoredEvent): DigestEvent {
   if (event.kind === "tool") {
@@ -370,11 +494,24 @@ export function toDigestEvent(event: ChatStoredEvent): DigestEvent {
       resultRef: event.resultRef ?? null,
     };
   }
+  if (event.kind === "approval") {
+    return { ...event, kind: "approval" };
+  }
   return { kind: event.kind, ts: event.ts, msgId: event.msgId ?? null, text: event.text };
 }
 
-export function fetchChatList(): Promise<ChatSummary[]> {
-  return getJson<{ chats: ChatSummary[] }>("/api/chat/list").then((r) => r.chats);
+/**
+ * Chat summaries. `triggerId` narrows the list to the runs of one trigger
+ * (the trigger page's "runs" link); `includeSilent` is a SEPARATE opt-in —
+ * a heartbeat's silent runs stay hidden unless asked for, even when filtering
+ * by trigger (see server.mjs::handleChatList).
+ */
+export function fetchChatList(filter: { triggerId?: string; includeSilent?: boolean } = {}): Promise<ChatSummary[]> {
+  const params = new URLSearchParams();
+  if (filter.triggerId) params.set("triggerId", filter.triggerId);
+  if (filter.includeSilent) params.set("includeSilent", "1");
+  const qs = params.toString();
+  return getJson<{ chats: ChatSummary[] }>(`/api/chat/list${qs ? `?${qs}` : ""}`).then((r) => r.chats);
 }
 
 export function fetchChat(chatId: string): Promise<{ chat: ChatSummary; events: ChatStoredEvent[] }> {
@@ -429,6 +566,27 @@ export function parseSseChunk(buffer: string): { frames: ChatStreamEvent[]; rest
  * the turn had finished normally — `onEvent` is the only way callers
  * observe individual frames.
  */
+/**
+ * Drains an already-open SSE response body, handing each parsed frame to
+ * `onFrame`. Shared by streamChatTurn() and fireTrigger() — both routes speak
+ * the identical `data: <json>\n\n` framing, they only differ in which final
+ * frame type means "this stream is done".
+ */
+async function readSseBody<T>(res: Response, onFrame: (frame: T) => void): Promise<void> {
+  if (!res.body) throw new Error("response has no body");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const { frames, rest } = parseSseChunk(buffer);
+    buffer = rest;
+    for (const frame of frames) onFrame(frame as unknown as T);
+  }
+}
+
 export async function streamChatTurn({
   chatId,
   text,
@@ -440,7 +598,7 @@ export async function streamChatTurn({
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
 }): Promise<void> {
-  const res = await fetch("/api/chat/turn", {
+  const res = await apiFetch("/api/chat/turn", {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
     body: JSON.stringify(chatId ? { chatId, text } : { text }),
@@ -451,22 +609,177 @@ export async function streamChatTurn({
     throw new Error(`Request failed (HTTP ${res.status})`);
   }
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
   let sawTurnComplete = false;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const { frames, rest } = parseSseChunk(buffer);
-    buffer = rest;
-    for (const frame of frames) {
-      if (frame.type === "turn-complete") sawTurnComplete = true;
-      onEvent(frame);
-    }
-  }
+  await readSseBody<ChatStreamEvent>(res, (frame) => {
+    if (frame.type === "turn-complete") sawTurnComplete = true;
+    onEvent(frame);
+  });
   if (!sawTurnComplete) {
     throw new IncompleteStreamError();
   }
+}
+
+// ---------------------------------------------------------------------------
+// Approvals (POST /api/approvals/<id>)
+// ---------------------------------------------------------------------------
+
+/**
+ * Answers one pending approval. Returns 'gone' for the two responses that
+ * mean "nothing left to answer" — 404 (unknown or expired: the server's own
+ * 10-minute timer already denied it, or the turn ended) and 409 (already
+ * decided). Neither is an error worth showing the user: the entry is simply
+ * dropped from the stack (see lib/approvals.ts::removeApproval).
+ */
+export async function answerApproval(
+  id: string,
+  { chatId, behavior, message }: { chatId: string; behavior: "allow" | "deny"; message?: string },
+): Promise<"ok" | "gone"> {
+  const res = await apiFetch(`/api/approvals/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(message === undefined ? { chatId, behavior } : { chatId, behavior, message }),
+  });
+  if (res.status === 404 || res.status === 409) return "gone";
+  await throwOnError(res);
+  return "ok";
+}
+
+// ---------------------------------------------------------------------------
+// Triggers (src/triggers/* via /api/triggers)
+// ---------------------------------------------------------------------------
+
+export type TriggerType = "heartbeat" | "schedule" | "file-watch" | "clipboard" | "saved-prompt";
+export type Escalation = "notify" | "question" | "review";
+
+export const TRIGGER_TYPES: TriggerType[] = ["heartbeat", "schedule", "file-watch", "clipboard", "saved-prompt"];
+export const ESCALATIONS: Escalation[] = ["notify", "question", "review"];
+export const FILE_WATCH_EVENTS = ["add", "change", "unlink"] as const;
+
+/** Union of every type's config fields (see src/triggers/registry.mjs's per-type validators). */
+export type TriggerConfig = {
+  intervalMinutes?: number;
+  checklistPath?: string;
+  everyMinutes?: number;
+  dailyAt?: string;
+  path?: string;
+  events?: string[];
+  debounceMs?: number;
+  maxDepth?: number;
+  pollMs?: number;
+  matchPattern?: string;
+};
+
+export type Trigger = {
+  id: string;
+  type: TriggerType;
+  config: TriggerConfig;
+  promptTemplate: string;
+  escalation: Escalation;
+  appScope: string[];
+  enabled: boolean;
+  approvalRequired: boolean;
+  limits: { maxRunsPerDay: number; maxCostPerDay: number };
+};
+
+/**
+ * A trigger as GET /api/triggers returns it: the stored trigger plus today's
+ * usage and the two "can this actually work" verdicts the server computes
+ * (see server.mjs::handleTriggersList).
+ */
+export type TriggerStatus = Trigger & {
+  runsToday: number;
+  costToday: number;
+  approvalPath: "policy" | "ui";
+  blocked: string | null;
+  supported: boolean;
+  unsupportedReason: string | null;
+};
+
+/** Thrown on POST /api/triggers 400 — carries the offending field so the form can show the message at it. */
+export class TriggerValidationError extends Error {
+  field: string | null;
+  constructor(message: string, field: string | null) {
+    super(message);
+    this.name = "TriggerValidationError";
+    this.field = field;
+  }
+}
+
+/** Thrown by fireTrigger() on 429 — some trigger-origin turn is already in flight (see server.mjs's loop guard). */
+export class TriggerBusyError extends Error {
+  constructor(reason: string) {
+    super(reason);
+    this.name = "TriggerBusyError";
+  }
+}
+
+export function fetchTriggers(): Promise<TriggerStatus[]> {
+  return getJson<{ triggers: TriggerStatus[] }>("/api/triggers").then((r) => r.triggers);
+}
+
+/** Creates or replaces a trigger by id. A 400 becomes TriggerValidationError, never a generic message. */
+export async function upsertTrigger(trigger: unknown): Promise<Trigger> {
+  const res = await apiFetch("/api/triggers", {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(trigger),
+  });
+  if (res.status === 400) {
+    const body = await res.json().catch(() => ({}) as Record<string, unknown>);
+    const message = typeof body.error === "string" ? body.error : "invalid trigger";
+    throw new TriggerValidationError(message, typeof body.field === "string" ? body.field : null);
+  }
+  await throwOnError(res);
+  return res.json() as Promise<Trigger>;
+}
+
+export function toggleTrigger(id: string, enabled: boolean): Promise<Trigger> {
+  return postJson<Trigger>(`/api/triggers/${encodeURIComponent(id)}/toggle`, { enabled });
+}
+
+export function deleteTrigger(id: string): Promise<{ removed: boolean }> {
+  return writeJson<{ removed: boolean }>(`/api/triggers/${encodeURIComponent(id)}`, "DELETE");
+}
+
+/** The final frame of a manual fire (see server.mjs::handleTriggerFire). */
+export type TriggerCompleteFrame = {
+  type: "trigger-complete";
+  fired: boolean;
+  reason?: string;
+  chatId?: string;
+  silent?: boolean;
+};
+
+export type TriggerStreamEvent = ChatStreamEvent | TriggerCompleteFrame;
+
+/**
+ * Fires a trigger by hand. Same SSE shape a chat turn streams (a 'chat-id'
+ * bootstrap frame, the turn's events, then one 'trigger-complete'), so the
+ * chat view can render a manual fire live — including its approval questions.
+ * Resolves with the final frame; throws TriggerBusyError on 429.
+ */
+export async function fireTrigger(
+  id: string,
+  { onEvent, signal }: { onEvent?: (event: TriggerStreamEvent) => void; signal?: AbortSignal } = {},
+): Promise<TriggerCompleteFrame | null> {
+  const res = await apiFetch(`/api/triggers/${encodeURIComponent(id)}/fire`, {
+    method: "POST",
+    headers: APP_HEADERS,
+    signal,
+  });
+  if (res.status === 429) {
+    const body = await res.json().catch(() => ({}) as Record<string, unknown>);
+    throw new TriggerBusyError(typeof body.reason === "string" ? body.reason : "trigger turn in progress");
+  }
+  if (!res.ok || !res.body) {
+    await throwOnError(res);
+    throw new Error(`Request failed (HTTP ${res.status})`);
+  }
+
+  let last: TriggerCompleteFrame | null = null;
+  await readSseBody<TriggerStreamEvent>(res, (frame) => {
+    if (frame.type === "trigger-complete") last = frame;
+    onEvent?.(frame);
+  });
+  return last;
 }

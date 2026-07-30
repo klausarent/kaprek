@@ -5,6 +5,18 @@
 // (a truncated response is a real possibility) is covered in
 // src/server/server.test.mjs.
 import { test, expect, vi, afterEach } from 'vitest';
+
+// api.ts reads the instance token from `<meta name="kaprek-token">` ONCE at
+// module load and refuses to fetch at all without one (see its MissingTokenError).
+// This runs in the node environment with no DOM, so the meta lookup has to be
+// faked BEFORE the import below evaluates — which is exactly what vi.hoisted
+// does (it is lifted above the imports, unlike a plain top-level statement).
+vi.hoisted(() => {
+  globalThis.document = {
+    querySelector: (selector) => (selector === 'meta[name="kaprek-token"]' ? { getAttribute: () => 'f'.repeat(64) } : null),
+  };
+});
+
 import { parseSseChunk, streamChatTurn, IncompleteStreamError } from '../../web/src/lib/api.ts';
 
 afterEach(() => {
