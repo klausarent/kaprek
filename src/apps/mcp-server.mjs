@@ -31,6 +31,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_NAME = 'kaprek-apps';
 
+/** The one place `<dataDir>/workspace` is spelled out — reused by mcp-config.mjs so the sandbox's --allow-fs-write target can never drift from what run() actually uses. */
+export function workspaceDirFor(dataDir) {
+  return path.join(dataDir, 'workspace');
+}
+
 function serverVersion() {
   try {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', '..', 'package.json'), 'utf8'));
@@ -170,7 +175,7 @@ export async function run({ dataDir, bundledDir, appsDir } = {}) {
     return;
   }
 
-  const workspaceDir = path.join(effectiveDataDir, 'workspace');
+  const workspaceDir = workspaceDirFor(effectiveDataDir);
   const { apps, errors } = loadApps({ bundledDir: effectiveBundledDir, dataDir: effectiveDataDir });
   for (const error of errors) {
     process.stderr.write(`kaprek-apps: ${error.dir}: ${error.message}\n`);

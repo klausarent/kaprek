@@ -3,7 +3,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { writeFile, readFile, listFiles, WorkspacePathError } from './fs.mjs';
+import { writeFile, readFile, listFiles, assertWorkspaceRoot, WorkspacePathError } from './fs.mjs';
 
 let workspaceDir;
 let outsideDir;
@@ -100,4 +100,44 @@ test('listFiles returns [] for a missing subdirectory', () => {
 
 test('listFiles rejects ".." traversal', () => {
   expect(() => listFiles({ workspaceDir, relPath: '..' })).toThrow(WorkspacePathError);
+});
+
+// ------------------------------------------------------------ assertWorkspaceRoot
+
+test('assertWorkspaceRoot accepts an existing real directory', () => {
+  expect(() => assertWorkspaceRoot(workspaceDir)).not.toThrow();
+});
+
+test('assertWorkspaceRoot accepts a not-yet-existing path (created lazily by writeFile)', () => {
+  const notYetCreated = path.join(path.dirname(workspaceDir), 'not-yet-created-workspace');
+  expect(() => assertWorkspaceRoot(notYetCreated)).not.toThrow();
+});
+
+test('assertWorkspaceRoot rejects a junction/symlink at the workspace root itself', () => {
+  const junctionRoot = path.join(path.dirname(workspaceDir), 'workspace-junction');
+  let symlinkCreated = true;
+  try {
+    fs.symlinkSync(outsideDir, junctionRoot, 'junction');
+  } catch {
+    symlinkCreated = false; // e.g. no privilege to create symlinks/junctions on this machine
+  }
+  if (!symlinkCreated) return;
+
+  expect(() => assertWorkspaceRoot(junctionRoot)).toThrow(WorkspacePathError);
+});
+
+test('writeFile/readFile/listFiles reject a workspace root that is itself a junction/symlink', () => {
+  const junctionRoot = path.join(path.dirname(workspaceDir), 'workspace-junction-2');
+  let symlinkCreated = true;
+  try {
+    fs.symlinkSync(outsideDir, junctionRoot, 'junction');
+  } catch {
+    symlinkCreated = false;
+  }
+  if (!symlinkCreated) return;
+
+  expect(() => writeFile({ workspaceDir: junctionRoot, relPath: 'x.txt', data: 'x' })).toThrow(WorkspacePathError);
+  expect(fs.existsSync(path.join(outsideDir, 'x.txt'))).toBe(false);
+  expect(() => readFile({ workspaceDir: junctionRoot, relPath: 'x.txt' })).toThrow(WorkspacePathError);
+  expect(() => listFiles({ workspaceDir: junctionRoot })).toThrow(WorkspacePathError);
 });

@@ -45,6 +45,51 @@ function assertSafeRelPath(relPath, { allowRoot = false } = {}) {
   }
 }
 
+/**
+ * Verifies the workspace root itself, not just paths under it: every
+ * assertSafeRelPath/resolveInsideWorkspace check above assumes workspaceDir
+ * IS the real workspace, but nothing enforced that assumption — a junction
+ * planted at `<dataDir>/workspace` pointing outside would make every "safe"
+ * relPath resolve outside the intended tree. Three checks, all against the
+ * root path itself (lstat, which never follows the very link being tested):
+ *   - missing entirely: fine — a write is what creates it (see writeFile's
+ *     mkdirSync), so this is the normal first-run state, not a violation.
+ *   - exists but is a symlink/junction: rejected outright.
+ *   - exists as a real directory: its realpath must equal itself (nothing
+ *     upstream silently retargeted it after the lstat above ran — same
+ *     posture as fs.realpathSync elsewhere in this file).
+ * Exported so a caller can validate a workspace root once up front too, not
+ * just implicitly on first read/write.
+ */
+export function assertWorkspaceRoot(workspaceDir) {
+  if (typeof workspaceDir !== 'string' || workspaceDir.length === 0) {
+    throw new WorkspacePathError(workspaceDir, 'workspace root must be a non-empty string');
+  }
+  const resolved = path.resolve(workspaceDir);
+  let stat;
+  try {
+    stat = fs.lstatSync(resolved);
+  } catch {
+    return resolved; // doesn't exist yet — nothing to validate, a write will create a real directory
+  }
+  if (stat.isSymbolicLink()) {
+    throw new WorkspacePathError(workspaceDir, 'workspace root must not be a symlink or junction');
+  }
+  if (!stat.isDirectory()) {
+    throw new WorkspacePathError(workspaceDir, 'workspace root must be a directory');
+  }
+  let real;
+  try {
+    real = fs.realpathSync(resolved);
+  } catch (err) {
+    throw new WorkspacePathError(workspaceDir, `could not resolve workspace root: ${err.message}`);
+  }
+  if (real !== resolved) {
+    throw new WorkspacePathError(workspaceDir, `workspace root resolves to a different real path: ${real}`);
+  }
+  return resolved;
+}
+
 /** Resolves relPath under workspaceDir and confirms the result did not escape workspaceDir (defense in depth on top of assertSafeRelPath's syntactic check). */
 function resolveInsideWorkspace(workspaceDir, relPath) {
   const workspaceResolved = path.resolve(workspaceDir);
@@ -80,6 +125,7 @@ function assertNoSymlinksInPath(workspaceResolved, target, relPath) {
 }
 
 function guard(workspaceDir, relPath, opts) {
+  assertWorkspaceRoot(workspaceDir);
   assertSafeRelPath(relPath, opts);
   const { workspaceResolved, target } = resolveInsideWorkspace(workspaceDir, relPath);
   assertNoSymlinksInPath(workspaceResolved, target, relPath);
