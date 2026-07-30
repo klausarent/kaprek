@@ -6,41 +6,146 @@
 // parallel counter could (e.g. after a crash mid-turn).
 import { readRuns } from '../orchestrator/runs.mjs';
 
+/**
+ * What one run of UNKNOWN cost is assumed to have cost. A harness that does
+ * not report `costUsd` used to contribute $0 to the daily total, which made
+ * the cost cap meaningless for exactly the harnesses whose cost we cannot
+ * see (adversarial review Tag 3, both peers). Counting an unknown as zero is
+ * the one answer that is certainly wrong; this is an ESTIMATE and nothing
+ * more — a stand-in used only when the trigger has no cost history of its own
+ * to estimate from (see estimatedUnitCost()). Roughly the order of magnitude
+ * of a short Sonnet turn in mid-2026; it is deliberately not $0 and not so
+ * large that one unknown run exhausts a default $1 cap.
+ */
+export const UNKNOWN_COST_ESTIMATE_USD = 0.25;
+
+// Global ceilings across ALL triggers together, counted from runs.jsonl's
+// `origin === 'trigger'` lines. Per-trigger caps cannot bound a CHAIN: trigger
+// A writes a file trigger B watches, B writes back, and every single trigger
+// stays inside its own limit while the pair runs all night (adversarial review
+// Tag 3: Grok P0 part 2, Codex F3). Provenance marking of trigger-caused
+// writes is the real fix and is scheduled separately; until then this is the
+// hard brake that makes such a chain finite.
+export const MAX_TRIGGER_TURNS_PER_HOUR = 20;
+export const MAX_TRIGGER_TURNS_PER_DAY = 100;
+
+const HOUR_MS = 60 * 60 * 1000;
+
 /** Midnight (local time) of the calendar day containing `now`, as epoch ms. */
 function startOfLocalDay(now) {
   const d = new Date(now);
   return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
 }
 
+/** The median of a numeric array (mean of the two middle values for an even count), or null for an empty one. */
+function median(values) {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
 /**
- * `checkLimits({dataDir, trigger, now})` -> `{allowed, reason?, runsToday, costToday}`.
+ * What to charge for a run whose `costUsd` is null: the median of everything
+ * this SAME trigger ever cost when the harness did report a number, or
+ * UNKNOWN_COST_ESTIMATE_USD if it never did. The whole log is used, not just
+ * today's window — a trigger's turns are the same prompt against the same
+ * harness day after day, so yesterday's numbers are the best available
+ * predictor of today's, and today alone is often empty at exactly the moment
+ * the estimate is needed.
+ */
+function estimatedUnitCost(runsForTrigger) {
+  const known = runsForTrigger.map((run) => run.costUsd).filter((cost) => typeof cost === 'number' && Number.isFinite(cost) && cost >= 0);
+  return median(known) ?? UNKNOWN_COST_ESTIMATE_USD;
+}
+
+/**
+ * `checkLimits({dataDir, trigger, now})` -> `{allowed, reason?, runsToday,
+ * costToday, costEstimated}`.
  *
  * Counts every runs.jsonl line with `triggerId === trigger.id` whose `ts`
  * falls in the LOCAL calendar day containing `now` (defaults to real
  * Date.now(), injectable for tests). A run with `costUsd: null` (a harness
- * that doesn't always report cost) still counts toward `maxRunsPerDay` —
- * only `costToday` treats it as 0 — otherwise a harness that simply omits
- * cost data would make the cost cap meaningless (SECURITY: fail-closed,
- * per the task brief).
+ * that doesn't always report cost) counts toward `maxRunsPerDay` AND toward
+ * `costToday`, with an estimate rather than a zero — see estimatedUnitCost().
+ * `costEstimated` says whether any of today's total came from that estimate,
+ * so a caller can show "$0.75 (estimated)" instead of implying a measurement.
  */
 export function checkLimits({ dataDir, trigger, now = Date.now() }) {
   const dayStart = startOfLocalDay(now);
   const dayEndExclusive = dayStart + 24 * 60 * 60 * 1000;
 
-  const todaysRuns = readRuns(dataDir).filter((run) => {
-    if (run.triggerId !== trigger.id) return false;
+  const runsForTrigger = readRuns(dataDir).filter((run) => run.triggerId === trigger.id);
+  const todaysRuns = runsForTrigger.filter((run) => {
     const ts = Date.parse(run.ts);
     return Number.isFinite(ts) && ts >= dayStart && ts < dayEndExclusive;
   });
 
   const runsToday = todaysRuns.length;
-  const costToday = todaysRuns.reduce((sum, run) => sum + (typeof run.costUsd === 'number' ? run.costUsd : 0), 0);
+  const unitCost = estimatedUnitCost(runsForTrigger);
+  let costEstimated = false;
+  const costToday = todaysRuns.reduce((sum, run) => {
+    if (typeof run.costUsd === 'number' && Number.isFinite(run.costUsd)) return sum + run.costUsd;
+    costEstimated = true;
+    return sum + unitCost;
+  }, 0);
 
   if (runsToday >= trigger.limits.maxRunsPerDay) {
-    return { allowed: false, reason: `daily run limit reached (${runsToday}/${trigger.limits.maxRunsPerDay})`, runsToday, costToday };
+    return { allowed: false, reason: `daily run limit reached (${runsToday}/${trigger.limits.maxRunsPerDay})`, runsToday, costToday, costEstimated };
   }
   if (costToday >= trigger.limits.maxCostPerDay) {
-    return { allowed: false, reason: `daily cost limit reached ($${costToday.toFixed(4)}/$${trigger.limits.maxCostPerDay})`, runsToday, costToday };
+    const estimateNote = costEstimated ? ', partly estimated' : '';
+    return {
+      allowed: false,
+      reason: `daily cost limit reached ($${costToday.toFixed(4)}/$${trigger.limits.maxCostPerDay}${estimateNote})`,
+      runsToday,
+      costToday,
+      costEstimated,
+    };
   }
-  return { allowed: true, runsToday, costToday };
+  return { allowed: true, runsToday, costToday, costEstimated };
+}
+
+/**
+ * `checkGlobalTriggerLimits({dataDir, now})` -> `{allowed, reason?,
+ * turnsLastHour, turnsToday}` — the ceiling across ALL triggers together (see
+ * MAX_TRIGGER_TURNS_PER_HOUR/_PER_DAY above for why it exists).
+ *
+ * Counted from the same runs.jsonl every other limit is derived from, over
+ * `origin === 'trigger'` lines only: a user's own chat turns are never
+ * throttled by this. A line without `origin` predates the field and is a user
+ * turn by definition (see runs.mjs), so it does not count either.
+ */
+export function checkGlobalTriggerLimits({ dataDir, now = Date.now() }) {
+  const dayStart = startOfLocalDay(now);
+  const dayEndExclusive = dayStart + 24 * HOUR_MS;
+  const hourStart = now - HOUR_MS;
+
+  let turnsLastHour = 0;
+  let turnsToday = 0;
+  for (const run of readRuns(dataDir)) {
+    if (run.origin !== 'trigger') continue;
+    const ts = Date.parse(run.ts);
+    if (!Number.isFinite(ts)) continue;
+    if (ts >= hourStart) turnsLastHour += 1;
+    if (ts >= dayStart && ts < dayEndExclusive) turnsToday += 1;
+  }
+
+  if (turnsLastHour >= MAX_TRIGGER_TURNS_PER_HOUR) {
+    return {
+      allowed: false,
+      reason: `global trigger cap reached (${turnsLastHour}/${MAX_TRIGGER_TURNS_PER_HOUR} trigger turns in the last hour, all triggers together)`,
+      turnsLastHour,
+      turnsToday,
+    };
+  }
+  if (turnsToday >= MAX_TRIGGER_TURNS_PER_DAY) {
+    return {
+      allowed: false,
+      reason: `global trigger cap reached (${turnsToday}/${MAX_TRIGGER_TURNS_PER_DAY} trigger turns today, all triggers together)`,
+      turnsLastHour,
+      turnsToday,
+    };
+  }
+  return { allowed: true, turnsLastHour, turnsToday };
 }
