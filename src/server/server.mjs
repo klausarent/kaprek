@@ -670,7 +670,7 @@ function approvalKey(chatId, requestId) {
  * Never rejects: every path resolves with an ApprovalDecision, deny being
  * the fail-closed default.
  */
-function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs }) {
+function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, describeSource = () => null }) {
   return (request) =>
     new Promise((resolve) => {
       const key = approvalKey(chatId, request.id);
@@ -687,7 +687,12 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
       // explicitly caught here (never actually rejects today; writeSseFrame
       // itself swallows write errors) so a future change to that guarantee
       // can't turn this into an unhandled rejection on the approval path.
-      enqueue({ type: 'approval', chatId, ...request }).catch(() => {});
+      // `source` says WHERE the question comes from (which trigger, or which
+      // chat). It matters because an approval is now delivered to whatever
+      // stream is open, not only to the one watching this chat — a user shown
+      // "allow Bash?" out of nowhere has to be able to see what asked, or they
+      // are granting rights blind.
+      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request }).catch(() => {});
     });
 }
 
@@ -797,7 +802,20 @@ async function handleApprovalDecision(req, res, id, pendingApprovals) {
 async function handleChatTurn(
   req,
   res,
-  { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools, pendingApprovals, approvalTimeoutMs, chatSseQueues, approvalStreams },
+  {
+    getChats,
+    harness,
+    harnessName,
+    dataDir,
+    chatAbortControllers,
+    permissionMode,
+    allowedTools,
+    pendingApprovals,
+    approvalTimeoutMs,
+    chatSseQueues,
+    approvalStreams,
+    describeSource,
+  },
 ) {
   const body = await readJsonBody(req);
   if (!body.ok) {
@@ -893,7 +911,7 @@ async function handleChatTurn(
       // so the response is only ended once every enqueued frame, including
       // this one, has actually reached the socket.
       onEvent: (event) => enqueue(event),
-      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs }),
+      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, describeSource }),
       signal: controller.signal,
     });
     await enqueue({ type: 'turn-complete', ...result });
@@ -1271,7 +1289,7 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
  * the reason is useful in the UI, the absolute path on this machine is not.
  */
 function handleAppsList(res, dataDir, bundledAppsDir) {
-  const { apps, errors } = loadApps({ bundledDir: bundledAppsDir, dataDir });
+  const { apps, errors, blocked } = loadApps({ bundledDir: bundledAppsDir, dataDir });
   sendJson(res, 200, {
     apps: apps.map(({ manifest, source }) => ({
       id: manifest.id,
@@ -1284,6 +1302,12 @@ function handleAppsList(res, dataDir, bundledAppsDir) {
       uiSlot: manifest.uiSlot,
       source,
     })),
+    // Third-party apps that were found but not loaded (see
+    // loader.mjs::userAppsAllowed). Listed so a user whose app is missing sees
+    // that it is switched off rather than broken. Directory names only — a
+    // blocked app's manifest is untrusted input with no reason to be parsed,
+    // and `dir` stays off the wire for the same reason it does above.
+    blocked: blocked.map(({ id }) => ({ id })),
     errors: errors.map((error) => ({ message: error.message })),
   });
 }
@@ -1374,6 +1398,7 @@ async function handleRequest(
     getRunner,
     chatSseQueues,
     approvalStreams,
+    describeSource,
     instanceToken,
     bundledAppsDir,
   },
@@ -1465,6 +1490,7 @@ async function handleRequest(
         approvalTimeoutMs,
         chatSseQueues,
         approvalStreams,
+        describeSource,
       });
       return;
     }
@@ -1643,6 +1669,25 @@ export function startServer({
     return Promise.all([...approvalStreams].map((enqueue) => enqueue(frame)));
   }
 
+  /**
+   * Where an approval question comes from, for the dialog's own "From trigger:
+   * nightly-check" line (see web/src/lib/approvals.ts::approvalSourceLabel).
+   * Best-effort: a chat that cannot be read yields null, and the dialog then
+   * simply shows no origin rather than the request failing over a label.
+   */
+  function describeApprovalSource(chatId) {
+    try {
+      const chat = getChats().get(chatId);
+      return {
+        kind: chat.origin === 'trigger' ? 'trigger' : 'chat',
+        triggerId: chat.triggerId ?? null,
+        title: chat.title ?? null,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // The trigger runner, opened lazily and started once listen() resolves
   // (see below), stopped when the server closes. `makeUiApprovalHandler`
   // reuses the SAME makeApprovalHandler() a normal chat turn uses — see the
@@ -1675,6 +1720,7 @@ export function startServer({
             enqueue: (frame) => deliverApprovalFrame(chatId, frame),
             pendingApprovals,
             approvalTimeoutMs,
+            describeSource: describeApprovalSource,
           }),
       });
     }
@@ -1742,6 +1788,7 @@ export function startServer({
       getRunner,
       chatSseQueues,
       approvalStreams,
+      describeSource: describeApprovalSource,
       instanceToken,
       bundledAppsDir,
     }).catch((err) => {

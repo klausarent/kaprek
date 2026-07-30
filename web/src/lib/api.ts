@@ -411,9 +411,18 @@ export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
  * decides on its own (10-minute auto-deny, turn ended) is cleaned up client-
  * side by the countdown / 'turn-complete' — see lib/approvals.ts.
  */
+/** Where an approval question came from — see server.mjs::describeApprovalSource. */
+export type ApprovalSource = {
+  kind: "trigger" | "chat";
+  triggerId: string | null;
+  title: string | null;
+};
+
 export type ApprovalFrame = {
   type: "approval";
   chatId: string;
+  /** Null when the chat could not be read; the dialog then shows no origin rather than a wrong one. */
+  source?: ApprovalSource | null;
   id: string;
   toolName: string | null;
   displayName: string | null;
@@ -672,8 +681,13 @@ export type AppSummary = {
 /** A manifest that failed to load. Carries the reason, never the path it was found at. */
 export type AppLoadError = { message: string };
 
-export function fetchApps(): Promise<{ apps: AppSummary[]; errors: AppLoadError[] }> {
-  return getJson<{ apps: AppSummary[]; errors: AppLoadError[] }>("/api/apps");
+/** A third-party app that exists on disk but is not loaded (see loader.mjs::userAppsAllowed). Directory name only. */
+export type BlockedApp = { id: string };
+
+export type AppsResponse = { apps: AppSummary[]; blocked: BlockedApp[]; errors: AppLoadError[] };
+
+export function fetchApps(): Promise<AppsResponse> {
+  return getJson<AppsResponse>("/api/apps");
 }
 
 // ---------------------------------------------------------------------------

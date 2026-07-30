@@ -1402,3 +1402,14 @@ pre,
   gap: 8px;
   font-size: 13px;
 }
+
+.app-card-blocked {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.approval-dialog-source {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}

@@ -1848,6 +1848,8 @@ test('triggers: an approval for a chat nobody streams is delivered to whatever s
 
   const approval = seen.find((f) => f.type === 'approval');
   expect(approval).toMatchObject({ type: 'approval', id: 'bg-approval-1', toolName: 'Bash' });
+  // Arriving unannounced in someone else's chat, it has to say what asked.
+  expect(approval.source).toEqual({ kind: 'trigger', triggerId: 'ask-me', title: expect.any(String) });
   // The frame carries the TRIGGER's chat, not the chat this stream belongs to
   // — which is exactly why the answer has to send that chatId back, and why a
   // client can answer a question about a chat it is not watching.
@@ -1997,10 +1999,10 @@ function writeApp(dir, id, overrides = {}) {
   return appDir;
 }
 
-test('apps: GET /api/apps returns display metadata for bundled and user apps', async () => {
+test('apps: GET /api/apps returns display metadata per app', async () => {
   const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
   writeApp(bundledDir, 'shipped');
-  writeApp(path.join(dataDir, 'apps'), 'installed', {
+  writeApp(bundledDir, 'sensitive', {
     policy: { fsWrite: true, dataEgress: true, externalAction: 'approval', sensitivity: 'high' },
   });
 
@@ -2010,8 +2012,9 @@ test('apps: GET /api/apps returns display metadata for bundled and user apps', a
   const body = await res.json();
 
   expect(body.errors).toEqual([]);
+  expect(body.blocked).toEqual([]);
   const byId = Object.fromEntries(body.apps.map((app) => [app.id, app]));
-  expect(Object.keys(byId).sort()).toEqual(['installed', 'shipped']);
+  expect(Object.keys(byId).sort()).toEqual(['sensitive', 'shipped']);
   expect(byId.shipped).toEqual({
     id: 'shipped',
     name: 'App shipped',
@@ -2023,8 +2026,56 @@ test('apps: GET /api/apps returns display metadata for bundled and user apps', a
     uiSlot: 'text',
     source: 'bundled',
   });
-  expect(byId.installed.source).toBe('user');
-  expect(byId.installed.policy).toEqual({ fsWrite: true, dataEgress: true, externalAction: 'approval', sensitivity: 'high' });
+  expect(byId.sensitive.policy).toEqual({ fsWrite: true, dataEgress: true, externalAction: 'approval', sensitivity: 'high' });
+
+  fs.rmSync(bundledDir, { recursive: true, force: true });
+});
+
+test('apps: KAPREK_ALLOW_USER_APPS=1 loads a third-party app again, source "user"', async () => {
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(path.join(dataDir, 'apps'), 'weather');
+  const previous = process.env.KAPREK_ALLOW_USER_APPS;
+  process.env.KAPREK_ALLOW_USER_APPS = '1';
+  try {
+    const { url } = await boot({ bundledAppsDir: bundledDir });
+    const body = await (await fetch(`${url}/api/apps`)).json();
+    expect(body.apps.map((app) => [app.id, app.source])).toEqual([['weather', 'user']]);
+    expect(body.blocked).toEqual([]);
+  } finally {
+    if (previous === undefined) delete process.env.KAPREK_ALLOW_USER_APPS;
+    else process.env.KAPREK_ALLOW_USER_APPS = previous;
+    fs.rmSync(bundledDir, { recursive: true, force: true });
+  }
+});
+
+test('apps: a third-party app under <dataDir>/apps is listed as blocked, not loaded', async () => {
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(bundledDir, 'shipped');
+  writeApp(path.join(dataDir, 'apps'), 'weather');
+
+  const { url } = await boot({ bundledAppsDir: bundledDir });
+  const body = await (await fetch(`${url}/api/apps`)).json();
+
+  expect(body.apps.map((app) => app.id)).toEqual(['shipped']);
+  // Not an error — the app is fine, it is switched off until worker isolation.
+  expect(body.errors).toEqual([]);
+  expect(body.blocked).toEqual([{ id: 'weather' }]);
+  // Directory name only: no manifest fields, and above all no path.
+  expect(Object.keys(body.blocked[0])).toEqual(['id']);
+
+  fs.rmSync(bundledDir, { recursive: true, force: true });
+});
+
+test('apps: a blocked third-party app is invisible to the trigger authorization too', async () => {
+  // The same loadApps() answer backs appScope validation (see startServer's
+  // installedAppIds), so an app that is not loaded cannot be granted either.
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(path.join(dataDir, 'apps'), 'weather');
+  const { url } = await boot({ bundledAppsDir: bundledDir });
+
+  const res = await postJson(`${url}/api/triggers`, everyMinutesTrigger({ appScope: ['weather'] }));
+  expect(res.status).toBe(400);
+  expect((await res.json()).field).toBe('appScope');
 
   fs.rmSync(bundledDir, { recursive: true, force: true });
 });

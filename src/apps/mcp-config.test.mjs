@@ -12,6 +12,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
+import { ALLOW_USER_APPS_ENV } from './loader.mjs';
 import readline from 'node:readline';
 import { writeMcpConfig, cleanupMcpConfig } from './mcp-config.mjs';
 
@@ -210,7 +211,10 @@ test(
     const entry = config.mcpServers['kaprek-apps'];
 
     child = spawn(entry.command, entry.args, {
-      env: { ...process.env, ...entry.env },
+      // Both sandbox cases put their fixture app under <dataDir>/apps, which is
+      // off by default now (see loader.mjs::userAppsAllowed). They are about the
+      // FILESYSTEM fence, not about that switch, so they opt in explicitly.
+      env: { ...process.env, ...entry.env, [ALLOW_USER_APPS_ENV]: '1' },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     let stderr = '';
@@ -290,7 +294,10 @@ test(
     const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
     const entry = config.mcpServers['kaprek-apps'];
 
-    child = spawn(entry.command, entry.args, { env: { ...process.env, ...entry.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    child = spawn(entry.command, entry.args, {
+      env: { ...process.env, ...entry.env, [ALLOW_USER_APPS_ENV]: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
     const client = createRpcClient(child);
 
     await client.request('initialize', {

@@ -67,8 +67,47 @@ function loadOneApp(appDir) {
 }
 
 /**
- * Loads every app under `bundledDir` and `<dataDir>/apps`. Returns
- * `{apps: [{manifest, dir, source}], errors: [{dir, message}]}`.
+ * The env var that opts back into loading third-party apps. Named rather than
+ * boolean-ish on purpose: it appears verbatim in the log line and in the
+ * README, so someone finding it in a shell profile can search for what it does.
+ */
+export const ALLOW_USER_APPS_ENV = 'KAPREK_ALLOW_USER_APPS';
+
+/**
+ * Whether apps under `<dataDir>/apps` may be loaded at all.
+ *
+ * DEFAULT: NO. Every app's tools run inside ONE shared Node process (see
+ * src/apps/mcp-server.mjs), which means an app has the whole runtime of every
+ * other app in reach: patch `JSON.stringify`, `process.stdout.write` or
+ * `Object.prototype` and it reads or rewrites another app's results; a
+ * synchronous `while (true)` wedges every tool at once. Node's `--permission`
+ * model (see mcp-config.mjs) fences the FILESYSTEM, and nothing else — not the
+ * network, not the shared globals.
+ *
+ * For BUNDLED apps that is a supply-chain risk we accept, because they ship
+ * with kaprek and are reviewed with it. For an app a user drops into a
+ * directory it is an open door, so it stays shut until app handlers run
+ * isolated (worker per app) — see README's Known gaps.
+ *
+ * Setting `KAPREK_ALLOW_USER_APPS=1` re-opens exactly that gap, knowingly.
+ * Deliberately env-only: a switch in the UI would make this a routine click,
+ * and it is not a routine decision.
+ */
+export function userAppsAllowed(env = process.env) {
+  return env[ALLOW_USER_APPS_ENV] === '1';
+}
+
+/**
+ * Loads apps under `bundledDir` and — only when explicitly allowed, see
+ * userAppsAllowed() — under `<dataDir>/apps`. Returns
+ * `{apps: [{manifest, dir, source}], errors: [{dir, message}], blocked: [{id, dir}]}`.
+ *
+ * `blocked` names the third-party app directories that were skipped. The id is
+ * the DIRECTORY NAME, never a parsed manifest: reading a blocked app's app.json
+ * would mean parsing untrusted input to display it, for no gain — the caller
+ * only needs to tell the user which of their apps are not running (see
+ * server.mjs::handleAppsList), so that a missing app is visibly disabled rather
+ * than mysteriously absent.
  *
  * Duplicate ids: a bundled app always wins over a user app of the same id —
  * the user app is dropped and reported in `errors` instead of silently
@@ -76,9 +115,10 @@ function loadOneApp(appDir) {
  * SAME source sharing an id is handled the same way: whichever is
  * encountered first (directory listing order) wins, the rest are reported.
  */
-export function loadApps({ bundledDir, dataDir }) {
+export function loadApps({ bundledDir, dataDir, env = process.env, log = (message) => console.warn(message) }) {
   const apps = [];
   const errors = [];
+  const blocked = [];
   const idsSeen = new Set();
 
   function loadSource(dir, source) {
@@ -101,9 +141,27 @@ export function loadApps({ bundledDir, dataDir }) {
   }
 
   if (bundledDir) loadSource(bundledDir, 'bundled');
-  if (dataDir) loadSource(userAppsDir(dataDir), 'user');
 
-  return { apps, errors };
+  if (dataDir) {
+    const userDir = userAppsDir(dataDir);
+    if (userAppsAllowed(env)) {
+      loadSource(userDir, 'user');
+    } else {
+      for (const appDir of listSubdirs(userDir)) {
+        blocked.push({ id: path.basename(appDir), dir: appDir });
+      }
+      // One line per load, not one per app: this runs on every /api/apps
+      // request and on every trigger authorization check.
+      if (blocked.length > 0) {
+        log(
+          `apps: ${blocked.length} app(s) in ${userDir} were skipped: third-party apps stay disabled until worker isolation lands ` +
+            `(set ${ALLOW_USER_APPS_ENV}=1 to load them anyway)`,
+        );
+      }
+    }
+  }
+
+  return { apps, errors, blocked };
 }
 
 /**

@@ -3,7 +3,12 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadApps, resolveToolOwnership } from './loader.mjs';
+import { ALLOW_USER_APPS_ENV, loadApps, resolveToolOwnership, userAppsAllowed } from './loader.mjs';
+
+// Third-party apps are OFF by default (see loadApps()'s doc comment). The
+// existing cases below are about the loading mechanics, so they opt in
+// explicitly; the default is covered by its own tests at the end of this file.
+const ALLOW_USER = { env: { [ALLOW_USER_APPS_ENV]: '1' }, log: () => {} };
 
 let root;
 let bundledDir;
@@ -44,7 +49,7 @@ test('loadApps loads a bundled app and a user app with no errors', () => {
   writeApp(bundledDir, 'notes', manifestFor('notes'));
   writeApp(path.join(dataDir, 'apps'), 'weather', manifestFor('weather'));
 
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
 
   expect(errors).toEqual([]);
   expect(apps).toHaveLength(2);
@@ -64,7 +69,7 @@ test('loadApps collects a broken manifest as an error instead of throwing, and s
   fs.mkdirSync(brokenDir, { recursive: true });
   fs.writeFileSync(path.join(brokenDir, 'app.json'), '{not valid json', 'utf8');
 
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
 
   expect(apps).toHaveLength(1);
   expect(apps[0].manifest.id).toBe('notes');
@@ -74,7 +79,7 @@ test('loadApps collects a broken manifest as an error instead of throwing, and s
 
 test('loadApps collects a schema-invalid manifest as an error', () => {
   writeApp(bundledDir, 'bad', manifestFor('Bad Id')); // invalid: not kebab-case
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
   expect(apps).toEqual([]);
   expect(errors).toHaveLength(1);
   expect(errors[0].message).toMatch(/invalid manifest/);
@@ -82,7 +87,7 @@ test('loadApps collects a schema-invalid manifest as an error', () => {
 
 test('loadApps reports a missing app.json as an error without crashing', () => {
   fs.mkdirSync(path.join(bundledDir, 'empty-dir'), { recursive: true });
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
   expect(apps).toEqual([]);
   expect(errors).toHaveLength(1);
 });
@@ -91,7 +96,7 @@ test('loadApps: a bundled app wins over a user app with the same id, and the use
   writeApp(bundledDir, 'notes', manifestFor('notes', { name: 'Bundled Notes' }));
   writeApp(path.join(dataDir, 'apps'), 'notes-user', manifestFor('notes', { name: 'User Notes' }));
 
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
 
   expect(apps).toHaveLength(1);
   expect(apps[0].manifest.name).toBe('Bundled Notes');
@@ -104,7 +109,7 @@ test('loadApps: two user apps sharing an id — first wins, second reported', ()
   writeApp(path.join(dataDir, 'apps'), 'a-first', manifestFor('dup'));
   writeApp(path.join(dataDir, 'apps'), 'b-second', manifestFor('dup'));
 
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
 
   expect(apps).toHaveLength(1);
   expect(errors).toHaveLength(1);
@@ -117,13 +122,91 @@ test('loadApps rejects an app.json over the size limit without ever parsing it, 
   const huge = JSON.stringify(manifestFor('huge', { description: 'x'.repeat(300 * 1024) }));
   fs.writeFileSync(path.join(hugeDir, 'app.json'), huge, 'utf8');
 
-  const { apps, errors } = loadApps({ bundledDir, dataDir });
+  const { apps, errors } = loadApps({ bundledDir, dataDir, ...ALLOW_USER });
 
   expect(apps).toHaveLength(1);
   expect(apps[0].manifest.id).toBe('notes');
   expect(errors).toHaveLength(1);
   expect(errors[0].dir).toBe(hugeDir);
   expect(errors[0].message).toMatch(/exceeds .* byte limit/);
+});
+
+// ------------------------------------------------- third-party apps are off
+
+const DENY_USER = { env: {}, log: () => {} };
+
+test('a user app is NOT loaded by default, and is reported as blocked instead', () => {
+  writeApp(bundledDir, 'notes', manifestFor('notes'));
+  const weatherDir = writeApp(path.join(dataDir, 'apps'), 'weather', manifestFor('weather'));
+
+  const { apps, errors, blocked } = loadApps({ bundledDir, dataDir, ...DENY_USER });
+
+  expect(apps.map((a) => a.manifest.id)).toEqual(['notes']);
+  // Not an error — nothing is broken about the app, it is switched off.
+  expect(errors).toEqual([]);
+  expect(blocked).toEqual([{ id: 'weather', dir: weatherDir }]);
+});
+
+test('a blocked app is named by its DIRECTORY, without its manifest being parsed', () => {
+  // A blocked app's app.json is untrusted input there is no reason to read.
+  // Even an unparseable one must still show up as blocked, not as an error.
+  const brokenDir = path.join(dataDir, 'apps', 'sketchy');
+  fs.mkdirSync(brokenDir, { recursive: true });
+  fs.writeFileSync(path.join(brokenDir, 'app.json'), '{ not json at all', 'utf8');
+
+  const { apps, errors, blocked } = loadApps({ bundledDir, dataDir, ...DENY_USER });
+
+  expect(apps).toEqual([]);
+  expect(errors).toEqual([]);
+  expect(blocked).toEqual([{ id: 'sketchy', dir: brokenDir }]);
+});
+
+test('the skip is logged once per load, naming the directory and the opt-in variable', () => {
+  writeApp(path.join(dataDir, 'apps'), 'weather', manifestFor('weather'));
+  writeApp(path.join(dataDir, 'apps'), 'stocks', manifestFor('stocks'));
+
+  const lines = [];
+  loadApps({ bundledDir, dataDir, env: {}, log: (message) => lines.push(message) });
+
+  expect(lines).toHaveLength(1);
+  expect(lines[0]).toContain('2 app(s)');
+  expect(lines[0]).toContain(path.join(dataDir, 'apps'));
+  expect(lines[0]).toContain(ALLOW_USER_APPS_ENV);
+});
+
+test('nothing is logged when there are no user apps at all', () => {
+  writeApp(bundledDir, 'notes', manifestFor('notes'));
+  const lines = [];
+  const { blocked } = loadApps({ bundledDir, dataDir, env: {}, log: (message) => lines.push(message) });
+  expect(lines).toEqual([]);
+  expect(blocked).toEqual([]);
+});
+
+test('KAPREK_ALLOW_USER_APPS=1 loads them again, and nothing else does', () => {
+  writeApp(path.join(dataDir, 'apps'), 'weather', manifestFor('weather'));
+
+  const loaded = loadApps({ bundledDir, dataDir, env: { [ALLOW_USER_APPS_ENV]: '1' }, log: () => {} });
+  expect(loaded.apps.map((a) => a.manifest.id)).toEqual(['weather']);
+  expect(loaded.blocked).toEqual([]);
+
+  // Only the exact value opts in — a stray "true"/"0"/empty must not.
+  for (const value of ['true', 'yes', '0', '', 'KAPREK_ALLOW_USER_APPS']) {
+    const result = loadApps({ bundledDir, dataDir, env: { [ALLOW_USER_APPS_ENV]: value }, log: () => {} });
+    expect(result.apps).toEqual([]);
+    expect(result.blocked).toHaveLength(1);
+  }
+});
+
+test('bundled apps are loaded either way — the switch is only about third-party ones', () => {
+  writeApp(bundledDir, 'notes', manifestFor('notes'));
+  expect(loadApps({ bundledDir, dataDir, ...DENY_USER }).apps.map((a) => a.manifest.id)).toEqual(['notes']);
+  expect(loadApps({ bundledDir, dataDir, ...ALLOW_USER }).apps.map((a) => a.manifest.id)).toEqual(['notes']);
+});
+
+test('userAppsAllowed reads exactly the documented variable', () => {
+  expect(userAppsAllowed({})).toBe(false);
+  expect(userAppsAllowed({ [ALLOW_USER_APPS_ENV]: '1' })).toBe(true);
+  expect(userAppsAllowed({ [ALLOW_USER_APPS_ENV]: '2' })).toBe(false);
 });
 
 // ------------------------------------------------------------- tool ownership

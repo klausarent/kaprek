@@ -7,7 +7,7 @@
 // AppCard is exported and hook-free so it can be tested without a DOM (see
 // src/test/tree.tsx).
 import { useEffect, useState } from "react";
-import { fetchApps, type AppLoadError, type AppSummary } from "../lib/api";
+import { fetchApps, type AppSummary, type AppsResponse, type BlockedApp } from "../lib/api";
 
 /**
  * The plain-language permission lines for one app's policy. Phrased as what the
@@ -51,8 +51,32 @@ export function AppCard({ app }: { app: AppSummary }) {
   );
 }
 
+/** One third-party app that exists on disk but is switched off, with the reason and the way to change it. */
+export function BlockedAppCard({ app }: { app: BlockedApp }) {
+  return (
+    <div className="app-card app-card-blocked">
+      <div className="app-card-top">
+        <span className="app-card-icon" aria-hidden="true">
+          ⛔
+        </span>
+        <span className="app-card-name">{app.id}</span>
+        <span className="badge badge-muted">not loaded</span>
+      </div>
+      <div className="app-card-description">
+        Third-party apps stay disabled until app handlers run isolated from one another. Today they share one process, so
+        any one of them can read or change another's results.
+      </div>
+      <div className="app-card-meta">
+        <span>
+          Set <code>KAPREK_ALLOW_USER_APPS=1</code> to load it anyway.
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function Apps() {
-  const [state, setState] = useState<{ apps: AppSummary[]; errors: AppLoadError[] } | null>(null);
+  const [state, setState] = useState<AppsResponse | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -81,12 +105,15 @@ export default function Apps() {
 
       {state === null ? (
         <div className="empty-box">Loading…</div>
-      ) : state.apps.length === 0 ? (
+      ) : state.apps.length === 0 && state.blocked.length === 0 ? (
         <div className="empty-box">No apps installed.</div>
       ) : (
         <div className="card-grid">
           {state.apps.map((app) => (
             <AppCard key={app.id} app={app} />
+          ))}
+          {state.blocked.map((app) => (
+            <BlockedAppCard key={`blocked-${app.id}`} app={app} />
           ))}
         </div>
       )}

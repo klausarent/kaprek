@@ -1,5 +1,5 @@
 import { test, expect } from "vitest";
-import { AppCard, policyNotes } from "./Apps";
+import { AppCard, BlockedAppCard, policyNotes } from "./Apps";
 import type { AppSummary } from "../lib/api";
 import { findByType, render, textOf } from "../test/tree";
 
@@ -57,6 +57,22 @@ test("policyNotes names writing, external action and sensitivity when they apply
 test("policyNotes stays quiet about what an app cannot do", () => {
   const notes = policyNotes({ fsWrite: false, dataEgress: false, externalAction: "never", sensitivity: "low" });
   expect(notes).toEqual(["🔒 Stays on this machine"]);
+});
+
+test("a blocked third-party app is shown as switched off, with the reason and the way in", () => {
+  const tree = render(<BlockedAppCard app={{ id: "weather" }} />);
+  const text = textOf(tree);
+  expect(text).toContain("weather");
+  expect(text).toContain("not loaded");
+  expect(text).toContain("share one process");
+  expect(text).toContain("KAPREK_ALLOW_USER_APPS=1");
+});
+
+test("a blocked card offers no way to enable it from the UI", () => {
+  // The opt-in is env-only on purpose: a click would make it a routine choice.
+  const tree = render(<BlockedAppCard app={{ id: "weather" }} />);
+  expect(findByType(tree, "button")).toHaveLength(0);
+  expect(findByType(tree, "input")).toHaveLength(0);
 });
 
 test("an approval-gated external action is distinguished from an unattended one", () => {
