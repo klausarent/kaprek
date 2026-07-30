@@ -21,11 +21,14 @@ export default function ApprovalDialog({
   approvals,
   nowMs,
   busy = false,
+  error = null,
   onDecide,
 }: {
   approvals: PendingApproval[];
   nowMs: number;
   busy?: boolean;
+  /** A failed answer attempt (not a 404/409 — those remove the entry). Shown here, next to the buttons the user has to press again. */
+  error?: string | null;
   onDecide: (entry: PendingApproval, behavior: "allow" | "deny") => void;
 }) {
   const entry = oldestApproval(approvals);
@@ -59,6 +62,8 @@ export default function ApprovalDialog({
       <div className="approval-dialog-countdown">
         Denied automatically in {formatCountdown(remainingMs(entry, nowMs))} if you do not answer.
       </div>
+
+      {error && <div className="error-box">{error}</div>}
 
       <div className="approval-dialog-actions">
         <button type="button" className="btn" disabled={busy} onClick={() => onDecide(entry, "allow")}>

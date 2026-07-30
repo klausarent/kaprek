@@ -19,14 +19,26 @@ export type PendingApproval = ApprovalFrame & {
   receivedAtMs: number;
 };
 
+/**
+ * An entry's real identity. The server keys pending approvals by
+ * `chatId:requestId` (see src/server/server.mjs::approvalKey) because two
+ * different CLI subprocesses can hand out colliding request_ids — so the
+ * client must key by both too, or answering one chat's question would silently
+ * drop the identically-named, still-open question of another chat.
+ */
+function sameApproval(entry: PendingApproval, chatId: string, id: string): boolean {
+  return entry.chatId === chatId && entry.id === id;
+}
+
 /** Appends a newly received request. A duplicate id for the same chat is ignored (a re-delivered frame must not double the stack). */
 export function addApproval(stack: PendingApproval[], frame: ApprovalFrame, nowMs: number): PendingApproval[] {
-  if (stack.some((entry) => entry.id === frame.id && entry.chatId === frame.chatId)) return stack;
+  if (stack.some((entry) => sameApproval(entry, frame.chatId, frame.id))) return stack;
   return [...stack, { ...frame, receivedAtMs: nowMs }];
 }
 
-export function removeApproval(stack: PendingApproval[], id: string): PendingApproval[] {
-  const next = stack.filter((entry) => entry.id !== id);
+/** Drops one entry, keyed by chat AND request id — see sameApproval(). */
+export function removeApproval(stack: PendingApproval[], chatId: string, id: string): PendingApproval[] {
+  const next = stack.filter((entry) => !sameApproval(entry, chatId, id));
   return next.length === stack.length ? stack : next;
 }
 
@@ -64,4 +76,26 @@ export function formatCountdown(ms: number): string {
 export function shortAgentId(agentId: string | null | undefined): string | null {
   if (!agentId) return null;
   return agentId.length <= 12 ? agentId : `${agentId.slice(0, 8)}…`;
+}
+
+/**
+ * The exact request an answer turns into: which approval, and which chat it
+ * belongs to. Pulled out of the Chat page so the one thing that must never be
+ * wrong — the entry's OWN chatId in the body, not "the chat the page happens to
+ * be showing" — is checkable without rendering anything. POST
+ * /api/approvals/<id> answers 404 for a chatId that does not own the request
+ * (see server.mjs::handleApprovalDecision), so a mix-up here silently loses the
+ * answer.
+ *
+ * `message` is only set for a deny; an allow never carries one (the server
+ * ignores it there anyway, and sending one would suggest it mattered).
+ */
+export function buildApprovalAnswer(
+  entry: PendingApproval,
+  behavior: "allow" | "deny",
+): { id: string; body: { chatId: string; behavior: "allow" | "deny"; message?: string } } {
+  return {
+    id: entry.id,
+    body: behavior === "deny" ? { chatId: entry.chatId, behavior, message: "denied by user" } : { chatId: entry.chatId, behavior },
+  };
 }

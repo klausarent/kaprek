@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 import {
   APPROVAL_TIMEOUT_MS,
   addApproval,
+  buildApprovalAnswer,
   dropExpired,
   formatCountdown,
   oldestApproval,
@@ -54,8 +55,23 @@ test("addApproval keeps the same request id apart when it comes from two differe
 
 test("removeApproval drops one entry and returns the same array when there was nothing to drop", () => {
   const stack = addApproval([], frame(), 1_000);
-  expect(removeApproval(stack, "req-1")).toHaveLength(0);
-  expect(removeApproval(stack, "unknown")).toBe(stack);
+  expect(removeApproval(stack, CHAT_A, "req-1")).toHaveLength(0);
+  expect(removeApproval(stack, CHAT_A, "unknown")).toBe(stack);
+});
+
+test("removeApproval keys by chat AND id, so answering one chat never drops another chat's identically-named question", () => {
+  // The server keys pending approvals by chatId:requestId because two CLI
+  // subprocesses can hand out the same request_id — the client must match that.
+  let stack = addApproval([], frame({ id: "req-1", chatId: CHAT_A }), 1_000);
+  stack = addApproval(stack, frame({ id: "req-1", chatId: CHAT_B }), 2_000);
+  expect(stack).toHaveLength(2);
+
+  const left = removeApproval(stack, CHAT_A, "req-1");
+  expect(left).toHaveLength(1);
+  expect(left[0].chatId).toBe(CHAT_B);
+
+  // The right id in the wrong chat removes nothing.
+  expect(removeApproval(left, CHAT_A, "req-1")).toBe(left);
 });
 
 test("removeApprovalsForChat drops only that chat's entries", () => {
@@ -83,6 +99,24 @@ test("formatCountdown renders zero-padded mm:ss", () => {
   expect(formatCountdown(65_000)).toBe("01:05");
   expect(formatCountdown(9_000)).toBe("00:09");
   expect(formatCountdown(-1)).toBe("00:00");
+});
+
+test("buildApprovalAnswer carries the ENTRY's own chatId, not whichever chat is on screen", () => {
+  // POST /api/approvals/<id> answers 404 for a chatId that does not own the
+  // request, so an answer built from the wrong chat is silently lost.
+  const stack = addApproval(addApproval([], frame({ id: "req-1", chatId: CHAT_A }), 0), frame({ id: "req-2", chatId: CHAT_B }), 0);
+
+  expect(buildApprovalAnswer(stack[0], "allow")).toEqual({ id: "req-1", body: { chatId: CHAT_A, behavior: "allow" } });
+  expect(buildApprovalAnswer(stack[1], "allow")).toEqual({ id: "req-2", body: { chatId: CHAT_B, behavior: "allow" } });
+});
+
+test("buildApprovalAnswer attaches the deny message only to a deny", () => {
+  const entry = addApproval([], frame(), 0)[0];
+  expect(buildApprovalAnswer(entry, "deny")).toEqual({
+    id: "req-1",
+    body: { chatId: CHAT_A, behavior: "deny", message: "denied by user" },
+  });
+  expect(buildApprovalAnswer(entry, "allow").body).not.toHaveProperty("message");
 });
 
 test("shortAgentId shortens a long id and leaves a short one alone", () => {

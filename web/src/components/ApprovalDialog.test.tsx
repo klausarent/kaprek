@@ -2,7 +2,7 @@ import { test, expect, vi } from "vitest";
 import ApprovalDialog from "./ApprovalDialog";
 import { addApproval, type PendingApproval } from "../lib/approvals";
 import type { ApprovalFrame } from "../lib/api";
-import { click, findOneByText, render, textOf } from "../test/tree";
+import { click, findAll, findOneByText, render, textOf } from "../test/tree";
 
 const CHAT_ID = "11111111-1111-4111-8111-111111111111";
 
@@ -89,8 +89,36 @@ test("a subagent's approval shows its shortened agentId", () => {
   expect(textOf(tree)).toContain("agent 01234567…");
 });
 
-test("both buttons are disabled while a decision is in flight", () => {
-  const tree = render(<ApprovalDialog approvals={stack(frame())} nowMs={0} busy onDecide={() => {}} />);
+test("both buttons are disabled while a decision is in flight, and a click cannot get through", () => {
+  const onDecide = vi.fn();
+  const tree = render(<ApprovalDialog approvals={stack(frame())} nowMs={0} busy onDecide={onDecide} />);
   expect(findOneByText(tree, "button", "Allow").props.disabled).toBe(true);
   expect(findOneByText(tree, "button", "Deny").props.disabled).toBe(true);
+  expect(() => click(findOneByText(tree, "button", "Allow"))).toThrow(/disabled/);
+  expect(onDecide).not.toHaveBeenCalled();
+});
+
+test("a failed answer is shown on the dialog, with the question and its buttons still there to retry", () => {
+  // A 500 or a dropped connection must not take the question away — the entry
+  // stays in the stack (see Chat.tsx::handleDecide) and this is where the user
+  // finds out why nothing happened.
+  const onDecide = vi.fn();
+  const tree = render(
+    <ApprovalDialog
+      approvals={stack(frame())}
+      nowMs={0}
+      error="Could not send your answer (Request failed (HTTP 500)). Try again."
+      onDecide={onDecide}
+    />,
+  );
+  expect(textOf(tree)).toContain("Could not send your answer");
+  expect(textOf(tree)).toContain("Try again");
+  // Still answerable: the buttons are live, not disabled by the error.
+  click(findOneByText(tree, "button", "Allow"));
+  expect(onDecide).toHaveBeenCalledTimes(1);
+});
+
+test("no error line when there is no error", () => {
+  const tree = render(<ApprovalDialog approvals={stack(frame())} nowMs={0} onDecide={() => {}} />);
+  expect(findAll(tree, (node) => (node.props.className as string | undefined) === "error-box")).toHaveLength(0);
 });
