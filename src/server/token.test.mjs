@@ -71,7 +71,11 @@ test('the token file is created with owner-only permissions where the platform r
 test('timingSafeTokenEqual: equal strings match, any difference does not', () => {
   const token = ensureInstanceToken(dataDir);
   expect(timingSafeTokenEqual(token, token)).toBe(true);
-  expect(timingSafeTokenEqual(`${token.slice(0, -1)}0`, token)).toBe(false);
+  // Flipped against the actual last character, not hardcoded: the token is
+  // random hex, so a fixed '0' left this test passing 15 runs out of 16 and
+  // comparing a token to itself on the sixteenth.
+  const differentLast = token.endsWith('0') ? '1' : '0';
+  expect(timingSafeTokenEqual(`${token.slice(0, -1)}${differentLast}`, token)).toBe(false);
 });
 
 test('timingSafeTokenEqual: a length mismatch is false, not a throw (crypto.timingSafeEqual would throw)', () => {
