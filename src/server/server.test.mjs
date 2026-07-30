@@ -1680,13 +1680,15 @@ function delayedHarness(delayMs) {
 }
 
 test('triggers: POST /api/triggers/<id>/fire while a trigger turn is already in flight is rejected with 429 (loop-guard layer 2), before opening any stream', async () => {
-  const { url } = await boot({ harness: delayedHarness(200), harnessName: 'fake' });
+  const { url } = await boot({ harness: delayedHarness(500), harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger());
 
   const firstFire = fetch(`${url}/api/triggers/nightly-sync/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
   // Give the first request's synchronous fireTrigger() prefix (through
-  // runningIds.add()) a chance to run before firing the second one.
-  await new Promise((resolve) => setTimeout(resolve, 20));
+  // runningIds.add()) a chance to run before firing the second one. A wide
+  // margin against delayedHarness's own delay above — this only needs to
+  // observe "still running", not race it precisely.
+  await new Promise((resolve) => setTimeout(resolve, 100));
 
   const secondRes = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
   expect(secondRes.status).toBe(429);
