@@ -15,7 +15,8 @@ import { parseManifest, ManifestValidationError } from './manifest.mjs';
 // via a stat() first, so an oversized file is never even read into memory.
 const MAX_MANIFEST_BYTES = 256 * 1024;
 
-function userAppsDir(dataDir) {
+/** The one place `<dataDir>/apps` is spelled out — exported so mcp-config.mjs's --allow-fs-read scope can never drift from what loadApps() actually reads (same pattern as mcp-server.mjs's workspaceDirFor()). */
+export function userAppsDir(dataDir) {
   return path.join(dataDir, 'apps');
 }
 

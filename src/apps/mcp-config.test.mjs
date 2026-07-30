@@ -47,12 +47,20 @@ test('writeMcpConfig (sandboxed, default) wires command=process.execPath and --p
   expect(entry.args).toEqual([
     '--permission',
     '--allow-fs-read=C:\\repo',
-    '--allow-fs-read=C:\\data',
+    '--allow-fs-read=C:\\data\\apps',
+    '--allow-fs-read=C:\\data\\workspace',
     '--allow-fs-read=C:\\apps',
     '--allow-fs-write=C:\\data\\workspace',
     'C:\\repo\\src\\apps\\mcp-server.mjs',
   ]);
   expect(entry.env).toEqual({ KAPREK_DATA_DIR: 'C:\\data', KAPREK_APPS_DIR: 'C:\\apps' });
+});
+
+test('writeMcpConfig never grants the bare dataDir itself as --allow-fs-read (only its apps/ and workspace/ subdirs)', () => {
+  const configPath = writeMcpConfig({ dataDir: 'C:\\data', packageRoot: 'C:\\repo', serverScriptPath: 'C:\\server.mjs', tmpDir });
+  const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  const entry = config.mcpServers['kaprek-apps'];
+  expect(entry.args).not.toContain('--allow-fs-read=C:\\data');
 });
 
 test('writeMcpConfig omits the appsDir --allow-fs-read flag and env var when appsDir is not given', () => {
@@ -62,7 +70,8 @@ test('writeMcpConfig omits the appsDir --allow-fs-read flag and env var when app
   expect(entry.args).toEqual([
     '--permission',
     '--allow-fs-read=C:\\repo',
-    '--allow-fs-read=C:\\data',
+    '--allow-fs-read=C:\\data\\apps',
+    '--allow-fs-read=C:\\data\\workspace',
     '--allow-fs-write=C:\\data\\workspace',
     'C:\\server.mjs',
   ]);
@@ -226,6 +235,80 @@ test(
     expect(escapeRes.result.isError).toBe(true);
     expect(escapeRes.result.content[0].text).toMatch(/access.*denied|permission/i);
     expect(fs.existsSync(outsideFile)).toBe(false);
+
+    child.stdin.end();
+  },
+  20000,
+);
+
+/** A user app whose handler tries to read an arbitrary path under dataDir directly via node:fs — proves the sandbox's --allow-fs-read scope is `<dataDir>/apps` + `<dataDir>/workspace`, never the bare dataDir (see mcp-config.mjs's module header). */
+function readDataDirFixtureApp(dataDir) {
+  const appDir = path.join(dataDir, 'apps', 'nosy');
+  fs.mkdirSync(appDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(appDir, 'app.json'),
+    JSON.stringify({
+      id: 'nosy',
+      version: '1.0.0',
+      name: 'Nosy',
+      description: 'Test fixture: reads an arbitrary path under dataDir directly via node:fs.',
+      tools: [
+        {
+          id: 'nosy.read',
+          description: 'Tries fs.readFileSync on a path given by the caller.',
+          inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
+          handler: 'handler.mjs',
+        },
+      ],
+      policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'high' },
+    }),
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `import fs from 'node:fs';\n` +
+      `export async function handler(args) {\n` +
+      `  return { content: fs.readFileSync(args.path, 'utf8') };\n` +
+      `}\n`,
+    'utf8',
+  );
+}
+
+test(
+  'sandboxed config: --allow-fs-read is scoped to <dataDir>/apps and <dataDir>/workspace, never the bare dataDir — a sibling directory under dataDir (e.g. chats/) is denied',
+  async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mcp-config-datadir-scope-test-'));
+    const dataDir = path.join(root, 'data');
+    fs.mkdirSync(path.join(dataDir, 'workspace'), { recursive: true });
+    const chatsDir = path.join(dataDir, 'chats');
+    fs.mkdirSync(chatsDir, { recursive: true });
+    const secretFile = path.join(chatsDir, 'secret.txt');
+    fs.writeFileSync(secretFile, 'this must never leave via a tool result', 'utf8');
+    readDataDirFixtureApp(dataDir);
+
+    const configPath = writeMcpConfig({ dataDir, packageRoot: REPO_ROOT, serverScriptPath: SERVER_PATH, tmpDir: root });
+    const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    const entry = config.mcpServers['kaprek-apps'];
+
+    child = spawn(entry.command, entry.args, { env: { ...process.env, ...entry.env }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const client = createRpcClient(child);
+
+    await client.request('initialize', {
+      protocolVersion: '2025-06-18',
+      capabilities: {},
+      clientInfo: { name: 'test-client', version: '0.0.0' },
+    });
+    client.notify('notifications/initialized', {});
+
+    // The user app itself (under <dataDir>/apps) loads fine — proves that
+    // narrowing away from the bare dataDir did not also break the one
+    // subdirectory that's actually supposed to stay readable.
+    const listRes = await client.request('tools/list', {});
+    expect(listRes.result.tools.map((t) => t.name)).toContain('nosy.read');
+
+    const res = await client.request('tools/call', { name: 'nosy.read', arguments: { path: secretFile } });
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toMatch(/access.*denied|permission/i);
 
     child.stdin.end();
   },

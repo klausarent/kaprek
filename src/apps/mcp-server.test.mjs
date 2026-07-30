@@ -18,12 +18,15 @@ import { buildToolRegistry, handleMessage } from './mcp-server.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = path.join(__dirname, 'mcp-server.mjs');
-const WORKSPACE_FS_PATH = path.join(__dirname, '..', 'workspace', 'fs.mjs');
 
 // ------------------------------------------------------------ unit: registry
 
-function appEntry(id, tools, dir = `/apps/${id}`) {
-  return { manifest: { id, tools }, dir, source: 'bundled' };
+// Default policy matches what parseManifest() would fill in for a real
+// app.json — real registry entries always have one (manifest.mjs requires
+// it), so tools/call's policy-gated workspace ctx (see createWorkspaceCtx()
+// in mcp-server.mjs) can assume `manifest.policy` exists without an `?.`.
+function appEntry(id, tools, dir = `/apps/${id}`, policy = { fsWrite: true, dataEgress: false, externalAction: 'never', sensitivity: 'low' }) {
+  return { manifest: { id, tools, policy }, dir, source: 'bundled' };
 }
 
 function tool(id, handler = 'handler.mjs', inputSchema = { type: 'object' }) {
@@ -289,6 +292,75 @@ test('handleMessage: an oversized handler result is truncated to the output byte
   }
 });
 
+// -------------------------------------------------------- unit: policy gate
+
+test('handleMessage: a handler only ever sees ctx.workspace + ctx.appDir — no raw workspaceDir or dataDir string', async () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-ctx-shape-handler-'));
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `export async function handler(args, ctx) {\n  return { keys: Object.keys(ctx).sort(), hasWriteFile: typeof ctx.workspace?.writeFile === 'function' };\n}\n`,
+    'utf8',
+  );
+  try {
+    const apps = [appEntry('introspect', [tool('introspect.run')], appDir)];
+    const { registry } = buildToolRegistry(apps);
+    const res = await handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'introspect.run', arguments: {} } },
+      readyCtx({ registry }),
+    );
+    const { keys, hasWriteFile } = JSON.parse(res.result.content[0].text);
+    expect(keys).toEqual(['appDir', 'workspace']);
+    expect(hasWriteFile).toBe(true); // appEntry()'s default policy has fsWrite: true
+  } finally {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
+});
+
+test('handleMessage: policy.fsWrite: false leaves ctx.workspace without a writeFile — a write attempt fails as isError:true, not silently', async () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-fswrite-false-handler-'));
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `export async function handler(args, ctx) {\n  ctx.workspace.writeFile({ relPath: 'x.txt', data: 'nope' });\n  return { ok: true };\n}\n`,
+    'utf8',
+  );
+  try {
+    const apps = [
+      appEntry('readonly', [tool('readonly.run')], appDir, { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' }),
+    ];
+    const { registry } = buildToolRegistry(apps);
+    const res = await handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'readonly.run', arguments: {} } },
+      readyCtx({ registry }),
+    );
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toMatch(/writeFile is not a function/);
+  } finally {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
+});
+
+test('handleMessage: policy.fsWrite: false still allows ctx.workspace.readFile/listFiles', async () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-fswrite-false-read-handler-'));
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `export async function handler(args, ctx) {\n  return { hasReadFile: typeof ctx.workspace.readFile === 'function', hasListFiles: typeof ctx.workspace.listFiles === 'function' };\n}\n`,
+    'utf8',
+  );
+  try {
+    const apps = [
+      appEntry('readonly2', [tool('readonly2.run')], appDir, { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' }),
+    ];
+    const { registry } = buildToolRegistry(apps);
+    const res = await handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'readonly2.run', arguments: {} } },
+      readyCtx({ registry }),
+    );
+    expect(JSON.parse(res.result.content[0].text)).toEqual({ hasReadFile: true, hasListFiles: true });
+  } finally {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
+});
+
 // ------------------------------------------------------- integration: process
 
 let child;
@@ -301,14 +373,7 @@ afterEach(() => {
   root = null;
 });
 
-/** Relative import specifier from `fromDir` to the real src/workspace/fs.mjs, so a fixture handler can use the actual write-path guard. */
-function importPathTo(fromDir, target) {
-  let rel = path.relative(fromDir, target).split(path.sep).join('/');
-  if (!rel.startsWith('.')) rel = `./${rel}`;
-  return rel;
-}
-
-/** Writes a fixture app (id 'echo') whose handler writes args.relPath/args.data verbatim through the real workspace fs guard — used to prove the server rejects traversal end to end, not just that the notes app happens to sanitize its title. */
+/** Writes a fixture app (id 'echo') whose handler writes args.relPath/args.data verbatim through ctx.workspace.writeFile() (itself backed by the real workspace fs guard) — used to prove the server rejects traversal end to end, not just that the notes app happens to sanitize its title. */
 function writeEchoFixtureApp(bundledDir) {
   const appDir = path.join(bundledDir, 'echo');
   fs.mkdirSync(appDir, { recursive: true });
@@ -339,9 +404,8 @@ function writeEchoFixtureApp(bundledDir) {
   );
   fs.writeFileSync(
     path.join(appDir, 'handler.mjs'),
-    `import { writeFile } from '${importPathTo(appDir, WORKSPACE_FS_PATH)}';\n` +
-      `export async function handler(args, ctx) {\n` +
-      `  writeFile({ workspaceDir: ctx.workspaceDir, relPath: args.relPath, data: args.data ?? '' });\n` +
+    `export async function handler(args, ctx) {\n` +
+      `  ctx.workspace.writeFile({ relPath: args.relPath, data: args.data ?? '' });\n` +
       `  return { relPath: args.relPath };\n` +
       `}\n`,
     'utf8',
@@ -531,6 +595,65 @@ test(
     const { maxSeen } = JSON.parse(peekRes.result.content[0].text);
     expect(maxSeen).toBeLessThanOrEqual(8);
     expect(maxSeen).toBeGreaterThan(1); // proves real concurrency, not accidental full serialization
+
+    child.stdin.end();
+  },
+  20000,
+);
+
+test(
+  'mcp-server subprocess: once MAX_CONCURRENT_REQUESTS + MAX_QUEUE_DEPTH requests are pending, further ones are rejected with -32603 instead of queued forever',
+  async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mcp-server-queue-depth-test-'));
+    const bundledDir = path.join(root, 'apps');
+    const dataDir = path.join(root, 'data');
+    fs.mkdirSync(bundledDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+    const appDir = path.join(bundledDir, 'slow');
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'app.json'),
+      JSON.stringify({
+        id: 'slow',
+        version: '1.0.0',
+        name: 'Slow',
+        description: 'Sleeps long enough to keep the queue backed up (test fixture).',
+        tools: [
+          {
+            id: 'slow.run',
+            description: 'Sleeps 500ms then returns.',
+            inputSchema: { type: 'object', properties: {} },
+            handler: 'handler.mjs',
+          },
+        ],
+        policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
+      }),
+      'utf8',
+    );
+    fs.writeFileSync(
+      path.join(appDir, 'handler.mjs'),
+      `export async function handler() {\n  await new Promise((resolve) => setTimeout(resolve, 500));\n  return { ok: true };\n}\n`,
+      'utf8',
+    );
+
+    child = spawn(process.execPath, [SERVER_PATH], {
+      env: { ...process.env, KAPREK_DATA_DIR: dataDir, KAPREK_APPS_DIR: bundledDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const client = createRpcClient(child);
+    await handshake(client);
+
+    // 8 (MAX_CONCURRENT_REQUESTS) + 64 (MAX_QUEUE_DEPTH) = 72 can be
+    // in-flight/queued at once; firing well more than that, all before
+    // awaiting any of them, must overflow the queue.
+    const calls = Array.from({ length: 90 }, () => client.request('tools/call', { name: 'slow.run', arguments: {} }));
+    const results = await Promise.all(calls);
+
+    const overflowed = results.filter((r) => r.error?.code === -32603 && /queue is full/.test(r.error.message));
+    const succeeded = results.filter((r) => r.result?.isError === undefined && r.result?.content);
+    expect(overflowed.length).toBeGreaterThan(0);
+    expect(succeeded.length).toBeLessThanOrEqual(72);
+    expect(overflowed.length + succeeded.length).toBe(90);
 
     child.stdin.end();
   },

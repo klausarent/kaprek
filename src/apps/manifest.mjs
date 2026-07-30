@@ -31,6 +31,12 @@ const MAX_TOOLS = 64;
 const MAX_NAME_LENGTH = 200;
 const MAX_DESCRIPTION_LENGTH = 2000;
 const MAX_INSTRUCTIONS_LENGTH = 20000;
+// A per-tool ceiling distinct from MAX_DESCRIPTION_LENGTH (the app-level
+// description): tool.description goes into every tools/list response verbatim
+// (see mcp-server.mjs), so an unbounded one is prompt-bloat multiplied by
+// however many clients call tools/list, not a one-time cost like the app
+// description.
+const MAX_TOOL_DESCRIPTION_LENGTH = 1000;
 
 const KNOWN_TOP_FIELDS = ['id', 'version', 'name', 'description', 'icon', 'instructions', 'tools', 'policy', 'uiSlot'];
 const KNOWN_TOOL_FIELDS = ['id', 'description', 'inputSchema', 'handler'];
@@ -93,6 +99,7 @@ function validateTool(tool, index) {
     fail(`${fieldPrefix}.id`, 'must be a canonical "namespace.action" tool id (lowercase, dot-separated)');
   }
   assertNonEmptyString(tool.description, `${fieldPrefix}.description`);
+  assertMaxLength(tool.description, MAX_TOOL_DESCRIPTION_LENGTH, `${fieldPrefix}.description`);
   if (!isPlainObject(tool.inputSchema)) {
     fail(`${fieldPrefix}.inputSchema`, 'must be a JSON Schema object');
   }
@@ -111,6 +118,23 @@ function validateTools(tools) {
   });
 }
 
+/**
+ * Enforcement status of each `policy` field — written here so a manifest
+ * author (or a reader of this code) never assumes a declared field is doing
+ * more than it is:
+ *   - `fsWrite`: enforced at tools/call time (see mcp-server.mjs's
+ *     createWorkspaceCtx()) — `false` means the handler's `ctx.workspace`
+ *     has no `writeFile` at all. Application-layer only, NOT an OS-level
+ *     boundary: the Node `--permission` write grant behind it
+ *     (`--allow-fs-write=<dataDir>/workspace`, see mcp-config.mjs) is one
+ *     flag shared by the whole process, not scoped per app.
+ *   - `externalAction`, `dataEgress`, `sensitivity`: advisory only, never
+ *     enforced at runtime. There is no mechanism in this codebase (Node's
+ *     `--permission` covers fs/child-process, not network) that could stop
+ *     a handler from making an HTTP request or otherwise sending data out,
+ *     regardless of what it declares here. Treat these as documentation for
+ *     a human reviewing the app, not a technical guarantee.
+ */
 function validatePolicy(policy) {
   if (!isPlainObject(policy)) fail('policy', 'must be an object');
   assertNoUnknownFields(policy, KNOWN_POLICY_FIELDS, 'policy');

@@ -29,6 +29,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadApps } from './loader.mjs';
+import { readFile as wsReadFile, writeFile as wsWriteFile, listFiles as wsListFiles } from '../workspace/fs.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -51,6 +52,13 @@ const MAX_LINE_BYTES = 4 * 1024 * 1024;
 // process's work unboundedly (fan-out bound, separate from
 // HANDLER_TIMEOUT_MS's per-call bound).
 const MAX_CONCURRENT_REQUESTS = 8;
+// MAX_CONCURRENT_REQUESTS bounds work in flight, not work waiting — a
+// stdin flood (far more lines than can ever be drained at 8-at-a-time)
+// would otherwise grow `queue` (see run()) without bound, one JS string per
+// message, until this process runs out of memory. Once the queue is this
+// deep, a new request is rejected outright (-32603) instead of queued —
+// this process is falling behind and adding more work only makes it worse.
+const MAX_QUEUE_DEPTH = 64;
 
 const KNOWN_JSON_TYPES = ['string', 'number', 'boolean', 'object', 'array'];
 
@@ -263,6 +271,41 @@ function truncateOutput(text) {
 }
 
 /**
+ * Builds the `ctx.workspace` a handler actually receives — this, not a raw
+ * `workspaceDir` string, is the tools/call enforcement point for
+ * `manifest.mjs`'s `policy.fsWrite`. A handler is never handed
+ * `workspaceDir` itself (see handleMessage()'s tools/call branch below): the
+ * only way to reach the workspace is through the functions returned here,
+ * so when `fsWrite` is `false` there simply IS no `writeFile` to call —
+ * `ctx.workspace.writeFile(...)` throws a plain TypeError ("not a
+ * function"), caught by the same try/catch already wrapping every handler
+ * call and surfaced as a normal `isError: true` CallToolResult.
+ *
+ * Explicitly NOT a hard security boundary — kept honest, not oversold: the
+ * OS-level grant behind this (`--allow-fs-write=<dataDir>/workspace`, see
+ * mcp-config.mjs) is a single process-wide Node `--permission` flag that
+ * every app's handler shares, regardless of that app's own `fsWrite`
+ * policy. A handler could still `import()` `../../src/workspace/fs.mjs` (or
+ * raw `node:fs`) itself and reconstruct the workspace path some other way,
+ * and Node's OS-level permission would allow that write — this function
+ * only removes the CONVENIENT path, it cannot revoke a capability the
+ * process already has. Real per-app write isolation needs per-app
+ * `--allow-fs-write` roots (i.e. per-app subprocesses), tracked separately
+ * (see the review this responds to) — not something one shared process can
+ * give one of its apps and not another.
+ */
+function createWorkspaceCtx({ workspaceDir, fsWrite }) {
+  const workspace = {
+    readFile: ({ relPath }) => wsReadFile({ workspaceDir, relPath }),
+    listFiles: ({ relPath } = {}) => wsListFiles({ workspaceDir, relPath }),
+  };
+  if (fsWrite) {
+    workspace.writeFile = ({ relPath, data }) => wsWriteFile({ workspaceDir, relPath, data });
+  }
+  return workspace;
+}
+
+/**
  * Handles one parsed JSON-RPC message and returns the response object to
  * write (or `null` for a notification/invalid-envelope-without-id, which
  * never gets a response on the wire).
@@ -286,7 +329,7 @@ function truncateOutput(text) {
  * be reported the same way (see loadHandler()'s call site below).
  */
 export async function handleMessage(msg, ctx) {
-  const { registry, dataDir, workspaceDir, state } = ctx;
+  const { registry, workspaceDir, state } = ctx;
   const classified = classifyMessage(msg);
 
   if (classified.kind === 'invalid') {
@@ -370,9 +413,16 @@ export async function handleMessage(msg, ctx) {
     // wait; run() (real stdin/stdout usage) never sets it, so production
     // always gets the full HANDLER_TIMEOUT_MS.
     const timeoutMs = ctx.handlerTimeoutMs ?? HANDLER_TIMEOUT_MS;
+    // No raw `dataDir`/`workspaceDir` string is ever handed to a handler —
+    // only `workspace` (policy-gated, see createWorkspaceCtx()) and
+    // `appDir`. `dataDir` in particular has no legitimate handler use (it's
+    // a strict superset of `workspace` containing other apps'/kaprek's own
+    // data) and giving it out would make the whole point of mcp-config.mjs's
+    // narrowed `--allow-fs-read` moot the moment a handler reads it back.
+    const workspace = createWorkspaceCtx({ workspaceDir, fsWrite: entry.app.manifest.policy.fsWrite });
     try {
       const result = await withTimeout(
-        handler(args, { dataDir, workspaceDir, appDir: entry.app.dir }),
+        handler(args, { workspace, appDir: entry.app.dir }),
         timeoutMs,
         `tool ${JSON.stringify(name)} timed out after ${timeoutMs}ms`,
       );
@@ -451,6 +501,24 @@ export async function run({ dataDir, bundledDir, appsDir } = {}) {
   function enqueue(line) {
     const trimmed = line.trim();
     if (!trimmed) return;
+    if (queue.length >= MAX_QUEUE_DEPTH) {
+      // Best-effort id extraction for a well-formed error response — an
+      // over-limit line is rejected outright, never buffered, so this must
+      // not itself risk parsing a hostile/huge payload beyond what JSON.parse
+      // already does for every line (see MAX_LINE_BYTES above, which already
+      // bounds `trimmed`'s size by the time we get here).
+      let parsed;
+      try {
+        parsed = JSON.parse(trimmed);
+      } catch {
+        parsed = null;
+      }
+      const id = extractIdIfValid(parsed);
+      process.stdout.write(
+        `${JSON.stringify(errorResponse(id, -32603, `request queue is full (max ${MAX_QUEUE_DEPTH} pending); server is falling behind, try again later`))}\n`,
+      );
+      return;
+    }
     queue.push(trimmed);
     pump();
   }

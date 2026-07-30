@@ -166,6 +166,24 @@ test('validateManifest rejects overlong instructions', () => {
   expect(() => validateManifest(validManifest({ instructions: 'x'.repeat(20001) }))).toThrow(ManifestValidationError);
 });
 
+test('validateManifest rejects an overlong tool description', () => {
+  const manifest = validManifest();
+  manifest.tools[0].description = 'x'.repeat(1001);
+  try {
+    validateManifest(manifest);
+    throw new Error('expected to throw');
+  } catch (err) {
+    expect(err).toBeInstanceOf(ManifestValidationError);
+    expect(err.field).toBe('tools[0].description');
+  }
+});
+
+test('validateManifest accepts a tool description at exactly the 1000-char limit', () => {
+  const manifest = validManifest();
+  manifest.tools[0].description = 'x'.repeat(1000);
+  expect(() => validateManifest(manifest)).not.toThrow();
+});
+
 // --------------------------------------------------------------- parseManifest
 
 test('parseManifest parses a JSON string and normalizes optional fields', () => {

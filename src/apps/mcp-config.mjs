@@ -18,21 +18,49 @@
 // bypassing src/workspace/fs.mjs entirely, is stopped by Node itself and
 // surfaces as a normal CallToolResult isError, not a crash).
 //
+// FS-read scope is deliberately narrow, NOT `--allow-fs-read=<dataDir>`: a
+// blanket dataDir grant would let any handler `fs.readFileSync()` sibling
+// data under dataDir it has no business touching (chats, receipts, keys,
+// other apps' private files) and hand the content back in a tool result —
+// exfiltration over MCP itself, no network needed. Only three directories
+// are readable: `packageRoot` (server code + bundled apps, see below),
+// `<dataDir>/apps` (user-installed app manifests/handlers — see
+// loader.mjs's userAppsDir(), reused here so this can't drift from what
+// loadApps() actually reads), and `<dataDir>/workspace` (so a handler can
+// read back files it or another app previously wrote there, matching
+// `--allow-fs-write` below). Verified empirically against this exact
+// server with these exact three read roots: it starts, loads both bundled
+// and user apps, and a handler reading a path under `dataDir` but outside
+// those three (e.g. `<dataDir>/chats/...`) gets ERR_ACCESS_DENIED.
+//
 // What has to be readable for the server to even start: the server's own
 // module graph (mcp-server.mjs statically imports loader.mjs, which imports
 // manifest.mjs, all under `packageRoot`), package.json (read for
 // serverVersion()), the bundled apps directory (also under packageRoot by
 // default), and every app's handler.mjs (bundled apps under packageRoot,
-// user apps under dataDir). Node's permission model checks EVERY fs read —
-// including ESM module resolution — so `packageRoot` must be readable, not
-// just the entry script; only the entry script itself is exempt (Node's own
-// bootstrap has to read it before any permission the process defines could
-// even apply).
+// user apps under `<dataDir>/apps`). Node's permission model checks EVERY
+// fs read — including ESM module resolution — so `packageRoot` must be
+// readable, not just the entry script; only the entry script itself is
+// exempt (Node's own bootstrap has to read it before any permission the
+// process defines could even apply).
+//
+// Env: Claude Code MERGES this config's `env` map into the spawned
+// process's full parent environment — it does NOT replace it (verified
+// empirically: a marker var set only in the parent shell, never mentioned
+// in `env` here, was still visible inside the spawned server). That means
+// there is no way, from this file, to keep the MCP subprocess from
+// inheriting whatever secrets/API keys happen to be in the parent's env —
+// `--permission` has no env-scoping flag at all, only fs/child-process.
+// The only thing under our control is not making it WORSE: `env` below
+// therefore only ever adds kaprek's own non-secret KAPREK_* path
+// variables, never anything the parent process wouldn't already have
+// leaked on its own.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { workspaceDirFor } from './mcp-server.mjs';
+import { userAppsDir } from './loader.mjs';
 
 /**
  * Writes a one-server --mcp-config JSON file wiring up kaprek's own apps
@@ -41,14 +69,20 @@ import { workspaceDirFor } from './mcp-server.mjs';
  * `serverScriptPath` is passed as an argv element to `node`, never
  * interpreted by a shell — so no escaping/quoting concerns even on Windows.
  * The server itself gets its directories via env, matching mcp-server.mjs's
- * `run()` (KAPREK_DATA_DIR / KAPREK_APPS_DIR), since Claude Code spawns the
- * server with a fresh environment we don't otherwise control the argv of.
+ * `run()` (KAPREK_DATA_DIR / KAPREK_APPS_DIR).
  *
  * `packageRoot` is required whenever `sandbox` is true (the default): it is
  * the directory that must stay readable for the server's own code and the
  * bundled apps under it to load at all (see module header). Callers already
  * know it — it's wherever kaprek itself is installed/checked out — so this
  * intentionally does not try to guess it from `serverScriptPath`'s layout.
+ *
+ * `appsDir`, when given, is a BUNDLED-apps override (KAPREK_APPS_DIR — see
+ * mcp-server.mjs's run()), for a bundled apps directory that lives outside
+ * `packageRoot` (e.g. test fixtures); it gets its own `--allow-fs-read`
+ * since it isn't otherwise covered. This is distinct from user-installed
+ * apps under `<dataDir>/apps` (loader.mjs's userAppsDir()), which is always
+ * readable regardless of `appsDir`.
  *
  * `command` is always `process.execPath` (the exact node binary running
  * THIS process), never the bare string `'node'` — the first `node` found on
@@ -65,11 +99,13 @@ export function writeMcpConfig({ dataDir, appsDir, packageRoot, serverScriptPath
 
   const workspaceDir = workspaceDirFor(dataDir);
 
+  // Deliberately NOT `--allow-fs-read=${dataDir}` — see module header.
   const args = sandbox
     ? [
         '--permission',
         `--allow-fs-read=${packageRoot}`,
-        `--allow-fs-read=${dataDir}`,
+        `--allow-fs-read=${userAppsDir(dataDir)}`,
+        `--allow-fs-read=${workspaceDir}`,
         ...(appsDir ? [`--allow-fs-read=${appsDir}`] : []),
         `--allow-fs-write=${workspaceDir}`,
         serverScriptPath,
