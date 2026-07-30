@@ -259,6 +259,11 @@ function validateConfigForType(type, config) {
  * in, unknown fields already rejected). Throws InvalidTriggerError with a
  * `.field` naming exactly what was wrong, on the first violation found.
  *
+ * `knownAppIds` (a Set, or null for "no app registry wired") is what makes
+ * `appScope` checkable at all: null keeps the old syntax-only check, a Set
+ * rejects any entry that is not an installed app id. The server always passes
+ * one (see startServer()); a runner/registry built in isolation may not.
+ *
  * `escalation` answers "when may this trigger interrupt the user" — the
  * model ambient-agent products use to keep proactivity from becoming spam:
  * 'notify' (a fact, no action taken without separate approval), 'question'
@@ -268,7 +273,7 @@ function validateConfigForType(type, config) {
  * thought about escalation gets the safe default, not an error, but the
  * field itself always exists on every stored trigger.
  */
-export function validateTrigger(obj) {
+export function validateTrigger(obj, { knownAppIds = null } = {}) {
   if (!isPlainObject(obj)) fail('<root>', 'trigger must be an object');
   assertNoUnknownFields(obj, KNOWN_TOP_FIELDS, '');
 
@@ -289,9 +294,22 @@ export function validateTrigger(obj) {
   }
   if (!Array.isArray(obj.appScope) || !obj.appScope.every((id) => typeof id === 'string' && id.length > 0)) {
     // An empty array is valid (and means "no app may be used" — see
-    // src/triggers/runner.mjs's allowedToolsFor()); what's rejected is a
+    // src/triggers/runner.mjs's notifyPolicyHandler()); what's rejected is a
     // non-array or an array with a non-string/empty entry.
     fail('appScope', 'must be an array of non-empty strings (app ids); use [] for none');
+  }
+  // Every entry must name an app that actually exists. Without this, an
+  // appScope was a free-text field: `["Bash"]` was accepted and used to read
+  // like a grant for the CLI's Bash tool (adversarial review Tag 3, Grok P0 /
+  // Codex F1). It never reaches the CLI any more (see runner.mjs), but a
+  // scope naming something that is not an app is a mistake worth reporting at
+  // the moment it is made, not a silent no-op.
+  if (knownAppIds !== null) {
+    for (const appId of obj.appScope) {
+      if (!knownAppIds.has(appId)) {
+        fail('appScope', `unknown app id "${appId}" — appScope may only name installed apps (see GET /api/apps)`);
+      }
+    }
   }
   if (obj.enabled !== undefined && typeof obj.enabled !== 'boolean') {
     fail('enabled', 'must be a boolean');
@@ -324,6 +342,66 @@ export function validateTrigger(obj) {
 
 function triggersPathFor(dataDir) {
   return path.join(dataDir, 'triggers.json');
+}
+
+/**
+ * Brings one stored entry back inside the ceilings before it is validated.
+ * A hand-edited `maxRunsPerDay: 5000` used to be loaded verbatim, because
+ * nothing re-validated the file after it was written (adversarial review Tag
+ * 3, both peers). Clamping rather than rejecting is deliberate: the user
+ * keeps the trigger they configured, just not the number they invented — and
+ * the clamp is logged, so it is not a silent correction either.
+ */
+function clampStoredLimits(entry, report) {
+  if (!isPlainObject(entry) || !isPlainObject(entry.limits)) return entry;
+  const limits = { ...entry.limits };
+  if (typeof limits.maxRunsPerDay === 'number' && limits.maxRunsPerDay > MAX_RUNS_PER_DAY_CEILING) {
+    report(`trigger "${entry.id}": maxRunsPerDay ${limits.maxRunsPerDay} exceeds the ceiling, clamped to ${MAX_RUNS_PER_DAY_CEILING}`);
+    limits.maxRunsPerDay = MAX_RUNS_PER_DAY_CEILING;
+  }
+  if (typeof limits.maxCostPerDay === 'number' && limits.maxCostPerDay > MAX_COST_PER_DAY_CEILING) {
+    report(`trigger "${entry.id}": maxCostPerDay ${limits.maxCostPerDay} exceeds the ceiling, clamped to ${MAX_COST_PER_DAY_CEILING}`);
+    limits.maxCostPerDay = MAX_COST_PER_DAY_CEILING;
+  }
+  return { ...entry, limits };
+}
+
+/**
+ * Drops appScope entries naming an app that is not installed. On the WRITE
+ * path an unknown app id is an error (see validateTrigger); on the read path
+ * it must not be, or a user who uninstalls an app loses every trigger that
+ * mentioned it. Fail-closed: the entry disappears from the scope (it grants
+ * nothing), the trigger survives, the removal is logged.
+ */
+function dropUnknownAppScope(entry, knownAppIds, report) {
+  if (knownAppIds === null || !isPlainObject(entry) || !Array.isArray(entry.appScope)) return entry;
+  const kept = entry.appScope.filter((appId) => knownAppIds.has(appId));
+  if (kept.length === entry.appScope.length) return entry;
+  const dropped = entry.appScope.filter((appId) => !knownAppIds.has(appId));
+  report(`trigger "${entry.id}": dropped unknown app id(s) from appScope: ${dropped.join(', ')}`);
+  return { ...entry, appScope: kept };
+}
+
+/**
+ * Runs every stored entry through the same validation a new trigger goes
+ * through, after clamping what can be clamped. An entry that is still invalid
+ * afterwards is SKIPPED (with a log line) rather than taking the file down
+ * with it — same posture as runs.mjs skipping a corrupt line. This is what
+ * makes "the ceilings hold" true across a restart, instead of only at the
+ * moment a trigger is created.
+ */
+function normalizeStoredTriggers(entries, knownAppIds, report) {
+  const normalized = [];
+  for (const entry of entries) {
+    const id = isPlainObject(entry) && typeof entry.id === 'string' ? entry.id : '<unnamed>';
+    try {
+      const clamped = dropUnknownAppScope(clampStoredLimits(entry, report), knownAppIds, report);
+      normalized.push(validateTrigger(clamped, { knownAppIds }));
+    } catch (err) {
+      report(`trigger "${id}": dropped while loading (${err.message})`);
+    }
+  }
+  return normalized;
 }
 
 /**
@@ -371,14 +449,27 @@ function writeTriggersFile(dataDir, triggers) {
 
 /**
  * Opens the trigger registry for `dataDir`: loads `triggers.json` (or starts
- * empty, see readTriggersFile()) and returns an API for reading and
+ * empty, see readTriggersFile()), NORMALIZES every entry through the same
+ * validation a new trigger goes through, and returns an API for reading and
  * mutating it. Every mutating call re-validates and rewrites the whole file
  * atomically — trigger count is expected to stay small (a handful per
  * user), so a full rewrite per change is simpler than an append-only log
  * and costs nothing measurable here.
+ *
+ * @param {string} dataDir
+ * @param {object} [options]
+ * @param {Set<string>|(() => Set<string>)|null} [options.knownAppIds] -
+ *   installed app ids; see validateTrigger(). A FUNCTION is re-evaluated per
+ *   use, which is what the server passes: an app installed after the registry
+ *   was opened must be scopeable without a restart.
+ * @param {(message: string) => void} [options.log] - where load-time
+ *   corrections (clamped limits, dropped app ids, skipped entries) are
+ *   reported. Defaults to console.warn: a correction the user never hears
+ *   about is indistinguishable from the tool ignoring their configuration.
  */
-export function openTriggers(dataDir) {
-  let triggers = readTriggersFile(dataDir);
+export function openTriggers(dataDir, { knownAppIds = null, log = (message) => console.warn(`triggers: ${message}`) } = {}) {
+  const currentAppIds = () => (typeof knownAppIds === 'function' ? knownAppIds() : knownAppIds);
+  let triggers = normalizeStoredTriggers(readTriggersFile(dataDir), currentAppIds(), log);
 
   return {
     list() {
@@ -390,9 +481,9 @@ export function openTriggers(dataDir) {
       return trigger ? { ...trigger } : null;
     },
 
-    /** Validates `trigger`, then inserts it (new id) or replaces the existing entry with the same id. Returns the normalized, stored trigger. */
+    /** Validates `trigger` (including its appScope against the installed apps), then inserts it (new id) or replaces the existing entry with the same id. Returns the normalized, stored trigger. */
     upsert(trigger) {
-      const validated = validateTrigger(trigger);
+      const validated = validateTrigger(trigger, { knownAppIds: currentAppIds() });
       const index = triggers.findIndex((t) => t.id === validated.id);
       const next = triggers.slice();
       if (index >= 0) next[index] = validated;

@@ -360,3 +360,117 @@ test('triggers.json is written atomically as {version, triggers}', () => {
   expect(raw.triggers).toHaveLength(1);
   expect(raw.triggers[0].id).toBe('daily-checkin');
 });
+
+// ------------------------------------------------------------- appScope is bound to installed apps
+
+const INSTALLED_APPS = new Set(['notes', 'weather']);
+
+test('appScope: an entry naming an installed app is accepted', () => {
+  expect(() => validateTrigger(validHeartbeat({ appScope: ['notes'] }), { knownAppIds: INSTALLED_APPS })).not.toThrow();
+});
+
+test('appScope: a CLI tool name is rejected — a scope names apps, never tools', () => {
+  // The finding this closes: `["Bash"]` used to be a valid scope AND was
+  // handed to the CLI as --allowedTools (adversarial review Tag 3).
+  for (const bogus of ['Bash', 'Write', 'WebFetch']) {
+    expect(() => validateTrigger(validHeartbeat({ appScope: [bogus] }), { knownAppIds: INSTALLED_APPS })).toThrow(InvalidTriggerError);
+  }
+  try {
+    validateTrigger(validHeartbeat({ appScope: ['Bash'] }), { knownAppIds: INSTALLED_APPS });
+  } catch (err) {
+    expect(err.field).toBe('appScope');
+    expect(err.message).toMatch(/unknown app id "Bash"/);
+  }
+});
+
+test('appScope: without a known-app list the check is skipped (a registry opened with no app registry wired)', () => {
+  expect(() => validateTrigger(validHeartbeat({ appScope: ['anything'] }))).not.toThrow();
+});
+
+test('upsert rejects an appScope naming an app that is not installed', () => {
+  const triggers = openTriggers(tmpDir, { knownAppIds: INSTALLED_APPS, log: () => {} });
+  expect(() => triggers.upsert(validHeartbeat({ appScope: ['Bash'] }))).toThrow(InvalidTriggerError);
+  expect(triggers.list()).toHaveLength(0);
+});
+
+test('knownAppIds may be a function, re-evaluated per use — an app installed later becomes scopeable without a restart', () => {
+  const installed = new Set();
+  const triggers = openTriggers(tmpDir, { knownAppIds: () => installed, log: () => {} });
+  expect(() => triggers.upsert(validHeartbeat({ appScope: ['notes'] }))).toThrow(InvalidTriggerError);
+
+  installed.add('notes');
+  expect(triggers.upsert(validHeartbeat({ appScope: ['notes'] })).appScope).toEqual(['notes']);
+});
+
+// ------------------------------------------------------------- load-time revalidation
+
+/** Writes triggers.json directly, past validateTrigger() — the route a hand edit takes. */
+function writeRawTriggersFile(triggers) {
+  fs.writeFileSync(path.join(tmpDir, 'triggers.json'), JSON.stringify({ version: 1, triggers }, null, 2), 'utf8');
+}
+
+function storedHeartbeat(overrides = {}) {
+  return {
+    id: 'daily-checkin',
+    type: 'heartbeat',
+    config: { intervalMinutes: 30, checklistPath: 'CHECKLIST.md' },
+    promptTemplate: 'Check the checklist.',
+    escalation: 'notify',
+    appScope: [],
+    enabled: true,
+    approvalRequired: false,
+    limits: { maxRunsPerDay: 24, maxCostPerDay: 1 },
+    ...overrides,
+  };
+}
+
+test('load: limits above the ceilings are clamped to them, not obeyed — and the clamp is logged', () => {
+  writeRawTriggersFile([storedHeartbeat({ limits: { maxRunsPerDay: 5000, maxCostPerDay: 999 } })]);
+  const messages = [];
+  const triggers = openTriggers(tmpDir, { log: (m) => messages.push(m) });
+
+  const loaded = triggers.get('daily-checkin');
+  expect(loaded.limits).toEqual({ maxRunsPerDay: 500, maxCostPerDay: 50 });
+  expect(messages.some((m) => m.includes('maxRunsPerDay 5000') && m.includes('clamped'))).toBe(true);
+  expect(messages.some((m) => m.includes('maxCostPerDay 999') && m.includes('clamped'))).toBe(true);
+});
+
+test('load: a clamped trigger keeps working — the user loses the invented number, not the trigger', () => {
+  writeRawTriggersFile([storedHeartbeat({ limits: { maxRunsPerDay: 5000, maxCostPerDay: 999 } })]);
+  const triggers = openTriggers(tmpDir, { log: () => {} });
+  expect(triggers.list()).toHaveLength(1);
+  expect(triggers.get('daily-checkin').enabled).toBe(true);
+});
+
+test('load: limits inside the ceilings are left exactly as they are', () => {
+  writeRawTriggersFile([storedHeartbeat({ limits: { maxRunsPerDay: 7, maxCostPerDay: 0.5 } })]);
+  const triggers = openTriggers(tmpDir, { log: () => {} });
+  expect(triggers.get('daily-checkin').limits).toEqual({ maxRunsPerDay: 7, maxCostPerDay: 0.5 });
+});
+
+test('load: an appScope entry naming an app that is not installed is dropped, the trigger survives', () => {
+  // Uninstalling an app must not delete every trigger that mentioned it —
+  // but the scope must not keep granting it either.
+  writeRawTriggersFile([storedHeartbeat({ appScope: ['notes', 'Bash'] })]);
+  const messages = [];
+  const triggers = openTriggers(tmpDir, { knownAppIds: INSTALLED_APPS, log: (m) => messages.push(m) });
+
+  expect(triggers.get('daily-checkin').appScope).toEqual(['notes']);
+  expect(messages.some((m) => m.includes('dropped unknown app id(s)') && m.includes('Bash'))).toBe(true);
+});
+
+test('load: an entry that cannot be repaired is skipped with a log line, the other entries still load', () => {
+  writeRawTriggersFile([storedHeartbeat({ id: 'broken', type: 'nonsense' }), storedHeartbeat()]);
+  const messages = [];
+  const triggers = openTriggers(tmpDir, { log: (m) => messages.push(m) });
+
+  expect(triggers.list().map((t) => t.id)).toEqual(['daily-checkin']);
+  expect(messages.some((m) => m.includes('"broken"') && m.includes('dropped while loading'))).toBe(true);
+});
+
+test('load: a stored entry is normalized, so a missing optional field comes back with its default', () => {
+  const stored = storedHeartbeat();
+  delete stored.config.checklistPath;
+  writeRawTriggersFile([stored]);
+  expect(openTriggers(tmpDir, { log: () => {} }).get('daily-checkin').config.checklistPath).toBe('CHECKLIST.md');
+});
