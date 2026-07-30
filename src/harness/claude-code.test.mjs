@@ -109,6 +109,99 @@ test('A5: an oversized output line is dropped and counted, does not stop the tur
   expect(result.droppedLines).toBe(1);
 }, 10000);
 
+test('A7: strictAskCoverage kills the turn immediately (not just resolves) when the CLI reports a tool not in requireAskCoverage', async () => {
+  const initLine = { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'SomeBrandNewTool'], model: 'm' };
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify(initLine))});`,
+    'setTimeout(() => {}, 30000);', // would hang the test if the child were not actually killed
+  ].join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: true,
+  });
+
+  expect(result.stopReason).toBe('error');
+  expect(result.error.message).toContain('SomeBrandNewTool');
+}, 10000);
+
+test('A8: without strictAskCoverage, an unrecognized tool is only a warning — the turn completes normally', async () => {
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'SomeBrandNewTool'], model: 'm' },
+    { type: 'result', session_id: 's1', total_cost_usd: 0, usage: {}, is_error: false },
+  ];
+  const script = lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: false,
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings.some((w) => w.includes('SomeBrandNewTool'))).toBe(true);
+}, 10000);
+
+test('A9: a read-only tool (KNOWN_READONLY_TOOLS) is never an ask-coverage gap, even when absent from requireAskCoverage', async () => {
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'Read', 'Grep'], model: 'm' },
+    { type: 'result', session_id: 's1', total_cost_usd: 0, usage: {}, is_error: false },
+  ];
+  const script = lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'], // deliberately does NOT list Read/Grep
+    strictAskCoverage: true,
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings).toEqual([]);
+});
+
+test('A10: an MCP tool (mcp__…) is never an ask-coverage gap, regardless of requireAskCoverage', async () => {
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'mcp__kaprek-apps__notes.write'], model: 'm' },
+    { type: 'result', session_id: 's1', total_cost_usd: 0, usage: {}, is_error: false },
+  ];
+  const script = lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: true,
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings).toEqual([]);
+});
+
+test('A11: omitting requireAskCoverage entirely skips the check (backward compatible)', async () => {
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'AnythingAtAll'], model: 'm' },
+    { type: 'result', session_id: 's1', total_cost_usd: 0, usage: {}, is_error: false },
+  ];
+  const script = lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings).toEqual([]);
+});
+
 test('A6: an is_error result carries subtype and result text in error.message', async () => {
   const resultLine = {
     type: 'result',

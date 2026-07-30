@@ -7,6 +7,7 @@ import { spawn as nodeSpawn, execFile as nodeExecFile } from 'node:child_process
 import readline from 'node:readline';
 import fs from 'node:fs';
 import path from 'node:path';
+import { KNOWN_READONLY_TOOLS } from './settings.mjs';
 
 /**
  * Locates the Claude Code CLI and decides whether a shell is required.
@@ -128,6 +129,25 @@ const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
 /** Removes ANSI escape sequences from `str`; non-strings pass through unchanged. */
 function stripAnsi(str) {
   return typeof str === 'string' ? str.replace(ANSI_ESCAPE_RE, '') : str;
+}
+
+/**
+ * Whether `toolName` (as reported by the CLI's own `init` event) is one
+ * kaprek recognizes for ask-coverage purposes (see startTurn()'s
+ * `requireAskCoverage`/`strictAskCoverage` options and settings.mjs's own
+ * doc comment on WHY `permissions.ask` has to name every tool explicitly).
+ * A tool always counts as known if it is either in `requireAskCoverage`
+ * (the caller's own ask list for this turn's profile) OR in
+ * KNOWN_READONLY_TOOLS (always exempt, regardless of profile — see that
+ * constant's doc comment) OR an MCP-provided tool (`mcp__…`, covered by
+ * kaprek's own MCP-scope policy instead, see
+ * src/triggers/runner.mjs::notifyPolicyHandler()).
+ */
+function isKnownTool(toolName, requireAskCoverage) {
+  if (typeof toolName !== 'string') return true; // malformed — not this check's job to flag
+  if (toolName.startsWith('mcp__')) return true;
+  if (KNOWN_READONLY_TOOLS.includes(toolName)) return true;
+  return requireAskCoverage.includes(toolName);
 }
 
 /** Extracts readable text from a tool_result content field (string or block array); mirrors src/parser/parse.mjs::toolResultText. */
@@ -255,8 +275,22 @@ function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, set
  * node:child_process spawn) so tests can launch a harmless stand-in process
  * instead of the real `claude` binary — no test in this repo ever calls the
  * real CLI.
- * @param {import('./adapter.mjs').StartTurnOptions & {spawnFn?: Function, timeoutMs?: number, absoluteTimeoutMs?: number, killGraceMs?: number}} options
- * @returns {Promise<import('./adapter.mjs').TurnResult>}
+ * @param {import('./adapter.mjs').StartTurnOptions & {spawnFn?: Function, timeoutMs?: number, absoluteTimeoutMs?: number, killGraceMs?: number, requireAskCoverage?: string[], strictAskCoverage?: boolean}} options
+ * @param {string[]} [options.requireAskCoverage] - the ask list this turn's
+ *   `--settings` profile was built from (see settings.mjs's ASK_TOOLS_CHAT/
+ *   ASK_TOOLS_TRIGGER). Checked against the CLI's own `init` event's `tools`
+ *   list — a built-in tool the CLI reports that is in neither this list nor
+ *   KNOWN_READONLY_TOOLS means kaprek's ask-coverage is stale against
+ *   whatever CLI version is actually running (task-7a Fix-Runde 2: a tool
+ *   NOT forced through `permissions.ask` can bypass kaprek's own approval
+ *   gate entirely, see settings.mjs's doc comment). Omitted entirely skips
+ *   the check.
+ * @param {boolean} [options.strictAskCoverage] - when true (a trigger-
+ *   started turn, see run.mjs), a coverage gap KILLS the turn immediately
+ *   (stopReason 'error', the child process terminated before any tool call
+ *   can run) — nobody is watching a trigger turn, so failing loud beats
+ *   failing open. When false (a plain chat turn, a human IS watching), a gap
+ *   is only recorded in TurnResult.warnings and the turn continues.
  */
 export async function startTurn({
   cwd,
@@ -273,6 +307,8 @@ export async function startTurn({
   timeoutMs = DEFAULT_TIMEOUT_MS,
   absoluteTimeoutMs = DEFAULT_ABSOLUTE_TIMEOUT_MS,
   killGraceMs = DEFAULT_KILL_GRACE_MS,
+  requireAskCoverage,
+  strictAskCoverage = false,
 } = {}) {
   if (signal?.aborted) {
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
@@ -615,7 +651,27 @@ export async function startTurn({
       }
 
       for (const event of mapLine(obj)) {
-        if (event.type === 'init' && event.sessionId) latestSessionId = event.sessionId;
+        if (event.type === 'init') {
+          if (event.sessionId) latestSessionId = event.sessionId;
+          if (requireAskCoverage) {
+            const unknownTools = (event.tools ?? []).filter((t) => !isKnownTool(t, requireAskCoverage));
+            if (unknownTools.length > 0) {
+              const message = `ask-policy coverage gap: CLI reports tool(s) not in the ask list: ${unknownTools.join(', ')}`;
+              if (strictAskCoverage) {
+                // Fail-closed, not fail-open: a tool this harness doesn't
+                // recognize could be one that skips permissions.ask entirely
+                // on a stale ASK_TOOLS_* list (see settings.mjs) — killing
+                // the child NOW (before mapLine() can ever emit a
+                // 'tool-start' for it) is what actually stops it, not just
+                // resolving this Promise while the process keeps running.
+                killChildTree(child);
+                finishError(message);
+                return;
+              }
+              onEventErrors.push(message);
+            }
+          }
+        }
         if (event.type === 'result') {
           sawResult = true;
           resultIsError = !!event.isError;
@@ -639,6 +695,12 @@ export async function startTurn({
 
     child.on('close', (code) => {
       rl.close();
+      // Guards against a double-finish: the ask-coverage-gap path above
+      // (killChildTree() + finishError()) resolves the turn WITHOUT going
+      // through requestKill()/killReason, so this handler would otherwise
+      // still try to interpret the child's own exit and call finishError()
+      // a second time once it actually closes.
+      if (resolved) return;
       if (killReason) {
         finish({ sessionId: latestSessionId, costUsd, usage, stopReason: killReason, error: null });
         return;
