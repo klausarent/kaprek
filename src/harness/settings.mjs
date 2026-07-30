@@ -87,6 +87,32 @@ export const ASK_TOOLS_TRIGGER = [...ASK_TOOLS_CHAT, ...KNOWN_READONLY_TOOLS];
 
 const PROFILES = { chat: ASK_TOOLS_CHAT, trigger: ASK_TOOLS_TRIGGER };
 
+/**
+ * Merges `learnedTools` (see src/harness/knownTools.mjs — names the CLI
+ * reported that neither ASK_TOOLS_CHAT/ASK_TOOLS_TRIGGER nor
+ * KNOWN_READONLY_TOOLS already knew about) on top of `profile`'s static ask
+ * list. The static list is always a FLOOR: an empty/missing/corrupt learned
+ * list (knownTools.mjs::readKnownTools() fails closed to []) still yields
+ * exactly the static list, never fewer entries.
+ *
+ * 'chat' still excludes KNOWN_READONLY_TOOLS from what it forces through
+ * `ask` (a human is watching — see ASK_TOOLS_CHAT's own doc comment), so a
+ * newly-learned tool that turns out to be read-only-ish is left out of the
+ * CHAT profile specifically; 'trigger' has no such exclusion — everything
+ * learned is added, since ASK_TOOLS_TRIGGER already includes every
+ * KNOWN_READONLY_TOOLS entry by construction. In practice a name only ever
+ * reaches `learnedTools` at all when it was NOT in KNOWN_READONLY_TOOLS to
+ * begin with (see claude-code.mjs's isKnownTool()), so this exclusion is
+ * defense in depth against KNOWN_READONLY_TOOLS growing later, not a path
+ * exercised by today's learning flow.
+ */
+export function mergeAskList(profile, learnedTools = []) {
+  const base = PROFILES[profile];
+  if (!base) throw new Error(`mergeAskList requires profile to be one of ${Object.keys(PROFILES).join(', ')} (got ${JSON.stringify(profile)})`);
+  const extra = learnedTools.filter((t) => !base.includes(t) && (profile === 'trigger' || !KNOWN_READONLY_TOOLS.includes(t)));
+  return [...base, ...extra];
+}
+
 /** Writes `content` to `settingsPath` via tmp+rename (matching src/orchestrator/run.mjs::writeHarnessMeta). */
 function writeAtomically(dir, settingsPath, content) {
   fs.mkdirSync(dir, { recursive: true });
@@ -126,11 +152,13 @@ function writeAtomically(dir, settingsPath, content) {
  * the last resort before this function gives up and lets the error
  * propagate (src/orchestrator/run.mjs turns that into a turn-level error
  * BEFORE the CLI is ever spawned, never a silent continue).
+ *
+ * @param {string[]} [learnedTools] - see mergeAskList() above; merged on top
+ *   of `profile`'s static ask list, additive only, never touches `allow`.
  */
-export function writeHarnessSettings({ dataDir, profile }) {
+export function writeHarnessSettings({ dataDir, profile, learnedTools = [] }) {
   if (!dataDir) throw new Error('writeHarnessSettings requires dataDir');
-  const ask = PROFILES[profile];
-  if (!ask) throw new Error(`writeHarnessSettings requires profile to be one of ${Object.keys(PROFILES).join(', ')} (got ${JSON.stringify(profile)})`);
+  const ask = mergeAskList(profile, learnedTools);
 
   const dir = path.join(dataDir, 'harness');
   const settingsPath = path.join(dir, `settings-${profile}.json`);

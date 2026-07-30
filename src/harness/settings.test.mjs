@@ -2,7 +2,7 @@ import { test, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { writeHarnessSettings, ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER, KNOWN_READONLY_TOOLS } from './settings.mjs';
+import { writeHarnessSettings, mergeAskList, ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER, KNOWN_READONLY_TOOLS } from './settings.mjs';
 
 let tmpDir;
 
@@ -56,6 +56,51 @@ test('the two profiles never overwrite each other — both can exist side by sid
 test('throws when profile is missing or unknown', () => {
   expect(() => writeHarnessSettings({ dataDir: tmpDir })).toThrow();
   expect(() => writeHarnessSettings({ dataDir: tmpDir, profile: 'bogus' })).toThrow();
+});
+
+// ------------------------------------------------------------- mergeAskList / learnedTools (task-7a Fix-Runde 3)
+
+test('mergeAskList with no learned tools returns exactly the static profile list', () => {
+  expect(mergeAskList('chat')).toEqual(ASK_TOOLS_CHAT);
+  expect(mergeAskList('trigger', [])).toEqual(ASK_TOOLS_TRIGGER);
+});
+
+test('mergeAskList adds a genuinely new learned tool to both profiles', () => {
+  expect(mergeAskList('chat', ['ScheduleWakeup'])).toEqual([...ASK_TOOLS_CHAT, 'ScheduleWakeup']);
+  expect(mergeAskList('trigger', ['ScheduleWakeup'])).toEqual([...ASK_TOOLS_TRIGGER, 'ScheduleWakeup']);
+});
+
+test('mergeAskList never adds a tool already in the static list twice', () => {
+  expect(mergeAskList('chat', ['Bash'])).toEqual(ASK_TOOLS_CHAT);
+});
+
+test('mergeAskList excludes a KNOWN_READONLY_TOOLS name from the chat profile, but the trigger profile already has it', () => {
+  // Defense-in-depth case (see mergeAskList's own doc comment): today a
+  // read-only tool never actually reaches "learned" status, but the merge
+  // logic itself must still honor the chat/trigger split if it ever did.
+  expect(mergeAskList('chat', ['Read'])).toEqual(ASK_TOOLS_CHAT);
+  expect(mergeAskList('trigger', ['Read'])).toEqual(ASK_TOOLS_TRIGGER);
+});
+
+test('mergeAskList throws for an unknown profile', () => {
+  expect(() => mergeAskList('bogus', [])).toThrow();
+});
+
+test('writeHarnessSettings merges learnedTools into the written ask array, and NEVER into allow', () => {
+  // Passed in the order src/harness/knownTools.mjs::readKnownTools() would
+  // actually hand it back (sorted) — mergeAskList() itself is a pure
+  // filter+concat and does not re-sort its input.
+  const settingsPath = writeHarnessSettings({ dataDir: tmpDir, profile: 'chat', learnedTools: ['Monitor', 'ScheduleWakeup'] });
+  const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+
+  expect(parsed.permissions.ask).toEqual([...ASK_TOOLS_CHAT, 'Monitor', 'ScheduleWakeup']);
+  expect(parsed.permissions.allow).toEqual([]);
+});
+
+test('writeHarnessSettings without learnedTools behaves exactly like before (the static list only)', () => {
+  const settingsPath = writeHarnessSettings({ dataDir: tmpDir, profile: 'chat' });
+  const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  expect(parsed.permissions.ask).toEqual(ASK_TOOLS_CHAT);
 });
 
 test('is idempotent — calling it again for the same profile overwrites the same file, no leftover tmp files', () => {
