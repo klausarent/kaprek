@@ -40,6 +40,13 @@ const MAX_CONTEXT_FILES = 50;
 // chat text field is (see run.mjs's DEFAULT_MAX_TEXT_LEN) — redacted FIRST,
 // truncated after, never the other way round.
 const MAX_CLIPBOARD_PROMPT_CHARS = 4000;
+// How much of the clipboard the user's own pattern is matched against — see
+// the backtracking note in pollClipboard().
+const MAX_CLIPBOARD_MATCH_CHARS = 4096;
+// A poll interval below this is treated as a broken config rather than
+// honoured (registry.mjs's own floor is 1000; this is the last line of defense
+// for a value that never went through validation).
+const MIN_SAFE_POLL_MS = 100;
 
 // Types with a condition of their own that a background tick evaluates. The
 // other three are event-driven (file-watch, clipboard) or manual-only
@@ -148,7 +155,7 @@ function toPosixPath(p) {
  * caller cannot accidentally get raw clipboard content into a prompt by
  * passing it here unprocessed.
  */
-function buildPrompt(trigger, { reason, checklist, files, clipboard }) {
+function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipboard }) {
   const fileList = Array.isArray(files) ? files.join('\n') : '';
   const substituted = trigger.promptTemplate
     .split('{{reason}}')
@@ -167,6 +174,9 @@ function buildPrompt(trigger, { reason, checklist, files, clipboard }) {
   ];
   if (checklist !== undefined) contextLines.push(`[trigger] checklist:\n${checklist}`);
   if (Array.isArray(files) && files.length > 0) contextLines.push(`[trigger] changed files:\n${fileList}`);
+  // Said out loud rather than silently dropped: an agent acting on "these are
+  // the files that changed" must know when that list is only the first 50.
+  if (filesTruncated === true) contextLines.push(`[trigger] note: more than ${MAX_CONTEXT_FILES} paths changed — this list is incomplete`);
   if (clipboard !== undefined) contextLines.push(`[trigger] clipboard (secrets redacted):\n${clipboard}`);
 
   return `${substituted}\n\n${contextLines.join('\n')}`;
@@ -403,8 +413,25 @@ export function createTriggerRunner({
    * genuinely needs: if the turn writes into the very directory that started
    * it, the watcher fires again. Buffering those events would only delay the
    * loop by one debounce window instead of breaking it, so they are DROPPED.
+   *
+   * This runs SYNCHRONOUSLY inside fs.watch's own callback, so an uncaught
+   * throw here would take the whole process down — and it reads a config that
+   * was deliberately NOT re-validated on load (see
+   * registry.mjs::readTriggersFile: a broken triggers.json must never take the
+   * server down). A hand-edited entry missing `config.events` is therefore a
+   * real, reachable case: it disables that one trigger with a logged reason and
+   * leaves everything else running.
    */
   function handleWatchEvent(triggerId, eventType, filename) {
+    try {
+      dispatchWatchEvent(triggerId, eventType, filename);
+    } catch (err) {
+      disableWithReason(triggerId, `file-watch event handling failed: ${err?.message ?? String(err)}`);
+    }
+  }
+
+  /** The actual event handling — every throw in here is caught by handleWatchEvent() above. */
+  function dispatchWatchEvent(triggerId, eventType, filename) {
     const state = watchStates.get(triggerId);
     if (!state) return;
 
@@ -420,32 +447,53 @@ export function createTriggerRunner({
     const trigger = triggers.get(triggerId);
     if (!trigger || !trigger.enabled || trigger.type !== 'file-watch') return;
 
-    if (state.isDir && trigger.config.maxDepth !== undefined) {
+    // Explicit shape checks instead of trusting the stored config: a clear
+    // "your triggers.json is broken" reason beats a TypeError from deeper in.
+    const config = trigger.config;
+    if (!Array.isArray(config?.events)) throw new Error('config.events is not an array (hand-edited triggers.json?)');
+    if (!Number.isFinite(config?.debounceMs)) throw new Error('config.debounceMs is not a number (hand-edited triggers.json?)');
+
+    if (state.isDir && config.maxDepth !== undefined) {
       const depth = toPosixPath(filename).split('/').length;
-      if (depth > trigger.config.maxDepth) return;
+      if (depth > config.maxDepth) return;
     }
     const kind = mapWatchEvent(state, eventType, filename);
-    if (kind === null || !trigger.config.events.includes(kind)) return;
+    if (kind === null || !config.events.includes(kind)) return;
 
-    state.pending.add(watchEventRelPath(state, filename));
+    // Capped HERE, not at flush time: a `git checkout` or `npm install` in the
+    // watched tree can produce thousands of events inside one debounce window,
+    // and collecting path strings we would throw away later is pure waste. The
+    // overflow is remembered rather than swallowed — the prompt says the list
+    // is incomplete (see buildPrompt).
+    const relPath = watchEventRelPath(state, filename);
+    if (!state.pending.has(relPath)) {
+      if (state.pending.size >= MAX_CONTEXT_FILES) state.truncated = true;
+      else state.pending.add(relPath);
+    }
+
     if (state.timer) return;
     // Debounce: one save produces several events (Windows produces them
     // reliably, other platforms occasionally), so the turn starts once the
     // dust has settled — not once per event.
-    state.timer = setTimeout(() => flushWatch(triggerId), trigger.config.debounceMs);
+    state.timer = setTimeout(() => flushWatch(triggerId), config.debounceMs);
     if (typeof state.timer.unref === 'function') state.timer.unref();
   }
 
-  /** Fires the trigger once for everything collected during one debounce window: deduped (a Set), sorted, capped at MAX_CONTEXT_FILES. */
+  /** Fires the trigger once for everything collected during one debounce window: deduped (a Set), sorted, already capped at collection time. */
   function flushWatch(triggerId) {
     const state = watchStates.get(triggerId);
     if (!state) return;
     state.timer = null;
+    // slice() is belt-and-braces: pending is already capped in
+    // dispatchWatchEvent(), this guarantees the contract at the only place the
+    // list leaves the runner.
     const files = [...state.pending].sort().slice(0, MAX_CONTEXT_FILES);
+    const filesTruncated = state.truncated === true;
     state.pending.clear();
+    state.truncated = false;
     if (files.length === 0) return;
 
-    fireTrigger(triggerId, { cause: { origin: 'file-watch', files } }).catch((err) => {
+    fireTrigger(triggerId, { cause: { origin: 'file-watch', files, filesTruncated } }).catch((err) => {
       log(`trigger ${triggerId}: file-watch fire error: ${err?.message ?? String(err)}`);
     });
   }
@@ -470,7 +518,17 @@ export function createTriggerRunner({
     }
 
     const isDir = stat.isDirectory();
-    const state = { configKey: configKeyOf(trigger), watcher: null, timer: null, pending: new Set(), isDir, absPath, relPath: trigger.config.path };
+    const state = {
+      configKey: configKeyOf(trigger),
+      watcher: null,
+      timer: null,
+      pending: new Set(),
+      truncated: false,
+      isDir,
+      absPath,
+      relPath: trigger.config.path,
+      identity: targetIdentity(stat),
+    };
     try {
       state.watcher = createWatcher(absPath, { recursive: isDir, persistent: false }, (eventType, filename) =>
         handleWatchEvent(trigger.id, eventType, filename),
@@ -488,6 +546,43 @@ export function createTriggerRunner({
 
     watchStates.set(trigger.id, state);
     log(`trigger ${trigger.id}: watching ${toPosixPath(trigger.config.path)} (${isDir ? 'recursive' : 'single file'}, debounce ${trigger.config.debounceMs}ms)`);
+  }
+
+  /**
+   * Identity of a watch target, as stable as a zero-dependency check can make
+   * it: device + inode + creation time + kind. The inode is what actually
+   * carries this — Windows preserves the creation time of a file recreated
+   * under the same name within a few seconds ("file system tunneling"), so
+   * birthtime alone would call a replaced file unchanged, while its NTFS file
+   * index (reported as `ino`) does change.
+   */
+  function targetIdentity(stat) {
+    return `${stat.dev}:${stat.ino}:${stat.birthtimeMs}:${stat.isDirectory() ? 'dir' : 'file'}`;
+  }
+
+  /**
+   * Health of one live watcher's target, checked on every tick. This is the
+   * only way a SILENTLY dead watcher becomes visible: when a watched single
+   * file is deleted — or replaced via the rename-over-temp-file dance most
+   * editors use to save — fs.watch stops delivering events on some platforms
+   * WITHOUT emitting 'error', so the error handler never runs and the trigger
+   * would look armed while watching a file that no longer exists.
+   *
+   * @returns {'ok'|'gone'|'replaced'} 'gone' = nothing at that path any more
+   *   (the trigger cannot recover on its own), 'replaced' = something is there
+   *   but it is not the object the watcher is holding (re-watch and carry on).
+   */
+  function watchTargetHealth(state) {
+    let absPath;
+    let stat;
+    try {
+      absPath = resolveWorkspacePath({ workspaceDir: cwd, relPath: state.relPath });
+      stat = fs.statSync(absPath);
+    } catch {
+      return 'gone';
+    }
+    if (absPath !== state.absPath) return 'replaced';
+    return targetIdentity(stat) === state.identity ? 'ok' : 'replaced';
   }
 
   /** Closes one trigger's watcher and clears its debounce timer. Idempotent. */
@@ -512,15 +607,34 @@ export function createTriggerRunner({
    * started at all, so the clipboard is never even READ: a trigger that would
    * fire on every copy is not a feature, and reading without a reason to act
    * is exactly the behaviour that separates a tool from spyware.
+   *
+   * A "not started" outcome still records a state (with `interval: null`), so
+   * the tick's reconciliation sees this trigger as handled: without it, every
+   * tick would retry and log the same line again, once a minute forever — and
+   * would dilute the consent line below, which must mean "a poller just
+   * started". A config change replaces the state (see configKeyOf) and the
+   * decision, including its log line, is made again.
    */
   function setupClipboardPoll(trigger) {
+    const skip = (reason) => {
+      log(`trigger ${trigger.id}: clipboard poller not started (${reason})`);
+      pollStates.set(trigger.id, { configKey: configKeyOf(trigger), interval: null, skippedReason: reason });
+    };
+
     const support = supportStatus(trigger);
     if (!support.supported) {
-      log(`trigger ${trigger.id}: clipboard poller not started (${support.unsupportedReason})`);
+      skip(support.unsupportedReason);
       return;
     }
     if (trigger.config.matchPattern === undefined) {
-      log(`trigger ${trigger.id}: clipboard poller not started (no matchPattern configured — the clipboard is never read)`);
+      skip('no matchPattern configured — the clipboard is never read');
+      return;
+    }
+    // Same reachable case as the file-watch listener's shape checks: a
+    // hand-edited triggers.json is never re-validated on load, and
+    // setInterval() with a non-number would busy-loop.
+    if (!Number.isFinite(trigger.config.pollMs) || trigger.config.pollMs < MIN_SAFE_POLL_MS) {
+      disableWithReason(trigger.id, `config.pollMs is not a usable number (hand-edited triggers.json?)`);
       return;
     }
     let regex;
@@ -535,7 +649,7 @@ export function createTriggerRunner({
     // between this and a keylogger. One per activation, every activation.
     log(`trigger ${trigger.id}: clipboard trigger ACTIVE — clipboard TEXT is read every ${trigger.config.pollMs}ms while this trigger stays enabled`);
 
-    const state = { configKey: configKeyOf(trigger), interval: null, regex, lastSeen: null, primed: false, busy: false };
+    const state = { configKey: configKeyOf(trigger), interval: null, regex, lastSeen: null, primed: false, busy: false, skippedReason: null };
     state.interval = setInterval(() => {
       pollClipboard(trigger.id).catch((err) => {
         log(`trigger ${trigger.id}: clipboard poll error: ${err?.message ?? String(err)}`);
@@ -559,7 +673,7 @@ export function createTriggerRunner({
    */
   async function pollClipboard(triggerId) {
     const state = pollStates.get(triggerId);
-    if (!state || state.busy) return;
+    if (!state || state.interval === null || state.busy) return;
     const trigger = triggers.get(triggerId);
     if (!trigger || !trigger.enabled || trigger.type !== 'clipboard') return;
     if (runningIds.has(triggerId)) return;
@@ -584,7 +698,14 @@ export function createTriggerRunner({
       }
       if (text === state.lastSeen) return;
       state.lastSeen = text;
-      if (!state.regex.test(text)) return;
+      // Matched against a bounded PREFIX, never the full 64 KB read: the
+      // pattern is user-supplied, and the 200-character limit on it (see
+      // registry.mjs) bounds its length, not its cost — a pattern like
+      // `(a+)+$` backtracks catastrophically and would block the event loop,
+      // i.e. the whole server, for as long as the input is long. A clipboard
+      // pattern exists to spot a URL or a marker, not to parse a novel; the
+      // cheap zero-dependency bound is the input, not a worker or a timeout.
+      if (!state.regex.test(text.slice(0, MAX_CLIPBOARD_MATCH_CHARS))) return;
 
       // Redaction BEFORE truncation — a secret must not survive by being cut
       // in half (see parse.mjs's SECRET_PATTERNS comment). Everything
@@ -625,7 +746,24 @@ export function createTriggerRunner({
 
     for (const [id, state] of [...watchStates]) {
       const trigger = wanted.get(id);
-      if (!trigger || trigger.type !== 'file-watch' || configKeyOf(trigger) !== state.configKey) teardownFileWatch(id);
+      if (!trigger || trigger.type !== 'file-watch' || configKeyOf(trigger) !== state.configKey) {
+        teardownFileWatch(id);
+        continue;
+      }
+      // A watcher whose target died silently (see watchTargetHealth) —
+      // 'replaced' is the normal editor save, so it gets a fresh watcher (the
+      // loop below re-creates it) and the trigger keeps working; only a target
+      // that is really gone disables the trigger. Pending paths of the old
+      // window are dropped with it: they described the previous file.
+      const health = watchTargetHealth(state);
+      if (health === 'gone') {
+        disableWithReason(id, `file-watch target no longer exists: ${toPosixPath(state.relPath)}`);
+        continue;
+      }
+      if (health === 'replaced') {
+        log(`trigger ${id}: watch target was replaced, reopening the watcher`);
+        teardownFileWatch(id);
+      }
     }
     for (const [id, state] of [...pollStates]) {
       const trigger = wanted.get(id);
@@ -697,6 +835,7 @@ export function createTriggerRunner({
     let slot;
     let reasonText;
     let files;
+    let filesTruncated = false;
     let clipboard;
     if (trigger.type === 'heartbeat') {
       try {
@@ -726,6 +865,7 @@ export function createTriggerRunner({
       // deliberate act and still passes every cap and escalation check — it
       // just gets an empty {{files}} and says so.
       files = Array.isArray(cause?.files) ? cause.files.filter((f) => typeof f === 'string') : [];
+      filesTruncated = cause?.filesTruncated === true;
       reasonText = files.length > 0 ? `${files.length} watched path(s) changed` : 'manual fire (no file changes recorded)';
     } else if (trigger.type === 'clipboard') {
       // Only this trigger's own poller can produce a clipboard cause. A
@@ -772,7 +912,7 @@ export function createTriggerRunner({
     // trigger-origin turn is currently in flight, not just this one.
     runningIds.add(id);
     try {
-      const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, clipboard });
+      const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, filesTruncated, clipboard });
 
       // A question/review handler needs the turn's chatId in its closure
       // (makeUiApprovalHandler(chatId) -> handler), but chatId is only
