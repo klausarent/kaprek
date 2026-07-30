@@ -2,7 +2,9 @@
 
 > Your Claude Code sessions never die — you just can't see them.
 
-kaprek is a local, read-only viewer for Claude Code session transcripts. It scans `~/.claude/projects`, turns the raw JSONL logs into a searchable list of threads, and serves them from a tiny local web UI. Nothing leaves your machine.
+kaprek is a local agent workspace built around the Claude Code CLI you already have. It runs chat turns and scheduled triggers through that CLI, shows you what the agents are doing, and asks before they do anything you said should need asking. It also reads `~/.claude/projects` and serves your existing session transcripts as a searchable list of threads.
+
+kaprek itself has no server and no account. Your prompts still go to Anthropic, because the `claude` CLI sends them — see [What leaves your machine](#what-leaves-your-machine).
 
 **Status: pre-release, not yet published.**
 
@@ -15,7 +17,9 @@ npx kaprek
 # → opens http://127.0.0.1:4900 — all projects, all sessions, thread view
 ```
 
-No install, no config, no account. Ctrl+C stops the server.
+No install and no config for kaprek itself, and it has no account of its own. Ctrl+C stops the server.
+
+Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI installed and signed in — kaprek runs your CLI and never asks for an API key.
 
 ## Flags
 
@@ -70,13 +74,36 @@ Important: a Stop hook fires *after* the turn already ended — after any tool c
 
 Policy mode lives in `<dataDir>/policy.json`: `observe` (default) fully evaluates both rules and logs any violation to `policy.log`, but always resolves to allow — it's for seeing what would happen before switching modes. `warn` writes its reasons to stderr (Claude Code hooks reference exit 0 as no objection either way, so this is best-effort visibility, not a blocking signal). `block` is the only mode that can actually end a turn abnormally, and even then at most once per session. The hook fails open on any internal error — a bug here must never stop you from ending a turn. This is the single exception to kaprek's read-only promise; every other feature only reads `~/.claude/projects`.
 
+## What leaves your machine
+
+kaprek runs agent turns. That changes the honest answer to "does anything leave my machine", so this section states it plainly rather than in a slogan.
+
+**Stays on your machine.** Chat logs (`<dataDir>/chats/`), trigger configuration (`triggers.json`), the run and cost log (`runs.jsonl`), everything an agent writes in the workspace (`<dataDir>/workspace/`), the board, the search index and preserved artifacts. kaprek operates no server of its own, has no account, and sends none of this anywhere. The static guard test `src/no-network.test.mjs` fails the build if a network call is added to `src/` or `bin/`.
+
+**Goes to Anthropic.** Everything an agent actually processes. kaprek starts your local `claude` CLI as a subprocess, and that CLI talks to Anthropic under your account and your agreement with them — kaprek neither adds to nor removes from what the CLI sends. That includes:
+
+- every chat message you type, and the tool results the turn produces;
+- every trigger prompt, on every automatic run. A heartbeat trigger sends its checklist file along each time it fires. A file-watch trigger sends the paths that changed. A clipboard trigger sends the clipboard text that matched its pattern.
+
+A trigger that runs every 30 minutes is 48 requests a day to Anthropic that you did not individually approve. That is the point of triggers; it is also worth knowing before you enable one on a workspace holding something sensitive.
+
+**What the instance token protects against.** Every `/api/*` route requires the per-installation token, and the browser gets it from a `<meta>` tag in the served `index.html`. That stops a random web page you have open from driving your local kaprek: a foreign origin cannot read the response to `GET /`, so it never learns the token, and it cannot set the required header either.
+
+It does **not** protect against other programs on this machine. Any local process can request `GET /` and read the token out of the HTML, then use the API exactly as you would — including starting agent turns. The fix is a desktop shell that keeps the token out of HTTP entirely; that is on the backlog and not built. Until then, the security boundary is "you trust the software running under your own user account".
+
+**What apps may do.** Bundled apps and apps you put under `<dataDir>/apps/` are loaded and their tools become callable in a turn. Their file access is genuinely enforced: the MCP server runs under Node's `--permission` model with a narrow allowlist (write only inside the workspace, read only the app directories and the workspace — see `src/apps/mcp-config.mjs`).
+
+Their **network access is not restricted at all.** Node's permission model has no network scope, so an app handler can open any connection it likes. The `policy.dataEgress` and `policy.externalAction` fields in a manifest are display metadata for the Apps page; nothing enforces them. Install an app only if you would run its code directly. Sandboxing app handlers in an isolated worker is on the backlog.
+
+**The tool list heals itself, and the first run after a CLI update may fail.** kaprek asks the `claude` CLI which tools it has and keeps a learned list, so that a tool the CLI added is covered by the approval rules instead of slipping past them. When the CLI gains a tool kaprek has never seen, the next trigger run stops fail-closed rather than proceeding with an unverified list — and records what it learned. The run after that generally succeeds; on our own machine it took two. This is deliberate: the safe direction for an unknown tool is to stop, not to allow.
+
 ## Privacy
 
 - **Local only.** The server binds to `127.0.0.1` and rejects requests with a foreign `Host` header — enforced by the server's own tests (`src/server/server.test.mjs`).
 - **Redaction on by default.** 10 secret patterns (API keys, Stripe/GitHub/Cloudflare/Google tokens, Bearer headers, `TOKEN=`/`SECRET=`/`API_KEY=`-style assignments) are replaced with `[REDACTED]` before a digest is built. Opt out consciously with `--no-redact`. Behavior is checked by an end-to-end test (`src/redaction-e2e.test.mjs`).
 - **Artifacts are the one exception to redaction.** Preserved scratchpad files (see [Artifact preservation](#artifact-preservation)) are copied byte-for-byte, in the clear, under `<dataDir>/artifacts/`. They are not chat transcripts — they're work products (scripts, data, images) — and running secret-redaction text substitution over arbitrary file content, including binaries, would silently corrupt it. Preservation stays strictly local either way: nothing here is ever sent anywhere.
 - **Read-only, with one opt-in exception.** kaprek never writes to `~/.claude` unless you explicitly run `kaprek hooks install` — see [Claude Code hook](#claude-code-hook-optional) above. Every other feature only reads `~/.claude/projects`.
-- **No telemetry.** Zero runtime dependencies, nothing phones home. A static guard test (`src/no-network.test.mjs`) fails the build if a network-client or subprocess call is added to the Node code (`src/`, `bin/`) outside the one documented case (opening your browser locally). The web UI naturally does use `fetch` — that's how it talks to kaprek's own local API on `127.0.0.1` (`web/src/lib/api.ts`) — but it has no other network call, and that promise isn't enforced by the static guard above (which only scans `src/`/`bin/`, not `web/`); it's plain source you can read yourself.
+- **No telemetry.** Zero runtime dependencies; kaprek itself phones nothing home (agent turns go to Anthropic through your own CLI, see [What leaves your machine](#what-leaves-your-machine)). A static guard test (`src/no-network.test.mjs`) fails the build if a network-client call is added anywhere in the Node code (`src/`, `bin/`), or if a subprocess call appears outside the three places that need one: `bin/cli.mjs` opening your browser, `src/harness/*` starting the `claude` CLI, and `src/triggers/clipboard.mjs` reading the Windows clipboard. The web UI naturally does use `fetch` — that's how it talks to kaprek's own local API on `127.0.0.1` (`web/src/lib/api.ts`) — but it has no other network call, and that promise isn't enforced by the static guard above (which only scans `src/`/`bin/`, not `web/`); it's plain source you can read yourself.
 - **Everything kaprek writes, in full:**
   - `<dataDir>` (default `~/.kaprek`, override with `KAPREK_DATA_DIR`): board events (`board/events.jsonl`), the search index (`search.db`, redacted content only), signing keys (`keys/`), policy state and logs (`policy.json`, `policy-state/`, `policy.log`), and preserved scratchpad artifacts (`artifacts/<projectSlug>/<sessionId>/`, **not** redacted — see [Artifact preservation](#artifact-preservation)).
   - Your OS temp directory: a small metadata cache (titles + timestamps + a `machineHint`, a username heuristic parsed out of a session's `cwd`, all redacted, auto-evicted after 30 days). Written with default file permissions (unlike the signing keys under `keys/`, which are created `0600`).
@@ -85,16 +112,25 @@ Policy mode lives in `<dataDir>/policy.json`: `observe` (default) fully evaluate
 
 These are not just claims in prose — each one is enforced by a test in `src/`. Read the tests if you want to verify it yourself instead of trusting this README.
 
+## Known gaps
+
+Things this version does not do, listed here because each one is a limit you can run into rather than a feature nobody got to.
+
+- **Approvals need an open browser tab.** A `question` or `review` trigger that fires on its own only runs while some kaprek page has a live connection. With none open it refuses to start and says so on the trigger page (`needs an open UI to ask for approval`), rather than raising a question nobody can answer and being auto-denied ten minutes later. A persistent approval inbox — questions that outlive the connection and wait for you — is the fix and is not built.
+- **The instance token does not stop local programs.** See [What leaves your machine](#what-leaves-your-machine). A desktop shell that never puts the token on HTTP is the fix.
+- **App handlers can reach the network.** File access is enforced, network access is not. Worker isolation is the fix.
+- **One server per data dir.** Two instances against the same `<dataDir>` is unsupported; a trigger's daily caps assume it is the only one counting.
+
 ## FAQ
 
 **Claude Code changed its transcript format and kaprek broke — now what?**
 The JSONL format Claude Code writes is undocumented and has drifted before. The parser is deliberately tolerant, but in two different ways depending on where the drift shows up: a line that isn't even valid JSON is silently skipped and counted (`brokenLines`), never thrown on. A well-formed line whose `type` the parser doesn't recognize is also silently skipped — it never becomes an event at all, so it does not surface anywhere in the UI. Separately, the web UI's event renderer falls back to a generic `UnknownBlock` for any event *kind* the parser itself emits that the renderer has no component for yet — a safety net for the UI lagging behind the parser, not a way to see raw unrecognized transcript lines. If a session renders oddly, missing content is more likely a silently-skipped line than a crash — a `doctor` command to diagnose format drift is planned but not built yet.
 
 **Which platforms are supported?**
-Windows, macOS, Linux. Requires Node.js ≥ 20.
+Windows, macOS, Linux. Requires Node.js ≥ 22 (the search index uses the built-in `node:sqlite`). Clipboard triggers are Windows-only; the trigger page says so on the trigger itself.
 
 **Does this send anything to Anthropic, or anywhere else?**
-No. See [Privacy](#privacy) above.
+Yes, to Anthropic — every chat message and every trigger prompt, because your own  CLI sends them under your account. kaprek adds no destination of its own and has no server. See [What leaves your machine](#what-leaves-your-machine) for the details, including what a scheduled trigger sends on each run.
 
 **Can I point it at a different directory, e.g. a backup of my sessions?**
 Yes, `--dir <path>`.
