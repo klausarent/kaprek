@@ -1694,11 +1694,29 @@ test('triggers: POST /api/triggers/<id>/fire on a disabled trigger streams a sin
   expect(frames).toEqual([{ type: 'trigger-complete', fired: false, reason: 'trigger disabled' }]);
 });
 
-/** A harness whose startTurn() only resolves after a real delay — used to keep a trigger turn observably "in flight" for a loop-guard test. */
-function delayedHarness(delayMs) {
+/**
+ * A harness whose turn STAYS in flight until release() is called, and whose
+ * `started` promise resolves the moment startTurn() is entered. Both halves
+ * are what make the loop-guard test below deterministic: no sleep, no margin
+ * against a wall-clock delay — the second request is issued exactly when the
+ * first turn is provably running, and the first turn ends exactly when the
+ * test says so.
+ */
+function gatedHarness() {
+  let markStarted;
+  let release;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
   return {
+    started,
+    release: () => release(),
     async startTurn({ onEvent } = {}) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      markStarted();
+      await gate;
       onEvent?.({ type: 'text', text: 'done' });
       onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
       return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
@@ -1707,21 +1725,19 @@ function delayedHarness(delayMs) {
 }
 
 test('triggers: POST /api/triggers/<id>/fire while a trigger turn is already in flight is rejected with 429 (loop-guard layer 2), before opening any stream', async () => {
-  const { url } = await boot({ harness: delayedHarness(500), harnessName: 'fake' });
+  const harness = gatedHarness();
+  const { url } = await boot({ harness, harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger());
 
   const firstFire = fetch(`${url}/api/triggers/nightly-sync/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
-  // Give the first request's synchronous fireTrigger() prefix (through
-  // runningIds.add()) a chance to run before firing the second one. A wide
-  // margin against delayedHarness's own delay above — this only needs to
-  // observe "still running", not race it precisely.
-  await new Promise((resolve) => setTimeout(resolve, 100));
+  await harness.started; // the first turn is in flight — no timing assumption
 
   const secondRes = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
   expect(secondRes.status).toBe(429);
   const secondBody = await secondRes.json();
   expect(secondBody).toEqual({ reason: 'trigger turn in progress' });
 
+  harness.release();
   const firstFrames = await readSse(await firstFire);
   expect(firstFrames.find((f) => f.type === 'trigger-complete').fired).toBe(true);
 });
