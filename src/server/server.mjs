@@ -30,6 +30,9 @@ import { signReceipt, verifyReceipt, InvalidAgentNameError } from '../receipt/re
 import { openChats, ChatNotFoundError } from '../chats/store.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
+import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
+import { createTriggerRunner } from '../triggers/runner.mjs';
+import { checkLimits } from '../triggers/limits.mjs';
 
 const DIGEST_CACHE_SIZE = 20;
 const MAX_BOARD_BODY_BYTES = 256 * 1024;
@@ -923,10 +926,18 @@ function handleChatCancel(res, getChats, chatId, chatAbortControllers) {
   }
 }
 
-/** GET /api/chat/list — chat summaries, newest first. */
-function handleChatList(res, getChats) {
+/**
+ * GET /api/chat/list — chat summaries, newest first. A chat whose
+ * `chat.created` carries `silent: true` (see src/chats/store.mjs and
+ * src/triggers/runner.mjs's heartbeat-silence handling) is excluded unless
+ * the caller passes `?includeSilent=1` — the whole point of a silent
+ * heartbeat run is to NOT clutter this list with 48 empty-check chats a
+ * day, while still keeping every one of them on disk for audit.
+ */
+function handleChatList(res, getChats, includeSilent) {
   const list = getChats()
     .list()
+    .filter((chat) => includeSilent || !chat.silent)
     .slice()
     .sort((a, b) => (b.updatedAt > a.updatedAt ? 1 : b.updatedAt < a.updatedAt ? -1 : 0));
   sendJson(res, 200, { chats: list });
@@ -953,7 +964,7 @@ function handleChatGet(res, getChats, chatId) {
 }
 
 /** Chat routes, mounted at /api/chat/*. Checked before the blanket GET-only rule (turn/cancel are POST). */
-async function handleChatRoutes(req, res, segments, ctx) {
+async function handleChatRoutes(req, res, segments, url, ctx) {
   if (segments.length === 3 && segments[2] === 'turn') {
     if (req.method !== 'POST') {
       sendJson(res, 405, { error: 'method not allowed' });
@@ -967,7 +978,7 @@ async function handleChatRoutes(req, res, segments, ctx) {
       sendJson(res, 405, { error: 'method not allowed' });
       return;
     }
-    handleChatList(res, ctx.getChats);
+    handleChatList(res, ctx.getChats, url.searchParams.get('includeSilent') === '1');
     return;
   }
   if (segments.length === 4 && segments[3] === 'cancel') {
@@ -985,6 +996,128 @@ async function handleChatRoutes(req, res, segments, ctx) {
     }
     handleChatGet(res, ctx.getChats, segments[2]);
     return;
+  }
+  sendJson(res, 404, { error: 'not found' });
+}
+
+/** GET /api/triggers — every trigger plus its runsToday/costToday (see src/triggers/limits.mjs::checkLimits), so a UI can show the daily cap without a second round trip per trigger. */
+function handleTriggersList(res, getTriggers, dataDir) {
+  const triggers = getTriggers()
+    .list()
+    .map((trigger) => {
+      const { runsToday, costToday } = checkLimits({ dataDir, trigger, now: Date.now() });
+      return { ...trigger, runsToday, costToday };
+    });
+  sendJson(res, 200, { triggers });
+}
+
+/** POST /api/triggers — upsert (create or replace by id). Body is the full trigger shape (see src/triggers/registry.mjs::validateTrigger); 400 with a field name on a validation error. */
+async function handleTriggerUpsert(req, res, getTriggers) {
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  try {
+    const trigger = getTriggers().upsert(body.data);
+    sendJson(res, 200, trigger);
+  } catch (err) {
+    if (err instanceof InvalidTriggerError) {
+      sendJson(res, 400, { error: err.message, field: err.field });
+      return;
+    }
+    throw err;
+  }
+}
+
+/** POST /api/triggers/<id>/toggle — body `{enabled}`. */
+async function handleTriggerToggle(req, res, getTriggers, id) {
+  if (!isSafeId(id)) {
+    sendJson(res, 400, { error: 'invalid trigger id' });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const enabled = body.data?.enabled;
+  if (typeof enabled !== 'boolean') {
+    sendJson(res, 400, { error: 'enabled must be a boolean' });
+    return;
+  }
+  const trigger = getTriggers().setEnabled(id, enabled);
+  if (!trigger) {
+    sendJson(res, 404, { error: `unknown trigger: ${id}` });
+    return;
+  }
+  sendJson(res, 200, trigger);
+}
+
+/**
+ * POST /api/triggers/<id>/fire — manual fire, for test/UI use (see the task
+ * brief). Runs through the exact same src/triggers/runner.mjs::fireTrigger()
+ * path a background tick uses, with `cause: {origin: 'user'}` — every
+ * fail-closed check (limits, loop guard, schedule slot, approval handler)
+ * still applies; this is not a bypass.
+ */
+async function handleTriggerFire(res, getRunner, id) {
+  if (!isSafeId(id)) {
+    sendJson(res, 400, { error: 'invalid trigger id' });
+    return;
+  }
+  const result = await getRunner().fireTrigger(id, { cause: { origin: 'user' } });
+  sendJson(res, 200, result);
+}
+
+/** DELETE /api/triggers/<id>. */
+function handleTriggerDelete(res, getTriggers, id) {
+  if (!isSafeId(id)) {
+    sendJson(res, 400, { error: 'invalid trigger id' });
+    return;
+  }
+  const removed = getTriggers().remove(id);
+  if (!removed) {
+    sendJson(res, 404, { error: `unknown trigger: ${id}` });
+    return;
+  }
+  sendJson(res, 200, { removed: true });
+}
+
+/** Trigger routes, mounted at /api/triggers/*. */
+async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir }) {
+  // /api/triggers
+  if (segments.length === 2) {
+    if (req.method === 'GET') {
+      handleTriggersList(res, getTriggers, dataDir);
+      return;
+    }
+    if (req.method === 'POST') {
+      await handleTriggerUpsert(req, res, getTriggers);
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+  // /api/triggers/<id>
+  if (segments.length === 3) {
+    if (req.method !== 'DELETE') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    handleTriggerDelete(res, getTriggers, segments[2]);
+    return;
+  }
+  // /api/triggers/<id>/toggle | /api/triggers/<id>/fire
+  if (segments.length === 4 && req.method === 'POST') {
+    if (segments[3] === 'toggle') {
+      await handleTriggerToggle(req, res, getTriggers, segments[2]);
+      return;
+    }
+    if (segments[3] === 'fire') {
+      await handleTriggerFire(res, getRunner, segments[2]);
+      return;
+    }
   }
   sendJson(res, 404, { error: 'not found' });
 }
@@ -1044,6 +1177,8 @@ async function handleRequest(
     allowedTools,
     pendingApprovals,
     approvalTimeoutMs,
+    getTriggers,
+    getRunner,
   },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
@@ -1100,7 +1235,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'chat') {
-      await handleChatRoutes(req, res, segments, {
+      await handleChatRoutes(req, res, segments, url, {
         getChats,
         harness,
         harnessName,
@@ -1111,6 +1246,10 @@ async function handleRequest(
         pendingApprovals,
         approvalTimeoutMs,
       });
+      return;
+    }
+    if (segments[1] === 'triggers') {
+      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir });
       return;
     }
     if (segments.length === 3 && segments[1] === 'approvals') {
@@ -1224,6 +1363,44 @@ export function startServer({
     return openChats(dataDir);
   }
 
+  // Trigger registry, opened lazily like the board above (most invocations
+  // never touch it either).
+  let triggers = null;
+  function getTriggers() {
+    if (!triggers) triggers = openTriggers(dataDir);
+    return triggers;
+  }
+
+  // Same dedicated workspace a chat turn's cwd already is (see
+  // handleChatTurn) — a heartbeat trigger's checklistPath is read from here
+  // (src/workspace/fs.mjs), and it's the harness's cwd for every trigger-
+  // started turn too.
+  const workspaceDir = path.join(dataDir, 'workspace');
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  // The trigger runner, opened lazily and started once listen() resolves
+  // (see below), stopped when the server closes. `onApprovalRequest` is
+  // deliberately NOT wired up here: there is no live UI yet to answer a
+  // trigger-started approval (Trigger-UI is a later task) — see
+  // src/triggers/runner.mjs's own doc comment on that option. A
+  // 'question'/'review' trigger simply will not fire until that wiring
+  // exists; that is the correct fail-closed default, not a bug.
+  let runner = null;
+  function getRunner() {
+    if (!runner) {
+      runner = createTriggerRunner({
+        dataDir,
+        triggers: getTriggers(),
+        runTurn,
+        harness,
+        harnessName,
+        cwd: workspaceDir,
+        permissionMode,
+      });
+    }
+    return runner;
+  }
+
   // One AbortController per chat with an in-flight turn, keyed by chatId —
   // lets POST /api/chat/<id>/cancel reach across requests to interrupt the
   // SSE request currently streaming that chat's turn.
@@ -1254,9 +1431,19 @@ export function startServer({
       allowedTools,
       pendingApprovals,
       approvalTimeoutMs,
+      getTriggers,
+      getRunner,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });
+  });
+
+  // The runner's own tick timer is unref()'d (see runner.mjs::start()), so
+  // it never keeps this process alive on its own — but it must still be
+  // stopped when the server closes, so a test's afterEach (which always
+  // closes the server) leaves no dangling interval behind either.
+  server.on('close', () => {
+    if (runner) runner.stop();
   });
 
   return new Promise((resolve, reject) => {
@@ -1264,6 +1451,7 @@ export function startServer({
     server.listen(port, '127.0.0.1', () => {
       const addr = server.address();
       boundPort = addr.port;
+      getRunner().start();
       resolve({ server, url: `http://127.0.0.1:${addr.port}` });
     });
   });

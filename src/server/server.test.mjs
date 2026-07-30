@@ -1559,3 +1559,175 @@ test('chat: approval — an unanswered approval is auto-denied once approvalTime
   const textFrame = frames.find((f) => f.type === 'text');
   expect(textFrame.text).toBe('decision was deny: approval timed out');
 });
+
+// ------------------------------------------------------------- triggers
+
+function deleteRequest(url, headers = APP_HEADERS) {
+  return fetch(url, { method: 'DELETE', headers });
+}
+
+function everyMinutesTrigger(overrides = {}) {
+  return {
+    id: 'nightly-sync',
+    type: 'schedule',
+    config: { everyMinutes: 5 },
+    promptTemplate: 'Run the nightly sync.',
+    appScope: [],
+    enabled: true,
+    ...overrides,
+  };
+}
+
+function heartbeatTriggerBody(overrides = {}) {
+  return {
+    id: 'heartbeat-check',
+    type: 'heartbeat',
+    config: { intervalMinutes: 30 },
+    promptTemplate: 'Check the checklist.',
+    appScope: [],
+    enabled: true,
+    ...overrides,
+  };
+}
+
+test('triggers: GET /api/triggers on an empty registry returns an empty list', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/triggers`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.triggers).toEqual([]);
+});
+
+test('triggers: POST /api/triggers creates a trigger, and GET reflects it with runsToday/costToday', async () => {
+  const { url } = await boot({});
+  const createRes = await postJson(`${url}/api/triggers`, everyMinutesTrigger());
+  expect(createRes.status).toBe(200);
+  const created = await createRes.json();
+  expect(created.id).toBe('nightly-sync');
+  expect(created.escalation).toBe('notify');
+
+  const listRes = await fetch(`${url}/api/triggers`);
+  const listBody = await listRes.json();
+  expect(listBody.triggers).toHaveLength(1);
+  expect(listBody.triggers[0]).toMatchObject({ id: 'nightly-sync', runsToday: 0, costToday: 0 });
+});
+
+test('triggers: POST /api/triggers with an invalid body returns 400 with the offending field', async () => {
+  const { url } = await boot({});
+  const res = await postJson(`${url}/api/triggers`, { id: 'bad', type: 'schedule', bogusField: true });
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(typeof body.error).toBe('string');
+  expect(body.field).toBe('bogusField');
+});
+
+test('triggers: POST /api/triggers with a malformed JSON body returns 400', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/triggers`, { method: 'POST', headers: APP_JSON_HEADERS, body: '{ not json' });
+  expect(res.status).toBe(400);
+});
+
+test('triggers: POST /api/triggers/<id>/toggle flips enabled; unknown id is 404; non-boolean body is 400', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ enabled: false }));
+
+  const toggled = await postJson(`${url}/api/triggers/nightly-sync/toggle`, { enabled: true });
+  expect(toggled.status).toBe(200);
+  expect((await toggled.json()).enabled).toBe(true);
+
+  const unknown = await postJson(`${url}/api/triggers/does-not-exist/toggle`, { enabled: true });
+  expect(unknown.status).toBe(404);
+
+  const badBody = await postJson(`${url}/api/triggers/nightly-sync/toggle`, { enabled: 'yes' });
+  expect(badBody.status).toBe(400);
+});
+
+test('triggers: POST /api/triggers/<id>/fire manually fires an enabled trigger and returns a chatId', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger());
+
+  const res = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.fired).toBe(true);
+  expect(typeof body.chatId).toBe('string');
+});
+
+test('triggers: POST /api/triggers/<id>/fire on a disabled trigger reports fired:false with a reason (not an HTTP error)', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ enabled: false }));
+
+  const res = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body).toEqual({ fired: false, reason: 'trigger disabled' });
+});
+
+test('triggers: DELETE /api/triggers/<id> removes it; a second DELETE returns 404', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger());
+
+  const first = await deleteRequest(`${url}/api/triggers/nightly-sync`);
+  expect(first.status).toBe(200);
+  expect(await first.json()).toEqual({ removed: true });
+
+  const second = await deleteRequest(`${url}/api/triggers/nightly-sync`);
+  expect(second.status).toBe(404);
+
+  const listRes = await fetch(`${url}/api/triggers`);
+  expect((await listRes.json()).triggers).toEqual([]);
+});
+
+test('triggers: CSRF hardening — POST/DELETE without x-app-request are rejected with 403', async () => {
+  const { url } = await boot({});
+  const create = await fetch(`${url}/api/triggers`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(everyMinutesTrigger()),
+  });
+  expect(create.status).toBe(403);
+
+  const del = await fetch(`${url}/api/triggers/nightly-sync`, { method: 'DELETE' });
+  expect(del.status).toBe(403);
+});
+
+test('triggers: DNS-rebinding hardening applies to /api/triggers too', async () => {
+  const { url, server } = await boot({});
+  const port = server.address().port;
+  const status = await rawGet(url, '/api/triggers', { Host: 'evil.example.com' });
+  expect(status).toBe(400);
+  const ok = await rawGet(url, '/api/triggers', { Host: `127.0.0.1:${port}` });
+  expect(ok).toBe(200);
+});
+
+test('triggers: an unknown /api/triggers/<id>/<verb> route returns 404', async () => {
+  const { url } = await boot({});
+  const res = await postJson(`${url}/api/triggers/nightly-sync/bogus`, {});
+  expect(res.status).toBe(404);
+});
+
+test('chat: GET /api/chat/list hides a silent heartbeat chat by default, includes it with ?includeSilent=1', async () => {
+  const heartbeatOkScript = [
+    { type: 'init', sessionId: 'sess-hb', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'text', text: 'HEARTBEAT_OK' },
+    { type: 'result', sessionId: 'sess-hb', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { url } = await boot({ harness: createFakeHarness({ script: heartbeatOkScript }), harnessName: 'fake' });
+  fs.mkdirSync(path.join(dataDir, 'workspace'), { recursive: true });
+  fs.writeFileSync(path.join(dataDir, 'workspace', 'CHECKLIST.md'), '- nothing due', 'utf8');
+  await postJson(`${url}/api/triggers`, heartbeatTriggerBody());
+
+  const fireRes = await postJson(`${url}/api/triggers/heartbeat-check/fire`, {});
+  const fireBody = await fireRes.json();
+  expect(fireBody.fired).toBe(true);
+  expect(fireBody.silent).toBe(true);
+
+  const defaultList = await (await fetch(`${url}/api/chat/list`)).json();
+  expect(defaultList.chats.map((c) => c.id)).not.toContain(fireBody.chatId);
+
+  const withSilent = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
+  expect(withSilent.chats.map((c) => c.id)).toContain(fireBody.chatId);
+  const silentChat = withSilent.chats.find((c) => c.id === fireBody.chatId);
+  expect(silentChat.origin).toBe('trigger');
+  expect(silentChat.triggerId).toBe('heartbeat-check');
+});
