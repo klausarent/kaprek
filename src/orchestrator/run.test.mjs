@@ -6,6 +6,7 @@ import { runTurn } from './run.mjs';
 import { readRuns } from './runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
+import { ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
 
 let tmpDir;
 
@@ -539,12 +540,59 @@ test('runTurn wires mcpConfigPath (kaprek apps MCP server) and settingsPath (neu
   const result = await runTurn({ dataDir: tmpDir, text: 'wire it up', harness });
 
   expect(result.stopReason).toBe('result');
-  expect(capturedSettings).toEqual({ hooks: {}, permissions: { defaultMode: 'default', allow: [], deny: [] } });
+  expect(capturedSettings).toEqual({ hooks: {}, permissions: { defaultMode: 'default', allow: [], deny: [], ask: ASK_TOOLS_CHAT } });
   expect(capturedMcpConfig.mcpServers['kaprek-apps'].command).toBe(process.execPath);
   expect(capturedMcpConfig.mcpServers['kaprek-apps'].env.KAPREK_DATA_DIR).toBe(tmpDir);
 
   // The mcp-config file is a per-turn temp file — must not accumulate.
   expect(fs.existsSync(mcpConfigPathUsed)).toBe(false);
+});
+
+// ------------------------------------------------------------- settings profile / ask-coverage (task-7a Fix-Runde 2)
+
+test('a plain user turn (origin "user", the default) uses the "chat" settings profile: settings-chat.json, ASK_TOOLS_CHAT, strictAskCoverage:false', async () => {
+  let captured;
+  const harness = {
+    async startTurn(options) {
+      captured = options;
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+
+  await runTurn({ dataDir: tmpDir, text: 'plain chat turn', harness });
+
+  expect(path.basename(captured.settingsPath)).toBe('settings-chat.json');
+  expect(JSON.parse(fs.readFileSync(captured.settingsPath, 'utf8')).permissions.ask).toEqual(ASK_TOOLS_CHAT);
+  expect(captured.requireAskCoverage).toEqual(ASK_TOOLS_CHAT);
+  expect(captured.strictAskCoverage).toBe(false);
+});
+
+test('a trigger-originated turn uses the "trigger" settings profile: settings-trigger.json, ASK_TOOLS_TRIGGER, strictAskCoverage:true', async () => {
+  let captured;
+  const harness = {
+    async startTurn(options) {
+      captured = options;
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+
+  await runTurn({ dataDir: tmpDir, text: 'triggered turn', harness, origin: 'trigger', triggerId: 'heartbeat-1' });
+
+  expect(path.basename(captured.settingsPath)).toBe('settings-trigger.json');
+  expect(JSON.parse(fs.readFileSync(captured.settingsPath, 'utf8')).permissions.ask).toEqual(ASK_TOOLS_TRIGGER);
+  expect(captured.requireAskCoverage).toEqual(ASK_TOOLS_TRIGGER);
+  expect(captured.strictAskCoverage).toBe(true);
+});
+
+test('a chat turn and a trigger turn for the SAME dataDir get their own settings files, side by side', async () => {
+  const harness = { async startTurn() { return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null }; } };
+
+  await runTurn({ dataDir: tmpDir, text: 'chat one', harness });
+  await runTurn({ dataDir: tmpDir, text: 'trigger one', harness, origin: 'trigger', triggerId: 't1' });
+
+  const harnessDir = path.join(tmpDir, 'harness');
+  expect(fs.existsSync(path.join(harnessDir, 'settings-chat.json'))).toBe(true);
+  expect(fs.existsSync(path.join(harnessDir, 'settings-trigger.json'))).toBe(true);
 });
 
 // Regression test for task-6a review Critical #2: the harness's OWN

@@ -13,7 +13,7 @@ import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
-import { writeHarnessSettings } from '../harness/settings.mjs';
+import { writeHarnessSettings, ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -435,6 +435,17 @@ export async function runTurn({
   // (their real permissions.allow list AND hooks, verified empirically to be
   // used in place of, not merged with, ours), which can silently be far more
   // permissive than kaprek's own fail-closed default. Fail the turn instead.
+  // 'trigger' origin (see src/triggers/runner.mjs) gets the STRICTER
+  // settings profile — nobody is watching, so every built-in tool (read-only
+  // included) is forced through kaprek's own approval handler. A plain user
+  // chat turn gets the lighter 'chat' profile (write/outward-effect tools
+  // only) so a human isn't asked to approve every Read/Grep. See
+  // settings.mjs's own doc comment for why `permissions.ask` is what makes
+  // this actually work against the CLI's own auto-approval at the 'Mode'
+  // stage (task-7a Fix-Runde 2).
+  const settingsProfile = origin === 'trigger' ? 'trigger' : 'chat';
+  const requireAskCoverage = origin === 'trigger' ? ASK_TOOLS_TRIGGER : ASK_TOOLS_CHAT;
+
   let mcpConfigPath;
   let settingsPath;
   try {
@@ -446,7 +457,7 @@ export async function runTurn({
       serverScriptPath: MCP_SERVER_SCRIPT_PATH,
       tmpDir: mcpConfigDir,
     });
-    settingsPath = writeHarnessSettings({ dataDir });
+    settingsPath = writeHarnessSettings({ dataDir, profile: settingsProfile });
   } catch (err) {
     const message = `failed to prepare harness config (mcp-config/settings): ${err?.message ?? String(err)}`;
     if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath); // best-effort — writeMcpConfig() itself may have succeeded before writeHarnessSettings() threw
@@ -484,6 +495,13 @@ export async function runTurn({
       onEvent: handleEvent,
       onApprovalRequest: wrappedOnApprovalRequest,
       signal,
+      requireAskCoverage,
+      // Fail-closed for a trigger turn: an unrecognized built-in tool means
+      // this file's ASK_TOOLS_* lists are stale against a newer CLI, which
+      // would otherwise let a tool call skip kaprek's own ask-forced gate
+      // silently (see settings.mjs's doc comment) — abort rather than run
+      // ungated. A plain chat turn only warns (a human is right there).
+      strictAskCoverage: origin === 'trigger',
     });
   } finally {
     if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath);
