@@ -27,10 +27,36 @@ const SECRET_PATTERNS = [
 const BEARER_RE = /Bearer\s+[A-Za-z0-9._~+/=-]{16,}/g;
 const KEY_VALUE_RE = /\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|API_KEY|APIKEY|PASSWORD|PASSWD)[A-Z0-9_]*)\s*[=:]\s*["']?\S{8,}/g;
 
+// Secrets registered at RUNTIME by the code that owns them — currently the
+// per-installation instance token (see src/server/token.mjs). Its format (64
+// hex characters) is indistinguishable from a harmless sha256 hash, of which
+// real transcripts are full, so no pattern above can catch it without
+// redacting every commit hash and content digest in every session. Registering
+// the one live value instead is exact: it can never over-redact, and it cannot
+// be forgotten at a single call site the way "remember to redact the token
+// here too" could.
+const registeredSecrets = new Set();
+
+/** Registers a literal secret value to be redacted from every string redactSecrets() touches. Values shorter than 16 chars are ignored — too short to replace without mangling ordinary text. */
+export function registerSecret(value) {
+  if (typeof value !== 'string' || value.length < 16) return;
+  registeredSecrets.add(value);
+}
+
+/** Clears the registered-secret set. For tests, so one test's registered value cannot influence another's expectations. */
+export function clearRegisteredSecrets() {
+  registeredSecrets.clear();
+}
+
 /** Replaces known secret formats in `str` with [REDACTED]. Non-strings/empty stay unchanged. */
 export function redactSecrets(str) {
   if (typeof str !== 'string' || str.length === 0) return str;
   let out = str;
+  // Registered literals first: a plain substring replacement, so no escaping
+  // question ever arises about a value that was never a pattern.
+  for (const secret of registeredSecrets) {
+    if (out.includes(secret)) out = out.split(secret).join('[REDACTED]');
+  }
   for (const re of SECRET_PATTERNS) {
     out = out.replace(re, '[REDACTED]');
   }
