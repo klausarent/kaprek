@@ -54,8 +54,23 @@ const MAX_STDERR_LEN = 8192;
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 
 // Default turn timeout: a hung CLI must not hold an SSE request (and this
-// turn's chat) open forever. Overridable per call for tests/tuning.
+// turn's chat) open forever. Overridable per call for tests/tuning. PAUSABLE
+// — see startTimeoutTimer()/pauseTimeoutTimer() below: time spent waiting on
+// a pending approval decision does not count against this budget.
 const DEFAULT_TIMEOUT_MS = 300_000;
+
+// Absolute wall-clock cap on a WHOLE turn, chosen by peer review (Codex) as
+// a backstop against DEFAULT_TIMEOUT_MS's pausability: without some
+// timer that keeps running NO MATTER WHAT, a chain of approvals (each one
+// individually well inside its own auto-deny window — see
+// src/server/server.mjs's approvalTimeoutMs, 10 minutes) could keep pausing
+// the turn's own budget indefinitely, holding the chat's 409 busy-gate
+// (src/server/server.mjs::handleChatTurn) closed forever. Deliberately NOT
+// an idle-reset timeout (considered and rejected during review: a chatty or
+// hung stream would then extend itself forever) — this is a single, fixed,
+// NEVER-paused ceiling on the turn's total wall-clock lifetime, independent
+// of DEFAULT_TIMEOUT_MS and of how many approvals came and went.
+const DEFAULT_ABSOLUTE_TIMEOUT_MS = 30 * 60_000;
 
 // Grace period between requesting a kill (abort or timeout) and giving up on
 // waiting for the child's 'close' event. A child that ignores its kill signal
@@ -240,7 +255,7 @@ function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, set
  * node:child_process spawn) so tests can launch a harmless stand-in process
  * instead of the real `claude` binary — no test in this repo ever calls the
  * real CLI.
- * @param {import('./adapter.mjs').StartTurnOptions & {spawnFn?: Function, timeoutMs?: number, killGraceMs?: number}} options
+ * @param {import('./adapter.mjs').StartTurnOptions & {spawnFn?: Function, timeoutMs?: number, absoluteTimeoutMs?: number, killGraceMs?: number}} options
  * @returns {Promise<import('./adapter.mjs').TurnResult>}
  */
 export async function startTurn({
@@ -256,6 +271,7 @@ export async function startTurn({
   signal,
   spawnFn = nodeSpawn,
   timeoutMs = DEFAULT_TIMEOUT_MS,
+  absoluteTimeoutMs = DEFAULT_ABSOLUTE_TIMEOUT_MS,
   killGraceMs = DEFAULT_KILL_GRACE_MS,
 } = {}) {
   if (signal?.aborted) {
@@ -307,6 +323,11 @@ export async function startTurn({
     let killReason = null;
     let killGiveUpTimer = null;
     let timeoutTimer = null;
+    // Backstop for DEFAULT_ABSOLUTE_TIMEOUT_MS — set up ONCE below and
+    // NEVER paused/restarted (unlike timeoutTimer), so it fires no matter
+    // how many approvals came and went or how long any single one paused
+    // the regular budget. See that constant's own doc comment.
+    let absoluteTimeoutTimer = null;
     // Time BUDGET left on the turn timeout, and when the currently-running
     // timeoutTimer (if any) was (re)started — together these let the timer
     // be PAUSED (see pauseTimeoutTimer()/startTimeoutTimer() below) while an
@@ -472,6 +493,7 @@ export async function startTurn({
       resolved = true;
       if (killGiveUpTimer) clearTimeout(killGiveUpTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
+      if (absoluteTimeoutTimer) clearTimeout(absoluteTimeoutTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
       pendingApprovals.clear();
       endStdin();
@@ -501,6 +523,9 @@ export async function startTurn({
     if (signal) signal.addEventListener('abort', onAbort);
 
     startTimeoutTimer();
+    if (Number.isFinite(absoluteTimeoutMs) && absoluteTimeoutMs > 0) {
+      absoluteTimeoutTimer = setTimeout(() => requestKill('timeout'), absoluteTimeoutMs);
+    }
 
     child.on('error', (err) => {
       finishError(err.message);

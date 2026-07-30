@@ -247,6 +247,36 @@ test('the turn timeout resumes once the last pending approval resolves — a tur
   expect(result.stopReason).toBe('timeout');
 }, 5000);
 
+// Peer-reviewed backstop (Codex, via team-lead's follow-up decision on
+// task-6a review Important #6): the PAUSABLE turn timeout alone would never
+// fire while an approval sits open forever — a chain of approvals could
+// keep pausing it indefinitely, holding the chat's busy-gate closed. The
+// SEPARATE, never-paused absoluteTimeoutMs must still kill the turn even
+// though the regular timeout is (correctly) paused the entire time.
+test('the absolute wall-clock cap fires even while an approval is indefinitely pending (never resolves), killing the turn regardless of the paused regular timeout', async () => {
+  const child = makeControllableChild();
+  // Never resolves — the pausable timeoutTimer would stay paused forever;
+  // only absoluteTimeoutMs can end this turn.
+  const onApprovalRequest = vi.fn(() => new Promise(() => {}));
+
+  const turn = startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    onApprovalRequest,
+    onEvent: () => {},
+    timeoutMs: 60_000, // large enough to prove it is NOT what fires here
+    absoluteTimeoutMs: 50,
+    killGraceMs: 30, // this fake child never emits 'close' on its own — no need to wait out the real default here
+    spawnFn: () => child,
+  });
+
+  writeLine(child, { type: 'control_request', request_id: 'req-wall-clock', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
+
+  const result = await turn;
+  expect(result.stopReason).toBe('timeout');
+  expect(child.killed).toBe(true);
+}, 5000);
+
 // Regression test for task-6a review Important #5: `pendingApprovals` was
 // written to but never read — a repeated control_request line for the SAME
 // request_id (a duplicated stdout line, or a misbehaving CLI) would be
