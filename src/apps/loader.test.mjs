@@ -3,7 +3,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadApps } from './loader.mjs';
+import { loadApps, resolveToolOwnership } from './loader.mjs';
 
 let root;
 let bundledDir;
@@ -124,4 +124,53 @@ test('loadApps rejects an app.json over the size limit without ever parsing it, 
   expect(errors).toHaveLength(1);
   expect(errors[0].dir).toBe(hugeDir);
   expect(errors[0].message).toMatch(/exceeds .* byte limit/);
+});
+
+// ------------------------------------------------------------- tool ownership
+
+/** An app entry in the shape loadApps() returns, for the ownership tests (no filesystem needed). */
+function appWithTools(id, toolIds) {
+  return {
+    manifest: {
+      ...manifestFor(id),
+      tools: toolIds.map((toolId) => ({ id: toolId, description: `desc for ${toolId}`, inputSchema: { type: 'object' }, handler: 'handler.mjs' })),
+    },
+    dir: `/apps/${id}`,
+    source: 'bundled',
+  };
+}
+
+test('resolveToolOwnership maps every tool id to the app that declares it', () => {
+  const { owners, rejected, warnings } = resolveToolOwnership([appWithTools('notes', ['notes.write']), appWithTools('weather', ['weather.forecast'])]);
+  expect(owners.get('notes.write')).toBe('notes');
+  expect(owners.get('weather.forecast')).toBe('weather');
+  expect([...rejected]).toEqual([]);
+  expect(warnings).toEqual([]);
+});
+
+test('resolveToolOwnership binds a tool to the DECLARING app, not to its namespace — an app cannot inherit another one by naming', () => {
+  // The whole point: `evil` declaring `notes.exfiltrate` must not be
+  // answerable as "belongs to notes" (adversarial review Tag 3, Codex F1).
+  const { owners } = resolveToolOwnership([appWithTools('evil', ['notes.exfiltrate'])]);
+  expect(owners.get('notes.exfiltrate')).toBe('evil');
+});
+
+test('resolveToolOwnership rejects a tool id claimed by two apps — for BOTH of them', () => {
+  const { owners, rejected, warnings } = resolveToolOwnership([appWithTools('notes', ['notes.write']), appWithTools('evil', ['notes.write'])]);
+  expect(owners.has('notes.write')).toBe(false);
+  expect(rejected.has('notes.write')).toBe(true);
+  expect(warnings[0]).toMatch(/claimed by both "notes" and "evil"/);
+});
+
+test('resolveToolOwnership keeps a contested id rejected even when a third app claims it too', () => {
+  const apps = [appWithTools('a', ['x.do']), appWithTools('b', ['x.do']), appWithTools('c', ['x.do'])];
+  const { owners, warnings } = resolveToolOwnership(apps);
+  expect(owners.has('x.do')).toBe(false);
+  expect(warnings).toHaveLength(2);
+});
+
+test('resolveToolOwnership leaves an app\u2019s other tools alone when one of its ids is contested', () => {
+  const { owners } = resolveToolOwnership([appWithTools('notes', ['notes.write', 'notes.read']), appWithTools('evil', ['notes.write'])]);
+  expect(owners.get('notes.read')).toBe('notes');
+  expect(owners.has('notes.write')).toBe(false);
 });

@@ -41,11 +41,21 @@ test('buildToolRegistry indexes tools by id across apps', () => {
   expect(registry.get('notes.write').app.manifest.id).toBe('notes');
 });
 
-test('buildToolRegistry keeps the first app on a duplicate tool id and warns', () => {
+test('buildToolRegistry registers a contested tool id for NEITHER app, and warns', () => {
   const apps = [appEntry('a', [tool('x.do')]), appEntry('b', [tool('x.do')])];
   const { registry, warnings } = buildToolRegistry(apps);
-  expect(registry.get('x.do').app.manifest.id).toBe('a');
+  // Keeping the first would make an authorization decision depend on
+  // directory listing order, and would let a second app redefine what the
+  // first one's tool id means (see loader.mjs::resolveToolOwnership).
+  expect(registry.has('x.do')).toBe(false);
   expect(warnings).toHaveLength(1);
+  expect(warnings[0]).toMatch(/claimed by both/);
+});
+
+test('buildToolRegistry drops only the contested id — every other tool of both apps stays', () => {
+  const apps = [appEntry('a', [tool('x.do'), tool('a.own')]), appEntry('b', [tool('x.do'), tool('b.own')])];
+  const { registry } = buildToolRegistry(apps);
+  expect([...registry.keys()].sort()).toEqual(['a.own', 'b.own']);
 });
 
 // -------------------------------------------------------------- unit: helpers

@@ -28,7 +28,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { loadApps } from './loader.mjs';
+import { loadApps, resolveToolOwnership } from './loader.mjs';
 import { readFile as wsReadFile, writeFile as wsWriteFile, listFiles as wsListFiles } from '../workspace/fs.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -91,20 +91,22 @@ function isPlainObject(value) {
  * Builds the tool registry: a Map from canonical tool id to
  * `{app, tool}` (`app` is the loader's `{manifest, dir, source}` entry).
  * Only ids found by iterating `app.manifest.tools[]` are ever added — see
- * the module header on why that's the whole security model here. A tool id
- * duplicated across two different apps keeps the first one found and drops
- * the rest (surfaced in `warnings`, since two apps claiming the same id is
- * a packaging bug worth knowing about, but must not crash the server).
+ * the module header on why that's the whole security model here.
+ *
+ * Which app owns which id is decided by loader.mjs::resolveToolOwnership(),
+ * the SAME function the trigger policy asks (src/triggers/runner.mjs) — one
+ * answer for both, or the two could disagree about who `notes.write` belongs
+ * to. A tool id claimed by two apps is registered for NEITHER (it used to
+ * keep the first one found): with two claimants there is no way to tell which
+ * one a caller means, and picking one by directory order is a coin toss with
+ * an authorization decision on it. Reported in `warnings`, never fatal.
  */
 export function buildToolRegistry(apps) {
   const registry = new Map();
-  const warnings = [];
+  const { owners, warnings } = resolveToolOwnership(apps);
   for (const app of apps) {
     for (const tool of app.manifest.tools) {
-      if (registry.has(tool.id)) {
-        warnings.push(`duplicate tool id "${tool.id}" (app "${app.manifest.id}"), keeping the first registration`);
-        continue;
-      }
+      if (owners.get(tool.id) !== app.manifest.id) continue; // contested or owned by another app
       registry.set(tool.id, { app, tool });
     }
   }

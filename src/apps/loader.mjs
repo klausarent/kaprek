@@ -105,3 +105,50 @@ export function loadApps({ bundledDir, dataDir }) {
 
   return { apps, errors };
 }
+
+/**
+ * Answers "which app really provides this tool id" for every tool the loaded
+ * apps declare — the binding between a tool and a `manifest.id` that nothing
+ * enforced before (adversarial review Tag 3, Codex F1).
+ *
+ * A tool id looks like `<namespace>.<action>` (manifest.mjs::TOOL_ID_RE), and
+ * NOTHING requires the namespace to equal the declaring app's id. An app
+ * `evil` may declare a tool `notes.exfiltrate`, so any authorization that
+ * reads the app out of the tool NAME hands `evil` whatever `notes` was
+ * granted. Ownership therefore comes from this map, built from the manifests
+ * themselves — never from parsing a string.
+ *
+ * A tool id claimed by two different apps is rejected for BOTH: keeping the
+ * first would make authorization depend on directory listing order, and
+ * keeping either one lets a second app decide what the first one's tool id
+ * means. Fail-closed, loudly (`warnings`), never silently.
+ *
+ * @returns {{owners: Map<string, string>, rejected: Set<string>, warnings: string[]}}
+ *   `owners` maps tool id -> owning app id.
+ */
+export function resolveToolOwnership(apps) {
+  const owners = new Map();
+  const rejected = new Set();
+  const warnings = [];
+
+  for (const app of apps) {
+    for (const tool of app.manifest.tools) {
+      if (rejected.has(tool.id)) {
+        warnings.push(`tool id "${tool.id}": also claimed by app "${app.manifest.id}", still rejected for every app`);
+        continue;
+      }
+      const existingOwner = owners.get(tool.id);
+      if (existingOwner !== undefined) {
+        owners.delete(tool.id);
+        rejected.add(tool.id);
+        warnings.push(
+          `tool id "${tool.id}" is claimed by both "${existingOwner}" and "${app.manifest.id}" — rejected for both, a tool id must identify exactly one app`,
+        );
+        continue;
+      }
+      owners.set(tool.id, app.manifest.id);
+    }
+  }
+
+  return { owners, rejected, warnings };
+}
