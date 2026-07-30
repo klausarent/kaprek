@@ -7,6 +7,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { startServer, createSseQueue } from './server.mjs';
@@ -1313,7 +1314,7 @@ test('chat: approval — SSE delivers an "approval" frame, POST /api/approvals/<
   const frames = await readSse(res, async (frame) => {
     if (frame.type === 'approval' && approvalFrame === null) {
       approvalFrame = frame;
-      const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'allow' });
+      const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'allow' });
       expect(decideRes.status).toBe(200);
       expect(await decideRes.json()).toEqual({ ok: true });
     }
@@ -1339,17 +1340,19 @@ test('chat: approval — a second POST to the same id is rejected 409, an unrela
 
   let firstStatus = null;
   let secondStatus = null;
+  let chatId = null;
   await readSse(res, async (frame) => {
     if (frame.type === 'approval' && firstStatus === null) {
-      firstStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'deny' })).status;
-      secondStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'allow' })).status;
+      chatId = frame.chatId;
+      firstStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { chatId, behavior: 'deny' })).status;
+      secondStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { chatId, behavior: 'allow' })).status;
     }
   });
 
   expect(firstStatus).toBe(200);
   expect(secondStatus).toBe(409);
 
-  const unknownRes = await postJson(`${url}/api/approvals/00000000-0000-0000-0000-000000000000`, { behavior: 'allow' });
+  const unknownRes = await postJson(`${url}/api/approvals/00000000-0000-0000-0000-000000000000`, { chatId, behavior: 'allow' });
   expect(unknownRes.status).toBe(404);
 });
 
@@ -1366,21 +1369,32 @@ test('chat: approval — POST /api/approvals/<id> rejects a missing/invalid beha
   });
 
   let badStatus = null;
+  let missingChatIdStatus = null;
   await readSse(res, async (frame) => {
     if (frame.type === 'approval' && badStatus === null) {
-      badStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'maybe' })).status;
-      await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'deny' }); // let the turn actually finish
+      badStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'maybe' })).status;
+      missingChatIdStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'deny' })).status;
+      await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'deny' }); // let the turn actually finish
     }
   });
 
   expect(badStatus).toBe(400);
+  expect(missingChatIdStatus).toBe(400);
 });
 
-test('chat: approval — cancelling the chat resolves an open approval as deny("turn ended"), the harness observes it (no deadlock)', async () => {
-  const { url } = await boot({
-    harness: approvalHarness({ request: { id: 'cancel-me-1', toolName: 'Bash', input: {} } }),
-    harnessName: 'fake',
-  });
+test('chat: approval — cancelling the chat resolves an open approval as deny("turn ended"), the harness observes exactly that decision (no deadlock)', async () => {
+  // A custom harness (not approvalHarness — that one skips emitting its
+  // decision-echoing text event once aborted, so it can't prove WHAT the
+  // harness actually received) that captures the resolved decision
+  // unconditionally, mirroring the disconnect test right below.
+  let capturedDecision = null;
+  const harness = {
+    async startTurn({ onApprovalRequest, signal } = {}) {
+      capturedDecision = await onApprovalRequest({ id: 'cancel-me-1', toolName: 'Bash', input: {} });
+      return { sessionId: null, costUsd: null, usage: null, stopReason: signal?.aborted ? 'aborted' : 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness, harnessName: 'fake' });
 
   const res = await fetch(`${url}/api/chat/turn`, {
     method: 'POST',
@@ -1398,11 +1412,80 @@ test('chat: approval — cancelling the chat resolves an open approval as deny("
   });
 
   expect(frames.at(-1)).toMatchObject({ type: 'turn-complete', stopReason: 'aborted' });
+  expect(capturedDecision).toEqual({ behavior: 'deny', message: 'turn ended' });
 
   // The approval id is gone from the pending map once the turn is cleaned
   // up — deciding it now is an unknown/expired id, not a "double decision".
-  const lateRes = await postJson(`${url}/api/approvals/cancel-me-1`, { behavior: 'allow' });
+  const lateRes = await postJson(`${url}/api/approvals/cancel-me-1`, { chatId, behavior: 'allow' });
   expect(lateRes.status).toBe(404);
+});
+
+test('chat: approval — deciding with a chatId that does not own this id is rejected 404, never resolves it', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'belongs-to-chat-a', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'chat a' }) });
+  let approval = null;
+  const framesPromise = readSse(res, async (frame) => {
+    if (frame.type === 'approval' && approval === null) approval = frame;
+  });
+  while (approval === null) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  // A well-formed but otherwise unrelated chatId — no pending entry was
+  // ever registered under approvalKey(someOtherChatId, approval.id).
+  const someOtherChatId = crypto.randomUUID();
+  expect(someOtherChatId).not.toBe(approval.chatId);
+  const wrongChatRes = await postJson(`${url}/api/approvals/${approval.id}`, { chatId: someOtherChatId, behavior: 'allow' });
+  expect(wrongChatRes.status).toBe(404);
+
+  // Untouched by that failed attempt — still decidable under its own,
+  // correct chatId.
+  const rightChatRes = await postJson(`${url}/api/approvals/${approval.id}`, { chatId: approval.chatId, behavior: 'deny' });
+  expect(rightChatRes.status).toBe(200);
+  await framesPromise;
+});
+
+test('chat: approval — two chats whose harness hands out the SAME request_id each keep their own independent resolve/timer', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'shared-request-id', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+  });
+
+  // Two independent chats whose harness happens to hand out the exact same
+  // request_id — collisions are exactly what approvalKey()'s composite
+  // chatId+requestId key exists to make structurally impossible (task-6a
+  // review Important #4/#5): each chat's entry lives under its OWN key even
+  // though the raw request_id is identical.
+  const first = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'chat one' }) });
+  let firstApproval = null;
+  const firstFramesPromise = readSse(first, async (frame) => {
+    if (frame.type === 'approval' && firstApproval === null) firstApproval = frame;
+  });
+  while (firstApproval === null) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  const second = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'chat two' }) });
+  let secondApproval = null;
+  const secondFramesPromise = readSse(second, async (frame) => {
+    if (frame.type === 'approval' && secondApproval === null) secondApproval = frame;
+  });
+  while (secondApproval === null) await new Promise((resolve) => setTimeout(resolve, 5));
+
+  expect(firstApproval.id).toBe(secondApproval.id); // the actual collision
+  expect(firstApproval.chatId).not.toBe(secondApproval.chatId);
+
+  // Resolving chat two's entry first must not touch chat one's — if both
+  // shared one bare request_id-keyed slot, this delete/resolve would have
+  // wiped chat one's `resolve`/`timer` out of the map entirely.
+  const secondDecisionRes = await postJson(`${url}/api/approvals/${secondApproval.id}`, { chatId: secondApproval.chatId, behavior: 'allow' });
+  expect(secondDecisionRes.status).toBe(200);
+  await secondFramesPromise;
+
+  // Chat one's own, colliding-id entry is still there, independently decidable.
+  const firstDecisionRes = await postJson(`${url}/api/approvals/${firstApproval.id}`, { chatId: firstApproval.chatId, behavior: 'deny' });
+  expect(firstDecisionRes.status).toBe(200);
+  await firstFramesPromise;
 });
 
 test('chat: approval — closing the SSE response (client disconnect) also resolves an open approval as deny, without deadlocking the harness', async () => {

@@ -546,3 +546,111 @@ test('runTurn wires mcpConfigPath (kaprek apps MCP server) and settingsPath (neu
   // The mcp-config file is a per-turn temp file — must not accumulate.
   expect(fs.existsSync(mcpConfigPathUsed)).toBe(false);
 });
+
+// Regression test for task-6a review Critical #2: the harness's OWN
+// 'approval' NormalizedEvent (safeEmit'd by claude-code.mjs's
+// handleApprovalRequest, carrying the RAW, unredacted request) used to fall
+// into handleEvent()'s `default:` case and go straight to onEvent/SSE — a
+// secret leak, and a SECOND, duplicate approval prompt alongside the
+// sanitized one from wrappedOnApprovalRequest.
+test('the raw harness approval NormalizedEvent is never forwarded via onEvent — no secret leak, no duplicate prompt', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { type: 'approval', phase: 'requested', id: 'req-1', toolName: 'Bash', input: { command: `curl -H "Authorization: ${SECRET_PATTERNS.bearer}"` } },
+      { type: 'approval', phase: 'resolved', id: 'req-1', toolName: 'Bash', behavior: 'allow' },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ],
+  });
+
+  const seen = [];
+  await runTurn({ dataDir: tmpDir, text: 'raw approval event check', harness: fakeHarness, onEvent: (e) => seen.push(e) });
+
+  const approvalFrames = seen.filter((e) => e.type === 'approval');
+  expect(approvalFrames).toHaveLength(0);
+  expect(JSON.stringify(seen)).not.toContain(SECRET_PATTERNS.bearer);
+});
+
+test('onApprovalRequest: exactly one sanitized approval frame per request reaches onEvent when a handler IS configured (via the wrapper, not the raw harness event)', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Bash', input: { command: `curl -H "Authorization: ${SECRET_PATTERNS.bearer}"` } } },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ],
+  });
+
+  const seen = [];
+  const onApprovalRequest = vi.fn(async () => ({ behavior: 'allow' }));
+  await runTurn({ dataDir: tmpDir, text: 'one frame check', harness: fakeHarness, onApprovalRequest, onEvent: (e) => seen.push(e) });
+
+  // The wrapper forwards to the CALLER's onApprovalRequest, not through
+  // onEvent — a browser client learns about an approval exclusively via the
+  // caller (e.g. server.mjs's own SSE enqueue inside makeApprovalHandler),
+  // so onEvent itself must see none of the 'approval' type at all here.
+  expect(seen.filter((e) => e.type === 'approval')).toHaveLength(0);
+  expect(onApprovalRequest).toHaveBeenCalledTimes(1);
+});
+
+// Regression test for task-6a review Important #7: `suggestions` derives
+// from the tool call and can itself embed a secret (e.g. a suggested
+// `Bash(curl -H "Authorization: Bearer …")` allow-rule) — it must go
+// through the exact same redaction chain as `input`, not ride along
+// unsanitized just because it isn't a plain string field.
+test('onApprovalRequest: a secret embedded in permission_suggestions is redacted for both the caller and the chat store', async () => {
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Bash'], model: 'm', permissionMode: 'default' },
+      {
+        approval: {
+          toolName: 'Bash',
+          input: { command: 'curl something' },
+          suggestions: [{ rule: `Bash(curl -H "Authorization: ${SECRET_PATTERNS.bearer}")` }],
+        },
+      },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ],
+  });
+
+  const seenByCaller = [];
+  const onApprovalRequest = vi.fn(async (request) => {
+    seenByCaller.push(request);
+    return { behavior: 'allow' };
+  });
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'suggestions redaction check', harness: fakeHarness, onApprovalRequest });
+
+  expect(JSON.stringify(seenByCaller)).not.toContain(SECRET_PATTERNS.bearer);
+  expect(JSON.stringify(seenByCaller)).toContain('[REDACTED]');
+
+  const approvalEvents = openChats(tmpDir).events(result.chatId).filter((e) => e.kind === 'approval');
+  expect(approvalEvents[0].suggestions).not.toContain(SECRET_PATTERNS.bearer);
+  expect(approvalEvents[0].suggestions).toContain('[REDACTED]');
+});
+
+// Regression test for task-6a review Critical #3: a failed mcp-config/
+// settings write must FAIL the turn (fail-closed), never let it proceed
+// without --settings — see settings.mjs's own comment for why that matters
+// (the CLI falls back to the user's own, potentially much more permissive
+// ~/.claude/settings.json).
+test('a failed mcp-config/settings write fails the turn instead of silently running without --settings (fail-closed, not fail-open)', async () => {
+  // Forces writeMcpConfig()'s own fs.mkdirSync(<dataDir>/mcp, {recursive:true})
+  // to throw by pre-occupying that exact path with a plain FILE instead of a
+  // directory — deterministic, no fs mocking needed.
+  fs.writeFileSync(path.join(tmpDir, 'mcp'), 'not a directory');
+
+  const fakeHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'should fail closed', harness: fakeHarness });
+
+  expect(result.stopReason).toBe('error');
+  expect(result.error.message).toMatch(/mcp-config|settings/i);
+  // Never even reached the harness — fails BEFORE running with weaker security.
+  expect(startTurnSpy).not.toHaveBeenCalled();
+
+  // The failure is still logged to runs.jsonl, same as any other turn error.
+  const runs = readRuns(tmpDir);
+  expect(runs).toHaveLength(1);
+  expect(runs[0].stopReason).toBe('error');
+});

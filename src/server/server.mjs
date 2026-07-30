@@ -622,14 +622,34 @@ export function createSseQueue(res) {
 }
 
 /**
+ * `pendingApprovals` is server-WIDE (see startServer()), not per-chat, so it
+ * needs a key that stays unique across every chat at once — the CLI's own
+ * `request_id` alone is NOT guaranteed to be that (task-6a review Important
+ * #4/#5): two different CLI subprocesses (two different chats) can in
+ * principle hand out colliding ids. A bare `request_id` key would let one
+ * chat's entry silently overwrite another's — the earlier chat's `resolve`
+ * and `timer` are then gone from the map entirely (leaked promise, orphaned
+ * timer that can later mis-fire and deny the WRONG chat's approval). Keying
+ * by `chatId:requestId` makes a collision structurally impossible (two
+ * different chats can never produce the same composite key even if their
+ * raw request_ids happen to match).
+ */
+function approvalKey(chatId, requestId) {
+  return `${chatId}:${requestId}`;
+}
+
+/**
  * Builds this turn's onApprovalRequest handler (passed to runTurn(), see
  * src/orchestrator/run.mjs), closing over the SSE `enqueue()` already open
  * for this turn's response. Per approval request:
- *   1. registers a pending entry (keyed by the CLI's own request_id, unique
- *      across every chat — see `pendingApprovals`, a server-wide map like
- *      `chatAbortControllers`) carrying the promise's own `resolve`,
- *   2. streams the (already-redacted, see run.mjs's wrapping) request to the
- *      browser as one more SSE frame,
+ *   1. registers a pending entry (keyed by approvalKey(chatId, request.id) —
+ *      see that function's doc comment — in `pendingApprovals`, a
+ *      server-wide map like `chatAbortControllers`) carrying the promise's
+ *      own `resolve`,
+ *   2. streams the (already-redacted, see run.mjs's wrapping) request, WITH
+ *      the chatId it belongs to, to the browser as one more SSE frame — the
+ *      client needs chatId back in POST /api/approvals/<id>'s body (see
+ *      handleApprovalDecision() below),
  *   3. returns the promise — resolved by POST /api/approvals/<id> below, by
  *      the timeout further down, or by handleChatTurn's cleanup on turn end/
  *      cancel/disconnect (see cleanupApprovalsForChat()).
@@ -639,15 +659,21 @@ export function createSseQueue(res) {
 function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs }) {
   return (request) =>
     new Promise((resolve) => {
+      const key = approvalKey(chatId, request.id);
       const timer = setTimeout(() => {
-        const entry = pendingApprovals.get(request.id);
+        const entry = pendingApprovals.get(key);
         if (!entry || entry.decided) return;
-        pendingApprovals.delete(request.id);
+        pendingApprovals.delete(key);
         resolve({ behavior: 'deny', message: 'approval timed out' });
       }, approvalTimeoutMs);
 
-      pendingApprovals.set(request.id, { chatId, decided: false, resolve, timer, createdAt: Date.now() });
-      enqueue({ type: 'approval', ...request });
+      pendingApprovals.set(key, { chatId, decided: false, resolve, timer, createdAt: Date.now() });
+      // Fire-and-forget, like every other onEvent->enqueue call in this
+      // file (see handleChatTurn's own comment on the same pattern) — but
+      // explicitly caught here (never actually rejects today; writeSseFrame
+      // itself swallows write errors) so a future change to that guarantee
+      // can't turn this into an unhandled rejection on the approval path.
+      enqueue({ type: 'approval', chatId, ...request }).catch(() => {});
     });
 }
 
@@ -665,24 +691,30 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
  * approval-route doc comment.
  */
 function cleanupApprovalsForChat(pendingApprovals, chatId) {
-  for (const [id, entry] of pendingApprovals) {
+  for (const [key, entry] of pendingApprovals) {
     if (entry.chatId !== chatId) continue;
     clearTimeout(entry.timer);
     if (!entry.decided) {
       entry.decided = true;
       entry.resolve({ behavior: 'deny', message: 'turn ended' });
     }
-    pendingApprovals.delete(id);
+    pendingApprovals.delete(key);
   }
 }
 
 /**
  * POST /api/approvals/<id> — answers a pending tool-use approval (see
- * makeApprovalHandler() above). Body: `{behavior:'allow'|'deny', message?}`.
- * `message` is only meaningful for a deny; an allow always resolves with a
- * plain `{behavior:'allow'}` (see adapter.mjs's ApprovalDecision — this
- * route never accepts an `updatedInput` override from the browser, only the
- * CLI's own proposed input is ever allowed through).
+ * makeApprovalHandler() above). Body: `{chatId, behavior:'allow'|'deny',
+ * message?}`. `chatId` is REQUIRED (not just an optional hint): the id alone
+ * is not enough to look an entry up (see approvalKey()'s doc comment above),
+ * and a caller that only knows `id` (e.g. from a different chat's own SSE
+ * stream) must get exactly the same 404 an unknown id would — never a 409
+ * or a decision for a chat it has no business deciding for (task-6a review
+ * Important #4). `message` is only meaningful for a deny; an allow always
+ * resolves with a plain `{behavior:'allow'}` (see adapter.mjs's
+ * ApprovalDecision — this route never accepts an `updatedInput` override
+ * from the browser, only the CLI's own proposed input is ever allowed
+ * through).
  */
 async function handleApprovalDecision(req, res, id, pendingApprovals) {
   if (!isSafeId(id)) {
@@ -694,13 +726,18 @@ async function handleApprovalDecision(req, res, id, pendingApprovals) {
     sendJson(res, body.status, { error: body.error });
     return;
   }
+  const chatId = body.data?.chatId;
+  if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
+    sendJson(res, 400, { error: 'chatId is required' });
+    return;
+  }
   const behavior = body.data?.behavior;
   if (behavior !== 'allow' && behavior !== 'deny') {
     sendJson(res, 400, { error: 'behavior must be "allow" or "deny"' });
     return;
   }
 
-  const entry = pendingApprovals.get(id);
+  const entry = pendingApprovals.get(approvalKey(chatId, id));
   if (!entry) {
     sendJson(res, 404, { error: 'unknown or expired approval' });
     return;

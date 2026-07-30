@@ -66,7 +66,7 @@ const EVENT_SHAPES = {
   tool: { required: ['name', 'input', 'result'], optional: ['msgId', 'resultRef'] },
   approval: {
     required: ['requestId', 'toolName', 'phase'],
-    optional: ['displayName', 'input', 'description', 'agentId', 'toolUseId', 'reasonType', 'reason', 'behavior', 'message'],
+    optional: ['displayName', 'input', 'description', 'agentId', 'toolUseId', 'reasonType', 'reason', 'suggestions', 'behavior', 'message'],
   },
 };
 export const EVENT_KINDS = Object.keys(EVENT_SHAPES);

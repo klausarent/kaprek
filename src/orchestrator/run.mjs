@@ -289,6 +289,20 @@ export async function runTurn({
         if (event.sessionId) cliSessionId = event.sessionId;
         onEvent?.(event);
         break;
+      case 'approval':
+        // Intentionally dropped, not forwarded to onEvent: this is the
+        // harness's OWN raw, unsanitized NormalizedEvent (see
+        // claude-code.mjs's handleApprovalRequest — 'requested' carries the
+        // full request, including tool input, exactly as the CLI proposed
+        // it, no redaction applied). The wrappedOnApprovalRequest below is
+        // the actual persistence/forwarding path for approvals — it runs
+        // BEFORE the caller's own handler and hands out only the sanitized
+        // request. Forwarding this raw event here as well (the `default`
+        // case used to do exactly that) would (a) leak an unredacted secret
+        // straight onto the SSE wire and (b) duplicate the approval prompt
+        // the client already gets from the sanitized path (SECURITY,
+        // task-6a review Critical #2).
+        break;
       default:
         onEvent?.(event); // 'error' — nothing to store, still forwarded
         break;
@@ -308,18 +322,31 @@ export async function runTurn({
         const sanitizedDescription = sanitizeText(request.description, maxToolLen, redact);
         const sanitizedReason = sanitizeText(request.reason, maxToolLen, redact);
 
+        // toolName/displayName are ordinarily short enum-like names (e.g.
+        // 'Bash') with nothing to redact, but `suggestions`
+        // (permission_suggestions) is derived FROM the tool call — a CLI
+        // can suggest an allow-rule string like `Bash(curl -H "Authorization:
+        // Bearer …")` that embeds the very secret input carries (task-6a
+        // review Important #7) — so every field that can possibly echo the
+        // call's arguments goes through the same sanitize chain, not just
+        // `input`.
+        const sanitizedToolName = sanitizeText(request.toolName, maxToolLen, redact);
+        const sanitizedDisplayName = sanitizeText(request.displayName, maxToolLen, redact);
+        const sanitizedSuggestions = redactInputObject(request.suggestions, redact);
+
         chats.appendEvent(effectiveChatId, {
           kind: 'approval',
           phase: 'requested',
           requestId: request.id,
-          toolName: request.toolName,
-          displayName: request.displayName,
+          toolName: sanitizedToolName,
+          displayName: sanitizedDisplayName,
           input: sanitizedInput,
           description: sanitizedDescription,
           agentId: request.agentId,
           toolUseId: request.toolUseId,
           reasonType: request.reasonType,
           reason: sanitizedReason,
+          suggestions: sanitizeToolInput(request.suggestions, maxToolLen, redact),
         });
 
         // The caller (e.g. server.mjs, streaming this over SSE) gets the
@@ -327,9 +354,12 @@ export async function runTurn({
         // before the data reaches ANY new write site, SSE included.
         const sanitizedRequest = {
           ...request,
+          toolName: sanitizedToolName,
+          displayName: sanitizedDisplayName,
           input: redactInputObject(request.input, redact),
           description: sanitizedDescription,
           reason: sanitizedReason,
+          suggestions: sanitizedSuggestions,
         };
 
         let decision;
@@ -365,18 +395,21 @@ export async function runTurn({
 
   // Wired up once per turn: --mcp-config points the CLI at kaprek's own apps
   // MCP server (see mcp-config.mjs), --settings neutralizes the user's own
-  // hooks for a deterministic headless turn (see settings.mjs). Both are
-  // written under dataDir (mcpConfigPath under a dedicated 'mcp' tmpDir, not
-  // the real OS temp dir) so a test's own tmpDir cleanup also removes them —
-  // see mcpConfigPath's cleanupMcpConfig() call below for the mcp-config
-  // file specifically (settings.json is overwritten in place, nothing to
-  // remove).
+  // hooks AND permissions.allow list for a deterministic, sandboxed headless
+  // turn (see settings.mjs). Both are written under dataDir (mcpConfigPath
+  // under a dedicated 'mcp' tmpDir, not the real OS temp dir) so a test's
+  // own tmpDir cleanup also removes them — see mcpConfigPath's
+  // cleanupMcpConfig() call below for the mcp-config file specifically
+  // (settings.json is a stable, idempotently-rewritten path — see
+  // settings.mjs's own doc comment for why that closes the concurrent-turn
+  // race a naive overwrite-every-time would hit on Windows).
   //
-  // Best-effort, same as appendRun()'s own try/catch further down: a turn
-  // must still run (with a slightly less deterministic/tooled CLI, same as
-  // omitting these options entirely) if this ONE auxiliary write hiccups —
-  // a transient fs error here (e.g. a Windows AV scanner briefly locking a
-  // just-written file) must not fail the user-visible turn itself.
+  // SECURITY (task-6a review Critical #3): a failed write here is NOT
+  // swallowed and the turn allowed to proceed without --settings — without
+  // it, the CLI falls back to reading the user's OWN ~/.claude/settings.json
+  // (their real permissions.allow list AND hooks, verified empirically to be
+  // used in place of, not merged with, ours), which can silently be far more
+  // permissive than kaprek's own fail-closed default. Fail the turn instead.
   let mcpConfigPath;
   let settingsPath;
   try {
@@ -389,9 +422,26 @@ export async function runTurn({
       tmpDir: mcpConfigDir,
     });
     settingsPath = writeHarnessSettings({ dataDir });
-  } catch {
-    mcpConfigPath = undefined;
-    settingsPath = undefined;
+  } catch (err) {
+    const message = `failed to prepare harness config (mcp-config/settings): ${err?.message ?? String(err)}`;
+    if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath); // best-effort — writeMcpConfig() itself may have succeeded before writeHarnessSettings() threw
+    try {
+      appendRun(dataDir, {
+        chatId: effectiveChatId,
+        harness: harnessName,
+        model: null,
+        costUsd: null,
+        usage: null,
+        tokens: null,
+        durationMs: Date.now() - startedAt,
+        stopReason: 'error',
+        rateLimit: null,
+        error: { message },
+      });
+    } catch {
+      // best-effort — see appendRun()'s own call further down for the same caveat
+    }
+    return { chatId: effectiveChatId, cliSessionId, costUsd: null, stopReason: 'error', error: { message } };
   }
 
   let turnResult;
