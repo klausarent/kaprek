@@ -291,6 +291,15 @@ function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, set
  *   can run) — nobody is watching a trigger turn, so failing loud beats
  *   failing open. When false (a plain chat turn, a human IS watching), a gap
  *   is only recorded in TurnResult.warnings and the turn continues.
+ * @param {(toolNames: string[]) => void} [options.learnUnknownTools] -
+ *   called with exactly the unknown, non-MCP tool name(s) the moment a
+ *   coverage gap is detected — BEFORE the strict-abort/warning branch below,
+ *   so even a turn that itself still fails closed (strictAskCoverage) has
+ *   already persisted the gap for the NEXT turn to self-heal from (see
+ *   src/harness/knownTools.mjs — run.mjs wires this to knownTools.mjs's
+ *   learnTools(dataDir, ...)). Errors thrown by this callback are swallowed
+ *   — a learning failure must never change how THIS turn's own coverage gap
+ *   is handled.
  */
 export async function startTurn({
   cwd,
@@ -309,6 +318,7 @@ export async function startTurn({
   killGraceMs = DEFAULT_KILL_GRACE_MS,
   requireAskCoverage,
   strictAskCoverage = false,
+  learnUnknownTools,
 } = {}) {
   if (signal?.aborted) {
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
@@ -656,7 +666,18 @@ export async function startTurn({
           if (requireAskCoverage) {
             const unknownTools = (event.tools ?? []).filter((t) => !isKnownTool(t, requireAskCoverage));
             if (unknownTools.length > 0) {
-              const message = `ask-policy coverage gap: CLI reports tool(s) not in the ask list: ${unknownTools.join(', ')}`;
+              // Learn BEFORE deciding what to do about THIS turn (see
+              // learnUnknownTools's own doc comment) — THIS turn's own
+              // --settings file was already written from a stale list
+              // before the CLI was even spawned, so it still fails closed
+              // below regardless; the point is the NEXT turn for this
+              // dataDir already has the benefit.
+              try {
+                learnUnknownTools?.(unknownTools);
+              } catch {
+                // best-effort — see learnUnknownTools's own doc comment
+              }
+              const message = `ask-policy coverage gap: CLI reports tool(s) not in the ask list: ${unknownTools.join(', ')} (learned for future turns)`;
               if (strictAskCoverage) {
                 // Fail-closed, not fail-open: a tool this harness doesn't
                 // recognize could be one that skips permissions.ask entirely

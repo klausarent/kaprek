@@ -185,6 +185,70 @@ test('A10: an MCP tool (mcp__…) is never an ask-coverage gap, regardless of re
   expect(result.warnings).toEqual([]);
 });
 
+test('A12: strictAskCoverage still calls learnUnknownTools with the unknown tool name(s) BEFORE killing the turn', async () => {
+  const initLine = { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'ScheduleWakeup', 'Monitor'], model: 'm' };
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify(initLine))});`,
+    'setTimeout(() => {}, 30000);',
+  ].join('\n');
+
+  const learned = [];
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: true,
+    learnUnknownTools: (toolNames) => learned.push(...toolNames),
+  });
+
+  expect(result.stopReason).toBe('error');
+  expect(learned.sort()).toEqual(['Monitor', 'ScheduleWakeup']);
+});
+
+test('A13: without strictAskCoverage, learnUnknownTools is still called (learning does not depend on aborting)', async () => {
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'ScheduleWakeup'], model: 'm' },
+    { type: 'result', session_id: 's1', total_cost_usd: 0, usage: {}, is_error: false },
+  ];
+  const script = lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`).join('\n');
+
+  const learned = [];
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: false,
+    learnUnknownTools: (toolNames) => learned.push(...toolNames),
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(learned).toEqual(['ScheduleWakeup']);
+});
+
+test('A14: a throwing learnUnknownTools does not change how the coverage gap itself is handled', async () => {
+  const initLine = { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'ScheduleWakeup'], model: 'm' };
+  const script = [
+    `console.log(${JSON.stringify(JSON.stringify(initLine))});`,
+    'setTimeout(() => {}, 30000);',
+  ].join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    requireAskCoverage: ['Bash'],
+    strictAskCoverage: true,
+    learnUnknownTools: () => {
+      throw new Error('learning boom');
+    },
+  });
+
+  expect(result.stopReason).toBe('error');
+  expect(result.error.message).toContain('ScheduleWakeup');
+});
+
 test('A11: omitting requireAskCoverage entirely skips the check (backward compatible)', async () => {
   const lines = [
     { type: 'system', subtype: 'init', session_id: 's1', tools: ['Bash', 'AnythingAtAll'], model: 'm' },
