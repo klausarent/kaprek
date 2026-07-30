@@ -53,16 +53,27 @@
 // instance token already lives on (src/server/token.mjs). Do not promise more
 // than that in the README.
 //
-// WHY an unclear answer refuses the start instead of moving to the next port.
-// When the lock address is taken, the only answer that justifies moving on is
-// a complete, valid greeting carrying a DIFFERENT dataDirHash: that proves
-// someone else owns the address. Silence, a timeout, half a line, broken
-// JSON, a reset — all of those are also what a live holder looks like while
-// its event loop is blocked, its GC is running, or a virus scanner has it
-// pinned. Treating them as "foreign software" would hand a second lock for
-// the same data dir to a process that is merely busy, which is exactly the
-// failure the file leases kept producing, reached through a new door. So an
-// unclear answer is re-asked a few times and then refuses the start.
+// WHAT AN OCCUPIED ADDRESS MEANS — four cases, and the line between them is
+// whether anything was actually said:
+//
+//   1. A valid greeting naming OUR dataDirHash -> that is our own instance,
+//      already running. Report it with its pid and url.
+//   2. A valid greeting naming a DIFFERENT hash -> another kaprek whose data
+//      dir landed on the same derived port. Step aside, take the next port.
+//   3. Data arrives that is not a kaprek greeting at all -> a foreign
+//      service. This is provable because the holder writes its greeting as
+//      the very first statement of its connection handler, with nothing
+//      awaited before it: a kaprek that can talk to us at all talks kaprek.
+//      Step aside, take the next port.
+//   4. NOTHING is said — a timeout, an empty close, a reset, a half line that
+//      never finishes — then nothing is proven. That is also exactly what a
+//      live holder looks like while its event loop is blocked, its GC is
+//      running, or a virus scanner has it pinned. Reading it as "foreign
+//      software, move along" would hand a second lock for the same data dir
+//      to a process that is merely busy, which is the failure the file leases
+//      kept producing, reached through a new door. So case 4 is re-asked a
+//      few times on the SAME address and then refuses the start. Never a
+//      fallback.
 //
 // `instance.lock` is still written, but it is DISPLAY ONLY: something for a
 // human to open when they wonder what is running. No decision about
@@ -144,9 +155,10 @@ function describeTarget(target) {
   return target.path ?? `${LOCK_HOST}:${target.port}`;
 }
 
-// The four things a probe can establish. Only OURS and FOREIGN are answers;
-// REFUSED and UNCLEAR are the absence of one, and the caller treats them very
-// differently (see the module header).
+// The four things a probe can establish, matching the four cases in the
+// module header. OURS and FOREIGN are answers; REFUSED proves nobody is
+// listening; UNCLEAR is the absence of an answer, and it is the only one that
+// refuses the start.
 const PROBE_OURS = 'ours';
 const PROBE_FOREIGN = 'foreign';
 const PROBE_REFUSED = 'refused';
@@ -193,20 +205,23 @@ function tryListen(server, target) {
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms).unref());
 
 /**
- * Classifies one greeting line. A greeting only counts as FOREIGN when it is
- * complete, parses, carries the protocol marker AND names a different data
- * dir. Everything short of that stays UNCLEAR — half a line from a holder
- * that got descheduled mid-write must never read as "someone else's address".
+ * Classifies something that was actually said (cases 1-3 in the module
+ * header). Only a greeting naming our own hash is OURS; everything else that
+ * arrived as data belongs to somebody else, whether it is another kaprek's
+ * greeting or an HTTP banner.
+ *
+ * Callers must not route silence through here — "no bytes at all" is case 4
+ * and stays UNCLEAR.
  */
-function classifyGreeting(raw, dataDirHash) {
+function classifySpokenData(raw, dataDirHash) {
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { kind: PROBE_UNCLEAR };
+    return { kind: PROBE_FOREIGN };
   }
   if (!parsed || parsed.kaprek !== 1 || typeof parsed.dataDirHash !== 'string') {
-    return { kind: PROBE_UNCLEAR };
+    return { kind: PROBE_FOREIGN };
   }
   if (parsed.dataDirHash !== dataDirHash) return { kind: PROBE_FOREIGN };
   return { kind: PROBE_OURS, pid: parsed.pid, url: typeof parsed.url === 'string' ? parsed.url : null };
@@ -218,9 +233,12 @@ function classifyGreeting(raw, dataDirHash) {
  * ECONNREFUSED (TCP) and ENOENT (pipe) are the one negative answer that
  * proves something rather than merely failing to prove anything: nothing is
  * listening. That is what an OS-reserved port answers, and the walk relies on
- * it to step over reserved blocks. Every other disappointment — timeout,
- * reset, a partial line, garbage — is UNCLEAR, because a busy holder produces
- * exactly those.
+ * it to step over reserved blocks.
+ *
+ * A line that arrives complete, or a peer that says something and then closes
+ * cleanly, is a statement and gets classified. A timeout is not, even with
+ * half a line in the buffer: an answer we cut off mid-sentence is not
+ * evidence about who is speaking.
  */
 function probeOnce(target, dataDirHash, timeoutMs) {
   return new Promise((resolve) => {
@@ -242,12 +260,16 @@ function probeOnce(target, dataDirHash, timeoutMs) {
     socket.on('data', (chunk) => {
       buffer += chunk;
       const newline = buffer.indexOf('\n');
-      if (newline !== -1) finish(classifyGreeting(buffer.slice(0, newline), dataDirHash));
-      else if (buffer.length > MAX_GREETING_BYTES) finish({ kind: PROBE_UNCLEAR });
+      if (newline !== -1) finish(classifySpokenData(buffer.slice(0, newline), dataDirHash));
+      // Our greeting is one short line. Anything still talking past this is a
+      // service with something else to say.
+      else if (buffer.length > MAX_GREETING_BYTES) finish({ kind: PROBE_FOREIGN });
     });
-    // A holder that closed after writing its line without a trailing newline
-    // still gave us everything it had.
-    socket.on('end', () => finish(classifyGreeting(buffer, dataDirHash)));
+    // A peer that closed after writing its line without a trailing newline
+    // still gave us everything it had. An empty close said nothing at all.
+    socket.on('end', () => {
+      finish(buffer.length > 0 ? classifySpokenData(buffer, dataDirHash) : { kind: PROBE_UNCLEAR });
+    });
     socket.on('error', (err) => {
       const nothingThere = err.code === 'ECONNREFUSED' || err.code === 'ENOENT';
       finish({ kind: nothingThere ? PROBE_REFUSED : PROBE_UNCLEAR });
@@ -398,16 +420,16 @@ export async function acquireInstanceLock({
   /** The POSIX path: walk upward from the derived port. */
   async function claimPort() {
     const basePort = lockPortFor(dataDir);
-    let ownedByOtherDataDirs = 0;
+    let spokenFor = 0;
 
     for (let index = 0; index < LOCK_PORT_WINDOW; index += 1) {
-      if (ownedByOtherDataDirs >= LOCK_PORT_ATTEMPTS) break;
+      if (spokenFor >= LOCK_PORT_ATTEMPTS) break;
       const target = { port: basePort + index };
       const outcome = await claimTarget(target);
 
       if (outcome === 'reserved') continue;
       if (outcome === 'foreign') {
-        ownedByOtherDataDirs += 1;
+        spokenFor += 1;
         continue;
       }
 
@@ -418,8 +440,8 @@ export async function acquireInstanceLock({
 
     throw new Error(
       `Could not claim the kaprek instance lock: ${LOCK_PORT_ATTEMPTS} candidate ports from ` +
-        `${basePort} upwards are all held by kaprek instances running on other data directories. ` +
-        'Stop one of them, or start kaprek against a different data directory.',
+        `${basePort} upwards are all answered by other software or by kaprek instances running on ` +
+        'other data directories. Stop one of them, or start kaprek against a different data directory.',
     );
   }
 

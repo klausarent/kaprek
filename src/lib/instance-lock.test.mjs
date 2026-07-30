@@ -13,6 +13,7 @@ import {
   LOCK_PORT_BASE,
   LOCK_PORT_RANGE,
   LOCK_PORT_WINDOW,
+  MAX_GREETING_BYTES,
   PIPE_PREFIX,
   lockPipePathFor,
   lockPortFor,
@@ -407,56 +408,81 @@ for (const transport of TRANSPORTS) {
 }
 
 // ---------------------------------------------------------------------------
-// What an occupied address means. Only a complete greeting for a different
-// data dir may move the walk along; everything else refuses the start.
+// What an occupied address means — one test per case, plus the line between
+// case 3 and case 4, which is whether anything was actually said.
 // ---------------------------------------------------------------------------
 
-test('foreign software that accepts but never speaks: acquire refuses to start', async () => {
+test('case 2: a greeting naming another data dir moves us to the next port', async () => {
   const dataDir = await tmpDataDirWithFreePorts();
   const basePort = lockPortFor(dataDir);
-  // Silence is what a blocked kaprek holder also produces, so it cannot be
-  // read as "someone else's port".
+  // Two data dirs whose hashes collide on one port: the other instance proves
+  // ownership by naming its own hash, so stepping aside is safe.
+  await listenForeign({ port: basePort }, (socket) => socket.end(foreignGreeting()));
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('case 3: a service that says something other than a greeting moves us to the next port', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  // Provable because a kaprek writes its greeting as the first statement of
+  // its connection handler: whatever can talk to us at all talks kaprek.
+  await listenForeign({ port: basePort }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('case 3: a peer that will not stop talking is a service too', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  // Our greeting is one short line; a flood is somebody else's protocol.
+  await listenForeign({ port: basePort }, (socket) => socket.write('x'.repeat(MAX_GREETING_BYTES + 100)));
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('case 4: something that accepts but never speaks refuses the start', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  // Silence is exactly what a blocked kaprek holder produces, so it proves
+  // nothing and must never read as "someone else's port".
   await listenForeign({ port: basePort }, () => {});
   await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
   // And it did not settle one port over.
   expect(await isBindable({ port: basePort + 1 })).toBe(true);
 });
 
-test('foreign software that sends garbage: acquire refuses to start', async () => {
+test('case 4: a greeting that arrives too late refuses the start, it does not count as a stranger', async () => {
   const dataDir = await tmpDataDirWithFreePorts();
   const basePort = lockPortFor(dataDir);
-  // A half-written greeting from a holder that got descheduled mid-write is
-  // also "not valid JSON", so garbage cannot be proof of a stranger either.
-  await listenForeign({ port: basePort }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
+  // The holder answers correctly, just later than the read budget — the shape
+  // of a real instance under load. Reading that as "foreign" is precisely the
+  // two-holder bug this rule exists to prevent.
+  await listenForeign({ port: basePort }, (socket) => {
+    const timer = setTimeout(() => socket.end(foreignGreeting()), FAST_GREETING_MS * 20);
+    socket.on('close', () => clearTimeout(timer));
+  });
   await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
   expect(await isBindable({ port: basePort + 1 })).toBe(true);
 });
 
-test('a truncated kaprek greeting refuses the start rather than counting as a stranger', async () => {
+test('case 4: an answer cut off mid-line is not evidence about who is speaking', async () => {
   const dataDir = await tmpDataDirWithFreePorts();
   const basePort = lockPortFor(dataDir);
-  await listenForeign({ port: basePort }, (socket) => socket.end('{"kaprek":1,"dataDirHa'));
+  // Half a line and then silence: the peer never finished its sentence, so
+  // there is nothing to classify. Note the difference to case 3, where the
+  // peer said its piece and closed.
+  await listenForeign({ port: basePort }, (socket) => socket.write('{"kaprek":1,"dataDirHa'));
   await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/did not answer with a valid kaprek greeting/);
 });
 
-test('a complete greeting from another data dir is the one thing that moves us to the next port', async () => {
-  const dataDir = await tmpDataDirWithFreePorts();
-  const basePort = lockPortFor(dataDir);
-  // Two data dirs whose hashes collide on one port: the other instance proves
-  // ownership by naming its own hash, so stepping aside is safe here and only
-  // here.
-  await listenForeign({ port: basePort }, (socket) => socket.end(foreignGreeting()));
-  const lock = await acquire(dataDir, { port: 4711 });
-  expect(lock.lockPort).toBe(basePort + 1);
-});
-
-test('an unclear answer is re-asked before the start is refused', async () => {
+test('case 4 is re-asked on the same address before the start is refused', async () => {
   const dataDir = await tmpDataDirWithFreePorts();
   const basePort = lockPortFor(dataDir);
   let connections = 0;
-  // Silent until the last permitted attempt, then answers properly — the
-  // shape of a holder that was blocked and got its turn back. The retry has
-  // to actually re-ask, or this stays a refusal.
+  // Silent until the last permitted attempt, then answers — the shape of a
+  // holder that was blocked and got its turn back. The retry has to actually
+  // re-ask, or this stays a refusal.
   await listenForeign({ port: basePort }, (socket) => {
     connections += 1;
     if (connections >= GREETING_ATTEMPTS) socket.end(foreignGreeting());
@@ -505,12 +531,25 @@ test('every candidate port owned by other data dirs: acquire fails loudly', asyn
 });
 
 test.skipIf(process.platform !== 'win32')(
-  'the pipe transport has no fallback name: a stranger on the name refuses the start',
+  'the pipe transport has no fallback name: a silent stranger on the name refuses the start',
   async () => {
     const dataDir = await tmpDataDir();
     await listenForeign(lockPipePathFor(dataDir), () => {});
     await expect(acquire(dataDir, { port: 4711, platform: PIPE.platform })).rejects.toThrow(
       /did not answer with a valid kaprek greeting/,
+    );
+  },
+);
+
+test.skipIf(process.platform !== 'win32')(
+  'on the pipe there is no next name, so even a provable stranger refuses the start',
+  async () => {
+    const dataDir = await tmpDataDir();
+    // The same answer that would mean "take the next port" on TCP has nowhere
+    // to go here: the name is derived from our own hash.
+    await listenForeign(lockPipePathFor(dataDir), (socket) => socket.end(foreignGreeting()));
+    await expect(acquire(dataDir, { port: 4711, platform: PIPE.platform })).rejects.toThrow(
+      /is held by something that is not this data directory's kaprek/,
     );
   },
 );
