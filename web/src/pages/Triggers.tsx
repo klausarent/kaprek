@@ -32,6 +32,7 @@ import {
   triggerToForm,
   type TriggerFormValue,
 } from "../lib/triggerForm";
+import { decideDelete, decideToggle } from "../lib/triggerActions";
 import { navigateToChats } from "../App";
 
 /** How the escalation level translates into "who decides" (see server.mjs::handleTriggersList's approvalPath). */
@@ -145,6 +146,35 @@ export function ClipboardConsentPanel({
       <div className="trigger-consent-actions">
         <button type="button" className="btn" onClick={onConfirm}>
           I understand, enable it
+        </button>
+        <button type="button" className="btn btn-load-older" onClick={onCancel}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** Same second-step mechanism as the clipboard consent, for the one other irreversible action on this page. */
+export function DeleteConfirmPanel({
+  trigger,
+  onConfirm,
+  onCancel,
+}: {
+  trigger: TriggerStatus;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="trigger-consent">
+      <div className="trigger-consent-title">Delete trigger “{trigger.id}”?</div>
+      <p className="trigger-consent-body">
+        Its prompt, schedule, escalation level and limits are removed. Past runs stay in the chat list. This cannot be
+        undone — if you only want it to stop firing, disable it instead.
+      </p>
+      <div className="trigger-consent-actions">
+        <button type="button" className="btn btn-danger" onClick={onConfirm}>
+          Delete it
         </button>
         <button type="button" className="btn btn-load-older" onClick={onCancel}>
           Cancel
@@ -438,8 +468,10 @@ export default function Triggers() {
   const [fieldError, setFieldError] = useState<{ field: keyof TriggerFormValue; message: string } | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
 
-  // The clipboard trigger currently awaiting its explicit consent step.
-  const [consentFor, setConsentFor] = useState<TriggerStatus | null>(null);
+  // The action waiting for its explicit second step: enabling a clipboard
+  // trigger, or deleting one. Both routed through the pure decideToggle() /
+  // decideDelete() below rather than decided inline here.
+  const [pending, setPending] = useState<{ action: "enable-clipboard" | "delete"; trigger: TriggerStatus } | null>(null);
 
   const reload = async () => {
     try {
@@ -476,14 +508,10 @@ export default function Triggers() {
     }
   };
 
-  /**
-   * Enabling a clipboard trigger routes through the consent panel instead of
-   * flipping the switch — see ClipboardConsentPanel. Disabling never needs a
-   * confirmation, and no other type does either.
-   */
+  /** Routes the switch through decideToggle() — see lib/triggerActions.ts for which case needs consent and why. */
   const handleToggleRequest = (trigger: TriggerStatus, enabled: boolean) => {
-    if (trigger.type === "clipboard" && enabled) {
-      setConsentFor(trigger);
+    if (decideToggle(trigger, enabled) === "needs-consent") {
+      setPending({ action: "enable-clipboard", trigger });
       return;
     }
     void applyToggle(trigger, enabled);
@@ -510,7 +538,7 @@ export default function Triggers() {
     }
   };
 
-  const handleDelete = async (trigger: TriggerStatus) => {
+  const applyDelete = async (trigger: TriggerStatus) => {
     setBusyId(trigger.id);
     try {
       await deleteTrigger(trigger.id);
@@ -521,6 +549,15 @@ export default function Triggers() {
     } finally {
       setBusyId(null);
     }
+  };
+
+  /** Delete always takes the confirmation step — see decideDelete(). */
+  const handleDeleteRequest = (trigger: TriggerStatus) => {
+    if (decideDelete() === "needs-confirm") {
+      setPending({ action: "delete", trigger });
+      return;
+    }
+    void applyDelete(trigger);
   };
 
   const startNew = () => {
@@ -535,6 +572,19 @@ export default function Triggers() {
     setEditing(true);
     setFieldError(null);
     setFormError(null);
+  };
+
+  /**
+   * Edits the form, and clears the server's complaint about a field the moment
+   * that field is touched — a stale "must be between 5 and 1440" under an input
+   * the user has already fixed reads like the fix did not take.
+   */
+  const handleFormChange = (patch: Partial<TriggerFormValue>) => {
+    setForm((prev) => (prev ? { ...prev, ...patch } : prev));
+    if (fieldError && Object.prototype.hasOwnProperty.call(patch, fieldError.field)) setFieldError(null);
+    // Changing the type swaps the whole set of visible fields, so a message
+    // pinned to a field that no longer exists must go too.
+    if (fieldError && patch.type !== undefined) setFieldError(null);
   };
 
   const handleSubmit = async () => {
@@ -570,15 +620,27 @@ export default function Triggers() {
 
       {loadError && <div className="error-box">{loadError}</div>}
 
-      {consentFor && (
+      {pending?.action === "enable-clipboard" && (
         <ClipboardConsentPanel
-          trigger={consentFor}
+          trigger={pending.trigger}
           onConfirm={() => {
-            const target = consentFor;
-            setConsentFor(null);
-            void applyToggle(target, true);
+            const { trigger } = pending;
+            setPending(null);
+            void applyToggle(trigger, true);
           }}
-          onCancel={() => setConsentFor(null)}
+          onCancel={() => setPending(null)}
+        />
+      )}
+
+      {pending?.action === "delete" && (
+        <DeleteConfirmPanel
+          trigger={pending.trigger}
+          onConfirm={() => {
+            const { trigger } = pending;
+            setPending(null);
+            void applyDelete(trigger);
+          }}
+          onCancel={() => setPending(null)}
         />
       )}
 
@@ -589,7 +651,7 @@ export default function Triggers() {
           saving={saving}
           fieldError={fieldError}
           formError={formError}
-          onChange={(patch) => setForm((prev) => (prev ? { ...prev, ...patch } : prev))}
+          onChange={handleFormChange}
           onSubmit={handleSubmit}
           onCancel={() => setForm(null)}
         />
@@ -614,7 +676,7 @@ export default function Triggers() {
               onToggleRequest={handleToggleRequest}
               onFire={handleFire}
               onEdit={startEdit}
-              onDelete={handleDelete}
+              onDelete={handleDeleteRequest}
             />
           ))}
         </div>

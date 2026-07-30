@@ -1,5 +1,5 @@
 import { test, expect, vi } from "vitest";
-import { ClipboardConsentPanel, TriggerForm, TriggerRow } from "./Triggers";
+import { ClipboardConsentPanel, DeleteConfirmPanel, TriggerForm, TriggerRow } from "./Triggers";
 import { emptyTriggerForm } from "../lib/triggerForm";
 import type { TriggerStatus } from "../lib/api";
 import { click, findAll, findByType, findOneByText, render, textOf } from "../test/tree";
@@ -94,6 +94,24 @@ test("the clipboard consent panel names what is read and requires an explicit co
   expect(onConfirm).toHaveBeenCalledTimes(1);
   click(findOneByText(tree, "button", "Cancel"));
   expect(onCancel).toHaveBeenCalledTimes(1);
+});
+
+test("the delete panel spells out what is lost and offers disabling instead", () => {
+  const onConfirm = vi.fn();
+  const onCancel = vi.fn();
+  const tree = render(<DeleteConfirmPanel trigger={triggerStatus()} onConfirm={onConfirm} onCancel={onCancel} />);
+
+  const text = textOf(tree);
+  expect(text).toContain("Delete trigger “nightly-sync”?");
+  expect(text).toContain("cannot be undone");
+  expect(text).toContain("disable it instead");
+
+  click(findOneByText(tree, "button", "Cancel"));
+  expect(onCancel).toHaveBeenCalledTimes(1);
+  expect(onConfirm).not.toHaveBeenCalled();
+
+  click(findOneByText(tree, "button", "Delete it"));
+  expect(onConfirm).toHaveBeenCalledTimes(1);
 });
 
 test("a clipboard trigger without a pattern says so in the consent panel", () => {

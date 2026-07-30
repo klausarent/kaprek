@@ -86,8 +86,18 @@ export function findOneByText(root: TestNode, type: string, label: string): Test
   return matches[0];
 }
 
-/** Clicks a node by invoking its onClick prop. No bubbling — the handler under test must sit on the node itself. */
+/**
+ * Clicks a node by invoking its onClick prop. No bubbling — the handler under
+ * test must sit on the node itself.
+ *
+ * A disabled node throws instead of firing: a real browser never delivers the
+ * click, so calling the handler anyway would let a test like "busy blocks the
+ * second click" pass against a component that had lost its `disabled`.
+ */
 export function click(node: TestNode): void {
+  if (node.props.disabled === true) {
+    throw new Error(`<${node.type}> is disabled — a real click would not reach its handler`);
+  }
   const onClick = node.props.onClick;
   if (typeof onClick !== "function") throw new Error(`<${node.type}> has no onClick prop`);
   (onClick as (event: unknown) => void)({ preventDefault() {}, stopPropagation() {} });
