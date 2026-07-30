@@ -18,6 +18,7 @@
 // late.
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 
 export const LOCK_HEARTBEAT_MS = 5_000;
@@ -123,11 +124,32 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
     await fs.writeFile(lockPath, JSON.stringify(ownState()));
   }
 
+  // The heartbeat ONLY refreshes mtime, it never rewrites content. A content
+  // rewrite (`fs.writeFile` truncates, then writes) opens a window where a
+  // concurrent reader sees an empty file, JSON.parse('') throws, and a
+  // perfectly healthy running server gets reported as "Corrupt instance
+  // lock". Content only ever changes through updatePort(), which is rare
+  // (once, right after startServer() resolves) — the heartbeat's only job is
+  // proving liveness to LOCK_STALE_MS, and mtime alone does that.
+  async function touch() {
+    const now = new Date();
+    await fs.utimes(lockPath, now, now);
+  }
+
+  function holderError(s) {
+    return new InstanceLockHeldError({
+      pid: s.pid,
+      port: s.port,
+      url: s.url ?? urlFor(s.port),
+      startedAt: s.startedAt,
+    });
+  }
+
   /**
    * `canSteal` allows exactly one takeover per acquire call, per the design
-   * doc: if we unlink an orphaned lock and lose the re-create race anyway,
-   * the winner's lock is reported as a normal live holder rather than
-   * re-evaluated for staleness a second time.
+   * doc: if the rename below loses the re-create race anyway, the winner's
+   * lock is reported as a normal live holder rather than re-evaluated for
+   * staleness a second time.
    */
   async function attempt(canSteal, vanishRetriesLeft) {
     try {
@@ -154,28 +176,78 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
     const orphaned = nowFn() - mtimeMs > LOCK_STALE_MS && !isPidAlive(state.pid);
 
     if (orphaned && canSteal) {
-      await fs.unlink(lockPath).catch((err) => {
+      // Takeover via an atomic rename, not unlink+recreate: two starters
+      // racing the same orphaned lock could both `unlink` successfully (the
+      // call does not check what it is deleting), so the second one would
+      // delete the FIRST one's freshly-created lock and then win its own
+      // `wx` too — two live holders. `fs.rename` gives exactly one winner
+      // the destination for a given source path.
+      //
+      // The loser's rename does NOT reliably throw, though — verified with
+      // an isolated `Promise.allSettled([fs.rename(src, destA),
+      // fs.rename(src, destB)])` repro on this repo's Windows/Node 22: both
+      // promises fulfilled, but only one of destA/destB actually existed
+      // afterward. So "our rename resolved" is not proof we hold the file;
+      // only a successful read of OUR OWN destination is.
+      const stealPath = `${lockPath}.steal-${nonce}`;
+      try {
+        await fs.rename(lockPath, stealPath);
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          // Beaten to the rename by another starter's steal (or a
+          // concurrent release()) — not our takeover to finish. Retry with
+          // no further steal rights, per "genau einmal übernehmen".
+          return attempt(false, vanishRetriesLeft);
+        }
+        throw err;
+      }
+
+      // Confirm we actually moved the orphaned lock we verified above, not
+      // a fresh one that a different starter wrote to lockPath between our
+      // read and our rename (rename moves whatever is currently at the
+      // path, it does not check content) — and confirm our rename actually
+      // landed at all, per the platform quirk noted above.
+      let stolenRaw;
+      try {
+        stolenRaw = await fs.readFile(stealPath, 'utf8');
+      } catch (err) {
+        if (err.code === 'ENOENT') {
+          return attempt(false, vanishRetriesLeft);
+        }
+        throw err;
+      }
+      let stolenState;
+      try {
+        stolenState = JSON.parse(stolenRaw);
+      } catch {
+        stolenState = null;
+      }
+
+      if (stolenState?.nonce !== state.nonce) {
+        // Wrong file — hand it back and report the holder we actually
+        // grabbed (accurate and current), not the stale one we originally
+        // read.
+        await fs.rename(stealPath, lockPath);
+        throw holderError(stolenState ?? state);
+      }
+
+      await fs.unlink(stealPath).catch((err) => {
         if (err.code !== 'ENOENT') throw err;
       });
       return attempt(false, vanishRetriesLeft);
     }
 
-    throw new InstanceLockHeldError({
-      pid: state.pid,
-      port: state.port,
-      url: state.url ?? urlFor(state.port),
-      startedAt: state.startedAt,
-    });
+    throw holderError(state);
   }
 
   await attempt(true, MAX_VANISH_RETRIES);
 
   const timer = setInterval(() => {
-    // Best-effort: a transient write failure self-heals on the next tick,
-    // and a permanent one (e.g. dataDir removed) surfaces as an orphaned
-    // lock to the next starter, which is the correct fail-open-to-recovery
-    // outcome rather than crashing an otherwise-healthy running server.
-    writeOwn().catch(() => {});
+    // Best-effort: a transient failure self-heals on the next tick, and a
+    // permanent one (e.g. dataDir removed) surfaces as an orphaned lock to
+    // the next starter, which is the correct fail-open-to-recovery outcome
+    // rather than crashing an otherwise-healthy running server.
+    touch().catch(() => {});
   }, heartbeatMs);
   timer.unref();
 
@@ -184,6 +256,7 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
   return {
     /** Rewrites the lock with the now-known real port. See the doc comment above on why port starts undefined. */
     async updatePort(newPort) {
+      if (released) return;
       currentPort = newPort;
       await writeOwn();
     },
@@ -214,6 +287,36 @@ export async function acquireInstanceLock({ dataDir, port, nowFn = Date.now, hea
       await fs.unlink(lockPath).catch((err) => {
         if (err.code !== 'ENOENT') throw err;
       });
+    },
+    /**
+     * Synchronous best-effort twin of release(), for process.on('exit')
+     * (see bin/cli.mjs): 'exit' handlers cannot await, so this uses the
+     * fs sync API instead of fs/promises. Same nonce check, same
+     * fail-silent-on-anything-unexpected posture — a swallowed error here
+     * just leaves the lock for LOCK_STALE_MS to reclaim, never worse.
+     */
+    releaseSync() {
+      if (released) return;
+      released = true;
+      clearInterval(timer);
+      let raw;
+      try {
+        raw = fsSync.readFileSync(lockPath, 'utf8');
+      } catch {
+        return;
+      }
+      let state;
+      try {
+        state = JSON.parse(raw);
+      } catch {
+        return;
+      }
+      if (state.nonce !== nonce) return;
+      try {
+        fsSync.unlinkSync(lockPath);
+      } catch {
+        // best-effort
+      }
     },
   };
 }

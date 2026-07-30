@@ -2,6 +2,7 @@
 // processes. Run: npx vitest run src/cli/cli.test.mjs
 import { test, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -135,4 +136,34 @@ test('a second start on the same dataDir refuses instead of silently falling bac
   await expect(fetch(`http://127.0.0.1:${port + 1}/api/projects`)).rejects.toThrow();
 
   first.kill();
+});
+
+test('a failed startServer() releases the instance lock instead of leaving it stuck for LOCK_STALE_MS', async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-test-'));
+  const port = 20000 + Math.floor(Math.random() * 20000);
+
+  // Occupies every port startWithPortRetry() would try (MAX_PORT_ATTEMPTS in
+  // bin/cli.mjs is 10; a wider range here so this test does not depend on
+  // that exact value) so startServer() is guaranteed to exhaust its retries
+  // and throw — the failure path this test is actually about.
+  const blockers = [];
+  for (let i = 0; i <= 20; i += 1) {
+    const blocker = net.createServer();
+    await new Promise((resolve, reject) => {
+      blocker.once('error', reject);
+      blocker.listen(port + i, '127.0.0.1', resolve);
+    });
+    blockers.push(blocker);
+  }
+
+  try {
+    const child = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
+    const { code } = await collectRun(child);
+    expect(code).not.toBe(0);
+
+    const lockPath = path.join(childDataDir, 'instance.lock');
+    expect(fs.existsSync(lockPath)).toBe(false);
+  } finally {
+    await Promise.all(blockers.map((blocker) => new Promise((resolve) => blocker.close(resolve))));
+  }
 });

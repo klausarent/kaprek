@@ -6,7 +6,6 @@ import { spawn } from 'node:child_process';
 import {
   acquireInstanceLock,
   InstanceLockHeldError,
-  LOCK_HEARTBEAT_MS,
   LOCK_STALE_MS,
 } from './instance-lock.mjs';
 
@@ -109,13 +108,71 @@ test('acquireInstanceLock: updatePort() rewrites the lock with the real port onc
   await lock.release();
 });
 
-test('acquireInstanceLock: heartbeat keeps the lock fresh so it is never mistaken for stale', async () => {
+test('acquireInstanceLock: heartbeat actually refreshes mtime over several ticks', async () => {
   const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
   const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
-  await new Promise((resolve) => setTimeout(resolve, LOCK_HEARTBEAT_MS > 100 ? 100 : LOCK_HEARTBEAT_MS + 50));
-  const stat = await fs.stat(path.join(dataDir, 'instance.lock'));
-  expect(Date.now() - stat.mtimeMs).toBeLessThan(LOCK_STALE_MS);
+  const before = (await fs.stat(lockPath)).mtimeMs;
+  // A fixed 100ms wait (< LOCK_STALE_MS) proved nothing on its own — the file
+  // is that fresh right after acquire() even with no heartbeat at all. Wait
+  // for several heartbeat ticks and assert the mtime actually moved forward.
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const after = (await fs.stat(lockPath)).mtimeMs;
+  expect(after).toBeGreaterThan(before);
   await lock.release();
+});
+
+test('acquireInstanceLock: heartbeat reclaims an mtime that was artificially aged, without touching content', async () => {
+  const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
+  const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
+  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const stat = await fs.stat(lockPath);
+  expect(Date.now() - stat.mtimeMs).toBeLessThan(LOCK_STALE_MS);
+  // The heartbeat must touch mtime only — content (and in particular JSON
+  // validity) is untouched between acquire() and updatePort().
+  const raw = await fs.readFile(lockPath, 'utf8');
+  expect(JSON.parse(raw).pid).toBe(process.pid);
+  await lock.release();
+});
+
+test('acquireInstanceLock: two concurrent acquires racing the same orphaned lock never both win', async () => {
+  const dataDir = await tmpDataDir();
+  const pid = await deadPid();
+  await writeLockFile(dataDir, { pid, port: 4711, nonce: 'orphan', startedAt: 0 });
+  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
+
+  // No await between the two calls: both see the same orphaned lock and
+  // both attempt the takeover. The old unlink-then-recreate mechanism let
+  // the second unlink delete the first acquirer's freshly-created lock,
+  // then win its own create too — two live holders. The rename-based steal
+  // must leave exactly one winner.
+  const results = await Promise.allSettled([
+    acquireInstanceLock({ dataDir, port: 5001 }),
+    acquireInstanceLock({ dataDir, port: 5002 }),
+  ]);
+
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  expect(fulfilled).toHaveLength(1);
+  expect(rejected).toHaveLength(1);
+  expect(rejected[0].reason).toMatchObject({ name: 'InstanceLockHeldError' });
+
+  // Exactly one heartbeat is now writing this file — the pid on disk must
+  // agree with the one lock handle that actually won.
+  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
+  expect(JSON.parse(raw).pid).toBe(process.pid);
+
+  await fulfilled[0].value.release();
+});
+
+test('acquireInstanceLock: updatePort() after release() does not resurrect the lock file', async () => {
+  const dataDir = await tmpDataDir();
+  const lock = await acquireInstanceLock({ dataDir, port: 4711 });
+  await lock.release();
+  await lock.updatePort(4712);
+  await expect(fs.stat(path.join(dataDir, 'instance.lock'))).rejects.toThrow();
 });
 
 test('acquireInstanceLock re-exports InstanceLockHeldError for instanceof checks', async () => {

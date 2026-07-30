@@ -174,7 +174,15 @@ async function main() {
     lock = await acquireInstanceLock({ dataDir, port: undefined });
   } catch (err) {
     if (err instanceof InstanceLockHeldError) {
-      console.error(`kaprek is already running at ${err.url} (pid ${err.pid})`);
+      // err.url is null while the holder is between acquiring the lock and
+      // calling updatePort() below — exactly the narrow double-click window
+      // this whole module exists to close, so it needs its own honest
+      // message rather than printing "at null".
+      console.error(
+        err.url
+          ? `kaprek is already running at ${err.url} (pid ${err.pid})`
+          : `kaprek is already starting (pid ${err.pid}), no port yet`,
+      );
     } else {
       console.error(`Failed to acquire instance lock: ${err.message}`);
     }
@@ -203,11 +211,25 @@ async function main() {
     openBrowser(url);
   }
 
-  process.on('SIGINT', () => {
+  // Best-effort safety net for exit paths that never reach the SIGINT/SIGTERM
+  // handlers below — e.g. kaprek holds SSE streams (approval/chat), so with a
+  // browser tab left open server.close()'s callback there can hang instead of
+  // ever running. 'exit' handlers must be synchronous, hence releaseSync()
+  // (see src/lib/instance-lock.mjs) instead of release(). Idempotent with the
+  // handlers below: whichever runs first marks the lock released, the other
+  // becomes a no-op.
+  process.on('exit', () => {
+    lock.releaseSync();
+  });
+
+  function shutdown() {
     server.close(() => {
       lock.release().finally(() => process.exit(0));
     });
-  });
+  }
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }
 
 main();
