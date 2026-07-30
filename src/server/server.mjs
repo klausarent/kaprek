@@ -38,6 +38,11 @@ const TASK_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const DEFAULT_HARNESS_NAME = 'claude-code';
 const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
+// Fail-closed: an approval nobody answers must not keep the CLI (and the
+// chat's turn) blocked forever — the server layer denies it on its own
+// after this long. Overridable per startServer() call so tests don't wait
+// 10 real minutes.
+const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -617,6 +622,102 @@ export function createSseQueue(res) {
 }
 
 /**
+ * Builds this turn's onApprovalRequest handler (passed to runTurn(), see
+ * src/orchestrator/run.mjs), closing over the SSE `enqueue()` already open
+ * for this turn's response. Per approval request:
+ *   1. registers a pending entry (keyed by the CLI's own request_id, unique
+ *      across every chat — see `pendingApprovals`, a server-wide map like
+ *      `chatAbortControllers`) carrying the promise's own `resolve`,
+ *   2. streams the (already-redacted, see run.mjs's wrapping) request to the
+ *      browser as one more SSE frame,
+ *   3. returns the promise — resolved by POST /api/approvals/<id> below, by
+ *      the timeout further down, or by handleChatTurn's cleanup on turn end/
+ *      cancel/disconnect (see cleanupApprovalsForChat()).
+ * Never rejects: every path resolves with an ApprovalDecision, deny being
+ * the fail-closed default.
+ */
+function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs }) {
+  return (request) =>
+    new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const entry = pendingApprovals.get(request.id);
+        if (!entry || entry.decided) return;
+        pendingApprovals.delete(request.id);
+        resolve({ behavior: 'deny', message: 'approval timed out' });
+      }, approvalTimeoutMs);
+
+      pendingApprovals.set(request.id, { chatId, decided: false, resolve, timer, createdAt: Date.now() });
+      enqueue({ type: 'approval', ...request });
+    });
+}
+
+/**
+ * Resolves (or garbage-collects) every pending approval belonging to
+ * `chatId` — called once per turn, from handleChatTurn's finally block, so
+ * turn end, cancel (POST /api/chat/<id>/cancel), and client disconnect all
+ * go through this ONE cleanup path (all three simply end the same in-flight
+ * runTurn() call, which always reaches this finally). An approval nobody
+ * ever answers must not dangle forever once its turn is gone — a HUNG
+ * onApprovalRequest promise inside the harness would otherwise never
+ * resolve, leaking an async call and (if a caller ever awaited on it) a
+ * hung request. `entry.chatId !== chatId` entries (a DIFFERENT chat's still
+ * in-flight approval) are left completely untouched — see the module's
+ * approval-route doc comment.
+ */
+function cleanupApprovalsForChat(pendingApprovals, chatId) {
+  for (const [id, entry] of pendingApprovals) {
+    if (entry.chatId !== chatId) continue;
+    clearTimeout(entry.timer);
+    if (!entry.decided) {
+      entry.decided = true;
+      entry.resolve({ behavior: 'deny', message: 'turn ended' });
+    }
+    pendingApprovals.delete(id);
+  }
+}
+
+/**
+ * POST /api/approvals/<id> — answers a pending tool-use approval (see
+ * makeApprovalHandler() above). Body: `{behavior:'allow'|'deny', message?}`.
+ * `message` is only meaningful for a deny; an allow always resolves with a
+ * plain `{behavior:'allow'}` (see adapter.mjs's ApprovalDecision — this
+ * route never accepts an `updatedInput` override from the browser, only the
+ * CLI's own proposed input is ever allowed through).
+ */
+async function handleApprovalDecision(req, res, id, pendingApprovals) {
+  if (!isSafeId(id)) {
+    sendJson(res, 400, { error: 'invalid approval id' });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const behavior = body.data?.behavior;
+  if (behavior !== 'allow' && behavior !== 'deny') {
+    sendJson(res, 400, { error: 'behavior must be "allow" or "deny"' });
+    return;
+  }
+
+  const entry = pendingApprovals.get(id);
+  if (!entry) {
+    sendJson(res, 404, { error: 'unknown or expired approval' });
+    return;
+  }
+  if (entry.decided) {
+    sendJson(res, 409, { error: 'approval already decided' });
+    return;
+  }
+
+  entry.decided = true;
+  clearTimeout(entry.timer);
+  const message = typeof body.data?.message === 'string' ? body.data.message : undefined;
+  entry.resolve(behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' });
+  sendJson(res, 200, { ok: true });
+}
+
+/**
  * POST /api/chat/turn — runs one chat turn and streams it back as SSE.
  *
  * The chat is resolved (created if `chatId` is omitted, looked up if given)
@@ -642,7 +743,11 @@ export function createSseQueue(res) {
  * them (chats.get()/createChat()/mkdirSync() are all synchronous), so two
  * concurrent requests for the same chatId can never both pass the check.
  */
-async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools }) {
+async function handleChatTurn(
+  req,
+  res,
+  { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools, pendingApprovals, approvalTimeoutMs },
+) {
   const body = await readJsonBody(req);
   if (!body.ok) {
     sendJson(res, body.status, { error: body.error });
@@ -694,6 +799,17 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
   const onClientClose = () => controller.abort();
   res.on('close', onClientClose);
 
+  // DEADLOCK GUARD: a pending approval must be resolved the MOMENT abort is
+  // requested (cancel route or client disconnect, both call
+  // controller.abort()), not only once `await runTurn(...)` below returns —
+  // the harness is itself AWAITING that approval's decision, so it would
+  // never return in the first place if cleanup waited for it. The `finally`
+  // block's own cleanupApprovalsForChat() call further down stays as a
+  // second, idempotent pass for any approval that outlives the turn without
+  // ever going through abort (e.g. it resolves on its own right as the turn
+  // is wrapping up for some other reason).
+  controller.signal.addEventListener('abort', () => cleanupApprovalsForChat(pendingApprovals, chatId));
+
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -720,6 +836,7 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
       // so the response is only ended once every enqueued frame, including
       // this one, has actually reached the socket.
       onEvent: (event) => enqueue(event),
+      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs }),
       signal: controller.signal,
     });
     await enqueue({ type: 'turn-complete', ...result });
@@ -736,6 +853,10 @@ async function handleChatTurn(req, res, { getChats, harness, harnessName, dataDi
     // slower-finishing turn's finally-block erase a different, still-running
     // turn's controller if the two were ever to overlap for the same key.
     if (chatAbortControllers.get(chatId) === controller) chatAbortControllers.delete(chatId);
+    // Turn end, cancel, AND client disconnect all reach here (see this
+    // function's own doc comment) — the single place that must never leave
+    // a pending approval for this chat dangling (SECURITY: fail-closed).
+    cleanupApprovalsForChat(pendingApprovals, chatId);
     if (!res.writableEnded) res.end();
   }
 }
@@ -884,6 +1005,8 @@ async function handleRequest(
     chatAbortControllers,
     permissionMode,
     allowedTools,
+    pendingApprovals,
+    approvalTimeoutMs,
   },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
@@ -940,7 +1063,25 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'chat') {
-      await handleChatRoutes(req, res, segments, { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools });
+      await handleChatRoutes(req, res, segments, {
+        getChats,
+        harness,
+        harnessName,
+        dataDir,
+        chatAbortControllers,
+        permissionMode,
+        allowedTools,
+        pendingApprovals,
+        approvalTimeoutMs,
+      });
+      return;
+    }
+    if (segments.length === 3 && segments[1] === 'approvals') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleApprovalDecision(req, res, segments[2], pendingApprovals);
       return;
     }
 
@@ -1015,6 +1156,7 @@ export function startServer({
   harnessName = DEFAULT_HARNESS_NAME,
   permissionMode = 'default',
   allowedTools = null,
+  approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -1050,6 +1192,12 @@ export function startServer({
   // SSE request currently streaming that chat's turn.
   const chatAbortControllers = new Map();
 
+  // One entry per in-flight tool-use approval, keyed by the CLI's own
+  // request_id — server-WIDE (not per-chat), since POST /api/approvals/<id>
+  // carries no chatId of its own; see makeApprovalHandler()/
+  // handleApprovalDecision()/cleanupApprovalsForChat() above.
+  const pendingApprovals = new Map();
+
   const server = http.createServer((req, res) => {
     handleRequest(req, res, {
       rootDir,
@@ -1067,6 +1215,8 @@ export function startServer({
       chatAbortControllers,
       permissionMode,
       allowedTools,
+      pendingApprovals,
+      approvalTimeoutMs,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });

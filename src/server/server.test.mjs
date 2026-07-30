@@ -1270,3 +1270,209 @@ test('chat: the first bytes of a still-running turn do not yet contain turn-comp
   expect(text).not.toContain('"turn-complete"');
   await reader.cancel();
 });
+
+// --- Approval chain (Task 6a) -------------------------------------------------
+
+/**
+ * A harness that asks for exactly one approval, then reports back what it
+ * decided. `postDecisionDelayMs` gives a test a real window to fire a SECOND
+ * POST /api/approvals/<id> before the turn (and its finally-block cleanup,
+ * see cleanupApprovalsForChat()) removes the now-decided entry — without it,
+ * a harness that finishes essentially synchronously after the decision would
+ * make the "second POST -> 409" case unobservably racy against turn-end
+ * cleanup.
+ */
+function approvalHarness({ request, postDecisionDelayMs = 30 }) {
+  return {
+    async startTurn({ onEvent, onApprovalRequest, signal } = {}) {
+      const decision = await onApprovalRequest(request);
+      if (postDecisionDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, postDecisionDelayMs));
+      if (signal?.aborted) {
+        return { sessionId: null, costUsd: null, usage: null, stopReason: 'aborted', error: null };
+      }
+      onEvent?.({ type: 'text', text: `decision was ${decision.behavior}${decision.message ? `: ${decision.message}` : ''}` });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0.001, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('chat: approval — SSE delivers an "approval" frame, POST /api/approvals/<id> resolves it, the turn continues with that decision', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'approve-me-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
+    harnessName: 'fake',
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'approve please' }),
+  });
+
+  let approvalFrame = null;
+  const frames = await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && approvalFrame === null) {
+      approvalFrame = frame;
+      const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'allow' });
+      expect(decideRes.status).toBe(200);
+      expect(await decideRes.json()).toEqual({ ok: true });
+    }
+  });
+
+  expect(approvalFrame).toMatchObject({ type: 'approval', id: 'approve-me-1', toolName: 'Bash', input: { command: 'ls' } });
+  const textFrame = frames.find((f) => f.type === 'text');
+  expect(textFrame.text).toBe('decision was allow');
+  expect(frames.at(-1)).toMatchObject({ type: 'turn-complete', stopReason: 'result' });
+});
+
+test('chat: approval — a second POST to the same id is rejected 409, an unrelated/unknown id is rejected 404', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'dup-id-1', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'dup test' }),
+  });
+
+  let firstStatus = null;
+  let secondStatus = null;
+  await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && firstStatus === null) {
+      firstStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'deny' })).status;
+      secondStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'allow' })).status;
+    }
+  });
+
+  expect(firstStatus).toBe(200);
+  expect(secondStatus).toBe(409);
+
+  const unknownRes = await postJson(`${url}/api/approvals/00000000-0000-0000-0000-000000000000`, { behavior: 'allow' });
+  expect(unknownRes.status).toBe(404);
+});
+
+test('chat: approval — POST /api/approvals/<id> rejects a missing/invalid behavior with 400', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'bad-body-1', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'bad body test' }),
+  });
+
+  let badStatus = null;
+  await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && badStatus === null) {
+      badStatus = (await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'maybe' })).status;
+      await postJson(`${url}/api/approvals/${frame.id}`, { behavior: 'deny' }); // let the turn actually finish
+    }
+  });
+
+  expect(badStatus).toBe(400);
+});
+
+test('chat: approval — cancelling the chat resolves an open approval as deny("turn ended"), the harness observes it (no deadlock)', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'cancel-me-1', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'cancel while pending' }),
+  });
+
+  let chatId = null;
+  const frames = await readSse(res, async (frame) => {
+    if (frame.type === 'chat-id') chatId = frame.chatId;
+    if (frame.type === 'approval') {
+      const cancelRes = await postJson(`${url}/api/chat/${chatId}/cancel`);
+      expect(cancelRes.status).toBe(200);
+    }
+  });
+
+  expect(frames.at(-1)).toMatchObject({ type: 'turn-complete', stopReason: 'aborted' });
+
+  // The approval id is gone from the pending map once the turn is cleaned
+  // up — deciding it now is an unknown/expired id, not a "double decision".
+  const lateRes = await postJson(`${url}/api/approvals/cancel-me-1`, { behavior: 'allow' });
+  expect(lateRes.status).toBe(404);
+});
+
+test('chat: approval — closing the SSE response (client disconnect) also resolves an open approval as deny, without deadlocking the harness', async () => {
+  let capturedDecision = null;
+  const harness = {
+    async startTurn({ onApprovalRequest, signal } = {}) {
+      capturedDecision = await onApprovalRequest({ id: 'disconnect-me-1', toolName: 'Bash', input: {} });
+      return { sessionId: null, costUsd: null, usage: null, stopReason: signal?.aborted ? 'aborted' : 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness, harnessName: 'fake' });
+
+  const clientController = new AbortController();
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'disconnect while pending' }),
+    signal: clientController.signal,
+  });
+
+  // Read only up to the approval frame, then simulate the client going away
+  // instead of ever answering it — mirrors this file's existing client-
+  // disconnect test pattern.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let sawApproval = false;
+  while (!sawApproval) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      const raw = buffer.slice(0, idx);
+      buffer = buffer.slice(idx + 2);
+      if (!raw.startsWith('data: ')) continue;
+      if (JSON.parse(raw.slice('data: '.length)).type === 'approval') sawApproval = true;
+    }
+  }
+  expect(sawApproval).toBe(true);
+
+  clientController.abort();
+  await reader.cancel().catch(() => {});
+
+  const timedOut = Symbol('timeout');
+  const outcome = await Promise.race([
+    (async () => {
+      while (capturedDecision === null) await new Promise((resolve) => setTimeout(resolve, 10));
+      return capturedDecision;
+    })(),
+    new Promise((resolve) => setTimeout(() => resolve(timedOut), 3000)),
+  ]);
+  expect(outcome).toEqual({ behavior: 'deny', message: 'turn ended' });
+});
+
+test('chat: approval — an unanswered approval is auto-denied once approvalTimeoutMs elapses', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'timeout-me-1', toolName: 'Bash', input: {} } }),
+    harnessName: 'fake',
+    approvalTimeoutMs: 20,
+  });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'never answer this' }),
+  });
+
+  const frames = await readSse(res);
+  expect(frames.some((f) => f.type === 'approval')).toBe(true);
+  const textFrame = frames.find((f) => f.type === 'text');
+  expect(textFrame.text).toBe('decision was deny: approval timed out');
+});
