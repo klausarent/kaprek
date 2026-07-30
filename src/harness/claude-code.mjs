@@ -105,6 +105,16 @@ function killChildTree(child) {
   }
 }
 
+// Strips ANSI escape sequences (e.g. color codes a hook or the CLI itself
+// may have embedded in decision_reason) before an ApprovalRequest's `reason`
+// is handed to onApprovalRequest — see adapter.mjs's ApprovalRequest typedef.
+const ANSI_ESCAPE_RE = /\x1b\[[0-9;]*[a-zA-Z]/g;
+
+/** Removes ANSI escape sequences from `str`; non-strings pass through unchanged. */
+function stripAnsi(str) {
+  return typeof str === 'string' ? str.replace(ANSI_ESCAPE_RE, '') : str;
+}
+
 /** Extracts readable text from a tool_result content field (string or block array); mirrors src/parser/parse.mjs::toolResultText. */
 function toolResultText(content) {
   if (typeof content === 'string') return content;
@@ -186,13 +196,41 @@ function mapLine(obj) {
   return [];
 }
 
-/** Builds the claude CLI argv (without the command name itself) for one turn. */
-function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools }) {
+/**
+ * Normalizes a `control_request`/`can_use_tool` line's `request` object into
+ * the ApprovalRequest shape onApprovalRequest expects (see adapter.mjs).
+ * `decision_reason` is stripped of ANSI escapes here, once, so nothing
+ * downstream (chat store, SSE, a handler's own logging) ever sees them.
+ */
+function normalizeApprovalRequest(requestId, request) {
+  return {
+    id: requestId,
+    toolName: request.tool_name,
+    displayName: request.display_name ?? request.tool_name,
+    input: request.input ?? {},
+    description: request.description ?? null,
+    agentId: request.agent_id ?? null,
+    toolUseId: request.tool_use_id ?? null,
+    reasonType: request.decision_reason_type ?? null,
+    reason: stripAnsi(request.decision_reason ?? null),
+    suggestions: request.permission_suggestions ?? null,
+  };
+}
+
+/**
+ * Builds the claude CLI argv (without the command name itself) for one turn.
+ * `--permission-prompt-tool stdio` is only added when an approval handler is
+ * actually configured — without one, a nonexistent `can_use_tool` channel
+ * would just hang the CLI waiting for a control_response nobody sends.
+ */
+function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler }) {
   const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose'];
   if (sessionId) args.push('--resume', sessionId);
   if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);
   if (permissionMode) args.push('--permission-mode', permissionMode);
   if (allowedTools && allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(','));
+  if (settingsPath) args.push('--settings', settingsPath);
+  if (hasApprovalHandler) args.push('--permission-prompt-tool', 'stdio');
   return args;
 }
 
@@ -212,7 +250,9 @@ export async function startTurn({
   mcpConfigPath,
   permissionMode,
   allowedTools,
+  settingsPath,
   onEvent,
+  onApprovalRequest,
   signal,
   spawnFn = nodeSpawn,
   timeoutMs = DEFAULT_TIMEOUT_MS,
@@ -222,7 +262,7 @@ export async function startTurn({
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
   }
 
-  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools });
+  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler: typeof onApprovalRequest === 'function' });
 
   const { command, useShell } = resolveCli();
 
@@ -267,6 +307,26 @@ export async function startTurn({
     let killReason = null;
     let killGiveUpTimer = null;
     let timeoutTimer = null;
+    // Tracks request_ids currently awaiting onApprovalRequest — bookkeeping
+    // only (each in-flight request is otherwise a self-contained async call,
+    // see handleApprovalRequest() below); cleared on turn end so a decision
+    // that resolves after the turn already finished is recognizable as stale.
+    const pendingApprovals = new Map();
+    // stdin must stay open until the turn actually ends (result/error/abort/
+    // timeout), NOT right after the prompt is written — closing it early is
+    // what breaks the can_use_tool approval channel (anthropics/claude-code
+    // #34046: the CLI treats stdin EOF as "no more control_responses are
+    // ever coming" and the whole approval round-trip stops working).
+    let stdinEnded = false;
+    const endStdin = () => {
+      if (stdinEnded) return;
+      stdinEnded = true;
+      try {
+        child.stdin?.end();
+      } catch {
+        // already closed/errored — nothing to do
+      }
+    };
 
     // Every onEvent() call goes through here: a throwing consumer must never
     // take down this harness (let alone the whole server process) — the
@@ -280,12 +340,89 @@ export async function startTurn({
       }
     };
 
+    // Writes exactly one control_response line for `requestId`. Guarded by
+    // stdinEnded so a decision that resolves after the turn has already
+    // ended (turn aborted/timed out/finished while onApprovalRequest was
+    // still pending) never attempts a write-after-end / EPIPE.
+    const writeControlResponse = (requestId, response) => {
+      pendingApprovals.delete(requestId);
+      if (stdinEnded) return;
+      try {
+        child.stdin?.write(`${JSON.stringify({ type: 'control_response', response })}\n`);
+      } catch {
+        // stdin closed/errored concurrently — best effort, same as the
+        // prompt write below and the stdin 'error' handler further down.
+      }
+    };
+
+    // Handles one `can_use_tool` control_request end to end: normalize →
+    // await onApprovalRequest → write exactly one control_response. Not
+    // awaited by the caller (the readline 'line' handler below) — several
+    // requests (e.g. from parallel subagents, each with their own agentId)
+    // run concurrently, none of them serialized behind another.
+    const handleApprovalRequest = async (requestId, rawRequest) => {
+      const request = normalizeApprovalRequest(requestId, rawRequest);
+      pendingApprovals.set(requestId, true);
+      safeEmit({ type: 'approval', phase: 'requested', ...request });
+
+      if (typeof onApprovalRequest !== 'function') {
+        // Fail-closed: no handler configured means every request is denied,
+        // never silently allowed.
+        writeControlResponse(requestId, {
+          subtype: 'success',
+          request_id: requestId,
+          response: { behavior: 'deny', message: 'no approval handler configured', interrupt: false },
+        });
+        safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'deny' });
+        return;
+      }
+
+      let decision;
+      try {
+        decision = await onApprovalRequest(request);
+      } catch (err) {
+        // A throwing/rejecting handler is our own bug, not a reason to kill
+        // the CLI's turn — report it as a control-response error and let the
+        // turn keep running (see adapter.mjs's onApprovalRequest contract).
+        writeControlResponse(requestId, {
+          subtype: 'error',
+          request_id: requestId,
+          error: err?.message ?? String(err),
+        });
+        safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'error' });
+        return;
+      }
+
+      if (decision?.behavior === 'allow') {
+        writeControlResponse(requestId, {
+          subtype: 'success',
+          request_id: requestId,
+          response: {
+            behavior: 'allow',
+            updatedInput: decision.updatedInput ?? request.input,
+            toolUseID: request.toolUseId,
+          },
+        });
+        safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'allow' });
+        return;
+      }
+
+      writeControlResponse(requestId, {
+        subtype: 'success',
+        request_id: requestId,
+        response: { behavior: 'deny', message: decision?.message ?? 'denied', interrupt: false },
+      });
+      safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'deny' });
+    };
+
     const finish = (result) => {
       if (resolved) return;
       resolved = true;
       if (killGiveUpTimer) clearTimeout(killGiveUpTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       if (signal) signal.removeEventListener('abort', onAbort);
+      pendingApprovals.clear();
+      endStdin();
       resolve({ droppedLines, warnings: onEventErrors, ...result });
     };
 
@@ -354,6 +491,22 @@ export async function startTurn({
       } catch {
         return; // malformed/half-written line: skip, keep going
       }
+
+      // control_request is a stdin/stdout control-channel message, not a
+      // stream-json turn event — handled here, never passed to mapLine()
+      // (which would either drop it silently or, worse, mis-map it as some
+      // other event type). Only 'can_use_tool' is a request we understand;
+      // any other subtype is ignored but recorded as a warning, never
+      // crashes the turn.
+      if (obj.type === 'control_request') {
+        if (obj.request?.subtype === 'can_use_tool') {
+          handleApprovalRequest(obj.request_id, obj.request);
+        } else {
+          onEventErrors.push(`ignored control_request subtype: ${obj.request?.subtype ?? 'unknown'}`);
+        }
+        return;
+      }
+
       for (const event of mapLine(obj)) {
         if (event.type === 'init' && event.sessionId) latestSessionId = event.sessionId;
         if (event.type === 'result') {
@@ -396,7 +549,8 @@ export async function startTurn({
 
     try {
       child.stdin?.write(`${JSON.stringify({ type: 'user', message: { role: 'user', content: prompt } })}\n`);
-      child.stdin?.end();
+      // stdin is deliberately NOT closed here — see endStdin() above. It is
+      // closed exactly once, from finish(), once the turn actually ends.
     } catch {
       // stdin already closed/errored (e.g. the CLI exited immediately) — the
       // 'error'/'close' handlers above take it from here.

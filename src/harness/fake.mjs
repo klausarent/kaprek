@@ -6,23 +6,33 @@
 
 /**
  * Creates a fake harness backed by a fixed script.
- * @param {{script?: import('./adapter.mjs').NormalizedEvent[]}} options
+ * @param {{script?: (import('./adapter.mjs').NormalizedEvent | {approval: object})[]}} options
  *   script: normalized events played back through onEvent(), in order. A
  *   'result' event's fields (sessionId, costUsd, usage, isError) become the
  *   resolved TurnResult; a script with no 'result' event resolves with
  *   stopReason 'error', mirroring claude-code.mjs's own "process ended
- *   without a result" case.
- * @returns {{startTurn: (options: import('./adapter.mjs').StartTurnOptions) => Promise<import('./adapter.mjs').TurnResult>}}
+ *   without a result" case. A `{approval: {toolName, input, ...}}` entry is
+ *   not a NormalizedEvent — it calls onApprovalRequest(request) with that
+ *   object (defaulted to a minimal valid ApprovalRequest, see below), awaits
+ *   the decision, and records it so orchestrator/server tests can assert on
+ *   it without a real CLI process — see the harness's `approvalLog` below.
+ * @returns {{startTurn: (options: import('./adapter.mjs').StartTurnOptions) => Promise<import('./adapter.mjs').TurnResult>, approvalLog: Array<{request: object, decision: object|null, error: string|null}>}}
  */
 export function createFakeHarness({ script = [] } = {}) {
-  async function startTurn({ sessionId: requestedSessionId, onEvent, signal } = {}) {
+  // Every `{approval: ...}` script entry's request/decision pair, in the
+  // order they were processed — lets a test assert exactly what was asked
+  // and what onApprovalRequest answered, without a real CLI/control-channel.
+  const approvalLog = [];
+  let approvalCounter = 0;
+
+  async function startTurn({ sessionId: requestedSessionId, onEvent, onApprovalRequest, signal } = {}) {
     let sessionId = requestedSessionId ?? null;
     let costUsd = null;
     let usage = null;
     let isError = false;
     let sawResult = false;
 
-    for (const event of script) {
+    for (const entry of script) {
       // Yield to the microtask queue so a caller that calls signal's
       // AbortController.abort() from a timer/promise between events can
       // actually interrupt playback, not just abort before/after it.
@@ -31,6 +41,24 @@ export function createFakeHarness({ script = [] } = {}) {
         return { sessionId, costUsd, usage, stopReason: 'aborted', error: null };
       }
 
+      if ('approval' in entry) {
+        approvalCounter += 1;
+        const request = { id: `fake-approval-${approvalCounter}`, toolName: 'Bash', input: {}, ...entry.approval };
+        if (typeof onApprovalRequest !== 'function') {
+          // Same fail-closed contract as claude-code.mjs: no handler means deny.
+          approvalLog.push({ request, decision: { behavior: 'deny', message: 'no approval handler configured' }, error: null });
+          continue;
+        }
+        try {
+          const decision = await onApprovalRequest(request);
+          approvalLog.push({ request, decision, error: null });
+        } catch (err) {
+          approvalLog.push({ request, decision: null, error: err?.message ?? String(err) });
+        }
+        continue;
+      }
+
+      const event = entry;
       onEvent?.(event);
 
       if (event.type === 'result') {
@@ -65,5 +93,5 @@ export function createFakeHarness({ script = [] } = {}) {
     };
   }
 
-  return { startTurn };
+  return { startTurn, approvalLog };
 }
