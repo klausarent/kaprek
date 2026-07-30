@@ -75,10 +75,21 @@
  *   `result.stopReason` comparison) keeps working unchanged
  * @property {'idle'|'tool-lease'|'active-total'|'absolute'} [timeoutClock] - present only
  *   when stopReason is 'timeout'; names which clock fired (see timeout.mjs's own doc
- *   comment on what each one measures and why NONE of them, including 'absolute', count
- *   time spent waiting on a human approval decision — that wait is bounded separately by
- *   the caller's own approval timeout, e.g. src/server/server.mjs's
- *   DEFAULT_APPROVAL_TIMEOUT_MS)
+ *   comment on what each one measures). idle/tool-lease/active-total all exclude time
+ *   spent waiting on a human approval decision — that SINGLE wait is bounded separately
+ *   by the caller's own approval timeout, e.g. src/server/server.mjs's
+ *   DEFAULT_APPROVAL_TIMEOUT_MS, which auto-denies one pending request but does not stop
+ *   the agent from immediately asking again. 'absolute' is deliberately the ONE exception:
+ *   a raw, never-paused wall clock that counts approval-wait time in full, because it is
+ *   the backstop against a CHAIN of such round-trips (see timeout.mjs's ABSOLUTE_MS doc
+ *   comment). Its right value is therefore CONTEXT-DEPENDENT, not a fixed default:
+ *     - Interactive chat (a human is watching, can always just answer sooner): the
+ *       ABSOLUTE_MS default (60 minutes) is fine as-is.
+ *     - An unattended trigger turn relying on task-3's overnight approval inbox: the
+ *       caller MUST override absoluteTimeoutMs to at least the inbox's own approval
+ *       deadline + ACTIVE_TOTAL_MS + a buffer — otherwise this raw wall clock kills the
+ *       very overnight wait the inbox exists to allow, regardless of how much of that
+ *       time was legitimately spent waiting on a human to check the inbox.
  * @property {{message: string}|null} error - set when stopReason is 'error', otherwise null
  *   (including for stopReason 'timeout' — a clock elapsing is not itself an error)
  * @property {number} [droppedLines] - count of oversized CLI output lines refused before

@@ -10,9 +10,9 @@
 //     measure GAPS between events, not a single long-running tool call that
 //     never produces intermediate output.
 // Hence: idle (gaps with no tool open), tool-lease (one open tool call),
-// active-total (the whole turn's own budget) and absolute (a backstop with
-// more headroom than active-total) — see createTurnClocks() below for how
-// they interact.
+// active-total (the whole turn's own budget) and absolute (a raw wall-clock
+// backstop against a CHAIN of approval round-trips — see ABSOLUTE_MS's own
+// doc comment) — see createTurnClocks() below for how they interact.
 //
 // This module is REINE LOGIK over an injected time source: no timer, no IO,
 // no process handle. The caller (claude-code.mjs) is the one that owns an
@@ -26,7 +26,28 @@ export const IDLE_MS = 120_000;
 export const TOOL_LEASE_MS = 25 * 60_000;
 /** Active-total budget: the turn's own overall budget, counted in active (non-approval-wait) time. */
 export const ACTIVE_TOTAL_MS = 35 * 60_000;
-/** Absolute budget: a backstop above active-total, also counted in active (non-approval-wait) time — see createTurnClocks()'s doc comment for why this is NOT a raw wall-clock cap. */
+// Absolute budget: a RAW, NEVER-paused wall-clock cap — unlike the other
+// three, approval-wait time counts fully against this one. Fix-round
+// (task-2, panel review): the first version of this file exempted approval
+// wait from all four clocks alike, which made `absolute` degenerate into a
+// second, strictly-larger threshold on the exact same quantity `active-total`
+// already measures — given the default constants below (35min <
+// 60min), active-total always fires first and `absolute` could never fire at
+// all. That defeated the actual reason `absolute` exists: a backstop against
+// a CHAIN of approval round-trips. The caller's own approval timeout (e.g.
+// src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS) only auto-denies ONE
+// pending request — it does not stop the agent from immediately asking
+// again. A long enough chain of such individually-timed-out round-trips
+// would keep active-total (and idle, and tool-lease) paused for almost the
+// entire wall-clock duration, while never once tripping any of them, and
+// hold the chat's own busy-gate (src/server/server.mjs's handleChatTurn 409)
+// closed indefinitely in the process. Only a clock that keeps ticking
+// THROUGH approval waits can catch that.
+//
+// This value is therefore CONTEXT-DEPENDENT, not a fixed default like the
+// other three — see adapter.mjs's TurnResult doc comment on the two regimes
+// (interactive chat vs. an unattended trigger turn with task-3's overnight
+// approval inbox) a caller must pick between when overriding it.
 export const ABSOLUTE_MS = 60 * 60_000;
 
 /**
@@ -54,24 +75,28 @@ function normalizeBudget(ms) {
  *   check: () => null | { reason: string, clock: 'idle'|'tool-lease'|'active-total'|'absolute' },
  * }}
  *
- * Approval-wait exemption (all four clocks, not just active-total): a
- * chat's own busy-gate (src/server/server.mjs's handleChatTurn 409) must
- * not be held closed by a turn that is really just waiting on a human. If
- * only active-total paused for that wait — the way the old, single
- * DEFAULT_TIMEOUT_MS did — idle and tool-lease would still tick during the
- * wait and a slow decision could kill the turn's OWN in-flight tool call
- * out from under it. And if absolute stayed a true never-pausing wall clock
- * (the old DEFAULT_ABSOLUTE_TIMEOUT_MS's documented job: outlive a chain of
- * approvals that each individually pause a shorter budget), it would
- * directly defeat task-3's overnight approval inbox — a turn parked
- * overnight waiting on a human would get killed by its OWN backstop before
- * the human ever answers. So: approval-wait time is subtracted from the
- * elapsed time all four clocks see, and the thing that actually bounds an
- * unattended approval is the CALLER's own approval-specific timeout
- * (src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS, which resolves
- * onApprovalRequest's promise with an auto-deny — see makeApprovalHandler())
- * — not a clock in this module. See task-2-report.md's Bedenken for the one
- * consequence of this that the brief's own numbers do not obviously cover.
+ * Approval-wait exemption (idle, tool-lease, active-total ONLY — NOT
+ * absolute): a chat's own busy-gate (src/server/server.mjs's handleChatTurn
+ * 409) must not be held closed by a turn that is really just waiting on a
+ * human, and a slow decision must not kill the turn's own in-flight tool
+ * call out from under it. If only active-total paused for that wait — the
+ * way the old, single DEFAULT_TIMEOUT_MS did — idle and tool-lease would
+ * still tick during the wait and cause exactly that. So: approval-wait time
+ * is subtracted from the elapsed time idle/tool-lease/active-total see.
+ *
+ * `absolute` is deliberately the ONE clock excluded from this exemption —
+ * see ABSOLUTE_MS's own doc comment for why (in short: it is the backstop
+ * against a CHAIN of individually-auto-denied approval round-trips, which
+ * would otherwise never trip any of the other three). It is a raw wall
+ * clock: approval-wait time counts fully against it, same as any other
+ * time. What bounds a SINGLE pending approval is instead the caller's own
+ * approval-specific timeout (src/server/server.mjs's
+ * DEFAULT_APPROVAL_TIMEOUT_MS, which resolves onApprovalRequest's promise
+ * with an auto-deny — see makeApprovalHandler()) — not a clock in this
+ * module. A caller relying on task-3's overnight approval inbox MUST size
+ * absoluteMs accordingly (see ABSOLUTE_MS's doc comment and adapter.mjs's
+ * TurnResult doc comment) — the default 60-minute ABSOLUTE_MS is sized for
+ * an interactive chat, not an unattended overnight wait.
  */
 export function createTurnClocks({ idleMs, toolLeaseMs, activeTotalMs, absoluteMs, nowFn = Date.now }) {
   const idleBudget = normalizeBudget(idleMs);
@@ -193,8 +218,14 @@ export function createTurnClocks({ idleMs, toolLeaseMs, activeTotalMs, absoluteM
     if (activeTotalBudget !== null && activeElapsed >= activeTotalBudget) {
       return { reason: `active turn time exceeded activeTotalMs (${activeTotalBudget}ms, approval waits excluded)`, clock: 'active-total' };
     }
-    if (absoluteBudget !== null && activeElapsed >= absoluteBudget) {
-      return { reason: `active turn time exceeded absoluteMs (${absoluteBudget}ms, approval waits excluded)`, clock: 'absolute' };
+
+    // RAW wall-clock elapsed — deliberately NOT `activeElapsed` (no `paused`
+    // subtraction). See ABSOLUTE_MS's own doc comment: this is what lets
+    // `absolute` catch a chain of approval round-trips that active-total's
+    // approval-wait exemption would otherwise hide from it entirely.
+    const rawElapsed = now - startedAt;
+    if (absoluteBudget !== null && rawElapsed >= absoluteBudget) {
+      return { reason: `turn exceeded the absolute wall-clock cap of absoluteMs (${absoluteBudget}ms) — includes approval-wait time by design`, clock: 'absolute' };
     }
 
     return null;

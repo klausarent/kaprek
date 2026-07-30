@@ -90,17 +90,42 @@ test('createTurnClocks: two overlapping tool calls keep the lease open until BOT
   expect(c.check()).toMatchObject({ clock: 'tool-lease' });
 });
 
-// Peer-review note (see task-2-report.md's Bedenken): with the brief's own
-// default constants (ACTIVE_TOTAL_MS=35min < ABSOLUTE_MS=60min), and both
-// clocks measuring the exact same "elapsed active time" quantity,
-// active-total always fires first — the absolute clock only becomes
-// reachable when a caller raises/disables active-total relative to it, as
-// this test does explicitly.
+// Fix-round (task-2 panel review): the first version of this module exempted
+// approval-wait time from ALL FOUR clocks, which made `absolute` degenerate
+// into a second, strictly-larger threshold on the exact same quantity
+// `active-total` already measures — under the brief's own default constants
+// (ACTIVE_TOTAL_MS=35min < ABSOLUTE_MS=60min), active-total would ALWAYS fire
+// first and `absolute` could never fire at all. `absolute` is now a RAW wall
+// clock instead (see ABSOLUTE_MS's own doc comment) — this test proves it
+// fires entirely on its own, with active-total disabled, independent of
+// approval activity.
 test('createTurnClocks: with active-total disabled, the absolute clock is independently reachable', () => {
   const t = fakeClock();
   const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 10_000, activeTotalMs: 0, absoluteMs: 5000, nowFn: t.now });
   for (let i = 0; i < 12; i += 1) { c.onProgress('assistant-message'); t.advance(500); }
   expect(c.check()).toMatchObject({ clock: 'absolute' });
+});
+
+// The actual reason `absolute` exists (see ABSOLUTE_MS's doc comment): a
+// backstop against a CHAIN of approval round-trips. The caller's own
+// approval timeout (e.g. src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS)
+// only ever auto-denies ONE pending request — nothing stops the agent from
+// immediately asking again, and a long enough chain of such round-trips
+// would keep idle/tool-lease/active-total paused for nearly the entire
+// wall-clock duration without ever tripping any of them. `absolute` alone
+// keeps ticking through approval waits, so it is the one clock that can
+// still end a turn stuck in such a chain.
+test('createTurnClocks: approval-wait time counts fully against the absolute clock, even though it counts against none of the other three', () => {
+  const t = fakeClock();
+  const c = createTurnClocks({ idleMs: 1000, toolLeaseMs: 10_000, activeTotalMs: 60_000, absoluteMs: 5000, nowFn: t.now });
+  c.onProgress('assistant-message');
+  c.onApprovalStart();
+  t.advance(5001); // entirely inside one long-running approval wait, past absoluteMs
+  expect(c.check()).toMatchObject({ clock: 'absolute' });
+  // Not a fluke of ordering: idle/tool-lease/active-total genuinely never
+  // fire here — the entire elapsed time was approval-wait, which they all
+  // exclude in full (see the 'approval wait counts against neither idle nor
+  // active-total' test above).
 });
 
 test('createTurnClocks: a non-finite or non-positive budget disables that clock entirely', () => {

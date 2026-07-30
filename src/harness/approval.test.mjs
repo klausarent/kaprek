@@ -251,25 +251,23 @@ test('the active-total clock keeps running once the last pending approval resolv
   expect(result.timeoutClock).toBe('active-total');
 }, 5000);
 
-// This test's OLD property (a never-paused absolute backstop still kills a
-// turn stuck on an approval that never resolves, per task-6a's Codex review)
-// no longer holds under task-2's four-clock model, and deliberately so: see
-// timeout.mjs's createTurnClocks() doc comment and task-2-report.md's
-// Bedenken. All four clocks — including 'absolute' — now exclude
-// approval-wait time, because task-3's overnight approval inbox needs a
-// turn parked on a human decision to survive indefinitely; a backstop that
-// still counted that wait would defeat it. What now bounds an approval that
-// truly never gets answered is the CALLER's own approval timeout
-// (src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS, which resolves
-// onApprovalRequest with an auto-deny), not a clock in this harness — so
-// this test now proves the opposite of what it used to: neither clock
-// fires while the approval is indefinitely pending, no matter how far past
-// both of their (here deliberately tiny) budgets real time moves.
-test('an indefinitely pending approval (never resolves) exempts BOTH the active-total and the absolute clock — only the caller\'s own approval timeout can end it', async () => {
+// Fix-round (task-2 panel review, after this test was first rewritten to
+// prove the opposite — see task-2-report.md's Fix-Runde): exempting
+// approval-wait time from ALL FOUR clocks made 'absolute' unable to ever
+// fire on its own (it degenerated into a second, always-later threshold on
+// the exact same quantity 'active-total' already measures), which silently
+// defeated the actual reason 'absolute' exists — see timeout.mjs's
+// ABSOLUTE_MS doc comment: a backstop against a CHAIN of individually
+// auto-denied approval round-trips, not against a single pending one.
+// 'absolute' is now the ONE clock NOT exempted — a raw, never-paused wall
+// clock — so this test's ORIGINAL property (task-6a's Codex review) is
+// restored: it still kills a turn stuck on an approval that never resolves
+// at all, even though 'active-total' (correctly, still approval-exempt)
+// would stay paused forever and never fire on its own.
+test('the absolute wall-clock cap fires even while an approval is indefinitely pending (never resolves), killing the turn regardless of the exempted active-total clock', async () => {
   const child = makeControllableChild();
-  // Never resolves — under the old model only absoluteTimeoutMs could end
-  // this turn; under the new model NEITHER clock can, see this test's own
-  // doc comment above.
+  // Never resolves — active-total (approval-exempt) would stay paused
+  // forever; only the raw wall-clock absolute clock can end this turn.
   const onApprovalRequest = vi.fn(() => new Promise(() => {}));
 
   const turn = startTurn({
@@ -277,22 +275,18 @@ test('an indefinitely pending approval (never resolves) exempts BOTH the active-
     prompt: 'hi',
     onApprovalRequest,
     onEvent: () => {},
-    timeoutMs: 50,
+    timeoutMs: 60_000, // large enough, and approval-exempt anyway, to prove it is NOT what fires here
     absoluteTimeoutMs: 50,
+    killGraceMs: 30, // this fake child never emits 'close' on its own — no need to wait out the real default here
     spawnFn: () => child,
   });
 
   writeLine(child, { type: 'control_request', request_id: 'req-wall-clock', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
-  // Far past both (deliberately tiny) budgets, while the approval is still
-  // pending — neither clock may have fired by the time the turn's own
-  // result arrives.
-  await new Promise((resolve) => setTimeout(resolve, 300));
-  writeLine(child, RESULT_LINE);
-  closeChild(child);
 
   const result = await turn;
-  expect(result.stopReason).toBe('result'); // NOT 'timeout'
-  expect(child.killed).toBeFalsy();
+  expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('absolute');
+  expect(child.killed).toBe(true);
 }, 5000);
 
 // Regression test for task-6a review Important #5: `pendingApprovals` was

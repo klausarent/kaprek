@@ -65,15 +65,19 @@ const MAX_LINE_BYTES = 8 * 1024 * 1024;
 // four options below are only where each budget's default lives and how a
 // caller can override one.
 //
-// IMPORTANT, and the opposite of what this same comment said before
-// task-2: NONE of the four clocks — including ABSOLUTE_MS below — is a raw,
-// never-paused wall clock anymore. All four exclude time spent waiting on a
-// human approval decision (see timeout.mjs's createTurnClocks() doc comment
-// on why: task-3's overnight approval inbox would be impossible otherwise).
-// What still bounds an approval that never gets answered is the CALLER's
-// own approval timeout (src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS,
-// which resolves onApprovalRequest with an auto-deny — see
-// makeApprovalHandler()), not a clock in this file or in timeout.mjs.
+// IMPORTANT, and the opposite of what this same comment said about
+// DEFAULT_TIMEOUT_MS before task-2: idle/tool-lease/active-total now exclude
+// time spent waiting on a human approval decision (see timeout.mjs's
+// createTurnClocks() doc comment on why: task-3's overnight approval inbox
+// would be impossible otherwise) — but ABSOLUTE_MS below is deliberately
+// the ONE exception, still a raw, never-paused wall clock (see that
+// constant's own doc comment in timeout.mjs for why: it is the backstop
+// against a CHAIN of individually-auto-denied approval round-trips, not
+// against a single pending one). What bounds a SINGLE approval that never
+// gets answered is the CALLER's own approval timeout
+// (src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS, which resolves
+// onApprovalRequest with an auto-deny — see makeApprovalHandler()), not a
+// clock in this file or in timeout.mjs.
 const DEFAULT_IDLE_MS = IDLE_MS;
 const DEFAULT_TOOL_LEASE_MS = TOOL_LEASE_MS;
 // timeoutMs is the pre-task-2 option name, kept as-is (not renamed to e.g.
@@ -309,7 +313,11 @@ export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedToo
  *   `activeTotalMs`, for backward compatibility (see DEFAULT_TIMEOUT_MS's
  *   own doc comment above)
  * @param {number} [options.absoluteTimeoutMs] - overrides the absolute
- *   clock's budget (timeout.mjs's ABSOLUTE_MS)
+ *   clock's budget (timeout.mjs's ABSOLUTE_MS) — a raw, never-paused wall
+ *   clock, unlike the other three; see ABSOLUTE_MS's own doc comment and
+ *   adapter.mjs's TurnResult doc comment for why the right value here is
+ *   context-dependent (interactive chat vs. an unattended trigger turn
+ *   relying on task-3's overnight approval inbox)
  * @param {string[]} [options.requireAskCoverage] - the ask list this turn's
  *   `--settings` profile was built from (see settings.mjs's ASK_TOOLS_CHAT/
  *   ASK_TOOLS_TRIGGER). Checked against the CLI's own `init` event's `tools`
