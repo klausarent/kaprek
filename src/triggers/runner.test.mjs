@@ -445,6 +445,44 @@ test('notify: a qualified MCP tool call for an app IN appScope is automatically 
   expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
 });
 
+test('notify: the underscore-normalized tool name a real CLI reports is allowed too', async () => {
+  // A live claude 2.1.220 run reports our advertised `notes.write` as
+  // `mcp__kaprek-apps__notes_write` — the CLI swaps the dot for an
+  // underscore. Caught by the day-3 live acceptance run: the dot-only
+  // parser denied an in-scope app tool.
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__notes_write', input: { title: 'x' } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
+test('notify: an underscore-normalized tool for an app NOT in appScope stays denied', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__otherapp_write', input: {} } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision.behavior).toBe('deny');
+});
+
 test('notify: a qualified MCP tool call for an app NOT in appScope is automatically denied', async () => {
   const script = [
     { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },

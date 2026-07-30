@@ -76,8 +76,14 @@ const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 function appIdForMcpTool(toolName) {
   if (typeof toolName !== 'string' || !toolName.startsWith(MCP_TOOL_PREFIX)) return null;
   const toolId = toolName.slice(MCP_TOOL_PREFIX.length);
-  const dotIndex = toolId.indexOf('.');
-  return dotIndex > 0 ? toolId.slice(0, dotIndex) : null;
+  // Verified against a live `claude` 2.1.220 run (2026-07-30): the CLI
+  // normalizes the dots in our advertised tool id to underscores, so
+  // `notes.write` arrives as `mcp__kaprek-apps__notes_write`. Tool-id
+  // segments themselves can never contain `_` (manifest.mjs::TOOL_ID_RE
+  // allows only [a-z0-9] segments joined by dots), so the mapping is
+  // bijective and the first `.` OR `_` both mark the end of the app id.
+  const sepIndex = toolId.search(/[._]/);
+  return sepIndex > 0 ? toolId.slice(0, sepIndex) : null;
 }
 
 /**
