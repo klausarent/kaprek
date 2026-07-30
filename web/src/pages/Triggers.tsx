@@ -38,8 +38,13 @@ import { decideDelete, decideToggle } from "../lib/triggerActions";
 import { navigateToChats } from "../App";
 
 /** How the escalation level translates into "who decides" (see server.mjs::handleTriggersList's approvalPath). */
-function approvalPathLabel(path: "policy" | "ui"): string {
-  return path === "policy" ? "automatically limited" : "asks you";
+function approvalPathLabel(path: "policy" | "ui" | "inbox"): string {
+  if (path === "policy") return "automatically limited";
+  // 'inbox' still means "asks you" — the difference is that the question
+  // waits in #/approvals instead of needing you to be looking when it is
+  // raised. Saying "asks you, waits" keeps the row honest about both halves.
+  if (path === "inbox") return "asks you, waits";
+  return "asks you";
 }
 
 export function TriggerRow({

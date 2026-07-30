@@ -4,6 +4,7 @@ import {
   addApproval,
   approvalSourceLabel,
   buildApprovalAnswer,
+  deadlineOf,
   dropExpired,
   formatCountdown,
   oldestApproval,
@@ -93,6 +94,27 @@ test("remainingMs counts down from the timeout and clamps at zero", () => {
   expect(remainingMs(entry, 0)).toBe(APPROVAL_TIMEOUT_MS);
   expect(remainingMs(entry, 60_000)).toBe(APPROVAL_TIMEOUT_MS - 60_000);
   expect(remainingMs(entry, APPROVAL_TIMEOUT_MS + 5_000)).toBe(0);
+});
+
+test("a server-sent deadline beats the client's ten-minute fallback — an eight-hour trigger question is not swept out after ten minutes", () => {
+  // Before deadlineAt existed, the client assumed every approval lapsed after
+  // APPROVAL_TIMEOUT_MS. With an unattended trigger's question waiting eight
+  // hours (APPROVAL_DEADLINE_UNATTENDED_MS), that assumption would remove a
+  // still-live question from the stack and stop showing the user the buttons
+  // that would answer it.
+  const eightHours = 8 * 60 * 60 * 1000;
+  const stack = addApproval([], frame({ deadlineAt: eightHours }), 0);
+
+  expect(dropExpired(stack, APPROVAL_TIMEOUT_MS + 1)).toBe(stack);
+  expect(remainingMs(stack[0], APPROVAL_TIMEOUT_MS)).toBe(eightHours - APPROVAL_TIMEOUT_MS);
+  expect(dropExpired(stack, eightHours)).toHaveLength(0);
+});
+
+test("deadlineOf falls back to the client clock only when the server sent no deadline", () => {
+  const withNone = addApproval([], frame(), 5_000)[0];
+  expect(deadlineOf(withNone)).toBe(5_000 + APPROVAL_TIMEOUT_MS);
+  const withOne = addApproval([], frame({ deadlineAt: 99_000 }), 5_000)[0];
+  expect(deadlineOf(withOne)).toBe(99_000);
 });
 
 test("formatCountdown renders zero-padded mm:ss", () => {

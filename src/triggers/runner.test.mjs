@@ -11,10 +11,12 @@ import { runTurn } from '../orchestrator/run.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
-import { createTriggerRunner } from './runner.mjs';
+import { createTriggerRunner, UNATTENDED_ABSOLUTE_TIMEOUT_MS } from './runner.mjs';
 import { MAX_TRIGGER_TURNS_PER_HOUR } from './limits.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { buildArgs } from '../harness/claude-code.mjs';
+import { createTurnClocks, IDLE_MS, TOOL_LEASE_MS, ACTIVE_TOTAL_MS, ABSOLUTE_MS } from '../harness/timeout.mjs';
+import { APPROVAL_DEADLINE_UNATTENDED_MS } from '../server/approval-store.mjs';
 
 let dataDir;
 let cwd;
@@ -78,7 +80,7 @@ const TEST_TOOL_OWNERS = new Map([
 ]);
 const resolveTestToolApp = (toolId) => TEST_TOOL_OWNERS.get(toolId) ?? null;
 
-function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {}, ...rest } = {}) {
+function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {}, wrapHarness, ...rest } = {}) {
   const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
   if (trigger) triggers.upsert(trigger);
   const harness = createFakeHarness({ script: script ?? textResultScript('ok') });
@@ -86,7 +88,10 @@ function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.n
     dataDir,
     triggers,
     runTurn,
-    harness,
+    // `wrapHarness` lets a test see the options the runner hands to
+    // startTurn() (the timeout budgets, which no normalized event carries)
+    // while still playing back the same fake script.
+    harness: wrapHarness ? wrapHarness(harness) : harness,
     harnessName: 'fake',
     cwd,
     now,
@@ -454,6 +459,184 @@ test('a runner built without hasApprovalClient refuses unattended question/revie
   const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
   expect(result.fired).toBe(false);
   expect(result.reason).toBe('needs an open UI to ask for approval');
+});
+
+// ------------------------------------------------------------- persistent approval inbox (task 3)
+//
+// With a store wired in, the question outlives the connection that would have
+// carried it: it is written down and can be LOOKED UP later (GET
+// /api/approvals). That, and only that, is what makes an unattended
+// question/review turn honest to start. Every test above this block runs
+// WITHOUT a store and must keep describing the old behaviour exactly.
+
+/** A store double with the four methods runner/server use. Records puts so a test can see what was written down. */
+function fakeApprovalStore() {
+  const puts = [];
+  return {
+    puts,
+    put: async (entry) => {
+      puts.push(entry);
+      return entry;
+    },
+    decide: async () => ({}),
+    listPending: async () => puts,
+    get: async () => null,
+  };
+}
+
+test('a scheduled question trigger DOES fire with an approval store, with no client streaming at all', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+    approvalStore: fakeApprovalStore(),
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(true);
+});
+
+test('approvalCapability reports the inbox path once a store is wired, attended or not', () => {
+  const trigger = scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' });
+  const { runner, triggers } = makeRunner({
+    trigger,
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+    approvalStore: fakeApprovalStore(),
+  });
+  const stored = triggers.list()[0];
+
+  expect(runner.approvalCapability(stored, { unattended: true })).toEqual({ approvalPath: 'inbox', blocked: null });
+  expect(runner.approvalCapability(stored, { unattended: false })).toEqual({ approvalPath: 'inbox', blocked: null });
+});
+
+test('a runner WITHOUT a store still refuses an unattended question turn — and starts nothing at all', async () => {
+  // The fail-closed default, restated as the inbox's own boundary: the store
+  // is what lifts the gate, so a runner that has none must behave exactly as
+  // it did before this feature existed. Stronger than the reason string
+  // alone — it also pins that NOTHING ran: no startTurn, no chat, no bill.
+  const started = [];
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+    wrapHarness: (harness) => ({
+      startTurn: (options) => {
+        started.push(options);
+        return harness.startTurn(options);
+      },
+    }),
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+  expect(started).toEqual([]);
+  expect(openChats(dataDir).list()).toEqual([]);
+});
+
+test('an inbox store does NOT override the missing-handler refusal — with nothing to raise the question with, writing it down changes nothing', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    approvalStore: fakeApprovalStore(),
+  });
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('no UI approval handler configured for this escalation level');
+});
+
+test('an inbox turn gets an absolute wall clock sized to outlast the unattended approval deadline', async () => {
+  const seen = [];
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    approvalStore: fakeApprovalStore(),
+    wrapHarness: (harness) => ({
+      startTurn: (options) => {
+        seen.push(options);
+        return harness.startTurn(options);
+      },
+    }),
+  });
+
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
+  expect(seen).toHaveLength(1);
+  // The contract from adapter.mjs's TurnResult.timeoutClock doc comment: at
+  // least the inbox deadline plus the turn's own active budget plus a buffer.
+  expect(seen[0].absoluteTimeoutMs).toBe(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
+  expect(seen[0].absoluteTimeoutMs).toBeGreaterThanOrEqual(APPROVAL_DEADLINE_UNATTENDED_MS + ACTIVE_TOTAL_MS);
+});
+
+test('a trigger turn WITHOUT a store passes no absoluteTimeoutMs at all — the interactive default stays untouched', async () => {
+  const seen = [];
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => true,
+    wrapHarness: (harness) => ({
+      startTurn: (options) => {
+        seen.push(options);
+        return harness.startTurn(options);
+      },
+    }),
+  });
+
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
+  expect(seen[0].absoluteTimeoutMs).toBeUndefined();
+});
+
+/** A hand-driven time source for the clock arithmetic below — no timers, no waiting. */
+function fakeClock(start = 1_000_000) {
+  let current = start;
+  return { now: () => current, advance: (ms) => { current += ms; } };
+}
+
+function inboxTurnClocks(absoluteMs, nowFn) {
+  return createTurnClocks({ idleMs: IDLE_MS, toolLeaseMs: TOOL_LEASE_MS, activeTotalMs: ACTIVE_TOTAL_MS, absoluteMs, nowFn });
+}
+
+test('an overnight inbox approval outlives every clock — and the interactive default absoluteMs would have killed exactly it', () => {
+  const clock = fakeClock();
+  const inbox = inboxTurnClocks(UNATTENDED_ABSOLUTE_TIMEOUT_MS, clock.now);
+  // The same turn under the DEFAULT wall clock, driven in lockstep, is the
+  // control: it is what proves the override is load-bearing rather than
+  // decorative.
+  const withDefault = inboxTurnClocks(ABSOLUTE_MS, clock.now);
+
+  for (const clocks of [inbox, withDefault]) {
+    clocks.onProgress('init');
+    clocks.onApprovalStart();
+  }
+  // Overnight: eight hours minus a minute of a human not being awake.
+  clock.advance(APPROVAL_DEADLINE_UNATTENDED_MS - 60_000);
+
+  expect(inbox.check()).toBeNull();
+  // absolute is the ONE clock that keeps ticking through an approval wait
+  // (see timeout.mjs's ABSOLUTE_MS doc comment) — which is why sizing it is
+  // not optional for this path.
+  expect(withDefault.check()).toMatchObject({ clock: 'absolute' });
+});
+
+test('an inbox approval that outlasts its deadline ends at the auto-deny, not at a clock — and the turn still has room to finish afterwards', () => {
+  const clock = fakeClock();
+  const clocks = inboxTurnClocks(UNATTENDED_ABSOLUTE_TIMEOUT_MS, clock.now);
+  clocks.onProgress('init');
+  clocks.onApprovalStart();
+
+  // The exact moment server.mjs's own timer gives up on this question
+  // (APPROVAL_DEADLINE_UNATTENDED_MS, see approval-store.mjs). Nothing else
+  // may have fired before it, or the auto-deny would be dead code.
+  clock.advance(APPROVAL_DEADLINE_UNATTENDED_MS);
+  expect(clocks.check()).toBeNull();
+
+  // Auto-denied: the wait ends, the turn resumes and works on for another
+  // twenty minutes. It must not die a second later on the wall clock — that
+  // is what the ACTIVE_TOTAL_MS + buffer part of the budget is for.
+  clocks.onApprovalEnd();
+  for (let minute = 0; minute < 20; minute += 1) {
+    clocks.onProgress('assistant-message');
+    clock.advance(60_000);
+    expect(clocks.check()).toBeNull();
+  }
 });
 
 test('escalation "notify" never uses makeUiApprovalHandler even when one is configured — it always uses its own self-contained policy decider', async () => {

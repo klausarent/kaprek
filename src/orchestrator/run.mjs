@@ -161,6 +161,15 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  *   SECURITY comment at startServer() for why that default matters
  * @param {string[]} [options.allowedTools] - passed straight through to
  *   harness.startTurn(), same caveat as permissionMode above
+ * @param {number} [options.absoluteTimeoutMs] - passed straight through to
+ *   harness.startTurn() too, and omitted entirely when undefined so the
+ *   harness's own default still applies. This layer holds no opinion on the
+ *   value: which wall clock a turn needs depends on what the CALLER knows
+ *   about it (see adapter.mjs's TurnResult.timeoutClock doc comment on the
+ *   two regimes, and runner.mjs::UNATTENDED_ABSOLUTE_TIMEOUT_MS for the one
+ *   caller that overrides it). Added for task 3 for the same reason task 2
+ *   had to add `timeoutClock` on the way back: the option died at this
+ *   boundary, so a caller could not size the clock at all.
  * @param {(event: import('../harness/adapter.mjs').NormalizedEvent) => void} [options.onEvent] -
  *   called for every adapter event, in order, in addition to the chat-store writes
  *   (e.g. an SSE route forwarding the live turn to a browser); events carry
@@ -217,6 +226,7 @@ export async function runTurn({
   cwd,
   permissionMode,
   allowedTools,
+  absoluteTimeoutMs,
   onEvent,
   onApprovalRequest,
   signal,
@@ -507,6 +517,12 @@ export async function runTurn({
       sessionId: priorSessionId,
       permissionMode,
       allowedTools,
+      // Spread, not passed as `absoluteTimeoutMs: undefined`: claude-code.mjs
+      // reads it as a defaulted destructuring parameter, so an explicit
+      // undefined would be indistinguishable from "not given" today but is
+      // exactly the kind of thing that stops being true when a harness starts
+      // checking `'absoluteTimeoutMs' in options`.
+      ...(absoluteTimeoutMs === undefined ? {} : { absoluteTimeoutMs }),
       mcpConfigPath,
       settingsPath,
       onEvent: handleEvent,

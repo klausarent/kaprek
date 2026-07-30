@@ -433,6 +433,14 @@ export type ApprovalFrame = {
   toolUseId?: string | null;
   reasonType?: string | null;
   suggestions?: unknown;
+  /**
+   * When the server will deny this on its own, as epoch milliseconds. Sent
+   * because the deadline is no longer one number the client can assume: a
+   * chat turn's question lapses in 10 minutes, a trigger's in 8 hours (see
+   * src/server/approval-store.mjs). Optional only for a frame from an older
+   * server; lib/approvals.ts falls back when it is missing.
+   */
+  deadlineAt?: number | null;
 };
 
 export type ChatStreamEvent =
@@ -633,11 +641,12 @@ export async function streamChatTurn({
 // ---------------------------------------------------------------------------
 
 /**
- * Answers one pending approval. Returns 'gone' for the two responses that
- * mean "nothing left to answer" — 404 (unknown or expired: the server's own
- * 10-minute timer already denied it, or the turn ended) and 409 (already
- * decided). Neither is an error worth showing the user: the entry is simply
- * dropped from the stack (see lib/approvals.ts::removeApproval).
+ * Answers one pending approval. Returns 'gone' for the three responses that
+ * mean "nothing left to answer" — 404 (unknown, or the turn ended), 409
+ * (already decided) and 410 (the question died with the process that asked
+ * it, see the inbox below). None is an error worth a red box: the entry is
+ * simply dropped from the stack (see lib/approvals.ts::removeApproval) or the
+ * inbox list.
  */
 export async function answerApproval(
   id: string,
@@ -648,9 +657,29 @@ export async function answerApproval(
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
     body: JSON.stringify(message === undefined ? { chatId, behavior } : { chatId, behavior, message }),
   });
-  if (res.status === 404 || res.status === 409) return "gone";
+  if (res.status === 404 || res.status === 409 || res.status === 410) return "gone";
   await throwOnError(res);
   return "ok";
+}
+
+/**
+ * One entry of the durable approval inbox (GET /api/approvals, see
+ * src/server/approval-store.mjs). Same fields an SSE ApprovalFrame carries,
+ * plus the two timestamps a list needs — an inbox entry is often hours old,
+ * so "when was this asked" and "when does it lapse" are the columns that
+ * matter, unlike the live dialog's own countdown.
+ *
+ * Only questions this server process is still waiting on are ever listed.
+ * Entries left behind by a previous process are unanswerable and deliberately
+ * not offered (answering one can only fail).
+ */
+export type InboxApproval = ApprovalFrame & {
+  requestedAt: number;
+  deadlineAt: number | null;
+};
+
+export function fetchApprovalInbox(): Promise<{ approvals: InboxApproval[] }> {
+  return getJson<{ approvals: InboxApproval[] }>("/api/approvals");
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +764,13 @@ export type Trigger = {
 export type TriggerStatus = Trigger & {
   runsToday: number;
   costToday: number;
-  approvalPath: "policy" | "ui";
+  /**
+   * Who answers this trigger's tool-use questions: 'policy' (kaprek's own
+   * code, no human), 'ui' (a live connection has to be open — the pre-inbox
+   * path, still what a runner without a store reports), or 'inbox' (recorded
+   * durably and answerable later, see src/server/approval-store.mjs).
+   */
+  approvalPath: "policy" | "ui" | "inbox";
   blocked: string | null;
   supported: boolean;
   unsupportedReason: string | null;

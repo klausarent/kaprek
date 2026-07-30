@@ -26,10 +26,38 @@ import { readFile as readWorkspaceFile, resolveWorkspacePath } from '../workspac
 import { readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
+import { ACTIVE_TOTAL_MS } from '../harness/timeout.mjs';
+import { APPROVAL_DEADLINE_UNATTENDED_MS } from '../server/approval-store.mjs';
 import { checkLimits, checkGlobalTriggerLimits } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Slack on top of "deadline + the turn's own active budget", so the wall clock
+ * cannot land on the exact millisecond the auto-deny does. Ten minutes is
+ * enough for the CLI to receive the denial, react to it and finish the turn.
+ */
+export const UNATTENDED_ABSOLUTE_BUFFER_MS = 10 * 60_000;
+
+/**
+ * The `absoluteTimeoutMs` an INBOX turn runs under (see adapter.mjs's
+ * TurnResult.timeoutClock doc comment, which makes this the caller's duty).
+ *
+ * timeout.mjs's `absolute` is the one clock that does NOT pause for an
+ * approval wait — deliberately, as the backstop against a chain of
+ * round-trips. Left at its 60-minute default, it would therefore kill an
+ * overnight inbox approval after an hour and report `timeoutClock: 'absolute'`
+ * for a turn that did nothing wrong except wait for the human the inbox exists
+ * to wait for. So the trigger path raises it to cover the full wait plus the
+ * turn's own active budget plus a buffer.
+ *
+ * Note the direction of control: APPROVAL_DEADLINE_UNATTENDED_MS is the
+ * primary limit on waiting (see its own doc comment) and this value follows
+ * from it. Raising this one alone buys nothing — the auto-deny still fires
+ * first; that is the intended order.
+ */
+export const UNATTENDED_ABSOLUTE_TIMEOUT_MS = APPROVAL_DEADLINE_UNATTENDED_MS + ACTIVE_TOTAL_MS + UNATTENDED_ABSOLUTE_BUFFER_MS;
 const HEARTBEAT_OK_MARKER = 'heartbeat_ok';
 
 // A file-watch turn gets a bounded list of paths, never "everything that
@@ -313,6 +341,21 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   'question'/'review' turns — see approvalCapability(). Defaults to false,
  *   the fail-closed answer: a runner built without this option has no way to
  *   reach a human, so it must not start a turn that will need one.
+ * @param {object|null} [options.approvalStore] - the persistent approval inbox
+ *   (src/server/approval-store.mjs), or null. The runner never reads or writes
+ *   it — the server's makeUiApprovalHandler does that. What the runner needs
+ *   from it is the one bit its own gate turns on: whether a question raised
+ *   now can be LOOKED UP later instead of only pushed at whoever happened to
+ *   be connected. With a store, an unattended question/review turn is honest
+ *   to start (see approvalCapability()) and runs under a much longer wall
+ *   clock (see UNATTENDED_ABSOLUTE_TIMEOUT_MS). Defaults to null, which keeps
+ *   every gate below exactly as it was.
+ * @param {(chatId: string) => void} [options.releaseApprovals] - called with
+ *   the turn's chatId once a trigger turn has ENDED, so the server can resolve
+ *   anything still pending for it (server.mjs::cleanupApprovalsForChat — the
+ *   same cleanup a chat turn gets from its own route's finally block). Without
+ *   it, an approval whose turn died some other way would keep its auto-deny
+ *   timer armed for the full unattended deadline — hours, with the inbox.
  */
 export function createTriggerRunner({
   dataDir,
@@ -331,6 +374,8 @@ export function createTriggerRunner({
   platform = process.platform,
   resolveToolApp = () => null,
   hasApprovalClient = () => false,
+  approvalStore = null,
+  releaseApprovals = () => {},
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -471,11 +516,23 @@ export function createTriggerRunner({
     // A manual fire (cause.origin 'user') passes — someone is demonstrably
     // there.
     //
-    // This is the honest stopgap, not the destination. The real fix is a
-    // PERSISTENT APPROVAL INBOX: questions outlive the stream that raised
-    // them, so an unattended trigger can ask now and be answered when the user
-    // next opens kaprek. That needs a store, an expiry policy and a resume
-    // path for a turn whose CLI has long exited — see README's Backlog.
+    // THE INBOX LIFTS THAT GATE (task 3). With a store wired in, the question
+    // is written down (src/server/approval-store.mjs) and can be looked up
+    // over GET /api/approvals by a page opened at any later point. "Nobody is
+    // connected right now" therefore stops being the same thing as "nobody
+    // can ever answer this", which is the only reason the refusal above
+    // existed. The wait itself stays bounded and fail-closed:
+    // APPROVAL_DEADLINE_UNATTENDED_MS auto-denies the question, and the turn
+    // runs under UNATTENDED_ABSOLUTE_TIMEOUT_MS so the wall clock outlasts
+    // that wait instead of cutting it short.
+    //
+    // What this does NOT buy — do not let a doc sentence imply it: the store
+    // is not restart-proof. Restart the server mid-wait and the CLI dies with
+    // it; the entry is marked 'process gone' and refused, never redeemed. The
+    // inbox makes a question survive a CLOSED TAB, not a closed process.
+    if (approvalStore) {
+      return { approvalPath: 'inbox', blocked: null };
+    }
     if (unattended && !hasApprovalClient()) {
       return { approvalPath: 'ui', blocked: 'needs an open UI to ask for approval' };
     }
@@ -1129,17 +1186,19 @@ export function createTriggerRunner({
     // see server.mjs's fire route) — runningIds.size > 0 means SOME
     // trigger-origin turn is currently in flight, not just this one.
     runningIds.add(id);
+    // A question/review handler needs the turn's chatId in its closure
+    // (makeUiApprovalHandler(chatId) -> handler), but chatId is only known
+    // once runTurn() resolves/creates it — resolvedChatId is filled in by
+    // onChatResolved below, called synchronously BEFORE harness.startTurn()
+    // ever runs, so strictly before any approval request could possibly
+    // arrive (see run.mjs's own doc comment on onChatResolved).
+    // notifyPolicyHandler() needs none of this. Declared OUTSIDE the try so
+    // the finally block can still release that chat's approvals for a turn
+    // that threw after resolving its chat.
+    let resolvedChatId = null;
     try {
       const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, filesTruncated, clipboard });
 
-      // A question/review handler needs the turn's chatId in its closure
-      // (makeUiApprovalHandler(chatId) -> handler), but chatId is only
-      // known once runTurn() resolves/creates it — resolvedChatId is filled
-      // in by onChatResolved below, called synchronously BEFORE
-      // harness.startTurn() ever runs, so strictly before any approval
-      // request could possibly arrive (see run.mjs's own doc comment on
-      // onChatResolved). notifyPolicyHandler() needs none of this.
-      let resolvedChatId = null;
       const approvalHandlerForTurn =
         trigger.escalation === 'notify'
           ? notifyPolicyHandler(trigger, cwd, resolveToolApp)
@@ -1162,6 +1221,12 @@ export function createTriggerRunner({
         // passes no `--allowedTools` flag, so every tool call reaches the
         // permission prompt and therefore our handler.
         allowedTools: [],
+        // Only the inbox path needs a wall clock longer than the harness's own
+        // default, and only the inbox path gets one: a runner without a store
+        // passes nothing here and keeps running under exactly the budgets it
+        // ran under before (see UNATTENDED_ABSOLUTE_TIMEOUT_MS's doc comment
+        // for why the inbox cannot).
+        ...(capability.approvalPath === 'inbox' ? { absoluteTimeoutMs: UNATTENDED_ABSOLUTE_TIMEOUT_MS } : {}),
         onApprovalRequest: approvalHandlerForTurn,
         onEvent,
         onChatResolved: (chatId) => {
@@ -1183,6 +1248,20 @@ export function createTriggerRunner({
       return { fired: true, chatId: result.chatId, result, silent };
     } finally {
       runningIds.delete(id);
+      // The turn is over however it ended (result, error, a CLI that died
+      // mid-approval). Anything still pending for its chat can no longer be
+      // answered by anyone, so it must be resolved now rather than left with
+      // an armed timer — hours of one, on the inbox path. A chat turn gets
+      // this from its own route's finally block; a trigger turn had no
+      // equivalent before, which only became visible once a deadline stopped
+      // being ten minutes.
+      if (resolvedChatId) {
+        try {
+          releaseApprovals(resolvedChatId);
+        } catch (err) {
+          log(`trigger ${id}: could not release pending approvals: ${err?.message ?? String(err)}`);
+        }
+      }
     }
   }
 

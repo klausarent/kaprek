@@ -1745,46 +1745,112 @@ test('triggers: POST /api/triggers/<id>/fire while a trigger turn is already in 
   expect(firstFrames.find((f) => f.type === 'trigger-complete').fired).toBe(true);
 });
 
-test('triggers: a question trigger reports the unattended block while nothing streams, and clears it while a stream is open', async () => {
+test('triggers: a question trigger is no longer blocked by "nobody is streaming" — the server wires the durable inbox', async () => {
   const harness = gatedHarness();
   const { url } = await boot({ harness, harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'quiet-one', escalation: 'notify' }));
 
-  const blockedFor = async (id) => {
+  const statusOf = async (id) => {
     const body = await (await fetch(`${url}/api/triggers`)).json();
-    return body.triggers.find((t) => t.id === id).blocked;
+    return body.triggers.find((t) => t.id === id);
   };
 
-  expect(await blockedFor('ask-me')).toBe('needs an open UI to ask for approval');
-  // A notify trigger needs no human at all, so this never blocks it.
-  expect(await blockedFor('quiet-one')).toBeNull();
+  // Nothing is streaming here, and it no longer matters: a question raised now
+  // is written to <dataDir>/approvals.json and can be looked up later (see
+  // approval-store.mjs). The old refusal — 'needs an open UI to ask for
+  // approval' — was correct only while a question could ONLY be pushed.
+  expect(await statusOf('ask-me')).toMatchObject({ approvalPath: 'inbox', blocked: null });
+  // A notify trigger decides in kaprek's own code and never needed either.
+  expect(await statusOf('quiet-one')).toMatchObject({ approvalPath: 'policy', blocked: null });
 
-  // Hold a chat turn's SSE stream open: that is an approval client.
+  // Still true with a stream open — the inbox is the path either way; a live
+  // stream only makes the question arrive faster.
   const turnRes = await postJson(`${url}/api/chat/turn`, { text: 'hold the stream open' });
   await harness.started;
-  expect(await blockedFor('ask-me')).toBeNull();
+  expect(await statusOf('ask-me')).toMatchObject({ approvalPath: 'inbox', blocked: null });
 
   harness.release();
   await readSse(turnRes);
-  // Stream closed again — back to blocked, so the answer tracks reality
-  // instead of latching on the first client that ever connected.
-  expect(await blockedFor('ask-me')).toBe('needs an open UI to ask for approval');
+  expect(await statusOf('ask-me')).toMatchObject({ approvalPath: 'inbox', blocked: null });
 });
 
-test('triggers: a question trigger driven by a background tick does not start a turn while nothing streams', async () => {
-  const { url, runner } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+/** A harness whose turn raises one approval and then blocks on the answer — the unattended case, with no stream anywhere. */
+function inboxApprovalHarness() {
+  let markAsked;
+  const asked = new Promise((resolve) => {
+    markAsked = resolve;
+  });
+  return {
+    asked,
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      const pending = onApprovalRequest({ id: 'night-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      markAsked();
+      const decision = await pending;
+      onEvent?.({ type: 'text', text: `decision was ${decision.behavior}` });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('triggers: a question trigger driven by a background tick DOES start a turn with nothing streaming, and its question waits in GET /api/approvals', async () => {
+  const harness = inboxApprovalHarness();
+  // A minute, not the real eight hours: a failing assertion below must not
+  // leave an eight-hour timer armed behind it.
+  const { url, runner } = await boot({ harness, harnessName: 'fake', unattendedApprovalTimeoutMs: 60_000 });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
 
   // Reaches fireTrigger the way a tick does — cause.origin is the trigger's
   // own type, never 'user'. No HTTP route can produce that, and waiting on the
   // real 60-second timer is not a test.
-  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+  const firing = runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  await harness.asked;
 
-  // Nothing was started, so no chat exists and nothing was billed.
-  const chats = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
-  expect(chats.chats).toEqual([]);
+  // THE POINT OF THE WHOLE FEATURE: no SSE stream was ever open — not during
+  // the request, not before it — and the question is still there to be found.
+  const inbox = await (await fetch(`${url}/api/approvals`)).json();
+  expect(inbox.approvals).toHaveLength(1);
+  expect(inbox.approvals[0]).toMatchObject({
+    id: 'night-1',
+    toolName: 'Bash',
+    input: { command: 'ls' },
+    source: { kind: 'trigger', triggerId: 'ask-me' },
+  });
+  expect(typeof inbox.approvals[0].chatId).toBe('string');
+
+  // And it is answerable through the route the live dialog already uses.
+  const decided = await postJson(`${url}/api/approvals/night-1`, { chatId: inbox.approvals[0].chatId, behavior: 'allow' });
+  expect(decided.status).toBe(200);
+
+  const result = await firing;
+  expect(result.fired).toBe(true);
+  // Answered, so it is out of the inbox — not still sitting there to be
+  // answered a second time.
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+});
+
+test('approvals: an entry left behind by a previous process is refused with 410 and names why, instead of a misleading 404', async () => {
+  // What a killed server leaves on disk: an entry still marked pending, from
+  // a process that is gone. Written BEFORE this server starts, because that
+  // is when the store reads it — the same order a real restart produces.
+  const chatId = '11111111-2222-3333-4444-555555555555';
+  fs.writeFileSync(
+    path.join(dataDir, 'approvals.json'),
+    JSON.stringify({
+      version: 1,
+      approvals: [{ id: `${chatId}:old-1`, requestId: 'old-1', chatId, status: 'pending', toolName: 'Bash', requestedAt: Date.now() }],
+    }),
+    'utf8',
+  );
+  const { url } = await boot({});
+
+  const res = await postJson(`${url}/api/approvals/old-1`, { chatId, behavior: 'allow' });
+  expect(res.status).toBe(410);
+  expect((await res.json()).error).toMatch(/process gone/);
+  // It is not offered as answerable either.
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
 });
 
 /**
@@ -1866,11 +1932,11 @@ test('triggers: a "question" escalation trigger fires (the server always wires a
 
   const listRes = await fetch(`${url}/api/triggers`);
   const listed = (await listRes.json()).triggers.find((t) => t.id === 'ask-me');
-  expect(listed.approvalPath).toBe('ui');
-  // Nothing is streaming at this moment, so the list reports the UNATTENDED
-  // answer: it would not fire on its own right now. Firing it by hand below
-  // still works — that is the point of the distinction.
-  expect(listed.blocked).toBe('needs an open UI to ask for approval');
+  // 'inbox', not 'ui': the server wires the durable store, so a question is
+  // recorded as well as pushed — and nothing is blocked by whether a stream
+  // happens to be open right now.
+  expect(listed.approvalPath).toBe('inbox');
+  expect(listed.blocked).toBeNull();
 
   const res = await fetch(`${url}/api/triggers/ask-me/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
 
@@ -2219,7 +2285,7 @@ test('token: startServer resolves with a 64-hex instance token and persists it i
 
 test('token: a missing token is 401 on every API route, GET included', async () => {
   const { url } = await boot({});
-  for (const target of ['/api/projects', '/api/triggers', '/api/chat/list', '/api/search?q=x']) {
+  for (const target of ['/api/projects', '/api/triggers', '/api/chat/list', '/api/search?q=x', '/api/approvals']) {
     const res = await rawFetch(`${url}${target}`);
     expect(res.status).toBe(401);
     expect(await res.text()).toBe(''); // no hint about what was wrong

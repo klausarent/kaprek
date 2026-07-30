@@ -36,6 +36,11 @@ import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
+import {
+  createApprovalStore,
+  APPROVAL_DEADLINE_INTERACTIVE_MS,
+  APPROVAL_DEADLINE_UNATTENDED_MS,
+} from './approval-store.mjs';
 
 // The apps/ directory shipped with kaprek, resolved the same way
 // src/apps/mcp-server.mjs resolves it (this file lives in src/server/).
@@ -52,11 +57,6 @@ const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const TRIGGER_ID_RE = /^[a-z0-9-]{1,64}$/;
 const DEFAULT_HARNESS_NAME = 'claude-code';
 const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
-// Fail-closed: an approval nobody answers must not keep the CLI (and the
-// chat's turn) blocked forever — the server layer denies it on its own
-// after this long. Overridable per startServer() call so tests don't wait
-// 10 real minutes.
-const DEFAULT_APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -670,18 +670,47 @@ function approvalKey(chatId, requestId) {
  * Never rejects: every path resolves with an ApprovalDecision, deny being
  * the fail-closed default.
  */
-function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, describeSource = () => null }) {
-  return (request) =>
-    new Promise((resolve) => {
-      const key = approvalKey(chatId, request.id);
+function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, approvalStore = null, describeSource = () => null }) {
+  return async (request) => {
+    const key = approvalKey(chatId, request.id);
+    const requestedAt = Date.now();
+
+    // Written down BEFORE the promise is returned, and awaited: from here on
+    // the CLI is blocked, and a GET /api/approvals arriving one millisecond
+    // later must already find this question. A store write that fails is
+    // fail-closed, not "carry on and hope someone is streaming" — a question
+    // that was never recorded is one nobody can look up.
+    if (approvalStore) {
+      try {
+        await approvalStore.put({
+          id: key,
+          requestId: request.id,
+          chatId,
+          source: describeSource(chatId),
+          toolName: request.toolName ?? null,
+          displayName: request.displayName ?? null,
+          input: request.input ?? null,
+          description: request.description ?? null,
+          reason: request.reason ?? null,
+          agentId: request.agentId ?? null,
+          requestedAt,
+          deadlineAt: requestedAt + approvalTimeoutMs,
+        });
+      } catch (err) {
+        return { behavior: 'deny', message: `approval could not be recorded: ${err.message}` };
+      }
+    }
+
+    return new Promise((resolve) => {
       const timer = setTimeout(() => {
         const entry = pendingApprovals.get(key);
         if (!entry || entry.decided) return;
         pendingApprovals.delete(key);
+        recordDecision(approvalStore, key, { behavior: 'deny', message: 'approval timed out' });
         resolve({ behavior: 'deny', message: 'approval timed out' });
       }, approvalTimeoutMs);
 
-      pendingApprovals.set(key, { chatId, decided: false, resolve, timer, createdAt: Date.now() });
+      pendingApprovals.set(key, { chatId, decided: false, resolve, timer, createdAt: requestedAt });
       // Fire-and-forget, like every other onEvent->enqueue call in this
       // file (see handleChatTurn's own comment on the same pattern) — but
       // explicitly caught here (never actually rejects today; writeSseFrame
@@ -692,8 +721,27 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
       // stream is open, not only to the one watching this chat — a user shown
       // "allow Bash?" out of nowhere has to be able to see what asked, or they
       // are granting rights blind.
-      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request }).catch(() => {});
+      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt: requestedAt + approvalTimeoutMs }).catch(() => {});
     });
+  };
+}
+
+/**
+ * Records an already-made decision in the durable inbox. Best-effort BY
+ * DESIGN, and the direction matters: the in-memory entry in `pendingApprovals`
+ * is what actually unblocks the CLI, so a store that cannot write must not
+ * turn a valid answer into a failed request or a hung turn. The store is the
+ * record, not the gate.
+ *
+ * The one thing it must never do is stay silent about a decision that DID
+ * happen — an entry left `pending` on disk would show up in the inbox as a
+ * question to answer twice. store.decide() throwing here means exactly one of
+ * three things (unknown id, already decided, expired), all of which mean the
+ * durable record is already at least as final as this call would make it.
+ */
+function recordDecision(approvalStore, key, decision) {
+  if (!approvalStore) return;
+  approvalStore.decide(key, decision).catch(() => {});
 }
 
 /**
@@ -709,12 +757,13 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
  * in-flight approval) are left completely untouched — see the module's
  * approval-route doc comment.
  */
-function cleanupApprovalsForChat(pendingApprovals, chatId) {
+function cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore = null) {
   for (const [key, entry] of pendingApprovals) {
     if (entry.chatId !== chatId) continue;
     clearTimeout(entry.timer);
     if (!entry.decided) {
       entry.decided = true;
+      recordDecision(approvalStore, key, { behavior: 'deny', message: 'turn ended' });
       entry.resolve({ behavior: 'deny', message: 'turn ended' });
     }
     pendingApprovals.delete(key);
@@ -735,7 +784,7 @@ function cleanupApprovalsForChat(pendingApprovals, chatId) {
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -756,8 +805,20 @@ async function handleApprovalDecision(req, res, id, pendingApprovals) {
     return;
   }
 
-  const entry = pendingApprovals.get(approvalKey(chatId, id));
+  const key = approvalKey(chatId, id);
+  const entry = pendingApprovals.get(key);
   if (!entry) {
+    // Nothing is waiting in THIS process. The durable record can still say
+    // why, and the two reasons are worth telling apart: a question that died
+    // with a previous process (410 — answering it is impossible, no amount of
+    // retrying helps) versus one that never existed here at all (404). A
+    // browser tab left open across a server restart hits the first case, and
+    // "unknown" would be a misleading thing to tell it.
+    const known = approvalStore ? await approvalStore.get(key) : null;
+    if (known?.status === 'expired') {
+      sendJson(res, 410, { error: `approval expired: ${known.expired}`, expired: known.expired });
+      return;
+    }
     sendJson(res, 404, { error: 'unknown or expired approval' });
     return;
   }
@@ -769,8 +830,45 @@ async function handleApprovalDecision(req, res, id, pendingApprovals) {
   entry.decided = true;
   clearTimeout(entry.timer);
   const message = typeof body.data?.message === 'string' ? body.data.message : undefined;
-  entry.resolve(behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' });
+  const decision = behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' };
+  recordDecision(approvalStore, key, decision);
+  entry.resolve(decision);
   sendJson(res, 200, { ok: true });
+}
+
+/**
+ * GET /api/approvals — the inbox: every question this process is still
+ * waiting on, oldest first. This is the half an SSE frame cannot cover: a
+ * frame only reaches whoever was connected at the moment it was pushed, so a
+ * page opened afterwards had no way to learn a question existed at all. Here
+ * it can simply ask.
+ *
+ * The response deliberately mirrors an SSE approval frame's fields (see
+ * makeApprovalHandler above), plus `requestedAt`/`deadlineAt`, so the web app
+ * renders an inbox entry with the same component and answers it through the
+ * same POST /api/approvals/<id> — `id` is the CLI's own request id and
+ * `chatId` is required alongside it (see approvalKey()).
+ *
+ * Entries left over from a previous process are NOT listed: they cannot be
+ * answered (see approval-store.mjs's own doc comment), and offering buttons
+ * that can only fail is worse than not showing the entry.
+ */
+async function handleApprovalsList(res, approvalStore) {
+  const pending = approvalStore ? await approvalStore.listPending() : [];
+  const approvals = pending.map((entry) => ({
+    id: entry.requestId,
+    chatId: entry.chatId,
+    source: entry.source ?? null,
+    toolName: entry.toolName,
+    displayName: entry.displayName,
+    input: entry.input,
+    description: entry.description,
+    reason: entry.reason,
+    agentId: entry.agentId,
+    requestedAt: entry.requestedAt,
+    deadlineAt: entry.deadlineAt,
+  }));
+  sendJson(res, 200, { approvals });
 }
 
 /**
@@ -812,6 +910,7 @@ async function handleChatTurn(
     allowedTools,
     pendingApprovals,
     approvalTimeoutMs,
+    approvalStore,
     chatSseQueues,
     approvalStreams,
     describeSource,
@@ -877,7 +976,7 @@ async function handleChatTurn(
   // second, idempotent pass for any approval that outlives the turn without
   // ever going through abort (e.g. it resolves on its own right as the turn
   // is wrapping up for some other reason).
-  controller.signal.addEventListener('abort', () => cleanupApprovalsForChat(pendingApprovals, chatId));
+  controller.signal.addEventListener('abort', () => cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore));
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
@@ -911,7 +1010,7 @@ async function handleChatTurn(
       // so the response is only ended once every enqueued frame, including
       // this one, has actually reached the socket.
       onEvent: (event) => enqueue(event),
-      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, describeSource }),
+      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, approvalStore, describeSource }),
       signal: controller.signal,
     });
     await enqueue({ type: 'turn-complete', ...result });
@@ -934,7 +1033,7 @@ async function handleChatTurn(
     // Turn end, cancel, AND client disconnect all reach here (see this
     // function's own doc comment) — the single place that must never leave
     // a pending approval for this chat dangling (SECURITY: fail-closed).
-    cleanupApprovalsForChat(pendingApprovals, chatId);
+    cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore);
     if (!res.writableEnded) res.end();
   }
 }
@@ -1394,6 +1493,7 @@ async function handleRequest(
     allowedTools,
     pendingApprovals,
     approvalTimeoutMs,
+    getApprovalStore,
     getTriggers,
     getRunner,
     chatSseQueues,
@@ -1488,6 +1588,7 @@ async function handleRequest(
         allowedTools,
         pendingApprovals,
         approvalTimeoutMs,
+        approvalStore: getApprovalStore(),
         chatSseQueues,
         approvalStreams,
         describeSource,
@@ -1503,7 +1604,15 @@ async function handleRequest(
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleApprovalDecision(req, res, segments[2], pendingApprovals);
+      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore());
+      return;
+    }
+    if (segments.length === 2 && segments[1] === 'approvals') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleApprovalsList(res, getApprovalStore());
       return;
     }
 
@@ -1584,7 +1693,8 @@ export function startServer({
   harnessName = DEFAULT_HARNESS_NAME,
   permissionMode = 'default',
   allowedTools = null,
-  approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS,
+  approvalTimeoutMs = APPROVAL_DEADLINE_INTERACTIVE_MS,
+  unattendedApprovalTimeoutMs = APPROVAL_DEADLINE_UNATTENDED_MS,
   bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
@@ -1647,6 +1757,17 @@ export function startServer({
   function getTriggers() {
     if (!triggers) triggers = openTriggers(dataDir, { knownAppIds: installedAppIds });
     return triggers;
+  }
+
+  // The durable approval inbox (see approval-store.mjs), opened lazily like
+  // the board and the registry above — creating it reads, and possibly
+  // rewrites, <dataDir>/approvals.json, which most invocations never need.
+  // Once opened it is shared by BOTH approval paths: a chat turn's questions
+  // and a trigger's. One store, one file, one place GET /api/approvals reads.
+  let approvalStore = null;
+  function getApprovalStore() {
+    if (!approvalStore) approvalStore = createApprovalStore({ dataDir });
+    return approvalStore;
   }
 
   // Same dedicated workspace a chat turn's cwd already is (see
@@ -1714,12 +1835,25 @@ export function startServer({
         // runner.mjs::notifyPolicyHandler).
         resolveToolApp: appIdForTool,
         hasApprovalClient: () => approvalStreams.size > 0,
+        // The inbox is what lets an unattended question/review trigger fire
+        // at all (see runner.mjs::approvalCapability). `hasApprovalClient`
+        // above stays wired: it is still the honest answer for a runner
+        // asked what it would do WITHOUT one, and the SSE broadcast below is
+        // still the fastest path to a browser that happens to be open.
+        approvalStore: getApprovalStore(),
+        releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
         makeUiApprovalHandler: (chatId) =>
           makeApprovalHandler({
             chatId,
             enqueue: (frame) => deliverApprovalFrame(chatId, frame),
             pendingApprovals,
-            approvalTimeoutMs,
+            // A trigger question waits the UNATTENDED deadline, not the chat
+            // one: nobody typed this turn, so "answer within ten minutes" is
+            // a rule about a person who was never there. See
+            // approval-store.mjs's APPROVAL_DEADLINE_UNATTENDED_MS for why it
+            // is hours rather than unbounded.
+            approvalTimeoutMs: unattendedApprovalTimeoutMs,
+            approvalStore: getApprovalStore(),
             describeSource: describeApprovalSource,
           }),
       });
@@ -1784,6 +1918,7 @@ export function startServer({
       allowedTools,
       pendingApprovals,
       approvalTimeoutMs,
+      getApprovalStore,
       getTriggers,
       getRunner,
       chatSseQueues,

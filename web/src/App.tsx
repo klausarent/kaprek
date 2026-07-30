@@ -4,6 +4,7 @@
 //   #/chat/<id>                 → one chat
 //   #/chats                     → chat list (?triggerId=, ?includeSilent=1)
 //   #/triggers                  → trigger page
+//   #/approvals                 → the durable approval inbox
 //   #/apps                      → installed apps (read-only)
 //   #/list, #/project/<slug>    → session list (the transcript viewer core)
 //   #/session/<project>/<id>    → thread view
@@ -18,6 +19,7 @@ import Board from "./pages/Board";
 import Chat from "./pages/Chat";
 import ChatList from "./pages/ChatList";
 import Triggers from "./pages/Triggers";
+import Approvals from "./pages/Approvals";
 import Apps from "./pages/Apps";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
@@ -30,6 +32,7 @@ export type Route =
   | { name: "chat"; chatId: string | undefined }
   | { name: "chats"; triggerId: string | undefined; includeSilent: boolean }
   | { name: "triggers" }
+  | { name: "approvals" }
   | { name: "apps" };
 
 function parseHash(hash: string): Route {
@@ -56,6 +59,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "triggers") {
     return { name: "triggers" };
+  }
+  if (parts[0] === "approvals") {
+    return { name: "approvals" };
   }
   if (parts[0] === "apps") {
     return { name: "apps" };
@@ -114,6 +120,10 @@ export function navigateToChats({ triggerId, includeSilent }: { triggerId?: stri
 
 export function navigateToTriggers() {
   window.location.hash = "#/triggers";
+}
+
+export function navigateToApprovals() {
+  window.location.hash = "#/approvals";
 }
 
 export function navigateToApps() {
@@ -256,6 +266,16 @@ export default function App() {
             Triggers
           </a>
           <a
+            href="#/approvals"
+            className={route.name === "approvals" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToApprovals();
+            }}
+          >
+            Approvals
+          </a>
+          <a
             href="#/apps"
             className={route.name === "apps" ? "active" : ""}
             onClick={(e) => {
@@ -300,6 +320,8 @@ export default function App() {
           <Board />
         ) : route.name === "triggers" ? (
           <Triggers />
+        ) : route.name === "approvals" ? (
+          <Approvals />
         ) : route.name === "apps" ? (
           <Apps />
         ) : route.name === "chats" ? (

@@ -4,13 +4,21 @@
 import type { ApprovalFrame } from "./api";
 
 /**
- * The server denies an unanswered approval after 10 minutes
- * (DEFAULT_APPROVAL_TIMEOUT_MS in src/server/server.mjs) and never tells the
- * client it did. The countdown below is therefore COSMETIC: it exists so the
- * user knows waiting has a deadline, and so a long-dead entry stops sitting in
- * the stack forever. The server's own timer is the authority — a client whose
- * clock or tab-throttling makes this number wrong changes nothing about what
- * actually happens to the tool call.
+ * Fallback deadline for a frame that carries no `deadlineAt` of its own.
+ *
+ * The server tells the client when it will give up (see
+ * server.mjs::makeApprovalHandler, which puts `deadlineAt` on every approval
+ * frame), and deadline() below prefers that. This constant is only what a
+ * frame from an older server, or one that somehow lost the field, falls back
+ * to. It must NOT be treated as the deadline in general: a question raised by
+ * an unattended trigger waits hours, not ten minutes
+ * (APPROVAL_DEADLINE_UNATTENDED_MS in src/server/approval-store.mjs), and a
+ * client that assumed ten minutes would drop a live question out of the stack
+ * while the server was still waiting on it.
+ *
+ * Either way the countdown is COSMETIC: the server's own timer is the
+ * authority, and a client whose clock or tab-throttling makes this number
+ * wrong changes nothing about what happens to the tool call.
  */
 export const APPROVAL_TIMEOUT_MS = 10 * 60 * 1000;
 
@@ -18,6 +26,11 @@ export type PendingApproval = ApprovalFrame & {
   /** Client-side receipt time, the countdown's zero point. */
   receivedAtMs: number;
 };
+
+/** When this entry lapses: the server's own `deadlineAt` when it sent one, otherwise the client-side fallback above. */
+export function deadlineOf(entry: PendingApproval): number {
+  return typeof entry.deadlineAt === "number" ? entry.deadlineAt : entry.receivedAtMs + APPROVAL_TIMEOUT_MS;
+}
 
 /**
  * An entry's real identity. The server keys pending approvals by
@@ -48,9 +61,9 @@ export function removeApprovalsForChat(stack: PendingApproval[], chatId: string)
   return next.length === stack.length ? stack : next;
 }
 
-/** Drops entries whose cosmetic countdown has run out — by then the server has denied them on its own. */
+/** Drops entries whose countdown has run out — by then the server has denied them on its own. Keyed off the server's own deadline where it gave one (see deadlineOf), so an eight-hour trigger question is not swept out of the stack after ten minutes. */
 export function dropExpired(stack: PendingApproval[], nowMs: number): PendingApproval[] {
-  const next = stack.filter((entry) => nowMs - entry.receivedAtMs < APPROVAL_TIMEOUT_MS);
+  const next = stack.filter((entry) => nowMs < deadlineOf(entry));
   return next.length === stack.length ? stack : next;
 }
 
@@ -61,7 +74,7 @@ export function oldestApproval(stack: PendingApproval[]): PendingApproval | null
 
 /** Milliseconds left on the cosmetic countdown, clamped at 0. */
 export function remainingMs(entry: PendingApproval, nowMs: number): number {
-  return Math.max(0, entry.receivedAtMs + APPROVAL_TIMEOUT_MS - nowMs);
+  return Math.max(0, deadlineOf(entry) - nowMs);
 }
 
 /** mm:ss, zero-padded. */
@@ -92,7 +105,13 @@ export function shortAgentId(agentId: string | null | undefined): string | null 
  * than the one on screen. Labelling the current chat's own question would be
  * noise on the common path.
  */
-export function approvalSourceLabel(entry: PendingApproval, currentChatId: string | undefined): string | null {
+// Takes the two fields it actually reads rather than a whole PendingApproval:
+// the same label is needed for an inbox entry (see pages/Approvals.tsx), which
+// carries no client-side receivedAtMs because it was never pushed to a client.
+export function approvalSourceLabel(
+  entry: Pick<ApprovalFrame, "source" | "chatId">,
+  currentChatId: string | undefined,
+): string | null {
   const source = entry.source;
   if (!source) return null;
   if (source.kind === "trigger") {

@@ -1413,3 +1413,15 @@ pre,
   font-weight: 600;
   color: var(--accent);
 }
+
+/* Approval inbox (#/approvals). Reuses the live dialog's own card so a
+   question looks the same whether it arrives over the stream or is found
+   here; only the layout around it differs (a list, not one modal). */
+.approval-inbox-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.approval-inbox-item {
+  border-color: var(--border);
+}
