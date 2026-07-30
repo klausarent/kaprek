@@ -33,6 +33,14 @@ export class InvalidTitleError extends Error {
   }
 }
 
+export class InvalidChatMetaError extends Error {
+  constructor(field, message) {
+    super(`${field}: ${message}`);
+    this.name = 'InvalidChatMetaError';
+    this.field = field;
+  }
+}
+
 export class UnknownEventKindError extends Error {
   constructor(kind) {
     super(`unknown event kind: ${kind} (expected one of ${EVENT_KINDS.join(', ')})`);
@@ -70,6 +78,11 @@ const EVENT_SHAPES = {
   },
 };
 export const EVENT_KINDS = Object.keys(EVENT_SHAPES);
+
+// A chat's origin: 'user' for a normal chat turn, 'trigger' for one started
+// by src/triggers/runner.mjs without any user input (see createChat()'s
+// origin/triggerId/silent params below).
+const CHAT_ORIGINS = ['user', 'trigger'];
 
 function eventsPathFor(dataDir, chatId) {
   return path.join(dataDir, 'chats', chatId, 'events.jsonl');
@@ -110,12 +123,25 @@ function applyEvent(chat, wrapper) {
   switch (type) {
     case 'chat.created':
       chat.title = data.title;
+      // A chat.created line written before origin/triggerId/silent existed
+      // has none of them — default to the values a plain user-started chat
+      // always had, so an old chat stays readable and visible.
+      chat.origin = data.origin ?? 'user';
+      chat.triggerId = data.triggerId ?? null;
+      chat.silent = data.silent ?? false;
       chat.createdAt = ts;
       chat.updatedAt = ts;
       break;
     case 'chat.event':
       chat.events.push(data);
       chat.eventCount = chat.events.length;
+      chat.updatedAt = ts;
+      break;
+    case 'chat.silent':
+      // Flips visibility after the fact — see setSilent()'s doc comment:
+      // src/triggers/runner.mjs uses this once a heartbeat turn's own
+      // response is known, which is only AFTER the chat already exists.
+      chat.silent = data.silent;
       chat.updatedAt = ts;
       break;
     default:
@@ -155,6 +181,9 @@ function summarize(chat) {
   return {
     id: chat.id,
     title: chat.title,
+    origin: chat.origin ?? 'user',
+    triggerId: chat.triggerId ?? null,
+    silent: chat.silent ?? false,
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
     eventCount: chat.eventCount,
@@ -176,7 +205,7 @@ export function openChats(dataDir) {
     for (const entry of fs.readdirSync(chatsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const chatId = entry.name;
-      const chat = { id: chatId, title: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
       for (const wrapper of loadEvents(eventsPathFor(dataDir, chatId))) {
         applyEvent(chat, wrapper);
       }
@@ -204,13 +233,31 @@ export function openChats(dataDir) {
   }
 
   return {
-    createChat({ title } = {}) {
+    /**
+     * @param {string} [title]
+     * @param {'user'|'trigger'} [origin] - who started this chat; 'trigger'
+     *   for one created by src/triggers/runner.mjs without user input
+     * @param {string|null} [triggerId] - which trigger, when origin is 'trigger'
+     * @param {boolean} [silent] - true hides the chat from GET /api/chat/list
+     *   by default (see src/server/server.mjs's ?includeSilent=1 handling) —
+     *   used for a heartbeat run whose whole point was "nothing to report"
+     */
+    createChat({ title, origin = 'user', triggerId = null, silent = false } = {}) {
       if (title !== undefined && (typeof title !== 'string' || title.trim().length === 0)) {
         throw new InvalidTitleError();
       }
+      if (!CHAT_ORIGINS.includes(origin)) {
+        throw new InvalidChatMetaError('origin', `must be one of ${CHAT_ORIGINS.join(', ')}`);
+      }
+      if (triggerId !== null && typeof triggerId !== 'string') {
+        throw new InvalidChatMetaError('triggerId', 'must be a string or null');
+      }
+      if (typeof silent !== 'boolean') {
+        throw new InvalidChatMetaError('silent', 'must be a boolean');
+      }
       const chatId = crypto.randomUUID();
-      const chat = { id: chatId, title: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
-      commit(chatId, chat, 'chat.created', { title: title ?? null });
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent });
       chats.set(chatId, chat);
       return summarize(chat);
     },
@@ -233,6 +280,23 @@ export function openChats(dataDir) {
     events(chatId) {
       const chat = requireChat(chatId);
       return clone(chat.events);
+    },
+
+    /**
+     * Flips a chat's `silent` flag after creation — appends a 'chat.silent'
+     * wrapper line rather than rewriting 'chat.created' (this log is
+     * append-only, see the module doc comment). Needed because whether a
+     * heartbeat trigger's run counts as "silent" is only known once the
+     * agent's response has arrived, which is necessarily AFTER createChat()
+     * already ran (see src/triggers/runner.mjs).
+     */
+    setSilent(chatId, silent) {
+      const chat = requireChat(chatId);
+      if (typeof silent !== 'boolean') {
+        throw new InvalidChatMetaError('silent', 'must be a boolean');
+      }
+      commit(chatId, chat, 'chat.silent', { silent });
+      return summarize(chat);
     },
   };
 }

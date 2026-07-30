@@ -181,6 +181,15 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  * @param {number} [options.maxTextLen] - cap on assistant/thinking/user text, see parse.mjs::digestSession()
  * @param {number} [options.maxToolLen] - cap on tool input/result, see parse.mjs::digestSession()
  * @param {boolean} [options.redact] - redact known secret formats before persisting/streaming (default true)
+ * @param {'user'|'trigger'} [options.origin] - who started this turn (default
+ *   'user'); only affects a NEWLY created chat (see chatId above) and every
+ *   runs.jsonl line this turn appends — see src/triggers/runner.mjs, the
+ *   only caller that passes 'trigger'
+ * @param {string|null} [options.triggerId] - which trigger, when origin is
+ *   'trigger'; ignored (forced null) otherwise
+ * @param {boolean} [options.silent] - initial value of a newly created
+ *   chat's `silent` flag (see src/chats/store.mjs::createChat) — ignored
+ *   when resuming an existing chatId, since that chat already has one
  * @returns {Promise<{chatId: string, cliSessionId: string|null, costUsd: number|null, stopReason: string, error: {message:string}|null}>}
  */
 export async function runTurn({
@@ -198,6 +207,9 @@ export async function runTurn({
   maxTextLen = DEFAULT_MAX_TEXT_LEN,
   maxToolLen = DEFAULT_MAX_TOOL_LEN,
   redact = true,
+  origin = 'user',
+  triggerId = null,
+  silent = false,
 } = {}) {
   const chats = openChats(dataDir);
   const startedAt = Date.now();
@@ -205,7 +217,7 @@ export async function runTurn({
   let effectiveChatId = chatId;
   if (!effectiveChatId) {
     const title = text.slice(0, 80).trim();
-    const chat = chats.createChat(title.length > 0 ? { title } : undefined);
+    const chat = chats.createChat({ ...(title.length > 0 ? { title } : {}), origin, triggerId, silent });
     effectiveChatId = chat.id;
   }
 
@@ -437,6 +449,8 @@ export async function runTurn({
         stopReason: 'error',
         rateLimit: null,
         error: { message },
+        origin,
+        triggerId,
       });
     } catch {
       // best-effort — see appendRun()'s own call further down for the same caveat
@@ -501,6 +515,8 @@ export async function runTurn({
       stopReason: turnResult.stopReason,
       rateLimit,
       error: turnResult.error,
+      origin,
+      triggerId,
     });
   } catch {
     // best-effort — see comment above

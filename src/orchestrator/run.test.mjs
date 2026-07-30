@@ -654,3 +654,69 @@ test('a failed mcp-config/settings write fails the turn instead of silently runn
   expect(runs).toHaveLength(1);
   expect(runs[0].stopReason).toBe('error');
 });
+
+// ------------------------------------------------------------- origin/triggerId/silent passthrough (task 7a)
+
+test('runTurn defaults to origin "user" with triggerId null on both the new chat and the runs.jsonl line', async () => {
+  const fakeHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false }] });
+  const result = await runTurn({ dataDir: tmpDir, text: 'a plain user turn', harness: fakeHarness, harnessName: 'fake' });
+
+  const chat = openChats(tmpDir).get(result.chatId);
+  expect(chat.origin).toBe('user');
+  expect(chat.triggerId).toBeNull();
+  expect(chat.silent).toBe(false);
+
+  const runs = readRuns(tmpDir);
+  expect(runs[0].origin).toBe('user');
+  expect(runs[0].triggerId).toBeNull();
+});
+
+test('runTurn with origin "trigger" carries origin/triggerId/silent onto a NEWLY created chat and onto the runs.jsonl line', async () => {
+  const fakeHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0.002, usage: {}, isError: false }] });
+  const result = await runTurn({
+    dataDir: tmpDir,
+    text: 'triggered turn',
+    harness: fakeHarness,
+    harnessName: 'fake',
+    origin: 'trigger',
+    triggerId: 'heartbeat-1',
+    silent: true,
+  });
+
+  const chat = openChats(tmpDir).get(result.chatId);
+  expect(chat.origin).toBe('trigger');
+  expect(chat.triggerId).toBe('heartbeat-1');
+  expect(chat.silent).toBe(true);
+
+  const runs = readRuns(tmpDir);
+  expect(runs[0].origin).toBe('trigger');
+  expect(runs[0].triggerId).toBe('heartbeat-1');
+});
+
+test('runTurn resuming an EXISTING chatId does not change that chat\'s already-stored origin/triggerId/silent, but still logs this turn\'s own origin to runs.jsonl', async () => {
+  const firstHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  const first = await runTurn({ dataDir: tmpDir, text: 'first', harness: firstHarness, harnessName: 'fake' });
+
+  const secondHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  await runTurn({
+    dataDir: tmpDir,
+    chatId: first.chatId,
+    text: 'second, resumed',
+    harness: secondHarness,
+    harnessName: 'fake',
+    origin: 'trigger',
+    triggerId: 'ignored-since-chat-already-exists',
+  });
+
+  // createChat() only ran once, for the first call — the chat's own origin
+  // stays 'user' forever, only individual runs.jsonl lines vary per turn.
+  const chat = openChats(tmpDir).get(first.chatId);
+  expect(chat.origin).toBe('user');
+  expect(chat.triggerId).toBeNull();
+
+  const runs = readRuns(tmpDir);
+  expect(runs).toHaveLength(2);
+  expect(runs[0].origin).toBe('user');
+  expect(runs[1].origin).toBe('trigger');
+  expect(runs[1].triggerId).toBe('ignored-since-chat-already-exists');
+});

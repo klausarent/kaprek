@@ -7,6 +7,7 @@ import {
   openChats,
   ChatNotFoundError,
   InvalidTitleError,
+  InvalidChatMetaError,
   UnknownEventKindError,
   InvalidEventError,
 } from './store.mjs';
@@ -51,6 +52,70 @@ test('createChat rejects a non-string/empty title when one is given', () => {
   expect(() => chats.createChat({ title: '' })).toThrow(InvalidTitleError);
   expect(() => chats.createChat({ title: '   ' })).toThrow(InvalidTitleError);
   expect(() => chats.createChat({ title: 42 })).toThrow(InvalidTitleError);
+});
+
+test('createChat defaults origin to "user", triggerId to null, silent to false', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  expect(chat.origin).toBe('user');
+  expect(chat.triggerId).toBeNull();
+  expect(chat.silent).toBe(false);
+});
+
+test('createChat accepts an explicit origin/triggerId/silent and round-trips them through get/list', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'Heartbeat check', origin: 'trigger', triggerId: 'heartbeat-1', silent: true });
+  expect(chat.origin).toBe('trigger');
+  expect(chat.triggerId).toBe('heartbeat-1');
+  expect(chat.silent).toBe(true);
+  expect(chats.get(chat.id)).toEqual(chat);
+  expect(chats.list()).toEqual([chat]);
+});
+
+test('createChat rejects an invalid origin/triggerId/silent', () => {
+  const chats = openChats(tmpDir);
+  expect(() => chats.createChat({ origin: 'robot' })).toThrow(InvalidChatMetaError);
+  expect(() => chats.createChat({ triggerId: 42 })).toThrow(InvalidChatMetaError);
+  expect(() => chats.createChat({ silent: 'yes' })).toThrow(InvalidChatMetaError);
+});
+
+test('setSilent flips a chat\'s silent flag and is visible immediately via get()', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'Heartbeat check', origin: 'trigger', triggerId: 'h1' });
+  expect(chat.silent).toBe(false);
+
+  const updated = chats.setSilent(chat.id, true);
+  expect(updated.silent).toBe(true);
+  expect(chats.get(chat.id).silent).toBe(true);
+
+  chats.setSilent(chat.id, false);
+  expect(chats.get(chat.id).silent).toBe(false);
+});
+
+test('setSilent throws ChatNotFoundError for an unknown chatId, InvalidChatMetaError for a non-boolean', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T' });
+  expect(() => chats.setSilent('nope', true)).toThrow(ChatNotFoundError);
+  expect(() => chats.setSilent(chat.id, 'yes')).toThrow(InvalidChatMetaError);
+});
+
+test('a chat.created line written before origin/triggerId/silent existed still loads with the old defaults', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'Old chat' });
+  // Simulate a pre-upgrade log line by stripping the new fields directly
+  // from the events.jsonl file, then reopening the store fresh.
+  const eventsPath = path.join(tmpDir, 'chats', chat.id, 'events.jsonl');
+  const wrapper = JSON.parse(fs.readFileSync(eventsPath, 'utf8').trim());
+  delete wrapper.data.origin;
+  delete wrapper.data.triggerId;
+  delete wrapper.data.silent;
+  fs.writeFileSync(eventsPath, `${JSON.stringify(wrapper)}\n`, 'utf8');
+
+  const reopened = openChats(tmpDir);
+  const reloaded = reopened.get(chat.id);
+  expect(reloaded.origin).toBe('user');
+  expect(reloaded.triggerId).toBeNull();
+  expect(reloaded.silent).toBe(false);
 });
 
 test('get throws ChatNotFoundError for an unknown id', () => {

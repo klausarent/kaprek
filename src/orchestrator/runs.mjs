@@ -32,6 +32,13 @@ export function appendRun(dataDir, entry = {}) {
     stopReason: entry.stopReason ?? null,
     rateLimit: entry.rateLimit ?? null,
     error: entry.error ?? null,
+    // Who/what started this turn — 'user' for a normal chat turn, 'trigger'
+    // for one started by src/triggers/runner.mjs without any user input.
+    // triggerId names WHICH trigger when origin is 'trigger', else null.
+    // Old lines predate both fields; readRuns() returns them as-is (no
+    // backfill), so a reader must treat a missing origin as 'user'.
+    origin: entry.origin ?? 'user',
+    triggerId: entry.triggerId ?? null,
   };
   fs.mkdirSync(dataDir, { recursive: true });
   fs.appendFileSync(runsPath, `${JSON.stringify(line)}\n`, 'utf8');
