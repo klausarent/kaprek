@@ -1000,13 +1000,23 @@ async function handleChatRoutes(req, res, segments, url, ctx) {
   sendJson(res, 404, { error: 'not found' });
 }
 
-/** GET /api/triggers — every trigger plus its runsToday/costToday (see src/triggers/limits.mjs::checkLimits), so a UI can show the daily cap without a second round trip per trigger. */
-function handleTriggersList(res, getTriggers, dataDir) {
+/**
+ * GET /api/triggers — every trigger plus its runsToday/costToday (see
+ * src/triggers/limits.mjs::checkLimits) and its approval-wiring status
+ * (`approvalPath`: 'policy' for 'notify' — kaprek's own code decides, no
+ * human, no wiring needed; 'ui' for 'question'/'review' — needs a live
+ * approval surface; see runner.mjs::approvalCapability()). `blocked` is a
+ * human-readable reason (or null) — a 'question'/'review' trigger that can
+ * structurally never fire (no UI approval handler wired) is visible here,
+ * not just a console.log line (task-7a-review.md Important #2).
+ */
+function handleTriggersList(res, getTriggers, getRunner, dataDir) {
+  const runner = getRunner();
   const triggers = getTriggers()
     .list()
     .map((trigger) => {
       const { runsToday, costToday } = checkLimits({ dataDir, trigger, now: Date.now() });
-      return { ...trigger, runsToday, costToday };
+      return { ...trigger, runsToday, costToday, ...runner.approvalCapability(trigger) };
     });
   sendJson(res, 200, { triggers });
 }
@@ -1055,19 +1065,79 @@ async function handleTriggerToggle(req, res, getTriggers, id) {
 }
 
 /**
- * POST /api/triggers/<id>/fire — manual fire, for test/UI use (see the task
- * brief). Runs through the exact same src/triggers/runner.mjs::fireTrigger()
- * path a background tick uses, with `cause: {origin: 'user'}` — every
- * fail-closed check (limits, loop guard, schedule slot, approval handler)
- * still applies; this is not a bypass.
+ * POST /api/triggers/<id>/fire — manual fire, for test/UI use. Runs through
+ * the exact same src/triggers/runner.mjs::fireTrigger() path a background
+ * tick uses, with `cause: {origin: 'user'}` — every fail-closed check
+ * (limits, loop guard, schedule slot, approval handler) still applies; this
+ * is not a bypass.
+ *
+ * Streams the SAME kind of SSE response POST /api/chat/turn does (a
+ * bootstrap `chat-id` frame once the turn's chat is known, live turn
+ * events, one final frame) — this is what actually lets a 'question'/
+ * 'review' trigger's approval question reach a live client (see
+ * getRunner()'s makeUiApprovalHandler wiring, bound to `chatSseQueues`
+ * below). A REJECTED fire (disabled, over its daily cap, no due slot, ...)
+ * never starts a turn at all — it streams exactly one rejection frame and
+ * ends, same shape as a completed one minus `chatId`/`result`.
+ *
+ * Loop-guard layer 2 of 3 (layer 1: a 'notify' trigger's own policy handler
+ * can never reach Bash/WebFetch to call this route in the first place —
+ * see runner.mjs::notifyPolicyHandler(); layer 3: an instance-token check
+ * across whatever multiple kaprek processes end up talking to the same
+ * dataDir, task 7b): while ANY trigger-origin turn is in flight
+ * (runner.isAnyTriggerRunning()), this route refuses OUTRIGHT with 429,
+ * before opening any stream at all. Deliberately coarse (see that method's
+ * own doc comment) — the simplest thing that makes an unnoticed
+ * trigger-A-fires-trigger-B-fires-trigger-A chain over HTTP structurally
+ * impossible: at most one trigger-origin turn can ever be in flight,
+ * system-wide, so a second trigger can never even reach fireTrigger() while
+ * a first one (however it started) is still running. A manual user fire
+ * briefly blocked by an unrelated already-running heartbeat is an
+ * acceptable false positive for that guarantee.
  */
-async function handleTriggerFire(res, getRunner, id) {
+async function handleTriggerFire(res, getRunner, id, chatSseQueues) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid trigger id' });
     return;
   }
-  const result = await getRunner().fireTrigger(id, { cause: { origin: 'user' } });
-  sendJson(res, 200, result);
+  const runner = getRunner();
+  if (runner.isAnyTriggerRunning()) {
+    sendJson(res, 429, { reason: 'trigger turn in progress' });
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  const enqueue = createSseQueue(res);
+
+  let chatIdForCleanup = null;
+  try {
+    const result = await runner.fireTrigger(id, {
+      cause: { origin: 'user' },
+      // Not awaited (same reasoning as handleChatTurn's own onEvent above):
+      // events arrive synchronously from deep inside the harness, and
+      // enqueue() itself preserves order/backpressure.
+      onEvent: (event) => enqueue(event),
+      onChatId: (chatId) => {
+        chatIdForCleanup = chatId;
+        chatSseQueues.set(chatId, enqueue);
+        enqueue({ type: 'chat-id', chatId }).catch(() => {});
+      },
+    });
+    await enqueue({ type: 'trigger-complete', ...result });
+  } catch (err) {
+    // A runner/orchestrator throw here is a genuine programming error, not
+    // a normal rejection (those already come back as {fired:false, reason}
+    // — see runner.mjs). Headers are long sent by this point, so this
+    // cannot become a 429/500 JSON response; report it as one more frame.
+    await enqueue({ type: 'trigger-complete', fired: false, reason: `internal error: ${err.message}` });
+  } finally {
+    if (chatIdForCleanup) chatSseQueues.delete(chatIdForCleanup);
+    if (!res.writableEnded) res.end();
+  }
 }
 
 /** DELETE /api/triggers/<id>. */
@@ -1085,11 +1155,11 @@ function handleTriggerDelete(res, getTriggers, id) {
 }
 
 /** Trigger routes, mounted at /api/triggers/*. */
-async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir }) {
+async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues }) {
   // /api/triggers
   if (segments.length === 2) {
     if (req.method === 'GET') {
-      handleTriggersList(res, getTriggers, dataDir);
+      handleTriggersList(res, getTriggers, getRunner, dataDir);
       return;
     }
     if (req.method === 'POST') {
@@ -1115,7 +1185,7 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
       return;
     }
     if (segments[3] === 'fire') {
-      await handleTriggerFire(res, getRunner, segments[2]);
+      await handleTriggerFire(res, getRunner, segments[2], chatSseQueues);
       return;
     }
   }
@@ -1179,6 +1249,7 @@ async function handleRequest(
     approvalTimeoutMs,
     getTriggers,
     getRunner,
+    chatSseQueues,
   },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
@@ -1249,7 +1320,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'triggers') {
-      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir });
+      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues });
       return;
     }
     if (segments.length === 3 && segments[1] === 'approvals') {
@@ -1379,12 +1450,15 @@ export function startServer({
   fs.mkdirSync(workspaceDir, { recursive: true });
 
   // The trigger runner, opened lazily and started once listen() resolves
-  // (see below), stopped when the server closes. `onApprovalRequest` is
-  // deliberately NOT wired up here: there is no live UI yet to answer a
-  // trigger-started approval (Trigger-UI is a later task) — see
-  // src/triggers/runner.mjs's own doc comment on that option. A
-  // 'question'/'review' trigger simply will not fire until that wiring
-  // exists; that is the correct fail-closed default, not a bug.
+  // (see below), stopped when the server closes. `makeUiApprovalHandler`
+  // reuses the SAME makeApprovalHandler() a normal chat turn uses — see the
+  // module doc comment further down — bound to `chatSseQueues` so a
+  // question/review trigger's approval streams live if (and only if) a
+  // client currently has THAT chatId open via the SSE fire route below;
+  // otherwise it still exists and still auto-denies after
+  // `approvalTimeoutMs`, it just never gets a live listener. A 'notify'
+  // trigger never calls this at all — its own self-contained policy
+  // decider (see runner.mjs::notifyPolicyHandler()) needs nothing from here.
   let runner = null;
   function getRunner() {
     if (!runner) {
@@ -1396,6 +1470,13 @@ export function startServer({
         harnessName,
         cwd: workspaceDir,
         permissionMode,
+        makeUiApprovalHandler: (chatId) =>
+          makeApprovalHandler({
+            chatId,
+            enqueue: (frame) => (chatSseQueues.get(chatId) ?? (() => Promise.resolve()))(frame),
+            pendingApprovals,
+            approvalTimeoutMs,
+          }),
       });
     }
     return runner;
@@ -1411,6 +1492,15 @@ export function startServer({
   // carries no chatId of its own; see makeApprovalHandler()/
   // handleApprovalDecision()/cleanupApprovalsForChat() above.
   const pendingApprovals = new Map();
+
+  // One live SSE enqueue() function per chatId currently being streamed by
+  // the trigger fire route below (POST /api/triggers/<id>/fire) — lets
+  // getRunner()'s makeUiApprovalHandler find "is anyone actually watching
+  // this trigger-started chat right now" without the runner needing to know
+  // anything about HTTP/SSE itself. A background tick-driven fire never has
+  // an entry here, so its approval requests still get created (and still
+  // time out via approvalTimeoutMs) but never try to write to a dead queue.
+  const chatSseQueues = new Map();
 
   const server = http.createServer((req, res) => {
     handleRequest(req, res, {
@@ -1433,6 +1523,7 @@ export function startServer({
       approvalTimeoutMs,
       getTriggers,
       getRunner,
+      chatSseQueues,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });

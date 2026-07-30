@@ -1642,25 +1642,100 @@ test('triggers: POST /api/triggers/<id>/toggle flips enabled; unknown id is 404;
   expect(badBody.status).toBe(400);
 });
 
-test('triggers: POST /api/triggers/<id>/fire manually fires an enabled trigger and returns a chatId', async () => {
+test('triggers: POST /api/triggers/<id>/fire manually fires an enabled trigger and streams the turn as SSE (bootstrap chat-id + trigger-complete)', async () => {
   const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger());
 
   const res = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
   expect(res.status).toBe(200);
-  const body = await res.json();
-  expect(body.fired).toBe(true);
-  expect(typeof body.chatId).toBe('string');
+  expect(res.headers.get('content-type')).toContain('text/event-stream');
+  const frames = await readSse(res);
+  expect(frames[0]).toMatchObject({ type: 'chat-id' });
+  const complete = frames.find((f) => f.type === 'trigger-complete');
+  expect(complete.fired).toBe(true);
+  expect(typeof complete.chatId).toBe('string');
+  expect(complete.chatId).toBe(frames[0].chatId);
 });
 
-test('triggers: POST /api/triggers/<id>/fire on a disabled trigger reports fired:false with a reason (not an HTTP error)', async () => {
+test('triggers: POST /api/triggers/<id>/fire on a disabled trigger streams a single rejection frame, never opens a turn (not an HTTP error)', async () => {
   const { url } = await boot({});
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ enabled: false }));
 
   const res = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
   expect(res.status).toBe(200);
-  const body = await res.json();
-  expect(body).toEqual({ fired: false, reason: 'trigger disabled' });
+  const frames = await readSse(res);
+  expect(frames).toEqual([{ type: 'trigger-complete', fired: false, reason: 'trigger disabled' }]);
+});
+
+/** A harness whose startTurn() only resolves after a real delay — used to keep a trigger turn observably "in flight" for a loop-guard test. */
+function delayedHarness(delayMs) {
+  return {
+    async startTurn({ onEvent } = {}) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+      onEvent?.({ type: 'text', text: 'done' });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('triggers: POST /api/triggers/<id>/fire while a trigger turn is already in flight is rejected with 429 (loop-guard layer 2), before opening any stream', async () => {
+  const { url } = await boot({ harness: delayedHarness(200), harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger());
+
+  const firstFire = fetch(`${url}/api/triggers/nightly-sync/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
+  // Give the first request's synchronous fireTrigger() prefix (through
+  // runningIds.add()) a chance to run before firing the second one.
+  await new Promise((resolve) => setTimeout(resolve, 20));
+
+  const secondRes = await postJson(`${url}/api/triggers/nightly-sync/fire`, {});
+  expect(secondRes.status).toBe(429);
+  const secondBody = await secondRes.json();
+  expect(secondBody).toEqual({ reason: 'trigger turn in progress' });
+
+  const firstFrames = await readSse(await firstFire);
+  expect(firstFrames.find((f) => f.type === 'trigger-complete').fired).toBe(true);
+});
+
+test('triggers: a "question" escalation trigger fires (the server always wires a UI approval handler), and its approval question appears live in the SSE stream and is answerable via POST /api/approvals/<id>', async () => {
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'trigger-approve-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
+    harnessName: 'fake',
+  });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const listRes = await fetch(`${url}/api/triggers`);
+  const listed = (await listRes.json()).triggers.find((t) => t.id === 'ask-me');
+  expect(listed.approvalPath).toBe('ui');
+  expect(listed.blocked).toBeNull();
+
+  const res = await fetch(`${url}/api/triggers/ask-me/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
+
+  let approvalFrame = null;
+  const frames = await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && approvalFrame === null) {
+      approvalFrame = frame;
+      const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'allow' });
+      expect(decideRes.status).toBe(200);
+    }
+  });
+
+  expect(approvalFrame).toMatchObject({ type: 'approval', id: 'trigger-approve-1', toolName: 'Bash' });
+  expect(approvalFrame.chatId).toBe(frames[0].chatId);
+  const textFrame = frames.find((f) => f.type === 'text');
+  expect(textFrame.text).toBe('decision was allow');
+  const complete = frames.find((f) => f.type === 'trigger-complete');
+  expect(complete.fired).toBe(true);
+});
+
+test('triggers: GET /api/triggers reports approvalPath:"policy" for a "notify" trigger, with blocked:null', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger());
+
+  const listRes = await fetch(`${url}/api/triggers`);
+  const listed = (await listRes.json()).triggers.find((t) => t.id === 'nightly-sync');
+  expect(listed.approvalPath).toBe('policy');
+  expect(listed.blocked).toBeNull();
 });
 
 test('triggers: DELETE /api/triggers/<id> removes it; a second DELETE returns 404', async () => {
@@ -1718,16 +1793,18 @@ test('chat: GET /api/chat/list hides a silent heartbeat chat by default, include
   await postJson(`${url}/api/triggers`, heartbeatTriggerBody());
 
   const fireRes = await postJson(`${url}/api/triggers/heartbeat-check/fire`, {});
-  const fireBody = await fireRes.json();
-  expect(fireBody.fired).toBe(true);
-  expect(fireBody.silent).toBe(true);
+  const fireFrames = await readSse(fireRes);
+  const fireComplete = fireFrames.find((f) => f.type === 'trigger-complete');
+  expect(fireComplete.fired).toBe(true);
+  expect(fireComplete.silent).toBe(true);
+  const chatId = fireComplete.chatId;
 
   const defaultList = await (await fetch(`${url}/api/chat/list`)).json();
-  expect(defaultList.chats.map((c) => c.id)).not.toContain(fireBody.chatId);
+  expect(defaultList.chats.map((c) => c.id)).not.toContain(chatId);
 
   const withSilent = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
-  expect(withSilent.chats.map((c) => c.id)).toContain(fireBody.chatId);
-  const silentChat = withSilent.chats.find((c) => c.id === fireBody.chatId);
+  expect(withSilent.chats.map((c) => c.id)).toContain(chatId);
+  const silentChat = withSilent.chats.find((c) => c.id === chatId);
   expect(silentChat.origin).toBe('trigger');
   expect(silentChat.triggerId).toBe('heartbeat-check');
 });
