@@ -23,6 +23,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.rmSync(cwd, { recursive: true, force: true });
   vi.useRealTimers();
@@ -750,6 +751,98 @@ test('file-watch: a watched single file REPLACED by a rename (how editors save) 
 function writeRawTriggersFile(triggers) {
   fs.writeFileSync(path.join(dataDir, 'triggers.json'), JSON.stringify({ version: 1, triggers }, null, 2), 'utf8');
 }
+
+/**
+ * Makes fs.statSync fail for exactly one path, for the next `times` calls, with
+ * `code` — everything else keeps the real implementation. That is how a
+ * transient EBUSY (an editor's delete-then-rename caught mid-flight, an SMB
+ * share blinking) is reproduced without waiting for one to happen.
+ */
+function failStatSync(absPath, { times, code }) {
+  const realStatSync = fs.statSync;
+  let remaining = times;
+  vi.spyOn(fs, 'statSync').mockImplementation((target, ...rest) => {
+    if (String(target) === absPath && remaining > 0) {
+      remaining -= 1;
+      const err = new Error('resource busy or locked');
+      err.code = code;
+      throw err;
+    }
+    return realStatSync(target, ...rest);
+  });
+}
+
+test('file-watch: a single transient stat failure does NOT disable the trigger — it is retried on the next tick', async () => {
+  vi.useFakeTimers();
+  makeInbox('todo.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner, triggers } = makeRunner({
+    trigger: fileWatchTrigger({ config: { path: 'inbox/todo.md', debounceMs: 100 } }),
+    createWatcher: watchFactory,
+    log: (m) => logMessages.push(m),
+    tickMs: 1000,
+  });
+  runner.start();
+
+  failStatSync(path.join(cwd, 'inbox', 'todo.md'), { times: 1, code: 'EBUSY' });
+  await vi.advanceTimersByTimeAsync(1000); // the failing tick
+  expect(triggers.get('watch-1').enabled).toBe(true);
+  expect(logMessages.some((m) => m.includes('retrying on the next tick'))).toBe(true);
+
+  await vi.advanceTimersByTimeAsync(1000); // succeeds again
+  expect(triggers.get('watch-1').enabled).toBe(true);
+  expect(logMessages.some((m) => m.includes('DISABLED itself'))).toBe(false);
+  expect(watchFactory.watchers).toHaveLength(1); // same watcher, never reopened
+  runner.stop();
+});
+
+test('file-watch: two consecutive stat failures disable the trigger, with the error in the reason', async () => {
+  vi.useFakeTimers();
+  makeInbox('todo.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner, triggers } = makeRunner({
+    trigger: fileWatchTrigger({ config: { path: 'inbox/todo.md', debounceMs: 100 } }),
+    createWatcher: watchFactory,
+    log: (m) => logMessages.push(m),
+    tickMs: 1000,
+  });
+  runner.start();
+
+  failStatSync(path.join(cwd, 'inbox', 'todo.md'), { times: 2, code: 'EBUSY' });
+  await vi.advanceTimersByTimeAsync(2000); // two ticks in a row
+
+  expect(triggers.get('watch-1').enabled).toBe(false);
+  expect(logMessages.some((m) => m.includes('DISABLED itself') && m.includes('resource busy') && m.includes('twice in a row'))).toBe(true);
+  runner.stop();
+});
+
+test('file-watch: a disabled-by-health trigger is not re-armed in the same tick (no contradicting second log line)', async () => {
+  vi.useFakeTimers();
+  makeInbox('todo.md');
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const { runner } = makeRunner({
+    trigger: fileWatchTrigger({ config: { path: 'inbox/todo.md', debounceMs: 100 } }),
+    createWatcher: watchFactory,
+    log: (m) => logMessages.push(m),
+    tickMs: 1000,
+  });
+  runner.start();
+  expect(watchFactory.watchers).toHaveLength(1);
+
+  fs.rmSync(path.join(cwd, 'inbox', 'todo.md'));
+  await vi.advanceTimersByTimeAsync(1000);
+
+  // The disable is the LAST word for this trigger: no second watcher opened
+  // from the stale snapshot, and no "watching …" line after the disable.
+  expect(watchFactory.watchers).toHaveLength(1);
+  const disabledAt = logMessages.findIndex((m) => m.includes('DISABLED itself'));
+  expect(disabledAt).toBeGreaterThanOrEqual(0);
+  expect(logMessages.slice(disabledAt + 1).some((m) => m.includes('watching '))).toBe(false);
+  runner.stop();
+});
 
 test('file-watch: a healthy watcher survives many ticks — writing inside the watched directory is not mistaken for a replaced target', async () => {
   vi.useFakeTimers();

@@ -568,19 +568,44 @@ export function createTriggerRunner({
    * WITHOUT emitting 'error', so the error handler never runs and the trigger
    * would look armed while watching a file that no longer exists.
    *
+   * Not every failed look is an answer, though. ENOENT/ENOTDIR is one: nothing
+   * is there. Everything else (EBUSY, EPERM, EIO, an SMB share blinking, a
+   * guard error) can be a millisecond-wide window in the middle of somebody's
+   * save — an editor that deletes and then renames would otherwise get a
+   * correctly configured trigger switched off permanently. So a non-ENOENT
+   * failure is tolerated once and only counts on the SECOND consecutive tick;
+   * any success resets the counter.
+   *
+   * Known limit: on a filesystem without stable inode numbers (`ino === 0`,
+   * e.g. some SMB mounts), replace detection degrades to delete detection —
+   * a replaced file then looks unchanged and keeps its stale watcher until the
+   * path actually disappears.
+   *
    * @returns {'ok'|'gone'|'replaced'} 'gone' = nothing at that path any more
    *   (the trigger cannot recover on its own), 'replaced' = something is there
    *   but it is not the object the watcher is holding (re-watch and carry on).
    */
-  function watchTargetHealth(state) {
+  function watchTargetHealth(triggerId, state) {
     let absPath;
     let stat;
     try {
       absPath = resolveWorkspacePath({ workspaceDir: cwd, relPath: state.relPath });
       stat = fs.statSync(absPath);
-    } catch {
+    } catch (err) {
+      if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+        state.statError = null;
+        return 'gone';
+      }
+      state.statFailures = (state.statFailures ?? 0) + 1;
+      state.statError = err?.message ?? String(err);
+      if (state.statFailures < 2) {
+        log(`trigger ${triggerId}: watch target check failed (${state.statError}), retrying on the next tick`);
+        return 'ok';
+      }
       return 'gone';
     }
+    state.statFailures = 0;
+    state.statError = null;
     if (absPath !== state.absPath) return 'replaced';
     return targetIdentity(stat) === state.identity ? 'ok' : 'replaced';
   }
@@ -755,9 +780,10 @@ export function createTriggerRunner({
       // loop below re-creates it) and the trigger keeps working; only a target
       // that is really gone disables the trigger. Pending paths of the old
       // window are dropped with it: they described the previous file.
-      const health = watchTargetHealth(state);
+      const health = watchTargetHealth(id, state);
       if (health === 'gone') {
-        disableWithReason(id, `file-watch target no longer exists: ${toPosixPath(state.relPath)}`);
+        const detail = state.statError ? ` (${state.statError}, twice in a row)` : '';
+        disableWithReason(id, `file-watch target no longer exists: ${toPosixPath(state.relPath)}${detail}`);
         continue;
       }
       if (health === 'replaced') {
@@ -771,6 +797,12 @@ export function createTriggerRunner({
     }
 
     for (const [id, trigger] of wanted) {
+      // `wanted` is the snapshot from the top of this function, and the loops
+      // above may have called disableWithReason() since — re-arming a trigger
+      // that was just switched off would log a line contradicting the one right
+      // before it, and open a watcher for a disabled trigger. So the LIVE state
+      // decides here, not the snapshot.
+      if (triggers.get(id)?.enabled !== true) continue;
       if (trigger.type === 'file-watch' && !watchStates.has(id)) setupFileWatch(trigger);
       if (trigger.type === 'clipboard' && !pollStates.has(id)) setupClipboardPoll(trigger);
     }
