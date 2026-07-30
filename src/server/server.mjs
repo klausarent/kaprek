@@ -1247,7 +1247,10 @@ function serveStatic(res, webDist, pathname, instanceToken) {
   const contentType = MIME_TYPES[extension] || 'application/octet-stream';
   if (extension === '.html') {
     const html = injectTokenMeta(fs.readFileSync(filePath, 'utf8'), instanceToken);
-    res.writeHead(200, { 'Content-Type': contentType });
+    // no-store because this document carries the instance token: a cached copy
+    // is the token sitting in the browser's on-disk cache, outliving the
+    // session it was minted for.
+    res.writeHead(200, { 'Content-Type': contentType, 'Cache-Control': 'no-store' });
     res.end(html);
     return;
   }
@@ -1305,12 +1308,14 @@ async function handleRequest(
   // and this server starts agent turns on request. A missing or wrong token
   // gets a bare 401: no body, no hint about which of the two it was.
   //
-  // THE ONE EXCEPTION is static delivery (everything that is not /api/*).
+  // THE EXCEPTION is static delivery (everything that is not /api/*).
   // index.html is what HANDS the browser the token (see injectTokenMeta), so
   // it cannot require it, and the JS/CSS it references are requested before
   // any script has had the chance to read that meta tag — requiring the header
-  // for those would make the app unloadable. Static delivery is read-only and
-  // exposes nothing beyond the shipped web build.
+  // for those would make the app unloadable. This is deliberately WIDER than
+  // the task brief's "only index.html": a stylesheet cannot set a header, so an
+  // index.html-only exception would ship an app that never loads. Static
+  // delivery is read-only and exposes nothing beyond the shipped web build.
   if (segments[0] === 'api' && !timingSafeTokenEqual(req.headers[TOKEN_HEADER], instanceToken)) {
     res.writeHead(401);
     res.end();

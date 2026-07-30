@@ -1,11 +1,17 @@
 // Tests for the streaming digest parser.
 // Run: npx vitest run src/parser
-import { test, expect } from 'vitest';
+import { test, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { digestSession, redactSecrets } from './parse.mjs';
+import { digestSession, redactSecrets, registerSecret, clearRegisteredSecrets } from './parse.mjs';
+
+// registerSecret() writes into module-level state, so one test's registered
+// value must not survive into the next one's expectations.
+afterEach(() => {
+  clearRegisteredSecrets();
+});
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE = path.join(__dirname, 'fixtures', 'mini-session.jsonl');
@@ -280,6 +286,31 @@ test('redactSecrets: short/harmless strings are NOT redacted', () => {
   expect(redactSecrets('ID=12345678')).toBe('ID=12345678');
   expect(redactSecrets('re_kurz')).toBe('re_kurz');
   expect(redactSecrets('normal text without secrets')).toBe('normal text without secrets');
+});
+
+test('registerSecret: a registered literal is redacted even though no pattern would match it', () => {
+  // The shape a 64-hex instance token has (see src/server/token.mjs) is
+  // indistinguishable from a sha256 hash, so it is registered, not matched.
+  const tokenShaped = 'a1b2c3d4'.repeat(8);
+  expect(redactSecrets(`token ${tokenShaped} here`)).toContain(tokenShaped);
+
+  registerSecret(tokenShaped);
+  expect(redactSecrets(`token ${tokenShaped} here`)).toBe('token [REDACTED] here');
+  // Every occurrence, not just the first.
+  expect(redactSecrets(`${tokenShaped}/${tokenShaped}`)).toBe('[REDACTED]/[REDACTED]');
+});
+
+test('registerSecret: a value too short to replace safely is ignored', () => {
+  registerSecret('abc');
+  expect(redactSecrets('abc and abcdef')).toBe('abc and abcdef');
+});
+
+test('clearRegisteredSecrets: a cleared value is no longer redacted', () => {
+  const value = 'b'.repeat(32);
+  registerSecret(value);
+  expect(redactSecrets(value)).toBe('[REDACTED]');
+  clearRegisteredSecrets();
+  expect(redactSecrets(value)).toBe(value);
 });
 
 test('redactSecrets: non-strings/empty string stay unchanged (no crash)', () => {

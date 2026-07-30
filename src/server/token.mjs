@@ -7,8 +7,15 @@
 // header itself. Since kaprek's server starts agent turns on request (see
 // src/triggers/runner.mjs), "any local process" is too wide a door. The
 // pattern is Goose's (ui/desktop/src/goosed.ts + crates/goose-server/src/
-// auth.rs): a random secret generated at first start, stored 0600 next to the
-// data it protects, required on every API request, compared in constant time.
+// auth.rs): a random secret generated at first start, stored next to the data
+// it protects, required on every API request, compared in constant time.
+//
+// About the file mode: `0o600` is honest only on POSIX. On Windows — kaprek's
+// main platform — Node maps it to the read-only attribute and nothing else, so
+// what actually keeps this file private there is the ACL on the user profile
+// directory it lives in (the same protection the transcripts beside it get).
+// The mode is set anyway because it costs nothing and does the right thing
+// where it means something.
 //
 // The token is a capability, not a password: never logged, never in an error
 // message, never in a URL (a query parameter lands in referrers, proxy logs
@@ -37,7 +44,8 @@ function freshToken() {
 
 /**
  * Returns this installation's token, creating `<dataDir>/instance-token` on
- * first use: 32 random bytes as hex, written with `mode: 0o600` and
+ * first use: 32 random bytes as hex, written with `mode: 0o600` (see the
+ * module comment on what that does and does not mean on Windows) and
  * `flag: 'wx'` (exclusive create).
  *
  * The `wx` + EEXIST path is what makes two servers starting at the same

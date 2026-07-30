@@ -1968,6 +1968,16 @@ test('token: index.html is served WITHOUT a token and carries it in a <meta> tag
   expect(api.status).toBe(200);
 });
 
+test('token: the token-carrying index.html is sent with Cache-Control: no-store', async () => {
+  const webDist = writeWebDist();
+  const { url } = await boot({ webDist });
+  const res = await rawFetch(`${url}/`);
+  // A cached copy of this document is the token sitting in the browser's
+  // on-disk cache after the session that minted it is long gone.
+  expect(res.headers.get('cache-control')).toBe('no-store');
+  await res.text();
+});
+
 test('token: static assets (JS) are served without a token — the browser needs them before it can read the meta tag', async () => {
   const webDist = writeWebDist();
   const { url } = await boot({ webDist });
