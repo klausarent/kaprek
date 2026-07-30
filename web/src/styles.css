@@ -1388,3 +1388,17 @@ pre,
   gap: 2px;
   font-size: 12px;
 }
+
+.trigger-form-appscope {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.trigger-form-appscope label {
+  display: grid;
+  grid-template-columns: auto auto 1fr;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 13px;
+}

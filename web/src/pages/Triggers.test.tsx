@@ -1,7 +1,7 @@
 import { test, expect, vi } from "vitest";
-import { ClipboardConsentPanel, DeleteConfirmPanel, TriggerForm, TriggerRow } from "./Triggers";
-import { emptyTriggerForm } from "../lib/triggerForm";
-import type { TriggerStatus } from "../lib/api";
+import { AppScopePicker, ClipboardConsentPanel, DeleteConfirmPanel, TriggerForm, TriggerRow } from "./Triggers";
+import { emptyTriggerForm, formToTrigger } from "../lib/triggerForm";
+import type { AppSummary, TriggerStatus } from "../lib/api";
 import { click, findAll, findByType, findOneByText, render, textOf } from "../test/tree";
 
 function triggerStatus(overrides: Partial<TriggerStatus> = {}): TriggerStatus {
@@ -154,6 +154,7 @@ test("a server validation error is rendered at the field it names, not as a form
   const tree = render(
     <TriggerForm
       value={{ ...emptyTriggerForm(), type: "heartbeat", intervalMinutes: "2" }}
+      apps={[]}
       editing={false}
       saving={false}
       fieldError={{ field: "intervalMinutes", message: "config.intervalMinutes: must be a number between 5 and 1440" }}
@@ -184,6 +185,7 @@ test("a 400 that names no form field falls back to a form-level error box", () =
   const tree = render(
     <TriggerForm
       value={emptyTriggerForm()}
+      apps={[]}
       editing={false}
       saving={false}
       fieldError={null}
@@ -202,6 +204,7 @@ test("the form shows only the selected type's fields", () => {
   const clipboard = render(
     <TriggerForm
       value={{ ...emptyTriggerForm(), type: "clipboard" }}
+      apps={[]}
       editing={false}
       saving={false}
       fieldError={null}
@@ -222,6 +225,7 @@ test("each escalation level comes with its own one-sentence explanation", () => 
   const tree = render(
     <TriggerForm
       value={emptyTriggerForm()}
+      apps={[]}
       editing={false}
       saving={false}
       fieldError={null}
@@ -237,10 +241,87 @@ test("each escalation level comes with its own one-sentence explanation", () => 
   expect(text).toContain("Prepares the work and hands it to you");
 });
 
+// ------------------------------------------------------------ app scope
+
+function appSummary(id: string, overrides: Partial<AppSummary> = {}): AppSummary {
+  return {
+    id,
+    name: id[0].toUpperCase() + id.slice(1),
+    description: `What ${id} does.`,
+    icon: "🧩",
+    version: "1.0.0",
+    toolCount: 1,
+    policy: { fsWrite: false, dataEgress: false, externalAction: "never", sensitivity: "low" },
+    uiSlot: "text",
+    source: "bundled",
+    ...overrides,
+  };
+}
+
+function pickerTree(selected: string[], apps: AppSummary[] | null, onChange = noop) {
+  return render(<AppScopePicker apps={apps} selected={selected} error={null} onChange={onChange} />);
+}
+
+test("the app picker offers exactly the installed apps and explains what selecting one grants", () => {
+  const tree = pickerTree([], [appSummary("notes"), appSummary("calendar")]);
+  const boxes = findAll(tree, (node) => node.type === "input" && node.props.name === "appScope");
+  expect(boxes.map((node) => node.props.value)).toEqual(["notes", "calendar"]);
+  expect(textOf(tree)).toContain("A notify trigger may only use tools from the apps you select here.");
+});
+
+test("the app picker has no free-text input — an app id can only be chosen, never typed", () => {
+  const tree = pickerTree([], [appSummary("notes")]);
+  const typeable = findAll(
+    tree,
+    (node) => (node.type === "input" && node.props.type !== "checkbox") || node.type === "textarea",
+  );
+  expect(typeable).toHaveLength(0);
+});
+
+test("checking an app adds its id to appScope, unchecking removes it", () => {
+  const onChange = vi.fn();
+  const tree = pickerTree(["notes"], [appSummary("notes"), appSummary("calendar")], onChange);
+  const boxes = findAll(tree, (node) => node.type === "input" && node.props.name === "appScope");
+
+  expect(boxes[0].props.checked).toBe(true);
+  expect(boxes[1].props.checked).toBe(false);
+
+  (boxes[1].props.onChange as (e: unknown) => void)({ target: { checked: true } });
+  expect(onChange).toHaveBeenCalledWith(["notes", "calendar"]);
+
+  (boxes[0].props.onChange as (e: unknown) => void)({ target: { checked: false } });
+  expect(onChange).toHaveBeenLastCalledWith([]);
+});
+
+test("an empty selection stays allowed, and says what it means", () => {
+  const tree = pickerTree([], [appSummary("notes")]);
+  expect(textOf(tree)).toContain("cannot use any app's tools");
+  // No app selected is a valid trigger, not a validation error.
+  expect(findAll(tree, (node) => (node.props.className as string | undefined) === "trigger-field-error")).toHaveLength(0);
+});
+
+test("with no apps installed the picker says so instead of showing an empty box", () => {
+  expect(textOf(pickerTree([], []))).toContain("No apps installed");
+  expect(textOf(pickerTree([], null))).toContain("Loading installed apps…");
+});
+
+test("a server appScope error is shown at the picker", () => {
+  const tree = render(
+    <AppScopePicker apps={[appSummary("notes")]} selected={["ghost"]} error="appScope: unknown app id: ghost" onChange={noop} />,
+  );
+  expect(textOf(tree)).toContain("unknown app id: ghost");
+});
+
+test("the selection reaches the wire shape as appScope", () => {
+  expect(formToTrigger({ ...emptyTriggerForm(), id: "x", promptTemplate: "y", appScope: ["notes"] }).appScope).toEqual(["notes"]);
+  expect(formToTrigger({ ...emptyTriggerForm(), id: "x", promptTemplate: "y" }).appScope).toEqual([]);
+});
+
 test("the id field is locked while editing an existing trigger", () => {
   const tree = render(
     <TriggerForm
       value={{ ...emptyTriggerForm(), id: "nightly-sync" }}
+      apps={[]}
       editing
       saving={false}
       fieldError={null}

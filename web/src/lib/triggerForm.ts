@@ -18,6 +18,13 @@ export type TriggerFormValue = {
   escalation: Escalation;
   promptTemplate: string;
   enabled: boolean;
+  /**
+   * App ids this trigger may use tools from. Only ever set by picking from the
+   * installed apps (GET /api/apps) — never typed. The registry rejects an id
+   * that names no installed app with a 400, and a free-text field would make
+   * that the user's problem instead of an impossible input.
+   */
+  appScope: string[];
   maxRunsPerDay: string;
   maxCostPerDay: string;
   // heartbeat
@@ -69,6 +76,7 @@ export const FORM_FIELD_FOR_SERVER_FIELD: Record<string, keyof TriggerFormValue>
   promptTemplate: "promptTemplate",
   escalation: "escalation",
   enabled: "enabled",
+  appScope: "appScope",
   "config.intervalMinutes": "intervalMinutes",
   "config.checklistPath": "checklistPath",
   "config.everyMinutes": "everyMinutes",
@@ -101,6 +109,7 @@ export function emptyTriggerForm(): TriggerFormValue {
     escalation: "notify",
     promptTemplate: "",
     enabled: false,
+    appScope: [],
     maxRunsPerDay: "24",
     maxCostPerDay: "1.00",
     intervalMinutes: "60",
@@ -126,6 +135,7 @@ export function triggerToForm(trigger: Trigger): TriggerFormValue {
     escalation: trigger.escalation,
     promptTemplate: trigger.promptTemplate,
     enabled: trigger.enabled,
+    appScope: [...trigger.appScope],
     maxRunsPerDay: String(trigger.limits.maxRunsPerDay),
     maxCostPerDay: String(trigger.limits.maxCostPerDay),
     intervalMinutes: config.intervalMinutes === undefined ? blank.intervalMinutes : String(config.intervalMinutes),
@@ -183,7 +193,11 @@ function configFor(form: TriggerFormValue): Record<string, unknown> {
   }
 }
 
-/** The POST /api/triggers body for this form. `appScope` is always [] — no app picker in this UI yet. */
+/**
+ * The POST /api/triggers body for this form. An empty `appScope` is a normal,
+ * useful state — the trigger can then still read and report, it just cannot
+ * use any app's tools (see runner.mjs::notifyPolicyHandler).
+ */
 export function formToTrigger(form: TriggerFormValue): Record<string, unknown> {
   return {
     id: form.id.trim(),
@@ -191,7 +205,7 @@ export function formToTrigger(form: TriggerFormValue): Record<string, unknown> {
     config: configFor(form),
     promptTemplate: form.promptTemplate,
     escalation: form.escalation,
-    appScope: [],
+    appScope: [...form.appScope],
     enabled: form.enabled,
     limits: compact({ maxRunsPerDay: num(form.maxRunsPerDay), maxCostPerDay: num(form.maxCostPerDay) }),
   };

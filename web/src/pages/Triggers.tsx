@@ -14,10 +14,12 @@ import {
   TriggerBusyError,
   TriggerValidationError,
   deleteTrigger,
+  fetchApps,
   fetchTriggers,
   fireTrigger,
   toggleTrigger,
   upsertTrigger,
+  type AppSummary,
   type Escalation,
   type TriggerStatus,
   type TriggerType,
@@ -189,8 +191,63 @@ function FieldError({ message }: { message: string | null }) {
   return <div className="trigger-field-error">{message}</div>;
 }
 
+/**
+ * Which installed apps this trigger may use tools from. A multi-select over
+ * GET /api/apps, never a text field: the registry rejects an app id that is not
+ * installed, so free text would only let a user type something that is
+ * guaranteed to come back as a 400.
+ */
+export function AppScopePicker({
+  apps,
+  selected,
+  error,
+  onChange,
+}: {
+  apps: AppSummary[] | null;
+  selected: string[];
+  error: string | null;
+  onChange: (appScope: string[]) => void;
+}) {
+  return (
+    <div className="trigger-form-field">
+      <label>Apps this trigger may use</label>
+      <div className="trigger-form-hint">A notify trigger may only use tools from the apps you select here.</div>
+      {apps === null ? (
+        <div className="trigger-form-hint">Loading installed apps…</div>
+      ) : apps.length === 0 ? (
+        <div className="trigger-form-hint">No apps installed, so there is nothing to grant. The trigger can still read and report.</div>
+      ) : (
+        <div className="trigger-form-appscope">
+          {apps.map((app) => (
+            <label key={app.id}>
+              <input
+                type="checkbox"
+                name="appScope"
+                value={app.id}
+                checked={selected.includes(app.id)}
+                onChange={(e) =>
+                  onChange(e.target.checked ? [...selected, app.id] : selected.filter((id) => id !== app.id))
+                }
+              />
+              <span>
+                {app.icon ?? "🧩"} {app.name}
+              </span>
+              <span className="trigger-form-hint">{app.description}</span>
+            </label>
+          ))}
+        </div>
+      )}
+      {selected.length === 0 && apps !== null && apps.length > 0 && (
+        <div className="trigger-form-hint">Nothing selected: the trigger may read and report, but cannot use any app's tools.</div>
+      )}
+      <FieldError message={error} />
+    </div>
+  );
+}
+
 export function TriggerForm({
   value,
+  apps,
   editing,
   saving,
   fieldError,
@@ -200,6 +257,8 @@ export function TriggerForm({
   onCancel,
 }: {
   value: TriggerFormValue;
+  /** Installed apps for the scope picker, or null while they are still loading. */
+  apps: AppSummary[] | null;
   editing: boolean;
   saving: boolean;
   /** The form field the server's 400 pointed at, with its message. */
@@ -402,6 +461,13 @@ export function TriggerForm({
         <FieldError message={errorFor("promptTemplate")} />
       </div>
 
+      <AppScopePicker
+        apps={apps}
+        selected={value.appScope}
+        error={errorFor("appScope")}
+        onChange={(appScope) => onChange({ appScope })}
+      />
+
       <div className="trigger-form-field">
         <label>Escalation</label>
         <div className="trigger-form-escalations">
@@ -458,6 +524,10 @@ export function TriggerForm({
 
 export default function Triggers() {
   const [triggers, setTriggers] = useState<TriggerStatus[] | null>(null);
+  // The app-scope picker's options. Loaded once — installing an app is a
+  // filesystem action outside this page, and a stale list is visible as such
+  // (a missing app simply cannot be selected) rather than silently wrong.
+  const [apps, setApps] = useState<AppSummary[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
@@ -484,6 +554,11 @@ export default function Triggers() {
 
   useEffect(() => {
     void reload();
+    // A failed app list must not blank the trigger page: the picker then shows
+    // "no apps installed", which is the fail-closed reading anyway.
+    fetchApps()
+      .then(({ apps: installed }) => setApps(installed))
+      .catch(() => setApps([]));
   }, []);
 
   const setNote = (id: string, note: string | null) => {
@@ -647,6 +722,7 @@ export default function Triggers() {
       {form ? (
         <TriggerForm
           value={form}
+          apps={apps}
           editing={editing}
           saving={saving}
           fieldError={fieldError}
