@@ -67,9 +67,20 @@
  * @property {string|null} sessionId - the CLI's session id (from the init or result event)
  * @property {number|null} costUsd - total_cost_usd from the result event, if any
  * @property {object|null} usage - usage object from the result event, if any
- * @property {'result'|'aborted'|'error'|'timeout'} stopReason - how the turn ended; 'timeout'
- *   means the harness's own timeoutMs elapsed and the child process was killed
+ * @property {'result'|'aborted'|'error'|'timeout'} stopReason - how the turn ended. 'timeout'
+ *   means one of the four independent clocks in src/harness/timeout.mjs (idle, tool-lease,
+ *   active-total, absolute — see createTurnClocks()) elapsed and the child process was
+ *   killed; WHICH one is named in `timeoutClock` below, not folded into this string, so a
+ *   caller checking `stopReason === 'timeout'` (pre-task-2 code, e.g. an existing
+ *   `result.stopReason` comparison) keeps working unchanged
+ * @property {'idle'|'tool-lease'|'active-total'|'absolute'} [timeoutClock] - present only
+ *   when stopReason is 'timeout'; names which clock fired (see timeout.mjs's own doc
+ *   comment on what each one measures and why NONE of them, including 'absolute', count
+ *   time spent waiting on a human approval decision — that wait is bounded separately by
+ *   the caller's own approval timeout, e.g. src/server/server.mjs's
+ *   DEFAULT_APPROVAL_TIMEOUT_MS)
  * @property {{message: string}|null} error - set when stopReason is 'error', otherwise null
+ *   (including for stopReason 'timeout' — a clock elapsing is not itself an error)
  * @property {number} [droppedLines] - count of oversized CLI output lines refused before
  *   parsing (harness-specific safety limit, see claude-code.mjs::MAX_LINE_BYTES); absent
  *   or 0 when nothing was dropped

@@ -203,15 +203,18 @@ test('stdin is closed as soon as a result event arrives, not only once the proce
   expect(result.stopReason).toBe('result');
 });
 
-// Regression test for task-6a review Important #6: DEFAULT_TIMEOUT_MS is a
-// hard turn-level budget, but the separate approval-specific auto-deny (the
-// CALLER's job — see src/server/server.mjs's approvalTimeoutMs, default 10
-// minutes) is meant to be the thing that actually times out a slow human
-// decision. Without pausing the turn timeout while an approval is pending,
-// the turn's own (much shorter) timeoutMs would kill the process out from
-// under a user who is still deciding, long before the approval's own,
-// intentionally more generous timeout ever gets a chance to fire.
-test('a pending approval pauses the turn timeout — deciding longer than timeoutMs does not kill the turn', async () => {
+// Regression test for task-6a review Important #6, re-verified against the
+// task-2 four-clock model (src/harness/timeout.mjs): timeoutMs now overrides
+// the ACTIVE-TOTAL clock's budget (the closest match to what "the turn
+// timeout" meant pre-task-2), but the property under test is unchanged —
+// the separate approval-specific auto-deny (the CALLER's job, see
+// src/server/server.mjs's approvalTimeoutMs, default 10 minutes) is meant to
+// be the thing that actually times out a slow human decision, not this
+// clock. Without excluding approval-wait time, the turn's own (much
+// shorter) active-total budget would kill the process out from under a user
+// who is still deciding, long before the approval's own, intentionally more
+// generous timeout ever gets a chance to fire.
+test('a pending approval exempts the active-total clock — deciding longer than timeoutMs does not kill the turn', async () => {
   const child = makeControllableChild();
   const onApprovalRequest = vi.fn(async () => {
     await new Promise((resolve) => setTimeout(resolve, 150));
@@ -231,32 +234,42 @@ test('a pending approval pauses the turn timeout — deciding longer than timeou
   expect(child.killed).toBeFalsy();
 });
 
-test('the turn timeout resumes once the last pending approval resolves — a turn that idles too long AFTER deciding still times out', async () => {
+test('the active-total clock keeps running once the last pending approval resolves — a turn that idles too long AFTER deciding still times out', async () => {
   const child = makeControllableChild();
   const onApprovalRequest = vi.fn(async () => ({ behavior: 'allow' }));
 
   const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, timeoutMs: 60, spawnFn: () => child });
 
   writeLine(child, { type: 'control_request', request_id: 'req-resume', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
-  // Let the (near-instant) decision resolve and the timer resume, then idle
-  // well past timeoutMs WITHOUT ever sending a result — the resumed timer
-  // must still be able to fire.
+  // Let the (near-instant) decision resolve and the approval-wait exemption
+  // end, then idle well past timeoutMs WITHOUT ever sending a result — the
+  // clock must still be able to fire once the exemption is over.
   await new Promise((resolve) => setTimeout(resolve, 200));
 
   const result = await turn;
   expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('active-total');
 }, 5000);
 
-// Peer-reviewed backstop (Codex, via team-lead's follow-up decision on
-// task-6a review Important #6): the PAUSABLE turn timeout alone would never
-// fire while an approval sits open forever — a chain of approvals could
-// keep pausing it indefinitely, holding the chat's busy-gate closed. The
-// SEPARATE, never-paused absoluteTimeoutMs must still kill the turn even
-// though the regular timeout is (correctly) paused the entire time.
-test('the absolute wall-clock cap fires even while an approval is indefinitely pending (never resolves), killing the turn regardless of the paused regular timeout', async () => {
+// This test's OLD property (a never-paused absolute backstop still kills a
+// turn stuck on an approval that never resolves, per task-6a's Codex review)
+// no longer holds under task-2's four-clock model, and deliberately so: see
+// timeout.mjs's createTurnClocks() doc comment and task-2-report.md's
+// Bedenken. All four clocks — including 'absolute' — now exclude
+// approval-wait time, because task-3's overnight approval inbox needs a
+// turn parked on a human decision to survive indefinitely; a backstop that
+// still counted that wait would defeat it. What now bounds an approval that
+// truly never gets answered is the CALLER's own approval timeout
+// (src/server/server.mjs's DEFAULT_APPROVAL_TIMEOUT_MS, which resolves
+// onApprovalRequest with an auto-deny), not a clock in this harness — so
+// this test now proves the opposite of what it used to: neither clock
+// fires while the approval is indefinitely pending, no matter how far past
+// both of their (here deliberately tiny) budgets real time moves.
+test('an indefinitely pending approval (never resolves) exempts BOTH the active-total and the absolute clock — only the caller\'s own approval timeout can end it', async () => {
   const child = makeControllableChild();
-  // Never resolves — the pausable timeoutTimer would stay paused forever;
-  // only absoluteTimeoutMs can end this turn.
+  // Never resolves — under the old model only absoluteTimeoutMs could end
+  // this turn; under the new model NEITHER clock can, see this test's own
+  // doc comment above.
   const onApprovalRequest = vi.fn(() => new Promise(() => {}));
 
   const turn = startTurn({
@@ -264,17 +277,22 @@ test('the absolute wall-clock cap fires even while an approval is indefinitely p
     prompt: 'hi',
     onApprovalRequest,
     onEvent: () => {},
-    timeoutMs: 60_000, // large enough to prove it is NOT what fires here
+    timeoutMs: 50,
     absoluteTimeoutMs: 50,
-    killGraceMs: 30, // this fake child never emits 'close' on its own — no need to wait out the real default here
     spawnFn: () => child,
   });
 
   writeLine(child, { type: 'control_request', request_id: 'req-wall-clock', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
+  // Far past both (deliberately tiny) budgets, while the approval is still
+  // pending — neither clock may have fired by the time the turn's own
+  // result arrives.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
 
   const result = await turn;
-  expect(result.stopReason).toBe('timeout');
-  expect(child.killed).toBe(true);
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'
+  expect(child.killed).toBeFalsy();
 }, 5000);
 
 // Regression test for task-6a review Important #5: `pendingApprovals` was
