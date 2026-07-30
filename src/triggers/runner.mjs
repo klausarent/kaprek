@@ -86,21 +86,85 @@ function appIdForMcpTool(toolName) {
   return sepIndex > 0 ? toolId.slice(0, sepIndex) : null;
 }
 
+// Meta-/read tools with no outward effect at all — allowed for a 'notify'
+// trigger even outside its own appScope, because without them the trigger
+// can't function at all. Live acceptance (task-7a Fix-Runde 4): a real CLI
+// build defers MCP tool schemas and calls ToolSearch to resolve
+// `mcp__kaprek-apps__notes_write`'s schema before ever proposing to call
+// it — denying ToolSearch (its previous, over-broad "not an MCP tool for
+// our appScope" fate) meant the agent could not discover the very tool its
+// appScope was supposed to grant it, and self-blocked on a harmless first
+// step. Read/Glob/Grep are the same story for "look at a file before
+// acting on it" — but unlike ToolSearch (searches tool NAMES/schemas, no
+// filesystem access) they DO touch the filesystem, so they are gated by
+// PATH_FIELD_BY_TOOL below instead of being unconditionally allowed.
+const NOTIFY_READONLY_ALLOW = ['ToolSearch', 'Read', 'Glob', 'Grep'];
+
+// The input field that carries a filesystem path, per tool in
+// NOTIFY_READONLY_ALLOW — verified against real approval-request `input`
+// shapes during live acceptance (task-7a Fix-Runde 4): Read's is
+// `file_path` (the file itself); Glob/Grep's is `path` (their search ROOT
+// directory — `pattern` is a glob/regex string, never a path). A tool with
+// no entry here (ToolSearch) has no path to check at all.
+const PATH_FIELD_BY_TOOL = { Read: 'file_path', Glob: 'path', Grep: 'path' };
+
+/**
+ * Whether `candidatePath` (as sent by the CLI — absolute in every observed
+ * case, but a relative one is accepted too) resolves inside `cwd`. Reuses
+ * src/workspace/fs.mjs's OWN containment/symlink/traversal guard
+ * (resolveWorkspacePath) rather than a second, parallel check — an
+ * absolute path is converted to `cwd`-relative first (path.relative), since
+ * that guard's assertSafeRelPath rejects an absolute path outright; a path
+ * that lands outside `cwd` (or on a different drive on Windows) turns into
+ * a relative path resolveWorkspacePath itself rejects (a leading `..`
+ * segment, or a raw drive letter it doesn't accept as "relative" at all),
+ * so the SAME function ends up being the single source of truth either way.
+ */
+function isInsideWorkspace(cwd, candidatePath) {
+  if (typeof candidatePath !== 'string' || candidatePath.length === 0) return false;
+  const relPath = path.isAbsolute(candidatePath) ? path.relative(cwd, candidatePath) : candidatePath;
+  try {
+    resolveWorkspacePath({ workspaceDir: cwd, relPath });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The `escalation:'notify'` approval handler — a pure policy decision, no
- * human, no SSE, no timeout: allows ONLY a kaprek-apps MCP tool call whose
- * app id is in `trigger.appScope`; denies literally everything else (Bash,
- * Write, Edit, WebFetch, a Read outside the scoped apps, an MCP tool from an
- * app NOT in scope, ...). This is what makes "kein Trigger erzeugt
- * Außenwirkung ohne Freigabe" true for the DEFAULT escalation level by
- * kaprek's own code, instead of depending on whatever the underlying CLI
- * happens to do when no `--permission-prompt-tool` is wired at all (see
- * task-7a-review.md Critical #2) — this handler is ALWAYS passed to
- * runTurn() for a 'notify' trigger, so `--permission-prompt-tool stdio` is
- * always active for one (see claude-code.mjs::buildArgs()).
+ * human, no SSE, no timeout: allows a kaprek-apps MCP tool call whose app id
+ * is in `trigger.appScope`, or a NOTIFY_READONLY_ALLOW meta-/read tool
+ * (path-checked where it has one, see PATH_FIELD_BY_TOOL); denies literally
+ * everything else (Bash, Write, Edit, WebFetch, a Read/Glob/Grep outside the
+ * workspace or with no path at all, an MCP tool from an app NOT in scope,
+ * ...). This is what makes "kein Trigger erzeugt Außenwirkung ohne Freigabe"
+ * true for the DEFAULT escalation level by kaprek's own code, instead of
+ * depending on whatever the underlying CLI happens to do when no
+ * `--permission-prompt-tool` is wired at all (see task-7a-review.md Critical
+ * #2) — this handler is ALWAYS passed to runTurn() for a 'notify' trigger,
+ * so `--permission-prompt-tool stdio` is always active for one (see
+ * claude-code.mjs::buildArgs()).
  */
-function notifyPolicyHandler(trigger) {
+function notifyPolicyHandler(trigger, cwd) {
   return async (request) => {
+    if (NOTIFY_READONLY_ALLOW.includes(request.toolName)) {
+      const pathField = PATH_FIELD_BY_TOOL[request.toolName];
+      if (!pathField) {
+        return { behavior: 'allow' }; // ToolSearch — no filesystem path to check
+      }
+      const candidatePath = request.input?.[pathField];
+      if (typeof candidatePath !== 'string' || candidatePath.length === 0) {
+        // Fail-closed, not a guess: no path in the input means there is
+        // nothing to validate against the workspace at all.
+        return { behavior: 'deny', message: 'no path in tool input' };
+      }
+      if (isInsideWorkspace(cwd, candidatePath)) {
+        return { behavior: 'allow' };
+      }
+      return { behavior: 'deny', message: 'outside the workspace' };
+    }
+
     const appId = appIdForMcpTool(request.toolName);
     if (appId !== null && trigger.appScope.includes(appId)) {
       return { behavior: 'allow' };
@@ -961,7 +1025,7 @@ export function createTriggerRunner({
       // onChatResolved). notifyPolicyHandler() needs none of this.
       let resolvedChatId = null;
       const approvalHandlerForTurn =
-        trigger.escalation === 'notify' ? notifyPolicyHandler(trigger) : (request) => makeUiApprovalHandler(resolvedChatId)(request);
+        trigger.escalation === 'notify' ? notifyPolicyHandler(trigger, cwd) : (request) => makeUiApprovalHandler(resolvedChatId)(request);
 
       const result = await runTurn({
         dataDir,

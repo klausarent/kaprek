@@ -500,6 +500,116 @@ test('notify: a qualified MCP tool call for an app NOT in appScope is automatica
   expect(harness.approvalLog[0].decision.behavior).toBe('deny');
 });
 
+test('notify: ToolSearch is allowed unconditionally — no path to check, and it has no appScope of its own', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'ToolSearch', input: { query: 'notes' } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
+test('notify: Read inside the workspace is allowed', async () => {
+  fs.writeFileSync(path.join(cwd, 'notes.md'), 'hi');
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Read', input: { file_path: path.join(cwd, 'notes.md') } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
+test('notify: Read outside the workspace is denied with "outside the workspace"', async () => {
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-triggers-runner-outside-'));
+  try {
+    fs.writeFileSync(path.join(outsideDir, 'secret.txt'), 'top secret');
+    const script = [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Read', input: { file_path: path.join(outsideDir, 'secret.txt') } } },
+      { type: 'text', text: 'done' },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ];
+    const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+    const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+    expect(result.fired).toBe(true);
+    expect(harness.approvalLog[0].decision).toEqual({ behavior: 'deny', message: 'outside the workspace' });
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('notify: Read with no path in the input is denied — fail-closed, not a guess', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Read', input: {} } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision.behavior).toBe('deny');
+});
+
+test('notify: Glob is path-checked via its `path` field, same as Read', async () => {
+  fs.mkdirSync(path.join(cwd, 'sub'), { recursive: true });
+  const insideScript = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Glob', input: { pattern: '*.md', path: path.join(cwd, 'sub') } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  // Distinct ids: the everyMinutes claim file would otherwise make the
+  // second fireTrigger() call in the same window a no-op rejection instead
+  // of actually running a second turn (see the schedule-slot idempotency
+  // tests above).
+  const inside = makeRunner({ trigger: scheduleTrigger({ id: 'glob-inside', config: { everyMinutes: 5 }, escalation: 'notify' }), script: insideScript });
+  await inside.runner.fireTrigger('glob-inside', { cause: { origin: 'user' } });
+  expect(inside.harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+
+  const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-triggers-runner-outside-'));
+  try {
+    const outsideScript = [
+      { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Glob', input: { pattern: '*.md', path: outsideDir } } },
+      { type: 'text', text: 'done' },
+      { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+    ];
+    const outside = makeRunner({ trigger: scheduleTrigger({ id: 'glob-outside', config: { everyMinutes: 5 }, escalation: 'notify' }), script: outsideScript });
+    await outside.runner.fireTrigger('glob-outside', { cause: { origin: 'user' } });
+    expect(outside.harness.approvalLog[0].decision).toEqual({ behavior: 'deny', message: 'outside the workspace' });
+  } finally {
+    fs.rmSync(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('notify: Grep is path-checked via its `path` field, same as Read/Glob', async () => {
+  fs.writeFileSync(path.join(cwd, 'notes.md'), 'hi');
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Grep', input: { pattern: 'hi', path: path.join(cwd, 'notes.md') } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
 // ------------------------------------------------------------- disabled / unknown / limits
 
 test('a disabled trigger never fires', async () => {
