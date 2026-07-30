@@ -344,7 +344,14 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
         <div ref={eventsEndRef} />
       </div>
 
-      <ApprovalDialog approvals={approvals} nowMs={nowMs} busy={deciding} error={decideError} onDecide={handleDecide} />
+      <ApprovalDialog
+        approvals={approvals}
+        nowMs={nowMs}
+        currentChatId={chatId}
+        busy={deciding}
+        error={decideError}
+        onDecide={handleDecide}
+      />
 
       <AgentPanel
         state={agentPanel}

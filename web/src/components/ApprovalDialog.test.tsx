@@ -82,6 +82,30 @@ test("a single approval shows no counter", () => {
   expect(textOf(tree)).not.toContain("more waiting");
 });
 
+test("a trigger's question names the trigger it came from", () => {
+  const tree = render(
+    <ApprovalDialog
+      approvals={stack(frame({ source: { kind: "trigger", triggerId: "nightly-check", title: "nightly run" } }))}
+      nowMs={0}
+      currentChatId={CHAT_ID}
+      onDecide={() => {}}
+    />,
+  );
+  expect(textOf(tree)).toContain("From trigger: nightly-check");
+});
+
+test("the current chat's own question carries no origin line", () => {
+  const tree = render(
+    <ApprovalDialog
+      approvals={stack(frame({ source: { kind: "chat", triggerId: null, title: "some chat" } }))}
+      nowMs={0}
+      currentChatId={CHAT_ID}
+      onDecide={() => {}}
+    />,
+  );
+  expect(textOf(tree)).not.toContain("From chat");
+});
+
 test("a subagent's approval shows its shortened agentId", () => {
   const tree = render(
     <ApprovalDialog approvals={stack(frame({ agentId: "0123456789abcdef" }))} nowMs={0} onDecide={() => {}} />,

@@ -79,6 +79,30 @@ export function shortAgentId(agentId: string | null | undefined): string | null 
 }
 
 /**
+ * The "From trigger: nightly-check" line, or null when there is nothing worth
+ * saying.
+ *
+ * A question raised by a trigger ALWAYS names it: those arrive unannounced —
+ * an unattended run's approval is delivered to whatever stream happens to be
+ * open (see server.mjs's approvalStreams), so it can appear in a chat the user
+ * is in the middle of, about work they did not start. Granting a right without
+ * knowing what asked for it is the thing to avoid.
+ *
+ * A question from a CHAT is only labelled when it belongs to a different chat
+ * than the one on screen. Labelling the current chat's own question would be
+ * noise on the common path.
+ */
+export function approvalSourceLabel(entry: PendingApproval, currentChatId: string | undefined): string | null {
+  const source = entry.source;
+  if (!source) return null;
+  if (source.kind === "trigger") {
+    return `From trigger: ${source.triggerId ?? "unknown"}`;
+  }
+  if (entry.chatId === currentChatId) return null;
+  return `From chat: ${source.title ?? "untitled"}`;
+}
+
+/**
  * The exact request an answer turns into: which approval, and which chat it
  * belongs to. Pulled out of the Chat page so the one thing that must never be
  * wrong — the entry's OWN chatId in the body, not "the chat the page happens to

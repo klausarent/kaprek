@@ -2,7 +2,14 @@
 // fetching: the stack, the clock and the POST all live in the Chat page (see
 // pages/Chat.tsx and lib/approvals.ts), which keeps this component a plain
 // function of its props and testable without a DOM.
-import { formatCountdown, oldestApproval, remainingMs, shortAgentId, type PendingApproval } from "../lib/approvals";
+import {
+  approvalSourceLabel,
+  formatCountdown,
+  oldestApproval,
+  remainingMs,
+  shortAgentId,
+  type PendingApproval,
+} from "../lib/approvals";
 
 /** The proposed tool input, pretty-printed. Rendered in a scrollable <pre> — a Write call's input can be a whole file. */
 function formatInput(input: Record<string, unknown> | null): string {
@@ -20,12 +27,15 @@ function formatInput(input: Record<string, unknown> | null): string {
 export default function ApprovalDialog({
   approvals,
   nowMs,
+  currentChatId,
   busy = false,
   error = null,
   onDecide,
 }: {
   approvals: PendingApproval[];
   nowMs: number;
+  /** The chat this page is showing — decides whether a question's origin is worth naming (see approvalSourceLabel). */
+  currentChatId?: string;
   busy?: boolean;
   /** A failed answer attempt (not a 404/409 — those remove the entry). Shown here, next to the buttons the user has to press again. */
   error?: string | null;
@@ -37,6 +47,7 @@ export default function ApprovalDialog({
   const others = approvals.length - 1;
   const agentLabel = shortAgentId(entry.agentId);
   const toolLabel = entry.displayName ?? entry.toolName ?? "a tool";
+  const sourceLabel = approvalSourceLabel(entry, currentChatId);
 
   return (
     <div className="approval-dialog">
@@ -49,6 +60,8 @@ export default function ApprovalDialog({
         )}
         {agentLabel && <span className="badge badge-muted approval-dialog-agent">agent {agentLabel}</span>}
       </div>
+
+      {sourceLabel && <div className="approval-dialog-source">{sourceLabel}</div>}
 
       <p className="approval-dialog-question">
         The agent wants to run <strong>{toolLabel}</strong>.

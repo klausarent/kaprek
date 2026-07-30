@@ -2,6 +2,7 @@ import { test, expect } from "vitest";
 import {
   APPROVAL_TIMEOUT_MS,
   addApproval,
+  approvalSourceLabel,
   buildApprovalAnswer,
   dropExpired,
   formatCountdown,
@@ -99,6 +100,35 @@ test("formatCountdown renders zero-padded mm:ss", () => {
   expect(formatCountdown(65_000)).toBe("01:05");
   expect(formatCountdown(9_000)).toBe("00:09");
   expect(formatCountdown(-1)).toBe("00:00");
+});
+
+test("a trigger's question always names the trigger, whatever chat is on screen", () => {
+  // An unattended run's approval is delivered to whatever stream is open, so it
+  // can appear in a chat the user is in the middle of, about work they never
+  // started. Naming the trigger is what makes that answerable rather than
+  // alarming.
+  const entry = addApproval([], frame({ source: { kind: "trigger", triggerId: "nightly-check", title: "nightly run" } }), 0)[0];
+  expect(approvalSourceLabel(entry, undefined)).toBe("From trigger: nightly-check");
+  expect(approvalSourceLabel(entry, CHAT_A)).toBe("From trigger: nightly-check");
+  expect(approvalSourceLabel(entry, CHAT_B)).toBe("From trigger: nightly-check");
+});
+
+test("a chat's question is labelled only when it belongs to a DIFFERENT chat", () => {
+  const entry = addApproval([], frame({ chatId: CHAT_A, source: { kind: "chat", triggerId: null, title: "refactor the parser" } }), 0)[0];
+  // Its own chat: labelling it would be noise on the common path.
+  expect(approvalSourceLabel(entry, CHAT_A)).toBeNull();
+  expect(approvalSourceLabel(entry, CHAT_B)).toBe("From chat: refactor the parser");
+});
+
+test("approvalSourceLabel degrades instead of showing 'undefined'", () => {
+  const noSource = addApproval([], frame(), 0)[0];
+  expect(approvalSourceLabel(noSource, CHAT_B)).toBeNull();
+
+  const namelessTrigger = addApproval([], frame({ source: { kind: "trigger", triggerId: null, title: null } }), 0)[0];
+  expect(approvalSourceLabel(namelessTrigger, CHAT_B)).toBe("From trigger: unknown");
+
+  const namelessChat = addApproval([], frame({ chatId: CHAT_A, source: { kind: "chat", triggerId: null, title: null } }), 0)[0];
+  expect(approvalSourceLabel(namelessChat, CHAT_B)).toBe("From chat: untitled");
 });
 
 test("buildApprovalAnswer carries the ENTRY's own chatId, not whichever chat is on screen", () => {
