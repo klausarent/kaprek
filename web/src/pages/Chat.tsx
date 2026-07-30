@@ -15,6 +15,7 @@ import {
 } from "../lib/api";
 import {
   addApproval,
+  buildApprovalAnswer,
   dropExpired,
   removeApproval,
   removeApprovalsForChat,
@@ -70,6 +71,7 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
   const [streamError, setStreamError] = useState<string | null>(null);
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [deciding, setDeciding] = useState(false);
+  const [decideError, setDecideError] = useState<string | null>(null);
   const [agentPanel, setAgentPanel] = useState(initialAgentPanel);
   const [panelExpanded, setPanelExpanded] = useState(false);
   // One shared clock for the approval countdown and the turn duration, ticked
@@ -84,6 +86,13 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
 
   // Load an existing chat's history when opened via #/chat/<id>. A brand new
   // chat (no id yet) starts with an empty transcript instead.
+  //
+  // The early return is safe ONLY because App.tsx gives this component a `key`
+  // that changes whenever the user navigates to a new chat (see
+  // chatInstanceKey()), so "no id" always means a freshly mounted instance with
+  // empty state. Remove that key and this effect silently keeps the previous
+  // chat's transcript, chatId, approval stack and agent panel — and the next
+  // message goes to the chat the user just tried to leave.
   useEffect(() => {
     if (!initialChatId) return;
     setLoadError(null);
@@ -248,24 +257,30 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
   }
 
   /**
-   * Answers the visible approval. 404/409 (already decided, or the server's
-   * own 10-minute timer got there first) come back as 'gone' and just drop the
-   * entry — no error box for "there was nothing left to answer".
+   * Answers the visible approval.
+   *
+   * The entry is removed for exactly two outcomes: the answer landed, or the
+   * server says there was nothing left to answer (404/409 — already decided, or
+   * its own 10-minute timer got there first; 'gone', no error shown).
+   *
+   * Any OTHER failure (500, network drop) keeps the entry in the stack and
+   * shows the message on the dialog, so the user can press the button again.
+   * Dropping it there would take the question away over a transient error and
+   * leave the tool call to be auto-denied ten minutes later with no way to
+   * intervene.
    */
   const handleDecide = async (entry: PendingApproval, behavior: "allow" | "deny") => {
     if (deciding) return;
     setDeciding(true);
+    setDecideError(null);
+    const answer = buildApprovalAnswer(entry, behavior);
     try {
-      await answerApproval(entry.id, {
-        chatId: entry.chatId,
-        behavior,
-        ...(behavior === "deny" ? { message: "denied by user" } : {}),
-      });
-    } catch (e) {
-      setStreamError((e as Error).message || "Failed to answer the approval");
-    } finally {
-      setApprovals((prev) => removeApproval(prev, entry.id));
+      await answerApproval(answer.id, answer.body);
+      setApprovals((prev) => removeApproval(prev, entry.chatId, entry.id));
       setAgentPanel((prev) => clearAwaitingApproval(prev, entry.agentId));
+    } catch (e) {
+      setDecideError(`Could not send your answer (${(e as Error).message}). Try again.`);
+    } finally {
       setDeciding(false);
     }
   };
@@ -329,7 +344,7 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
         <div ref={eventsEndRef} />
       </div>
 
-      <ApprovalDialog approvals={approvals} nowMs={nowMs} busy={deciding} onDecide={handleDecide} />
+      <ApprovalDialog approvals={approvals} nowMs={nowMs} busy={deciding} error={decideError} onDecide={handleDecide} />
 
       <AgentPanel
         state={agentPanel}
