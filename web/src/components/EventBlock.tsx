@@ -5,7 +5,7 @@
 // Note: `tool` events carry `input` already as a (possibly truncated) JSON
 // string, not an object — truncateEvent() in parse.mjs serializes before
 // truncating. `result` is a string or null (interrupted tool call).
-import type { DigestEvent, SubagentThread, TextEvent, ToolEvent, SubagentEvent, CompactEvent } from "../lib/api";
+import type { ApprovalEvent, DigestEvent, SubagentThread, TextEvent, ToolEvent, SubagentEvent, CompactEvent } from "../lib/api";
 
 function fmtTime(ts: string): string {
   const ms = Date.parse(ts);
@@ -49,6 +49,8 @@ export default function EventBlock({
       return <SubagentBlock event={event} thread={subagentThread ?? null} />;
     case "compact":
       return <CompactBlock event={event} />;
+    case "approval":
+      return <ApprovalBlock event={event} />;
     default:
       return <UnknownBlock event={event} />;
   }
@@ -157,6 +159,36 @@ function SubagentBlock({ event, thread }: { event: SubagentEvent; thread: Subage
         )}
       </div>
     </details>
+  );
+}
+
+/**
+ * The persisted trace of an approval (src/chats/store.mjs's 'approval' event
+ * shape). Two events per approval reach a reloaded chat — 'requested' when the
+ * agent asked, 'resolved' with the decision — so this stays a single compact
+ * line each rather than a re-run of the live ApprovalDialog. `behavior` can
+ * also be 'error' (the handler itself threw, see run.mjs), which is neither an
+ * allow nor a deny and must not be shown as one.
+ */
+function ApprovalBlock({ event }: { event: ApprovalEvent }) {
+  const outcome =
+    event.phase === "requested"
+      ? "asked"
+      : event.behavior === "allow"
+        ? "allowed"
+        : event.behavior === "deny"
+          ? "denied"
+          : event.behavior === "error"
+            ? "failed"
+            : "no answer";
+  return (
+    <div className="event-approval">
+      <span className="event-approval-label">
+        🔐 {event.toolName ?? "(unknown tool)"} — {outcome}
+      </span>
+      {event.message && <span className="event-approval-message">{event.message}</span>}
+      <span className="event-time">{fmtTime(event.ts)}</span>
+    </div>
   );
 }
 

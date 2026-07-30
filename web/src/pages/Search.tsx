@@ -3,7 +3,7 @@
 // when the index hasn't been built yet or the query has no hits.
 import { useEffect, useState } from "react";
 import { fetchSearch, reindexSearch, type SearchHit } from "../lib/api";
-import { navigateToThread } from "../App";
+import { navigateToProjects, navigateToThread } from "../App";
 
 /**
  * Splits an FTS5 snippet (containing literal `<b>…</b>` markers from
@@ -80,11 +80,11 @@ export default function Search({ query }: { query: string }) {
   return (
     <div className="page">
       <a
-        href="#/"
+        href="#/list"
         className="back-link"
         onClick={(e) => {
           e.preventDefault();
-          window.location.hash = "#/";
+          navigateToProjects();
         }}
       >
         ← All projects

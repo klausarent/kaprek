@@ -3,7 +3,7 @@
 // project's sessions with client-side search over title/session id.
 import { useEffect, useMemo, useState } from "react";
 import { fetchProjects, fetchSessions, type ProjectSummary, type SessionMeta } from "../lib/api";
-import { navigateToSessions, navigateToThread } from "../App";
+import { navigateToProjects, navigateToSessions, navigateToThread } from "../App";
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -189,11 +189,11 @@ function ProjectSessions({ project }: { project: string }) {
   return (
     <div className="page">
       <a
-        href="#/"
+        href="#/list"
         className="back-link"
         onClick={(e) => {
           e.preventDefault();
-          window.location.hash = "#/";
+          navigateToProjects();
         }}
       >
         ← All projects

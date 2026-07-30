@@ -5,6 +5,7 @@
 // the session viewer already uses for finished transcripts.
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
+  answerApproval,
   cancelChatTurn,
   fetchChat,
   streamChatTurn,
@@ -12,7 +13,19 @@ import {
   type ChatStreamEvent,
   type DigestEvent,
 } from "../lib/api";
+import {
+  addApproval,
+  dropExpired,
+  removeApproval,
+  removeApprovalsForChat,
+  type PendingApproval,
+} from "../lib/approvals";
+import { applyAgentEvent, clearAwaitingApproval, initialAgentPanel, shouldAutoExpand } from "../lib/agents";
+import { setStatus } from "../lib/status";
+import { navigateToChats } from "../App";
 import EventBlock from "../components/EventBlock";
+import ApprovalDialog from "../components/ApprovalDialog";
+import AgentPanel from "../components/AgentPanel";
 
 /**
  * Turns a live SSE 'tool-start' event into a DigestEvent with `result: null`
@@ -55,6 +68,13 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
   const [rateLimitHint, setRateLimitHint] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [streamError, setStreamError] = useState<string | null>(null);
+  const [approvals, setApprovals] = useState<PendingApproval[]>([]);
+  const [deciding, setDeciding] = useState(false);
+  const [agentPanel, setAgentPanel] = useState(initialAgentPanel);
+  const [panelExpanded, setPanelExpanded] = useState(false);
+  // One shared clock for the approval countdown and the turn duration, ticked
+  // only while something is actually running or waiting (see below).
+  const [nowMs, setNowMs] = useState(() => Date.now());
 
   const abortRef = useRef<AbortController | null>(null);
   // id -> index into `events`, for the tool-start/tool-end event this turn
@@ -84,6 +104,38 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
     return () => abortRef.current?.abort();
   }, []);
 
+  // The clock only runs while there is something to count: a live turn (the
+  // agent panel's duration) or an open approval (its countdown). An idle chat
+  // page must not re-render once a second forever.
+  const needsClock = streaming || approvals.length > 0;
+  useEffect(() => {
+    if (!needsClock) return;
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setNowMs(now);
+      // An entry whose cosmetic countdown ran out was denied by the server's
+      // own timer long since — stop offering buttons for it.
+      setApprovals((prev) => dropExpired(prev, now));
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [needsClock]);
+
+  // A second agent showing up opens the panel by itself; a single agent leaves
+  // it collapsed. Either way the user's own toggle wins afterwards.
+  useEffect(() => {
+    if (shouldAutoExpand(agentPanel)) setPanelExpanded(true);
+  }, [agentPanel]);
+
+  // Feeds the header's status dot (lib/status.ts) — no polling endpoint, just
+  // the state this page already holds.
+  useEffect(() => {
+    setStatus({ turnRunning: streaming, approvalsOpen: approvals.length });
+  }, [streaming, approvals.length]);
+
+  useEffect(() => {
+    return () => setStatus({ turnRunning: false, approvalsOpen: 0 });
+  }, []);
+
   const canSend = draft.trim().length > 0 && !streaming;
 
   const handleSend = async () => {
@@ -95,6 +147,9 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
     setRateLimitHint(null);
     setEvents((prev) => [...prev, nowEvent("user", text)]);
     pendingToolIndex.current = new Map();
+    setAgentPanel(initialAgentPanel());
+    setPanelExpanded(false);
+    setNowMs(Date.now());
 
     const controller = new AbortController();
     abortRef.current = controller;
@@ -126,6 +181,10 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
   };
 
   function handleStreamEvent(event: ChatStreamEvent) {
+    // Every frame also feeds the agent panel; irrelevant types are identity
+    // there (see lib/agents.ts::applyAgentEvent).
+    const seenAt = Date.now();
+    setAgentPanel((prev) => applyAgentEvent(prev, event, seenAt));
     switch (event.type) {
       case "chat-id":
         setChatId(event.chatId);
@@ -165,6 +224,10 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
       case "rate-limit":
         setRateLimitHint("Rate limit signal received from the CLI — this turn may be slower or get throttled.");
         break;
+      case "approval":
+        setNowMs(seenAt);
+        setApprovals((prev) => addApproval(prev, event, seenAt));
+        break;
       case "error":
         setStreamError(event.message);
         break;
@@ -174,11 +237,38 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
         break;
       case "turn-complete":
         setLastTurn({ costUsd: event.costUsd, stopReason: event.stopReason, errorMessage: event.error?.message ?? null });
+        // The server resolved (denied) every approval still pending for this
+        // chat when the turn ended — see cleanupApprovalsForChat — so nothing
+        // left in the stack for it can still be answered.
+        setApprovals((prev) => removeApprovalsForChat(prev, event.chatId));
         break;
       default:
         break;
     }
   }
+
+  /**
+   * Answers the visible approval. 404/409 (already decided, or the server's
+   * own 10-minute timer got there first) come back as 'gone' and just drop the
+   * entry — no error box for "there was nothing left to answer".
+   */
+  const handleDecide = async (entry: PendingApproval, behavior: "allow" | "deny") => {
+    if (deciding) return;
+    setDeciding(true);
+    try {
+      await answerApproval(entry.id, {
+        chatId: entry.chatId,
+        behavior,
+        ...(behavior === "deny" ? { message: "denied by user" } : {}),
+      });
+    } catch (e) {
+      setStreamError((e as Error).message || "Failed to answer the approval");
+    } finally {
+      setApprovals((prev) => removeApproval(prev, entry.id));
+      setAgentPanel((prev) => clearAwaitingApproval(prev, entry.agentId));
+      setDeciding(false);
+    }
+  };
 
   const handleStop = async () => {
     if (!chatId) {
@@ -214,7 +304,18 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
     <div className="page chat-page">
       <header className="page-header">
         <h1>Chat</h1>
-        <p className="page-subtitle">Runs against your own Claude Code CLI, in the background — no API key involved.</p>
+        <p className="page-subtitle">
+          Runs against your own Claude Code CLI, in the background — no API key involved.{" "}
+          <a
+            href="#/chats"
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToChats();
+            }}
+          >
+            All chats
+          </a>
+        </p>
       </header>
 
       {loadError && <div className="error-box">{loadError}</div>}
@@ -227,6 +328,15 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
         )}
         <div ref={eventsEndRef} />
       </div>
+
+      <ApprovalDialog approvals={approvals} nowMs={nowMs} busy={deciding} onDecide={handleDecide} />
+
+      <AgentPanel
+        state={agentPanel}
+        nowMs={nowMs}
+        expanded={panelExpanded}
+        onToggle={() => setPanelExpanded((prev) => !prev)}
+      />
 
       {streamError && <div className="error-box">{streamError}</div>}
       {lastTurn?.errorMessage && <div className="error-box">{lastTurn.errorMessage}</div>}
