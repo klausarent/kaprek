@@ -1636,7 +1636,12 @@ test('a file-watch trigger enabled AFTER start() gets its watcher on the next ti
 // ------------------------------------------------------------- caps: post-check, global ceiling, cross-process claims
 
 test('cost cap: crossing it during a turn is reported right after that turn, and the next fire is refused', async () => {
-  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  // Pinned to the real clock, not a literal date: the runner's day window is
+  // computed from this injected `now`, but runs.jsonl stamps entries with the
+  // actual wall clock (runs.mjs `entry.ts ?? new Date().toISOString()`). A
+  // literal date put an expiry into the test — it went red at the first
+  // midnight after it was written (found 2026-07-31, the morning after).
+  const fixedNow = Date.now();
   const logMessages = [];
   // One turn costing more than the whole cap: the preflight said yes at
   // $0.00, and the turn itself put the day over the line.
