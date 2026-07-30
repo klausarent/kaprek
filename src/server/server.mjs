@@ -797,7 +797,7 @@ async function handleApprovalDecision(req, res, id, pendingApprovals) {
 async function handleChatTurn(
   req,
   res,
-  { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools, pendingApprovals, approvalTimeoutMs },
+  { getChats, harness, harnessName, dataDir, chatAbortControllers, permissionMode, allowedTools, pendingApprovals, approvalTimeoutMs, chatSseQueues, approvalStreams },
 ) {
   const body = await readJsonBody(req);
   if (!body.ok) {
@@ -867,6 +867,12 @@ async function handleChatTurn(
     Connection: 'keep-alive',
   });
   const enqueue = createSseQueue(res);
+  // A chat turn's stream can render an approval question too (it is the same
+  // ApprovalDialog), so it counts as an approval client for as long as it runs
+  // — and can be handed a background trigger's question via
+  // deliverApprovalFrame(). See startServer's `approvalStreams`.
+  approvalStreams.add(enqueue);
+  chatSseQueues.set(chatId, enqueue);
   enqueue({ type: 'chat-id', chatId });
 
   try {
@@ -900,6 +906,9 @@ async function handleChatTurn(
     await enqueue({ type: 'turn-complete', chatId, cliSessionId: null, costUsd: null, stopReason: 'error', error: { message: err.message } });
   } finally {
     res.off('close', onClientClose);
+    approvalStreams.delete(enqueue);
+    // Same "only our own entry" rule as the abort controller below.
+    if (chatSseQueues.get(chatId) === enqueue) chatSseQueues.delete(chatId);
     // Only remove OUR OWN entry: blindly deleting by chatId would let a
     // slower-finishing turn's finally-block erase a different, still-running
     // turn's controller if the two were ever to overlap for the same key.
@@ -1043,7 +1052,11 @@ function handleTriggersList(res, getTriggers, getRunner) {
       // same idea as `blocked` one field over: a clipboard trigger on a
       // non-Windows machine says so here in plain text, instead of offering a
       // switch that silently does nothing.
-      const capability = runner.approvalCapability(trigger);
+      // `unattended: true` — this list answers "will it fire on its own?", so
+      // a question/review trigger with no stream open reads as blocked here
+      // even though the caller could still fire it by hand (see
+      // runner.mjs::approvalCapability's unattended gate).
+      const capability = runner.approvalCapability(trigger, { unattended: true });
       const { blockedReason, runsToday, costToday, costEstimated } = runner.limitStatus(trigger);
       return {
         ...trigger,
@@ -1140,7 +1153,7 @@ async function handleTriggerToggle(req, res, getTriggers, id) {
  * briefly blocked by an unrelated already-running heartbeat is an
  * acceptable false positive for that guarantee.
  */
-async function handleTriggerFire(res, getRunner, id, chatSseQueues) {
+async function handleTriggerFire(res, getRunner, id, chatSseQueues, approvalStreams) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid trigger id' });
     return;
@@ -1157,6 +1170,10 @@ async function handleTriggerFire(res, getRunner, id, chatSseQueues) {
     Connection: 'keep-alive',
   });
   const enqueue = createSseQueue(res);
+  // This stream can show an approval question, so it counts towards
+  // hasApprovalClient() for the whole time it is open (see startServer's
+  // `approvalStreams`).
+  approvalStreams.add(enqueue);
 
   let chatIdForCleanup = null;
   try {
@@ -1180,6 +1197,7 @@ async function handleTriggerFire(res, getRunner, id, chatSseQueues) {
     // cannot become a 429/500 JSON response; report it as one more frame.
     await enqueue({ type: 'trigger-complete', fired: false, reason: `internal error: ${err.message}` });
   } finally {
+    approvalStreams.delete(enqueue);
     if (chatIdForCleanup) chatSseQueues.delete(chatIdForCleanup);
     if (!res.writableEnded) res.end();
   }
@@ -1200,7 +1218,7 @@ function handleTriggerDelete(res, getTriggers, id) {
 }
 
 /** Trigger routes, mounted at /api/triggers/*. */
-async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues }) {
+async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams }) {
   // /api/triggers
   if (segments.length === 2) {
     if (req.method === 'GET') {
@@ -1230,7 +1248,7 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
       return;
     }
     if (segments[3] === 'fire') {
-      await handleTriggerFire(res, getRunner, segments[2], chatSseQueues);
+      await handleTriggerFire(res, getRunner, segments[2], chatSseQueues, approvalStreams);
       return;
     }
   }
@@ -1355,6 +1373,7 @@ async function handleRequest(
     getTriggers,
     getRunner,
     chatSseQueues,
+    approvalStreams,
     instanceToken,
     bundledAppsDir,
   },
@@ -1444,11 +1463,13 @@ async function handleRequest(
         allowedTools,
         pendingApprovals,
         approvalTimeoutMs,
+        chatSseQueues,
+        approvalStreams,
       });
       return;
     }
     if (segments[1] === 'triggers') {
-      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues });
+      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams });
       return;
     }
     if (segments.length === 3 && segments[1] === 'approvals') {
@@ -1609,16 +1630,29 @@ export function startServer({
   const workspaceDir = path.join(dataDir, 'workspace');
   fs.mkdirSync(workspaceDir, { recursive: true });
 
+  /**
+   * Delivers one approval frame for `chatId`: to the stream watching that
+   * exact chat if there is one, otherwise to every open stream (see
+   * `approvalStreams` below for why that is both safe and necessary). Resolves
+   * even when nothing is listening — the approval still exists server-side and
+   * still auto-denies on the timeout.
+   */
+  function deliverApprovalFrame(chatId, frame) {
+    const dedicated = chatSseQueues.get(chatId);
+    if (dedicated) return dedicated(frame);
+    return Promise.all([...approvalStreams].map((enqueue) => enqueue(frame)));
+  }
+
   // The trigger runner, opened lazily and started once listen() resolves
   // (see below), stopped when the server closes. `makeUiApprovalHandler`
   // reuses the SAME makeApprovalHandler() a normal chat turn uses — see the
-  // module doc comment further down — bound to `chatSseQueues` so a
-  // question/review trigger's approval streams live if (and only if) a
-  // client currently has THAT chatId open via the SSE fire route below;
-  // otherwise it still exists and still auto-denies after
-  // `approvalTimeoutMs`, it just never gets a live listener. A 'notify'
-  // trigger never calls this at all — its own self-contained policy
-  // decider (see runner.mjs::notifyPolicyHandler()) needs nothing from here.
+  // module doc comment further down — so a question/review trigger's approval
+  // reaches whichever client is currently streaming (see
+  // deliverApprovalFrame). `hasApprovalClient` is the matching gate: with no
+  // stream open at all, such a trigger does not fire in the first place
+  // instead of raising a question into the void. A 'notify' trigger never
+  // calls any of this — its own self-contained policy decider (see
+  // runner.mjs::notifyPolicyHandler()) needs nothing from here.
   let runner = null;
   function getRunner() {
     if (!runner) {
@@ -1634,10 +1668,11 @@ export function startServer({
         // tool, read from the manifests rather than from the tool's name (see
         // runner.mjs::notifyPolicyHandler).
         resolveToolApp: appIdForTool,
+        hasApprovalClient: () => approvalStreams.size > 0,
         makeUiApprovalHandler: (chatId) =>
           makeApprovalHandler({
             chatId,
-            enqueue: (frame) => (chatSseQueues.get(chatId) ?? (() => Promise.resolve()))(frame),
+            enqueue: (frame) => deliverApprovalFrame(chatId, frame),
             pendingApprovals,
             approvalTimeoutMs,
           }),
@@ -1661,10 +1696,28 @@ export function startServer({
   // the trigger fire route below (POST /api/triggers/<id>/fire) — lets
   // getRunner()'s makeUiApprovalHandler find "is anyone actually watching
   // this trigger-started chat right now" without the runner needing to know
-  // anything about HTTP/SSE itself. A background tick-driven fire never has
-  // an entry here, so its approval requests still get created (and still
-  // time out via approvalTimeoutMs) but never try to write to a dead queue.
+  // anything about HTTP/SSE itself.
   const chatSseQueues = new Map();
+
+  // EVERY open SSE stream, whatever opened it (a chat turn or a manual trigger
+  // fire). Two jobs, both for the unattended-approval problem (see
+  // runner.mjs::approvalCapability):
+  //
+  //  1. `approvalStreams.size > 0` is the runner's hasApprovalClient() — the
+  //     gate that keeps a tick-driven question/review trigger from starting a
+  //     turn whose approval nobody could ever answer.
+  //  2. It is where an approval for a chat NOBODY is streaming gets delivered.
+  //     A background trigger creates its own fresh chat, so `chatSseQueues`
+  //     never has an entry for it and the question used to go to a no-op. It
+  //     is now broadcast to whatever streams are open instead.
+  //
+  // Broadcasting is safe because an approval frame carries its own `chatId`
+  // and the answer must send that same chatId back (see approvalKey() and
+  // web/src/lib/approvals.ts::buildApprovalAnswer) — a client can therefore
+  // answer a question about a chat it is not itself watching, and cannot
+  // accidentally answer for the wrong one. It is deliberately NOT a new
+  // protocol: same `{type:'approval', chatId, …}` frame, more recipients.
+  const approvalStreams = new Set();
 
   const server = http.createServer((req, res) => {
     handleRequest(req, res, {
@@ -1688,6 +1741,7 @@ export function startServer({
       getTriggers,
       getRunner,
       chatSseQueues,
+      approvalStreams,
       instanceToken,
       bundledAppsDir,
     }).catch((err) => {
@@ -1711,8 +1765,12 @@ export function startServer({
       getRunner().start();
       // `token` is returned for the process that STARTED the server (the CLI,
       // a test) — it is deliberately not printed anywhere by default; see
-      // token.mjs on why it never goes into a log line.
-      resolve({ server, url: `http://127.0.0.1:${addr.port}`, token: instanceToken });
+      // token.mjs on why it never goes into a log line. `runner` comes back
+      // for the same caller: a test needs to reach fireTrigger() the way a
+      // background tick does (no HTTP route does that — POST .../fire is
+      // always cause.origin 'user'), and waiting on a real 60-second timer is
+      // not a test.
+      resolve({ server, url: `http://127.0.0.1:${addr.port}`, token: instanceToken, runner: getRunner() });
     });
   });
 }

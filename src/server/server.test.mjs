@@ -1745,6 +1745,116 @@ test('triggers: POST /api/triggers/<id>/fire while a trigger turn is already in 
   expect(firstFrames.find((f) => f.type === 'trigger-complete').fired).toBe(true);
 });
 
+test('triggers: a question trigger reports the unattended block while nothing streams, and clears it while a stream is open', async () => {
+  const harness = gatedHarness();
+  const { url } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'quiet-one', escalation: 'notify' }));
+
+  const blockedFor = async (id) => {
+    const body = await (await fetch(`${url}/api/triggers`)).json();
+    return body.triggers.find((t) => t.id === id).blocked;
+  };
+
+  expect(await blockedFor('ask-me')).toBe('needs an open UI to ask for approval');
+  // A notify trigger needs no human at all, so this never blocks it.
+  expect(await blockedFor('quiet-one')).toBeNull();
+
+  // Hold a chat turn's SSE stream open: that is an approval client.
+  const turnRes = await postJson(`${url}/api/chat/turn`, { text: 'hold the stream open' });
+  await harness.started;
+  expect(await blockedFor('ask-me')).toBeNull();
+
+  harness.release();
+  await readSse(turnRes);
+  // Stream closed again — back to blocked, so the answer tracks reality
+  // instead of latching on the first client that ever connected.
+  expect(await blockedFor('ask-me')).toBe('needs an open UI to ask for approval');
+});
+
+test('triggers: a question trigger driven by a background tick does not start a turn while nothing streams', async () => {
+  const { url, runner } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  // Reaches fireTrigger the way a tick does — cause.origin is the trigger's
+  // own type, never 'user'. No HTTP route can produce that, and waiting on the
+  // real 60-second timer is not a test.
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+
+  // Nothing was started, so no chat exists and nothing was billed.
+  const chats = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
+  expect(chats.chats).toEqual([]);
+});
+
+/**
+ * A harness for the broadcast test: the FIRST turn parks until released (the
+ * chat turn holding a stream open), the SECOND raises an approval (the
+ * background trigger's turn). Ordered by construction — the test only fires
+ * the trigger once the first turn is provably in flight.
+ */
+function chatThenApprovalHarness() {
+  let markStarted;
+  let release;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  let turns = 0;
+  return {
+    started,
+    release: () => release(),
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      turns += 1;
+      if (turns === 1) {
+        markStarted();
+        await gate;
+        onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+        return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+      }
+      const decision = await onApprovalRequest({ id: 'bg-approval-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      onEvent?.({ type: 'text', text: `decision was ${decision.behavior}` });
+      onEvent?.({ type: 'result', sessionId: 's2', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's2', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('triggers: an approval for a chat nobody streams is delivered to whatever stream IS open', async () => {
+  // A background trigger creates its own chat, so no client is watching THAT
+  // chatId — the question used to go to a no-op writer and be auto-denied ten
+  // minutes later (codex-tag3.md F6).
+  const harness = chatThenApprovalHarness();
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const turnRes = await postJson(`${url}/api/chat/turn`, { text: 'a completely unrelated chat' });
+  await harness.started;
+
+  const seen = [];
+  const reading = readSse(turnRes, async (frame) => {
+    seen.push(frame);
+    if (frame.type !== 'approval') return;
+    const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'deny' });
+    expect(decideRes.status).toBe(200);
+    harness.release();
+  });
+
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' }, onEvent: () => {} });
+  await reading;
+  expect(result.fired).toBe(true);
+
+  const approval = seen.find((f) => f.type === 'approval');
+  expect(approval).toMatchObject({ type: 'approval', id: 'bg-approval-1', toolName: 'Bash' });
+  // The frame carries the TRIGGER's chat, not the chat this stream belongs to
+  // — which is exactly why the answer has to send that chatId back, and why a
+  // client can answer a question about a chat it is not watching.
+  expect(approval.chatId).toBe(result.chatId);
+  expect(approval.chatId).not.toBe(seen[0].chatId);
+});
+
 test('triggers: a "question" escalation trigger fires (the server always wires a UI approval handler), and its approval question appears live in the SSE stream and is answerable via POST /api/approvals/<id>', async () => {
   const { url } = await boot({
     harness: approvalHarness({ request: { id: 'trigger-approve-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
@@ -1755,7 +1865,10 @@ test('triggers: a "question" escalation trigger fires (the server always wires a
   const listRes = await fetch(`${url}/api/triggers`);
   const listed = (await listRes.json()).triggers.find((t) => t.id === 'ask-me');
   expect(listed.approvalPath).toBe('ui');
-  expect(listed.blocked).toBeNull();
+  // Nothing is streaming at this moment, so the list reports the UNATTENDED
+  // answer: it would not fire on its own right now. Firing it by hand below
+  // still works — that is the point of the distinction.
+  expect(listed.blocked).toBe('needs an open UI to ask for approval');
 
   const res = await fetch(`${url}/api/triggers/ask-me/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
 

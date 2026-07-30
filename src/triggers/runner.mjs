@@ -307,6 +307,12 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   anything", which denies every app tool: without a real app registry the
  *   policy cannot know whose tool it is being asked about, and guessing from
  *   the name is exactly the hole this replaces.
+ * @param {() => boolean} [options.hasApprovalClient] - whether ANY client is
+ *   currently streaming and could therefore be shown an approval question
+ *   (the server counts its open SSE streams). Gates unattended
+ *   'question'/'review' turns — see approvalCapability(). Defaults to false,
+ *   the fail-closed answer: a runner built without this option has no way to
+ *   reach a human, so it must not start a turn that will need one.
  */
 export function createTriggerRunner({
   dataDir,
@@ -324,6 +330,7 @@ export function createTriggerRunner({
   readClipboard = readWindowsClipboard,
   platform = process.platform,
   resolveToolApp = () => null,
+  hasApprovalClient = () => false,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -443,12 +450,34 @@ export function createTriggerRunner({
    * structurally can never fire is visible via the API, not just a
    * console.log line (task-7a-review.md Important #2).
    */
-  function approvalCapability(trigger) {
+  function approvalCapability(trigger, { unattended = true } = {}) {
     if (trigger.escalation === 'notify') {
       return { approvalPath: 'policy', blocked: null };
     }
     if (typeof makeUiApprovalHandler !== 'function') {
       return { approvalPath: 'ui', blocked: 'no UI approval handler configured for this escalation level' };
+    }
+    // UNATTENDED ESCALATION GATE (codex-tag3.md F6).
+    //
+    // A 'question'/'review' trigger's whole point is that a human decides. A
+    // tick/watcher/clipboard-driven turn has no human by definition, and the
+    // approval it raises can only reach one over a live SSE stream — with no
+    // stream open, the question went to a no-op writer, sat invisible for ten
+    // minutes and was auto-denied. The escalation level that exists to involve
+    // a person failed silently in exactly the unattended case it was built for.
+    //
+    // So: do not fire at all. A refusal that says why beats a turn that runs,
+    // gets denied on its first real tool call, and bills for the privilege.
+    // A manual fire (cause.origin 'user') passes — someone is demonstrably
+    // there.
+    //
+    // This is the honest stopgap, not the destination. The real fix is a
+    // PERSISTENT APPROVAL INBOX: questions outlive the stream that raised
+    // them, so an unattended trigger can ask now and be answered when the user
+    // next opens kaprek. That needs a store, an expiry policy and a resume
+    // path for a turn whose CLI has long exited — see README's Backlog.
+    if (unattended && !hasApprovalClient()) {
+      return { approvalPath: 'ui', blocked: 'needs an open UI to ask for approval' };
     }
     return { approvalPath: 'ui', blocked: null };
   }
@@ -985,6 +1014,29 @@ export function createTriggerRunner({
       return { fired: false, reason: support.unsupportedReason };
     }
 
+    // Escalation gate: EVERY trigger turn gets a real approval handler, no
+    // exceptions — a 'notify' trigger always has one (its own self-contained
+    // notifyPolicyHandler(), built below, needs nothing external). Only
+    // 'question'/'review' can actually be unfireable here: they need
+    // makeUiApprovalHandler wired (see approvalCapability() above); without
+    // it the trigger does not fire at all — never "fires but auto-denies
+    // every tool call", which would just be a confusing silent failure deep
+    // inside the turn instead of a clear, logged rejection here.
+    //
+    // `unattended` is what separates a tick/watcher/clipboard cause from a
+    // manual fire: only cause.origin 'user' means a person is demonstrably at
+    // the other end and can answer the question this turn may raise.
+    const capability = approvalCapability(trigger, { unattended: cause?.origin !== 'user' });
+    if (capability.blocked) {
+      log(`trigger ${id}: rejected (${capability.blocked})`);
+      return { fired: false, reason: capability.blocked };
+    }
+
+    // Deliberately BEFORE the type-specific block below: a turn that may not
+    // fire must not consume a schedule/heartbeat/file-watch window claim on
+    // its way to being refused (that claim is cross-process and would silence
+    // the window for everyone until the next one).
+    //
     // Type-specific firing precondition.
     let checklist;
     let slot;
@@ -1067,20 +1119,6 @@ export function createTriggerRunner({
         return { fired: false, reason };
       }
       reasonText = 'manual fire (saved prompt)';
-    }
-
-    // Escalation gate: EVERY trigger turn gets a real approval handler, no
-    // exceptions — a 'notify' trigger always has one (its own self-contained
-    // notifyPolicyHandler(), built below, needs nothing external). Only
-    // 'question'/'review' can actually be unfireable here: they need
-    // makeUiApprovalHandler wired (see approvalCapability() above); without
-    // it the trigger does not fire at all — never "fires but auto-denies
-    // every tool call", which would just be a confusing silent failure deep
-    // inside the turn instead of a clear, logged rejection here.
-    const capability = approvalCapability(trigger);
-    if (capability.blocked) {
-      log(`trigger ${id}: rejected (${capability.blocked})`);
-      return { fired: false, reason: capability.blocked };
     }
 
     // Everything past this point is synchronous up to the `await runTurn`

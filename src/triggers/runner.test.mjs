@@ -375,6 +375,87 @@ test('escalation "review" WITH a configured UI approval handler factory fires, a
   expect(typeof result.chatId).toBe('string');
 });
 
+// The unattended-escalation gate (codex-tag3.md F6): a question/review turn
+// nobody can answer must not start. `hasApprovalClient` is the server's count
+// of open SSE streams; these tests drive it directly.
+const allowingApprovalHandler = () => async () => ({ behavior: 'allow' });
+
+test('a scheduled question/review trigger does NOT fire while no client could be shown its approval', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('needs an open UI to ask for approval');
+});
+
+test('the same trigger fires from a tick once a client is streaming', async () => {
+  let clientConnected = false;
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => clientConnected,
+  });
+
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(false);
+  clientConnected = true;
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
+});
+
+test('a MANUAL fire of a question/review trigger is never gated — someone is demonstrably there', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+});
+
+test('a notify trigger fires unattended regardless — its policy decider needs no human at all', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }),
+    hasApprovalClient: () => false,
+  });
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
+});
+
+test('approvalCapability reports the unattended gate as blocked, and clears it once a client connects', () => {
+  let clientConnected = false;
+  const trigger = scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' });
+  const { runner, triggers } = makeRunner({
+    trigger,
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => clientConnected,
+  });
+  const stored = triggers.list()[0];
+
+  expect(runner.approvalCapability(stored, { unattended: true })).toEqual({
+    approvalPath: 'ui',
+    blocked: 'needs an open UI to ask for approval',
+  });
+  // The same trigger IS fireable by hand right now, so the attended answer
+  // must differ — GET /api/triggers deliberately reports the unattended one.
+  expect(runner.approvalCapability(stored, { unattended: false })).toEqual({ approvalPath: 'ui', blocked: null });
+
+  clientConnected = true;
+  expect(runner.approvalCapability(stored, { unattended: true })).toEqual({ approvalPath: 'ui', blocked: null });
+});
+
+test('a runner built without hasApprovalClient refuses unattended question/review turns (fail-closed default)', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+  });
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('needs an open UI to ask for approval');
+});
+
 test('escalation "notify" never uses makeUiApprovalHandler even when one is configured — it always uses its own self-contained policy decider', async () => {
   const makeUiApprovalHandler = () => {
     throw new Error('should never be called for a notify trigger');
