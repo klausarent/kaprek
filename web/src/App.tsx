@@ -4,6 +4,7 @@
 //   #/chat/<id>                 → one chat
 //   #/chats                     → chat list (?triggerId=, ?includeSilent=1)
 //   #/triggers                  → trigger page
+//   #/apps                      → installed apps (read-only)
 //   #/list, #/project/<slug>    → session list (the transcript viewer core)
 //   #/session/<project>/<id>    → thread view
 //   #/search?q=, #/board        → search / board
@@ -17,17 +18,19 @@ import Board from "./pages/Board";
 import Chat from "./pages/Chat";
 import ChatList from "./pages/ChatList";
 import Triggers from "./pages/Triggers";
+import Apps from "./pages/Apps";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
 
-type Route =
+export type Route =
   | { name: "list"; project: string | null }
   | { name: "thread"; project: string; sessionId: string }
   | { name: "search"; query: string }
   | { name: "board" }
   | { name: "chat"; chatId: string | undefined }
   | { name: "chats"; triggerId: string | undefined; includeSilent: boolean }
-  | { name: "triggers" };
+  | { name: "triggers" }
+  | { name: "apps" };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -53,6 +56,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "triggers") {
     return { name: "triggers" };
+  }
+  if (parts[0] === "apps") {
+    return { name: "apps" };
   }
   if (parts[0] === "chats") {
     const params = new URLSearchParams(queryPart ?? "");
@@ -110,14 +116,46 @@ export function navigateToTriggers() {
   window.location.hash = "#/triggers";
 }
 
-function useHashRoute(): Route {
-  const [route, setRoute] = useState(() => parseHash(window.location.hash));
+export function navigateToApps() {
+  window.location.hash = "#/apps";
+}
+
+/**
+ * The current route plus how many hash changes have happened. The counter
+ * exists for chatInstanceKey() below — see its doc comment.
+ */
+function useHashRoute(): { route: Route; navCount: number } {
+  const [state, setState] = useState(() => ({ route: parseHash(window.location.hash), navCount: 0 }));
   useEffect(() => {
-    const onChange = () => setRoute(parseHash(window.location.hash));
+    const onChange = () =>
+      setState((prev) => ({ route: parseHash(window.location.hash), navCount: prev.navCount + 1 }));
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
-  return route;
+  return state;
+}
+
+/**
+ * React `key` for the <Chat> element, so that navigating to a NEW chat throws
+ * the old component instance (transcript, chatId, approval stack, agent panel)
+ * away instead of carrying it over.
+ *
+ * A key of just `chatId ?? 'new'` is not enough, and this is the whole bug:
+ * the Chat page rewrites the hash to `#/chat/<id>` with history.replaceState
+ * once a new chat gets its id, and replaceState fires NO hashchange — so the
+ * router still believes it is on `#/chat` with no id. Clicking "Chat" in the nav
+ * then lands on `#/chat`, which parses to the same `chatId: undefined` the
+ * router already held: same key, no remount, and the next message would be
+ * appended to the chat the user just tried to leave.
+ *
+ * Including navCount for the id-less case makes every navigation to `#/chat` a
+ * distinct instance. A deep link `#/chat/<id>` keys by the id itself, so
+ * re-rendering for an unrelated state change never remounts it — and
+ * replaceState, which fires no event, never bumps the counter mid-turn.
+ */
+export function chatInstanceKey(route: Route, navCount: number): string {
+  if (route.name !== "chat") return "chat";
+  return route.chatId ? `chat-${route.chatId}` : `chat-new-${navCount}`;
 }
 
 function HeaderSearch({ initialQuery }: { initialQuery: string }) {
@@ -177,7 +215,7 @@ function MissingTokenScreen() {
 }
 
 export default function App() {
-  const route = useHashRoute();
+  const { route, navCount } = useHashRoute();
 
   if (!hasInstanceToken()) return <MissingTokenScreen />;
 
@@ -218,6 +256,16 @@ export default function App() {
             Triggers
           </a>
           <a
+            href="#/apps"
+            className={route.name === "apps" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToApps();
+            }}
+          >
+            Apps
+          </a>
+          <a
             href="#/list"
             className={advancedActive ? "active" : ""}
             onClick={(e) => {
@@ -252,12 +300,14 @@ export default function App() {
           <Board />
         ) : route.name === "triggers" ? (
           <Triggers />
+        ) : route.name === "apps" ? (
+          <Apps />
         ) : route.name === "chats" ? (
           <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
         ) : route.name === "list" ? (
           <SessionList project={route.project} />
         ) : (
-          <Chat chatId={route.chatId} />
+          <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} />
         )}
       </main>
     </div>

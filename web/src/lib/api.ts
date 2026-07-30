@@ -645,6 +645,38 @@ export async function answerApproval(
 }
 
 // ---------------------------------------------------------------------------
+// Apps (src/apps/loader.mjs via GET /api/apps)
+// ---------------------------------------------------------------------------
+
+/** What an app is allowed to do (src/apps/manifest.mjs's policy block). */
+export type AppPolicy = {
+  fsWrite: boolean;
+  dataEgress: boolean;
+  externalAction: "never" | "approval" | "auto";
+  sensitivity: "low" | "medium" | "high";
+};
+
+/** Display metadata only — the route deliberately exposes no handler paths, tool schemas or instructions. */
+export type AppSummary = {
+  id: string;
+  name: string;
+  description: string;
+  icon: string | null;
+  version: string;
+  toolCount: number;
+  policy: AppPolicy;
+  uiSlot: "none" | "text" | "gallery";
+  source: "bundled" | "user";
+};
+
+/** A manifest that failed to load. Carries the reason, never the path it was found at. */
+export type AppLoadError = { message: string };
+
+export function fetchApps(): Promise<{ apps: AppSummary[]; errors: AppLoadError[] }> {
+  return getJson<{ apps: AppSummary[]; errors: AppLoadError[] }>("/api/apps");
+}
+
+// ---------------------------------------------------------------------------
 // Triggers (src/triggers/* via /api/triggers)
 // ---------------------------------------------------------------------------
 

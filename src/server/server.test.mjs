@@ -1855,6 +1855,111 @@ test('chat: GET /api/chat/list hides a silent heartbeat chat by default, include
   expect(silentChat.triggerId).toBe('heartbeat-check');
 });
 
+/** Writes a valid app manifest into `<dir>/<id>/app.json`. */
+function writeApp(dir, id, overrides = {}) {
+  const appDir = path.join(dir, id);
+  fs.mkdirSync(appDir, { recursive: true });
+  const manifest = {
+    id,
+    version: '1.0.0',
+    name: `App ${id}`,
+    description: `Does something for ${id}.`,
+    icon: '🧩',
+    instructions: 'Internal instructions that must never reach the apps list.',
+    tools: [
+      {
+        id: `${id}.do`,
+        description: 'Does the thing.',
+        inputSchema: { type: 'object', properties: {}, required: [] },
+        handler: 'handler.mjs',
+      },
+    ],
+    policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
+    uiSlot: 'text',
+    ...overrides,
+  };
+  fs.writeFileSync(path.join(appDir, 'app.json'), JSON.stringify(manifest), 'utf8');
+  return appDir;
+}
+
+test('apps: GET /api/apps returns display metadata for bundled and user apps', async () => {
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(bundledDir, 'shipped');
+  writeApp(path.join(dataDir, 'apps'), 'installed', {
+    policy: { fsWrite: true, dataEgress: true, externalAction: 'approval', sensitivity: 'high' },
+  });
+
+  const { url } = await boot({ bundledAppsDir: bundledDir });
+  const res = await fetch(`${url}/api/apps`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+
+  expect(body.errors).toEqual([]);
+  const byId = Object.fromEntries(body.apps.map((app) => [app.id, app]));
+  expect(Object.keys(byId).sort()).toEqual(['installed', 'shipped']);
+  expect(byId.shipped).toEqual({
+    id: 'shipped',
+    name: 'App shipped',
+    description: 'Does something for shipped.',
+    icon: '🧩',
+    version: '1.0.0',
+    toolCount: 1,
+    policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
+    uiSlot: 'text',
+    source: 'bundled',
+  });
+  expect(byId.installed.source).toBe('user');
+  expect(byId.installed.policy).toEqual({ fsWrite: true, dataEgress: true, externalAction: 'approval', sensitivity: 'high' });
+
+  fs.rmSync(bundledDir, { recursive: true, force: true });
+});
+
+test('apps: GET /api/apps exposes nothing executable — no handler paths, tool schemas or instructions', async () => {
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(bundledDir, 'shipped');
+  const { url } = await boot({ bundledAppsDir: bundledDir });
+
+  const raw = await (await fetch(`${url}/api/apps`)).text();
+  expect(raw).not.toContain('handler.mjs');
+  expect(raw).not.toContain('inputSchema');
+  expect(raw).not.toContain('Internal instructions');
+  // A filesystem path is not display data, and loadApps() reports one per app.
+  expect(raw).not.toContain(bundledDir.split(path.sep).join('/'));
+  expect(JSON.parse(raw).apps[0].tools).toBeUndefined();
+
+  fs.rmSync(bundledDir, { recursive: true, force: true });
+});
+
+test('apps: a broken manifest is reported without its path and without hiding the healthy apps', async () => {
+  const bundledDir = fs.mkdtempSync(path.join(os.tmpdir(), 'server-test-apps-'));
+  writeApp(bundledDir, 'healthy');
+  const brokenDir = path.join(bundledDir, 'broken');
+  fs.mkdirSync(brokenDir, { recursive: true });
+  fs.writeFileSync(path.join(brokenDir, 'app.json'), '{ not json', 'utf8');
+
+  const { url } = await boot({ bundledAppsDir: bundledDir });
+  const body = await (await fetch(`${url}/api/apps`)).json();
+
+  expect(body.apps.map((app) => app.id)).toEqual(['healthy']);
+  expect(body.errors).toHaveLength(1);
+  expect(Object.keys(body.errors[0])).toEqual(['message']);
+  expect(body.errors[0].message).toMatch(/invalid manifest/);
+
+  fs.rmSync(bundledDir, { recursive: true, force: true });
+});
+
+test('apps: GET /api/apps needs the instance token like every other API route', async () => {
+  const { url } = await boot({});
+  const res = await rawFetch(`${url}/api/apps`);
+  expect(res.status).toBe(401);
+  expect(await res.text()).toBe('');
+});
+
+test('apps: GET /api/apps rejects a non-GET method', async () => {
+  const { url } = await boot({});
+  expect((await postJson(`${url}/api/apps`, {})).status).toBe(405);
+});
+
 test('chat: GET /api/chat/list?triggerId= narrows the list to that one trigger, orthogonally to includeSilent', async () => {
   const { url } = await boot({});
   const chats = openChats(dataDir);

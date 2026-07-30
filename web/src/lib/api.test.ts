@@ -195,6 +195,18 @@ test("fetchChatList builds the triggerId and includeSilent query independently",
   ]);
 });
 
+test("fetchApps returns the route's apps and load errors, with the token attached", async () => {
+  stubDocument(TOKEN);
+  stubFetch(() => jsonResponse(200, { apps: [{ id: "notes" }], errors: [{ message: "invalid manifest (id)" }] }));
+  const api = await loadApi();
+
+  const result = await api.fetchApps();
+  expect(calls[0].url).toBe("/api/apps");
+  expect(headerOf(calls[0], TOKEN_HEADER)).toBe(TOKEN);
+  expect(result.apps).toHaveLength(1);
+  expect(result.errors[0].message).toContain("invalid manifest");
+});
+
 test("toDigestEvent passes a persisted approval event through as its own kind", async () => {
   stubDocument(TOKEN);
   const api = await loadApi();

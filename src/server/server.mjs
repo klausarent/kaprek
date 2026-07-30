@@ -9,6 +9,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession, registerSecret } from '../parser/parse.mjs';
 import { buildSearchIndex, searchSessions } from '../search/index.mjs';
@@ -31,9 +32,14 @@ import { openChats, ChatNotFoundError } from '../chats/store.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
+import { loadApps } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
+
+// The apps/ directory shipped with kaprek, resolved the same way
+// src/apps/mcp-server.mjs resolves it (this file lives in src/server/).
+const DEFAULT_BUNDLED_APPS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'apps');
 
 const DIGEST_CACHE_SIZE = 20;
 const MAX_BOARD_BODY_BYTES = 256 * 1024;
@@ -1215,6 +1221,39 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
 }
 
 /**
+ * GET /api/apps — the installed apps, read-only, for the Apps page.
+ *
+ * Deliberately DISPLAY metadata only: id, name, description, icon, version,
+ * how many tools the app brings, its `policy` (what it is allowed to do), its
+ * source (bundled with kaprek vs. user-installed), and its uiSlot. Never the
+ * tool `inputSchema`s, never `instructions`, and above all never a `handler`
+ * path — a filesystem path is not display data, and this route offers no way to
+ * install, enable, disable or run anything. Everything actually executable
+ * still goes exclusively through the MCP server (src/apps/mcp-server.mjs).
+ *
+ * A broken app.json shows up in `errors` rather than taking the list down, the
+ * same posture loadApps() itself takes. `dir` is stripped from those errors:
+ * the reason is useful in the UI, the absolute path on this machine is not.
+ */
+function handleAppsList(res, dataDir, bundledAppsDir) {
+  const { apps, errors } = loadApps({ bundledDir: bundledAppsDir, dataDir });
+  sendJson(res, 200, {
+    apps: apps.map(({ manifest, source }) => ({
+      id: manifest.id,
+      name: manifest.name,
+      description: manifest.description,
+      icon: manifest.icon,
+      version: manifest.version,
+      toolCount: manifest.tools.length,
+      policy: manifest.policy,
+      uiSlot: manifest.uiSlot,
+      source,
+    })),
+    errors: errors.map((error) => ({ message: error.message })),
+  });
+}
+
+/**
  * Injects the instance token into a served HTML document as
  * `<meta name="kaprek-token" content="…">`, right after the opening <head>
  * tag (or at the very top for a document without one). This is the ONE way
@@ -1300,6 +1339,7 @@ async function handleRequest(
     getRunner,
     chatSseQueues,
     instanceToken,
+    bundledAppsDir,
   },
 ) {
   // Clickjacking hardening, applied to EVERY response (API and static alike):
@@ -1411,6 +1451,10 @@ async function handleRequest(
       handleProjects(res, rootDir);
       return;
     }
+    if (segments.length === 2 && segments[1] === 'apps') {
+      handleAppsList(res, dataDir, bundledAppsDir);
+      return;
+    }
     if (segments.length === 2 && segments[1] === 'sessions') {
       handleSessions(res, rootDir, url.searchParams.get('project'));
       return;
@@ -1477,6 +1521,7 @@ export function startServer({
   permissionMode = 'default',
   allowedTools = null,
   approvalTimeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS,
+  bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -1606,6 +1651,7 @@ export function startServer({
       getRunner,
       chatSseQueues,
       instanceToken,
+      bundledAppsDir,
     }).catch((err) => {
       sendJson(res, 500, { error: 'internal error', message: err.message });
     });
