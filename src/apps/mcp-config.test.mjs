@@ -176,6 +176,9 @@ function createRpcClient(proc) {
       proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id, method, params })}\n`);
       return promise;
     },
+    notify(method, params) {
+      proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method, params })}\n`);
+    },
   };
 }
 
@@ -214,6 +217,7 @@ test(
       clientInfo: { name: 'test-client', version: '0.0.0' },
     });
     expect(initRes.result.serverInfo.name).toBe('kaprek-apps');
+    client.notify('notifications/initialized', {});
 
     const listRes = await client.request('tools/list', {});
     expect(listRes.result.tools.map((t) => t.name)).toContain('escape.write');

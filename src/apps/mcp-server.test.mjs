@@ -26,8 +26,8 @@ function appEntry(id, tools, dir = `/apps/${id}`) {
   return { manifest: { id, tools }, dir, source: 'bundled' };
 }
 
-function tool(id, handler = 'handler.mjs') {
-  return { id, description: `desc for ${id}`, inputSchema: { type: 'object' }, handler };
+function tool(id, handler = 'handler.mjs', inputSchema = { type: 'object' }) {
+  return { id, description: `desc for ${id}`, inputSchema, handler };
 }
 
 test('buildToolRegistry indexes tools by id across apps', () => {
@@ -45,37 +45,140 @@ test('buildToolRegistry keeps the first app on a duplicate tool id and warns', (
   expect(warnings).toHaveLength(1);
 });
 
-// ------------------------------------------------------------- unit: messages
+// -------------------------------------------------------------- unit: helpers
 
-test('handleMessage: initialize returns the MCP-shaped result', async () => {
+/** ctx for handleMessage() with lifecycle already past the handshake — for tests that aren't themselves about lifecycle. */
+function readyCtx(extra = {}) {
   const { registry } = buildToolRegistry([]);
+  return { registry, dataDir: '/data', workspaceDir: '/data/workspace', state: { phase: 'ready' }, ...extra };
+}
+
+function freshState() {
+  return { phase: 'uninitialized' };
+}
+
+// --------------------------------------------------------- unit: envelope (2a)
+
+test('handleMessage: {} (no method, no id) gets a -32600 Invalid Request response, not silent notification handling', async () => {
+  const res = await handleMessage({}, readyCtx());
+  expect(res.error.code).toBe(-32600);
+  expect(res.id).toBeNull();
+});
+
+test('handleMessage: a top-level array is rejected as -32600 (no batch support)', async () => {
+  const res = await handleMessage([], readyCtx());
+  expect(res.error.code).toBe(-32600);
+});
+
+test('handleMessage: wrong jsonrpc version is rejected as -32600', async () => {
+  const res = await handleMessage({ jsonrpc: '1.0', id: 1, method: 'tools/list' }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+  expect(res.id).toBe(1);
+});
+
+test('handleMessage: id:null is rejected as -32600 with a null id in the response', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', id: null, method: 'tools/list' }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+  expect(res.id).toBeNull();
+});
+
+test('handleMessage: an object id is rejected as -32600', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', id: { x: 1 }, method: 'tools/list' }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+});
+
+test('handleMessage: an array id is rejected as -32600', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', id: [1], method: 'tools/list' }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+});
+
+test('handleMessage: a request with no id and a non-"notifications/" method is rejected as -32600 (not treated as fire-and-forget)', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', method: 'tools/list' }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+});
+
+test('handleMessage: a real notification (no id, "notifications/..." method) returns null — no response on the wire', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, readyCtx());
+  expect(res).toBeNull();
+});
+
+test('handleMessage: an unrelated "notifications/..." notification returns null and does not affect lifecycle state', async () => {
+  const state = { phase: 'ready' };
+  const res = await handleMessage({ jsonrpc: '2.0', method: 'notifications/progress', params: {} }, readyCtx({ state }));
+  expect(res).toBeNull();
+  expect(state.phase).toBe('ready');
+});
+
+// --------------------------------------------------------- unit: lifecycle (2b)
+
+test('handleMessage: initialize returns the MCP-shaped result and advances state to "initializing"', async () => {
+  const state = freshState();
   const res = await handleMessage(
     { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'x', version: '1' } } },
-    { registry, dataDir: '/data', workspaceDir: '/data/workspace' },
+    readyCtx({ state }),
   );
   expect(res.id).toBe(1);
   expect(res.result.capabilities).toEqual({ tools: {} });
   expect(res.result.serverInfo.name).toBe('kaprek-apps');
   expect(typeof res.result.protocolVersion).toBe('string');
+  expect(state.phase).toBe('initializing');
 });
 
-test('handleMessage: notifications/initialized (no id) returns null — no response for a notification', async () => {
-  const { registry } = buildToolRegistry([]);
-  const res = await handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, { registry });
-  expect(res).toBeNull();
+test('handleMessage: tools/list before initialize is rejected with a JSON-RPC error, not served', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, readyCtx({ state: freshState() }));
+  expect(res.result).toBeUndefined();
+  expect(res.error).toBeDefined();
+  expect(res.error.code).toBe(-32002);
 });
+
+test('handleMessage: tools/call before initialize is rejected with a JSON-RPC error', async () => {
+  const res = await handleMessage(
+    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'x', arguments: {} } },
+    readyCtx({ state: freshState() }),
+  );
+  expect(res.error.code).toBe(-32002);
+});
+
+test('handleMessage: tools/list after initialize but before notifications/initialized is still rejected', async () => {
+  const state = { phase: 'initializing' };
+  const res = await handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, readyCtx({ state }));
+  expect(res.error.code).toBe(-32002);
+});
+
+test('handleMessage: notifications/initialized moves "initializing" to "ready", after which tools/list works', async () => {
+  const state = { phase: 'initializing' };
+  const notifyRes = await handleMessage({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} }, readyCtx({ state }));
+  expect(notifyRes).toBeNull();
+  expect(state.phase).toBe('ready');
+
+  const listRes = await handleMessage({ jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }, readyCtx({ state }));
+  expect(listRes.result.tools).toEqual([]);
+});
+
+test('handleMessage: a second initialize is rejected once already initializing', async () => {
+  const state = { phase: 'initializing' };
+  const res = await handleMessage({ jsonrpc: '2.0', id: 4, method: 'initialize', params: {} }, readyCtx({ state }));
+  expect(res.error.code).toBe(-32600);
+  expect(state.phase).toBe('initializing'); // unchanged by the rejected re-init
+});
+
+test('handleMessage: a second initialize is rejected once ready', async () => {
+  const res = await handleMessage({ jsonrpc: '2.0', id: 5, method: 'initialize', params: {} }, readyCtx());
+  expect(res.error.code).toBe(-32600);
+});
+
+// ---------------------------------------------------------------- unit: messages
 
 test('handleMessage: tools/list returns entries from the registry', async () => {
   const { registry } = buildToolRegistry([appEntry('notes', [tool('notes.write')])]);
-  const res = await handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, { registry });
+  const res = await handleMessage({ jsonrpc: '2.0', id: 2, method: 'tools/list', params: {} }, readyCtx({ registry }));
   expect(res.result.tools).toEqual([{ name: 'notes.write', description: 'desc for notes.write', inputSchema: { type: 'object' } }]);
 });
 
 test('handleMessage: tools/call for an unknown tool id returns a JSON-RPC error, not a tool result', async () => {
-  const { registry } = buildToolRegistry([]);
   const res = await handleMessage(
     { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'no.such.tool', arguments: {} } },
-    { registry },
+    readyCtx(),
   );
   expect(res.result).toBeUndefined();
   expect(res.error).toBeDefined();
@@ -83,9 +186,107 @@ test('handleMessage: tools/call for an unknown tool id returns a JSON-RPC error,
 });
 
 test('handleMessage: unknown method returns a JSON-RPC method-not-found error', async () => {
-  const { registry } = buildToolRegistry([]);
-  const res = await handleMessage({ jsonrpc: '2.0', id: 4, method: 'bogus/method', params: {} }, { registry });
+  const res = await handleMessage({ jsonrpc: '2.0', id: 4, method: 'bogus/method', params: {} }, readyCtx());
   expect(res.error.code).toBe(-32601);
+});
+
+// ---------------------------------------------------- unit: inputSchema validation (2c)
+
+test('handleMessage: tools/call rejects a missing required argument with -32602, without invoking the handler', async () => {
+  const apps = [appEntry('notes', [tool('notes.write', 'handler.mjs', { type: 'object', properties: { title: { type: 'string' } }, required: ['title'] })])];
+  const { registry } = buildToolRegistry(apps);
+  const res = await handleMessage(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'notes.write', arguments: {} } },
+    readyCtx({ registry }),
+  );
+  expect(res.error.code).toBe(-32602);
+  expect(res.error.message).toMatch(/title/);
+});
+
+test('handleMessage: tools/call rejects an unknown top-level argument with -32602', async () => {
+  const apps = [appEntry('notes', [tool('notes.write', 'handler.mjs', { type: 'object', properties: { title: { type: 'string' } } })])];
+  const { registry } = buildToolRegistry(apps);
+  const res = await handleMessage(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'notes.write', arguments: { title: 'x', evil: true } } },
+    readyCtx({ registry }),
+  );
+  expect(res.error.code).toBe(-32602);
+  expect(res.error.message).toMatch(/evil/);
+});
+
+test('handleMessage: tools/call rejects a wrong-typed argument with -32602', async () => {
+  const apps = [appEntry('notes', [tool('notes.write', 'handler.mjs', { type: 'object', properties: { title: { type: 'string' } } })])];
+  const { registry } = buildToolRegistry(apps);
+  const res = await handleMessage(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'notes.write', arguments: { title: 123 } } },
+    readyCtx({ registry }),
+  );
+  expect(res.error.code).toBe(-32602);
+  expect(res.error.message).toMatch(/title/);
+});
+
+// -------------------------------------------------- unit: handler error separation (2d)
+
+test('handleMessage: a handler-loading failure (bad import) is a JSON-RPC -32603 error, not a CallToolResult', async () => {
+  const apps = [appEntry('broken', [tool('broken.run', 'does-not-exist.mjs')], path.join(os.tmpdir(), 'kaprek-broken-app-fixture'))];
+  const { registry } = buildToolRegistry(apps);
+  const res = await handleMessage(
+    { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'broken.run', arguments: {} } },
+    readyCtx({ registry }),
+  );
+  expect(res.result).toBeUndefined();
+  expect(res.error).toBeDefined();
+  expect(res.error.code).toBe(-32603);
+});
+
+// integration test below (real handler exception -> isError:true) covers the
+// other half of this split, since it needs a real importable handler module.
+
+// ------------------------------------------------- unit: timeout + truncation (2e)
+
+test('handleMessage: a handler that never resolves times out and surfaces as isError:true', async () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hang-handler-'));
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `export async function handler() {\n  return new Promise(() => {}); // never resolves\n}\n`,
+    'utf8',
+  );
+  try {
+    const apps = [appEntry('hang', [tool('hang.run')], appDir)];
+    const { registry } = buildToolRegistry(apps);
+    // handlerTimeoutMs is a test-only ctx override (see mcp-server.mjs) so
+    // this doesn't have to wait out the real 60s HANDLER_TIMEOUT_MS.
+    const res = await handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'hang.run', arguments: {} } },
+      readyCtx({ registry, handlerTimeoutMs: 20 }),
+    );
+    expect(res.result.isError).toBe(true);
+    expect(res.result.content[0].text).toMatch(/timed out/);
+  } finally {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
+});
+
+test('handleMessage: an oversized handler result is truncated to the output byte cap', async () => {
+  const appDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-huge-handler-'));
+  fs.writeFileSync(
+    path.join(appDir, 'handler.mjs'),
+    `export async function handler() {\n  return 'x'.repeat(300 * 1024);\n}\n`,
+    'utf8',
+  );
+  try {
+    const apps = [appEntry('huge', [tool('huge.run')], appDir)];
+    const { registry } = buildToolRegistry(apps);
+    const res = await handleMessage(
+      { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'huge.run', arguments: {} } },
+      readyCtx({ registry }),
+    );
+    expect(res.result.isError).toBeUndefined();
+    expect(Buffer.byteLength(res.result.content[0].text, 'utf8')).toBeLessThan(300 * 1024);
+    expect(res.result.content[0].text).toMatch(/truncated/);
+  } finally {
+    fs.rmSync(appDir, { recursive: true, force: true });
+  }
 });
 
 // ------------------------------------------------------- integration: process
@@ -125,6 +326,12 @@ function writeEchoFixtureApp(bundledDir) {
           inputSchema: { type: 'object', properties: { relPath: { type: 'string' }, data: { type: 'string' } } },
           handler: 'handler.mjs',
         },
+        {
+          id: 'echo.throw',
+          description: 'Always throws (test fixture for handler-exception isError:true).',
+          inputSchema: { type: 'object', properties: {} },
+          handler: 'throw.mjs',
+        },
       ],
       policy: { fsWrite: true, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
     }),
@@ -137,6 +344,11 @@ function writeEchoFixtureApp(bundledDir) {
       `  writeFile({ workspaceDir: ctx.workspaceDir, relPath: args.relPath, data: args.data ?? '' });\n` +
       `  return { relPath: args.relPath };\n` +
       `}\n`,
+    'utf8',
+  );
+  fs.writeFileSync(
+    path.join(appDir, 'throw.mjs'),
+    `export async function handler() {\n` + `  throw new Error('deliberate fixture failure');\n` + `}\n`,
     'utf8',
   );
   return appDir;
@@ -176,8 +388,19 @@ function createRpcClient(proc) {
   };
 }
 
+/** Drives the full MCP handshake (initialize + notifications/initialized) so the rest of a test can call tools/* — every integration test needs this now that lifecycle is enforced. */
+async function handshake(client) {
+  const initRes = await client.request('initialize', {
+    protocolVersion: '2025-06-18',
+    capabilities: {},
+    clientInfo: { name: 'test-client', version: '0.0.0' },
+  });
+  client.notify('notifications/initialized', {});
+  return initRes;
+}
+
 test(
-  'mcp-server subprocess: initialize, tools/list, tools/call (success + unknown tool + path traversal) over real stdio JSON-RPC',
+  'mcp-server subprocess: full lifecycle, tools/list, tools/call (success + unknown tool + path traversal + handler exception) over real stdio JSON-RPC',
   async () => {
     root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mcp-server-test-'));
     const bundledDir = path.join(root, 'apps');
@@ -197,19 +420,17 @@ test(
 
     const client = createRpcClient(child);
 
-    const initRes = await client.request('initialize', {
-      protocolVersion: '2025-06-18',
-      capabilities: {},
-      clientInfo: { name: 'test-client', version: '0.0.0' },
-    });
+    // tools/list before the handshake completes must be rejected, not served.
+    const tooEarlyRes = await client.request('tools/list', {});
+    expect(tooEarlyRes.error).toBeDefined();
+    expect(tooEarlyRes.error.code).toBe(-32002);
+
+    const initRes = await handshake(client);
     expect(initRes.result.serverInfo.name).toBe('kaprek-apps');
     expect(initRes.result.capabilities).toEqual({ tools: {} });
 
-    // A notification must never produce a response line on stdout.
-    client.notify('notifications/initialized', {});
-
     const listRes = await client.request('tools/list', {});
-    expect(listRes.result.tools.map((t) => t.name)).toEqual(['echo.write']);
+    expect(listRes.result.tools.map((t) => t.name).sort()).toEqual(['echo.throw', 'echo.write']);
 
     const okRes = await client.request('tools/call', {
       name: 'echo.write',
@@ -227,13 +448,124 @@ test(
     expect(fs.existsSync(path.join(root, 'escaped.txt'))).toBe(false);
     expect(fs.existsSync(path.join(path.dirname(root), 'escaped.txt'))).toBe(false);
 
+    const throwRes = await client.request('tools/call', { name: 'echo.throw', arguments: {} });
+    expect(throwRes.result.isError).toBe(true);
+    expect(throwRes.result.content[0].text).toMatch(/deliberate fixture failure/);
+
     const unknownRes = await client.request('tools/call', { name: 'no.such.tool', arguments: {} });
     expect(unknownRes.result).toBeUndefined();
     expect(unknownRes.error.code).toBe(-32602);
 
-    // Exactly one stdout line per request (3 real requests: initialize, tools/list, tools/call x3) —
-    // the notification above must not have added a fourth/extra line.
-    expect(client.received).toHaveLength(5);
+    const badArgsRes = await client.request('tools/call', { name: 'echo.write', arguments: { relPath: 5 } });
+    expect(badArgsRes.result).toBeUndefined();
+    expect(badArgsRes.error.code).toBe(-32602);
+
+    // Exactly one stdout line per real request (8: tooEarly, initialize,
+    // tools/list, tools/call x5) — the notifications/initialized above must
+    // not have added an extra line.
+    expect(client.received).toHaveLength(8);
+
+    child.stdin.end();
+  },
+  20000,
+);
+
+test(
+  'mcp-server subprocess: at most MAX_CONCURRENT_REQUESTS (8) tools/call handlers run at once, the rest queue',
+  async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mcp-server-concurrency-test-'));
+    const bundledDir = path.join(root, 'apps');
+    const dataDir = path.join(root, 'data');
+    fs.mkdirSync(bundledDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+    const appDir = path.join(bundledDir, 'conc');
+    fs.mkdirSync(appDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(appDir, 'app.json'),
+      JSON.stringify({
+        id: 'conc',
+        version: '1.0.0',
+        name: 'Concurrency probe',
+        description: 'Tracks how many calls run at once (test fixture).',
+        tools: [
+          {
+            id: 'conc.run',
+            description: 'Sleeps briefly, tracking concurrent in-flight calls; {peek:true} returns the max seen.',
+            inputSchema: { type: 'object', properties: { peek: { type: 'boolean' } } },
+            handler: 'handler.mjs',
+          },
+        ],
+        policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
+      }),
+      'utf8',
+    );
+    // Module-scoped `active`/`maxSeen` persist across calls because
+    // dynamic import() caches the module by resolved URL — every
+    // conc.run call in this test hits the same module instance.
+    fs.writeFileSync(
+      path.join(appDir, 'handler.mjs'),
+      'let active = 0;\n' +
+        'let maxSeen = 0;\n' +
+        'export async function handler(args) {\n' +
+        '  if (args?.peek) return { maxSeen };\n' +
+        '  active += 1;\n' +
+        '  maxSeen = Math.max(maxSeen, active);\n' +
+        '  await new Promise((resolve) => setTimeout(resolve, 150));\n' +
+        '  active -= 1;\n' +
+        '  return { ok: true };\n' +
+        '}\n',
+      'utf8',
+    );
+
+    child = spawn(process.execPath, [SERVER_PATH], {
+      env: { ...process.env, KAPREK_DATA_DIR: dataDir, KAPREK_APPS_DIR: bundledDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const client = createRpcClient(child);
+    await handshake(client);
+
+    const calls = Array.from({ length: 20 }, () => client.request('tools/call', { name: 'conc.run', arguments: {} }));
+    await Promise.all(calls);
+
+    const peekRes = await client.request('tools/call', { name: 'conc.run', arguments: { peek: true } });
+    const { maxSeen } = JSON.parse(peekRes.result.content[0].text);
+    expect(maxSeen).toBeLessThanOrEqual(8);
+    expect(maxSeen).toBeGreaterThan(1); // proves real concurrency, not accidental full serialization
+
+    child.stdin.end();
+  },
+  20000,
+);
+
+test(
+  'mcp-server subprocess: a line over the 4 MB limit is rejected with a parse-error response and does not crash the server',
+  async () => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mcp-server-oversize-test-'));
+    const bundledDir = path.join(root, 'apps');
+    const dataDir = path.join(root, 'data');
+    fs.mkdirSync(bundledDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+
+    child = spawn(process.execPath, [SERVER_PATH], {
+      env: { ...process.env, KAPREK_DATA_DIR: dataDir, KAPREK_APPS_DIR: bundledDir },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    const client = createRpcClient(child);
+    await handshake(client);
+
+    // A single line whose JSON payload alone exceeds MAX_LINE_BYTES (4 MB).
+    const oversizedArg = 'x'.repeat(5 * 1024 * 1024);
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: 999, method: 'tools/list', params: { junk: oversizedArg } })}\n`);
+
+    // The server must still be alive and answering afterwards.
+    const listRes = await client.request('tools/list', {});
+    expect(listRes.result.tools).toEqual([]);
+
+    // The oversized line got a parse-error response (id:null, since it was
+    // never actually parsed), not silently ignored.
+    const oversizeResponse = client.received.find((m) => m.error?.code === -32700);
+    expect(oversizeResponse).toBeDefined();
+    expect(oversizeResponse.id).toBeNull();
 
     child.stdin.end();
   },

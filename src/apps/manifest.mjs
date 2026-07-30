@@ -20,6 +20,18 @@ export const EXTERNAL_ACTIONS = ['never', 'approval', 'auto'];
 export const SENSITIVITIES = ['low', 'medium', 'high'];
 export const UI_SLOTS = ['none', 'text', 'gallery'];
 
+// A single app claiming more tools than this is a packaging bug, not a
+// legitimate large app — bounds how much the registry (mcp-server.mjs) and
+// tools/list responses can grow from one manifest.
+const MAX_TOOLS = 64;
+// "Sensible" string-length ceilings for the free-text fields a manifest
+// author fully controls — generous enough for real copy, small enough that
+// one field can't be used to balloon a tools/list response or a
+// system-prompt-sized `instructions` block without bound.
+const MAX_NAME_LENGTH = 200;
+const MAX_DESCRIPTION_LENGTH = 2000;
+const MAX_INSTRUCTIONS_LENGTH = 20000;
+
 const KNOWN_TOP_FIELDS = ['id', 'version', 'name', 'description', 'icon', 'instructions', 'tools', 'policy', 'uiSlot'];
 const KNOWN_TOOL_FIELDS = ['id', 'description', 'inputSchema', 'handler'];
 const KNOWN_POLICY_FIELDS = ['fsWrite', 'dataEgress', 'externalAction', 'sensitivity'];
@@ -54,6 +66,12 @@ function assertNonEmptyString(value, field) {
   }
 }
 
+function assertMaxLength(value, max, field) {
+  if (typeof value === 'string' && value.length > max) {
+    fail(field, `must not exceed ${max} characters`);
+  }
+}
+
 /** Rejects a handler path that isn't a plain relative path within the app dir — defense in depth even though the id, not the handler, is the authorization boundary. */
 function assertSafeHandlerPath(value, field) {
   assertNonEmptyString(value, field);
@@ -83,6 +101,7 @@ function validateTool(tool, index) {
 
 function validateTools(tools) {
   if (!Array.isArray(tools)) fail('tools', 'must be an array');
+  if (tools.length > MAX_TOOLS) fail('tools', `must not contain more than ${MAX_TOOLS} tools`);
   tools.forEach(validateTool);
 
   const seen = new Set();
@@ -122,13 +141,18 @@ export function validateManifest(obj) {
     fail('version', 'must be a semver-like string, e.g. "1.0.0"');
   }
   assertNonEmptyString(obj.name, 'name');
+  assertMaxLength(obj.name, MAX_NAME_LENGTH, 'name');
   assertNonEmptyString(obj.description, 'description');
+  assertMaxLength(obj.description, MAX_DESCRIPTION_LENGTH, 'description');
 
   if (obj.icon !== undefined && typeof obj.icon !== 'string') {
     fail('icon', 'must be a string');
   }
-  if (obj.instructions !== undefined && typeof obj.instructions !== 'string') {
-    fail('instructions', 'must be a string');
+  if (obj.instructions !== undefined) {
+    if (typeof obj.instructions !== 'string') {
+      fail('instructions', 'must be a string');
+    }
+    assertMaxLength(obj.instructions, MAX_INSTRUCTIONS_LENGTH, 'instructions');
   }
 
   validateTools(obj.tools);

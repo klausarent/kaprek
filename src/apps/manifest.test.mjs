@@ -118,6 +118,54 @@ test('validateManifest rejects an invalid uiSlot', () => {
   expect(() => validateManifest(validManifest({ uiSlot: 'chart' }))).toThrow(ManifestValidationError);
 });
 
+// ------------------------------------------------------------------- limits
+
+test('validateManifest rejects more than 64 tools', () => {
+  const manifest = validManifest();
+  manifest.tools = Array.from({ length: 65 }, (_, i) => ({
+    id: `x.tool${i}`,
+    description: 'desc',
+    inputSchema: { type: 'object' },
+    handler: 'handler.mjs',
+  }));
+  try {
+    validateManifest(manifest);
+    throw new Error('expected to throw');
+  } catch (err) {
+    expect(err).toBeInstanceOf(ManifestValidationError);
+    expect(err.field).toBe('tools');
+  }
+});
+
+test('validateManifest accepts exactly 64 tools', () => {
+  const manifest = validManifest();
+  manifest.tools = Array.from({ length: 64 }, (_, i) => ({
+    id: `x.tool${i}`,
+    description: 'desc',
+    inputSchema: { type: 'object' },
+    handler: 'handler.mjs',
+  }));
+  expect(() => validateManifest(manifest)).not.toThrow();
+});
+
+test('validateManifest rejects an overlong name', () => {
+  try {
+    validateManifest(validManifest({ name: 'x'.repeat(201) }));
+    throw new Error('expected to throw');
+  } catch (err) {
+    expect(err).toBeInstanceOf(ManifestValidationError);
+    expect(err.field).toBe('name');
+  }
+});
+
+test('validateManifest rejects an overlong description', () => {
+  expect(() => validateManifest(validManifest({ description: 'x'.repeat(2001) }))).toThrow(ManifestValidationError);
+});
+
+test('validateManifest rejects overlong instructions', () => {
+  expect(() => validateManifest(validManifest({ instructions: 'x'.repeat(20001) }))).toThrow(ManifestValidationError);
+});
+
 // --------------------------------------------------------------- parseManifest
 
 test('parseManifest parses a JSON string and normalizes optional fields', () => {

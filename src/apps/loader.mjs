@@ -8,6 +8,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { parseManifest, ManifestValidationError } from './manifest.mjs';
 
+// An app.json this large is never a legitimate manifest (a real one is a
+// few KB) — reading/parsing it anyway would let one oversized user-supplied
+// file block the event loop (synchronous JSON.parse of a huge string) or
+// balloon this process's memory before `initialize` even completes. Checked
+// via a stat() first, so an oversized file is never even read into memory.
+const MAX_MANIFEST_BYTES = 256 * 1024;
+
 function userAppsDir(dataDir) {
   return path.join(dataDir, 'apps');
 }
@@ -30,6 +37,16 @@ function listSubdirs(dir) {
  */
 function loadOneApp(appDir) {
   const manifestPath = path.join(appDir, 'app.json');
+  let stat;
+  try {
+    stat = fs.statSync(manifestPath);
+  } catch (err) {
+    return { error: { dir: appDir, message: `could not read app.json: ${err.message}` } };
+  }
+  if (stat.size > MAX_MANIFEST_BYTES) {
+    return { error: { dir: appDir, message: `app.json exceeds ${MAX_MANIFEST_BYTES} byte limit (${stat.size} bytes)` } };
+  }
+
   let raw;
   try {
     raw = fs.readFileSync(manifestPath, 'utf8');

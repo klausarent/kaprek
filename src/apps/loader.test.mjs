@@ -109,3 +109,19 @@ test('loadApps: two user apps sharing an id — first wins, second reported', ()
   expect(apps).toHaveLength(1);
   expect(errors).toHaveLength(1);
 });
+
+test('loadApps rejects an app.json over the size limit without ever parsing it, and keeps loading other apps', () => {
+  writeApp(bundledDir, 'notes', manifestFor('notes'));
+  const hugeDir = path.join(bundledDir, 'huge');
+  fs.mkdirSync(hugeDir, { recursive: true });
+  const huge = JSON.stringify(manifestFor('huge', { description: 'x'.repeat(300 * 1024) }));
+  fs.writeFileSync(path.join(hugeDir, 'app.json'), huge, 'utf8');
+
+  const { apps, errors } = loadApps({ bundledDir, dataDir });
+
+  expect(apps).toHaveLength(1);
+  expect(apps[0].manifest.id).toBe('notes');
+  expect(errors).toHaveLength(1);
+  expect(errors[0].dir).toBe(hugeDir);
+  expect(errors[0].message).toMatch(/exceeds .* byte limit/);
+});

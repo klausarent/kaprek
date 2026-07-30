@@ -5,13 +5,18 @@
 // server/CLI code never imports it (that's why it's fine for this file to
 // read stdin/write stdout directly instead of exporting a library API; the
 // pure helpers below are exported anyway so tests can unit-test them
-// without paying for a subprocess every time).
+// without paying for a subprocess every time). The sandbox itself (Node's
+// --permission model) is applied by the CALLER — see mcp-config.mjs's
+// writeMcpConfig(); this file has no idea whether it's running sandboxed.
 //
 // Protocol: JSON-RPC 2.0, one message per line on stdin/stdout. Field names
 // verified against the official MCP schema (modelcontextprotocol/
 // modelcontextprotocol, schema/2025-06-18/schema.json) rather than guessed:
 // InitializeResult = {protocolVersion, capabilities, serverInfo}, Tool =
 // {name, description, inputSchema}, CallToolResult = {content, isError?}.
+// Lifecycle also follows that spec: initialize -> initialized notification
+// -> normal operation (see classifyMessage()/handleMessage()'s `state`
+// argument) — https://modelcontextprotocol.io/specification/2025-06-18/basic/lifecycle.
 //
 // Tool-id-is-canon (see manifest.mjs / loader.mjs): the registry built below
 // is keyed by tool id, resolved by scanning each app's manifest.tools[] —
@@ -22,7 +27,6 @@
 // defense on top of that.
 import fs from 'node:fs';
 import path from 'node:path';
-import readline from 'node:readline';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { loadApps } from './loader.mjs';
 
@@ -30,6 +34,25 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PROTOCOL_VERSION = '2025-06-18';
 const SERVER_NAME = 'kaprek-apps';
+
+// A hung/misbehaving handler must not hold a request (and the client
+// waiting on it) forever — see withTimeout()'s use in tools/call below.
+const HANDLER_TIMEOUT_MS = 60_000;
+// A CallToolResult's text is capped (UTF-8 bytes) so a runaway handler
+// result can't flood the stdout pipe the client is reading — see
+// truncateOutput().
+const MAX_OUTPUT_BYTES = 256 * 1024;
+// No single stdin line (a full JSON-RPC message) may exceed this many bytes
+// — see run()'s manual buffering below for why this can't just be a
+// node:readline option (it doesn't have one).
+const MAX_LINE_BYTES = 4 * 1024 * 1024;
+// At most this many handleMessage() calls run concurrently; the rest queue
+// — an app driving many parallel tool calls must not be able to fork this
+// process's work unboundedly (fan-out bound, separate from
+// HANDLER_TIMEOUT_MS's per-call bound).
+const MAX_CONCURRENT_REQUESTS = 8;
+
+const KNOWN_JSON_TYPES = ['string', 'number', 'boolean', 'object', 'array'];
 
 /** The one place `<dataDir>/workspace` is spelled out — reused by mcp-config.mjs so the sandbox's --allow-fs-write target can never drift from what run() actually uses. */
 export function workspaceDirFor(dataDir) {
@@ -43,6 +66,10 @@ function serverVersion() {
   } catch {
     return '0.0.0';
   }
+}
+
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
@@ -69,11 +96,6 @@ export function buildToolRegistry(apps) {
   return { registry, warnings };
 }
 
-/** True if `msg` is a JSON-RPC notification (no response expected) rather than a request. */
-function isNotification(msg) {
-  return msg && typeof msg === 'object' && !('id' in msg);
-}
-
 function okResponse(id, result) {
   return { jsonrpc: '2.0', id, result };
 }
@@ -82,11 +104,62 @@ function errorResponse(id, code, message) {
   return { jsonrpc: '2.0', id: id ?? null, error: { code, message } };
 }
 
+function validRequestId(id) {
+  return typeof id === 'string' || typeof id === 'number';
+}
+
+/** Extracts a usable id from a malformed message for an Invalid Request error response — null if none can be determined, per JSON-RPC 2.0's own guidance for that case ("if it was not possible ... it MUST be Null"). */
+function extractIdIfValid(msg) {
+  return isPlainObject(msg) && 'id' in msg && validRequestId(msg.id) ? msg.id : null;
+}
+
 /**
- * Loads the handler module for `entry` (a registry `{app, tool}` pair),
- * bound-checked to stay inside `entry.app.dir` even though the handler path
- * comes from an already-validated manifest (defense in depth, not the
- * authorization boundary — see the module header).
+ * Classifies one already-JSON-parsed message before any method dispatch —
+ * the JSON-RPC 2.0 envelope check the MCP spec assumes but doesn't itself
+ * define: right `jsonrpc` version, a real `method` string, and an `id`
+ * that's either absent (only ever treated as a true notification when the
+ * method is also namespaced `notifications/...` — this server does not
+ * treat an arbitrary id-less method as "fire and forget") or a valid
+ * string/number (not `null`, not an object/array). Everything else is
+ * `invalid`. A top-level JSON array is also `invalid` — JSON-RPC batching
+ * is out of scope, matching the MCP 2025-06-18 spec, which dropped it.
+ */
+function classifyMessage(msg) {
+  if (!isPlainObject(msg)) {
+    return { kind: 'invalid', id: null, reason: 'message must be a JSON object' };
+  }
+  if (msg.jsonrpc !== '2.0') {
+    return { kind: 'invalid', id: extractIdIfValid(msg), reason: 'jsonrpc must be "2.0"' };
+  }
+  if (typeof msg.method !== 'string' || msg.method.length === 0) {
+    return { kind: 'invalid', id: extractIdIfValid(msg), reason: 'method must be a non-empty string' };
+  }
+  if (!('id' in msg)) {
+    if (msg.method.startsWith('notifications/')) {
+      return { kind: 'notification', method: msg.method, params: msg.params };
+    }
+    return { kind: 'invalid', id: null, reason: 'request is missing an id' };
+  }
+  if (!validRequestId(msg.id)) {
+    return { kind: 'invalid', id: null, reason: 'id must be a string or number, not null/object/array' };
+  }
+  return { kind: 'request', id: msg.id, method: msg.method, params: msg.params };
+}
+
+/**
+ * Loads the handler module for `entry` (a registry `{app, tool}` pair).
+ * Two checks before `import()` ever runs, both defense in depth on top of
+ * the real authorization boundary (tool id lookup in the registry — see the
+ * module header), not the boundary itself:
+ *   - lexical containment: the un-resolved handler path must stay inside
+ *     the app directory (catches "../../evil.mjs" even before touching disk;
+ *     manifest.mjs already rejects this at load time too, this is a second
+ *     line of defense against a manifest that was hand-edited after loading).
+ *   - real-path containment: `realpathSync` both sides and re-check —
+ *     lexical containment alone says nothing about a symlink placed AT the
+ *     handler path (or an ancestor of it) that resolves somewhere outside
+ *     the app directory entirely; `import()` follows symlinks like any
+ *     other fs read, so this is what actually stops that.
  */
 async function loadHandler(entry) {
   const appDirResolved = path.resolve(entry.app.dir);
@@ -94,37 +167,168 @@ async function loadHandler(entry) {
   if (handlerPath !== appDirResolved && !handlerPath.startsWith(appDirResolved + path.sep)) {
     throw new Error(`handler path escapes app directory: ${entry.tool.handler}`);
   }
-  const mod = await import(pathToFileURL(handlerPath).href);
+
+  let realHandlerPath;
+  let realAppDir;
+  try {
+    realHandlerPath = fs.realpathSync(handlerPath);
+    realAppDir = fs.realpathSync(appDirResolved);
+  } catch (err) {
+    throw new Error(`could not resolve handler path: ${err.message}`);
+  }
+  if (realHandlerPath !== realAppDir && !realHandlerPath.startsWith(realAppDir + path.sep)) {
+    throw new Error(`handler path resolves outside the app directory (symlink?): ${entry.tool.handler}`);
+  }
+
+  const mod = await import(pathToFileURL(realHandlerPath).href);
   if (typeof mod.handler !== 'function') {
     throw new Error(`handler module does not export an async function 'handler': ${entry.tool.handler}`);
   }
   return mod.handler;
 }
 
+function typeMatches(value, type) {
+  switch (type) {
+    case 'string':
+      return typeof value === 'string';
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'object':
+      return isPlainObject(value);
+    case 'array':
+      return Array.isArray(value);
+    default:
+      return true; // an unsupported/unknown declared type is not enforced here
+  }
+}
+
 /**
- * Handles one parsed JSON-RPC message and returns the response object to
- * write (or `null` for a notification, which never gets a response).
- * Never throws: a handler exception becomes a CallToolResult with
- * `isError: true` (per the MCP spec — tool-execution errors belong INSIDE
- * the result, not as a protocol-level error, so the model can see and
- * react to them); everything else that goes wrong becomes a normal
- * JSON-RPC error response.
+ * Minimal, non-recursive check of a tools/call `arguments` value against
+ * its tool's `inputSchema`: required top-level fields present, no unknown
+ * top-level keys, and declared types for string/number/boolean/object/array
+ * match. Not a JSON Schema implementation (no $ref, no nested/array-item
+ * validation, no format/pattern/enum/minimum/etc.) — enough to reject an
+ * obviously malformed call before it ever reaches a handler, with zero
+ * added dependencies (matches this project's "zero runtime-deps" rule).
+ * Returns `null` when valid or when `schema` itself isn't a usable object
+ * (a handler still gets called with whatever it received in that case —
+ * this is a courtesy check on top of a handler's own input validation, not
+ * a replacement for it), or a message describing the first violation found.
  */
-export async function handleMessage(msg, { registry, dataDir, workspaceDir }) {
-  if (isNotification(msg)) {
-    // 'notifications/initialized' and any other notification: acknowledged
-    // by doing nothing (notifications never get a response on the wire).
+function validateToolArguments(args, schema) {
+  if (!isPlainObject(schema)) return null;
+  const properties = isPlainObject(schema.properties) ? schema.properties : {};
+  const required = Array.isArray(schema.required) ? schema.required : [];
+  const topType = schema.type ?? 'object';
+
+  if (topType === 'object') {
+    if (!isPlainObject(args)) return 'arguments must be an object';
+    for (const key of Object.keys(args)) {
+      if (!(key in properties)) return `unexpected argument ${JSON.stringify(key)}`;
+    }
+    for (const key of required) {
+      if (!(key in args)) return `missing required argument ${JSON.stringify(key)}`;
+    }
+    for (const [key, value] of Object.entries(args)) {
+      const propSchema = properties[key];
+      if (isPlainObject(propSchema) && KNOWN_JSON_TYPES.includes(propSchema.type) && !typeMatches(value, propSchema.type)) {
+        return `argument ${JSON.stringify(key)} must be of type ${propSchema.type}`;
+      }
+    }
     return null;
   }
 
-  const { id, method, params } = msg;
+  if (KNOWN_JSON_TYPES.includes(topType) && !typeMatches(args, topType)) {
+    return `arguments must be of type ${topType}`;
+  }
+  return null;
+}
+
+/** Races `promise` against a `ms` timeout; rejects with `new Error(message)` if the timeout wins. Does not (cannot) cancel `promise` itself — a handler that ignores this just keeps running in the background, unobserved; the point is only to stop the REQUEST from hanging forever. */
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+/** Caps `text` at MAX_OUTPUT_BYTES (UTF-8 bytes, not JS string length) with a trailing note when it had to cut — an oversized handler result must not flood the stdout pipe the client reads from. */
+function truncateOutput(text) {
+  if (Buffer.byteLength(text, 'utf8') <= MAX_OUTPUT_BYTES) return text;
+  const truncated = Buffer.from(text, 'utf8').subarray(0, MAX_OUTPUT_BYTES).toString('utf8');
+  return `${truncated}\n... [truncated: output exceeded ${MAX_OUTPUT_BYTES} bytes]`;
+}
+
+/**
+ * Handles one parsed JSON-RPC message and returns the response object to
+ * write (or `null` for a notification/invalid-envelope-without-id, which
+ * never gets a response on the wire).
+ *
+ * `ctx.state` is a small mutable `{phase}` object the CALLER owns and
+ * reuses across every message of one connection (see run()) — `'
+ * uninitialized' -> 'initializing' -> 'ready'`, following the MCP lifecycle:
+ * nothing except `initialize` is accepted in `'uninitialized'`, and nothing
+ * except `initialize`/`notifications/initialized` is accepted before
+ * `'ready'`. This is deliberately strict (some real clients are lenient
+ * about ordering) because "no lifecycle state at all" was the actual bug
+ * being fixed here.
+ *
+ * Never throws: a HANDLER exception (or handler timeout) becomes a
+ * CallToolResult with `isError: true` (per the MCP spec — tool-execution
+ * errors belong INSIDE the result, not as a protocol-level error, so the
+ * model can see and react to them); a SERVER/packaging defect (failed to
+ * import the handler module, no `handler` export, unknown tool, malformed
+ * envelope, wrong lifecycle state) becomes a normal JSON-RPC error
+ * response instead — those are two different failure classes and must not
+ * be reported the same way (see loadHandler()'s call site below).
+ */
+export async function handleMessage(msg, ctx) {
+  const { registry, dataDir, workspaceDir, state } = ctx;
+  const classified = classifyMessage(msg);
+
+  if (classified.kind === 'invalid') {
+    return errorResponse(classified.id, -32600, `invalid request: ${classified.reason}`);
+  }
+
+  if (classified.kind === 'notification') {
+    if (classified.method === 'notifications/initialized' && state.phase === 'initializing') {
+      state.phase = 'ready';
+    }
+    // Any other notification (or this one arriving in an unexpected phase)
+    // is acknowledged the same way every notification is: silently, no
+    // response — notifications never get one on the wire.
+    return null;
+  }
+
+  const { id, method, params } = classified;
 
   if (method === 'initialize') {
+    if (state.phase !== 'uninitialized') {
+      return errorResponse(id, -32600, 'server has already received "initialize"');
+    }
+    state.phase = 'initializing';
     return okResponse(id, {
       protocolVersion: PROTOCOL_VERSION,
       capabilities: { tools: {} },
       serverInfo: { name: SERVER_NAME, version: serverVersion() },
     });
+  }
+
+  if (state.phase !== 'ready') {
+    // -32002 is outside JSON-RPC's own reserved range (-32768..-32000) but
+    // inside the range the spec explicitly leaves free for
+    // implementation-defined server errors; used consistently for exactly
+    // this one condition ("too early"), distinct from -32600 (malformed
+    // request) and -32601 (no such method at all) — documented here since
+    // the spec doesn't mandate a specific code for it.
+    return errorResponse(
+      id,
+      -32002,
+      `server not initialized: call "initialize" and send "notifications/initialized" before "${method}"`,
+    );
   }
 
   if (method === 'tools/list') {
@@ -145,13 +349,37 @@ export async function handleMessage(msg, { registry, dataDir, workspaceDir }) {
       // spec, not a CallToolResult with isError — see the module header.
       return errorResponse(id, -32602, `unknown tool: ${JSON.stringify(name)}`);
     }
+
+    const schemaViolation = validateToolArguments(args, entry.tool.inputSchema);
+    if (schemaViolation) {
+      return errorResponse(id, -32602, `invalid arguments for tool ${JSON.stringify(name)}: ${schemaViolation}`);
+    }
+
+    let handler;
     try {
-      const handler = await loadHandler(entry);
-      const result = await handler(args, { dataDir, workspaceDir, appDir: entry.app.dir });
-      const text = typeof result === 'string' ? result : JSON.stringify(result ?? null);
-      return okResponse(id, { content: [{ type: 'text', text }] });
+      handler = await loadHandler(entry);
     } catch (err) {
-      return okResponse(id, { content: [{ type: 'text', text: err.message ?? String(err) }], isError: true });
+      // Import failure / missing export / handler-path escape are server
+      // defects, not the tool "running and failing" — see this function's
+      // docstring on why these two error classes are kept apart.
+      return errorResponse(id, -32603, `failed to load handler for tool ${JSON.stringify(name)}: ${err.message ?? String(err)}`);
+    }
+
+    // ctx.handlerTimeoutMs overrides HANDLER_TIMEOUT_MS — only ever set by
+    // tests, so they can prove the timeout path fires without a real 60s
+    // wait; run() (real stdin/stdout usage) never sets it, so production
+    // always gets the full HANDLER_TIMEOUT_MS.
+    const timeoutMs = ctx.handlerTimeoutMs ?? HANDLER_TIMEOUT_MS;
+    try {
+      const result = await withTimeout(
+        handler(args, { dataDir, workspaceDir, appDir: entry.app.dir }),
+        timeoutMs,
+        `tool ${JSON.stringify(name)} timed out after ${timeoutMs}ms`,
+      );
+      const text = typeof result === 'string' ? result : JSON.stringify(result ?? null);
+      return okResponse(id, { content: [{ type: 'text', text: truncateOutput(text) }] });
+    } catch (err) {
+      return okResponse(id, { content: [{ type: 'text', text: truncateOutput(err.message ?? String(err)) }], isError: true });
     }
   }
 
@@ -185,24 +413,105 @@ export async function run({ dataDir, bundledDir, appsDir } = {}) {
     process.stderr.write(`kaprek-apps: ${warning}\n`);
   }
 
-  const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-  rl.on('line', (rawLine) => {
-    const line = rawLine.trim();
-    if (!line) return;
+  const ctx = { registry, dataDir: effectiveDataDir, workspaceDir, state: { phase: 'uninitialized' } };
+
+  // Concurrency cap (see MAX_CONCURRENT_REQUESTS): `queue` holds raw line
+  // strings waiting for a free slot, `active` counts calls in flight.
+  let active = 0;
+  const queue = [];
+
+  function processLine(line) {
     let msg;
     try {
       msg = JSON.parse(line);
     } catch {
       process.stdout.write(`${JSON.stringify(errorResponse(null, -32700, 'parse error'))}\n`);
-      return;
+      return Promise.resolve();
     }
-    handleMessage(msg, { registry, dataDir: effectiveDataDir, workspaceDir })
+    return handleMessage(msg, ctx)
       .then((response) => {
         if (response) process.stdout.write(`${JSON.stringify(response)}\n`);
       })
       .catch((err) => {
         process.stdout.write(`${JSON.stringify(errorResponse(msg?.id ?? null, -32603, err.message ?? String(err)))}\n`);
       });
+  }
+
+  function pump() {
+    while (active < MAX_CONCURRENT_REQUESTS && queue.length > 0) {
+      const line = queue.shift();
+      active += 1;
+      processLine(line).finally(() => {
+        active -= 1;
+        pump();
+      });
+    }
+  }
+
+  function enqueue(line) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    queue.push(trimmed);
+    pump();
+  }
+
+  // Manual newline splitting instead of node:readline: readline has no
+  // option to cap how large a single buffered "line" may grow before it
+  // sees '\n', which is exactly the stdin DoS this guards against — an
+  // unterminated or gigantic line must not be allowed to grow this
+  // process's memory unbounded. `pending` accumulates raw bytes across
+  // 'data' events; `droppedTail` is set once `pending` alone (with no '\n'
+  // found yet) has already exceeded MAX_LINE_BYTES, so that the eventual
+  // matching '\n' — which terminates the TAIL of an already-reported
+  // oversized line, not a new one — is recognized and skipped rather than
+  // parsed as if it were a fresh (truncated, and therefore malformed) line.
+  let pending = Buffer.alloc(0);
+  let droppedTail = false;
+
+  function reportOversizedLine() {
+    process.stdout.write(`${JSON.stringify(errorResponse(null, -32700, `line exceeds ${MAX_LINE_BYTES} byte limit`))}\n`);
+  }
+
+  process.stdin.on('data', (chunk) => {
+    pending = Buffer.concat([pending, chunk]);
+    for (;;) {
+      const nl = pending.indexOf(0x0a); // '\n'
+      if (nl === -1) {
+        if (pending.length > MAX_LINE_BYTES) {
+          if (!droppedTail) {
+            droppedTail = true;
+            reportOversizedLine();
+          }
+          pending = Buffer.alloc(0);
+        }
+        break;
+      }
+      const lineBuf = pending.subarray(0, nl);
+      pending = pending.subarray(nl + 1);
+      const wasDropped = droppedTail;
+      droppedTail = false;
+      if (wasDropped) continue; // tail of an already-reported oversized line — resynced, not a new message
+      if (lineBuf.length > MAX_LINE_BYTES) {
+        reportOversizedLine();
+        continue;
+      }
+      enqueue(lineBuf.toString('utf8'));
+    }
+  });
+
+  // A final message without a trailing '\n' before the client closes stdin
+  // is still a complete message — flush whatever's left in `pending` (if
+  // it wasn't itself already reported as oversized) rather than silently
+  // dropping the last line of the conversation.
+  process.stdin.on('end', () => {
+    if (!droppedTail && pending.length > 0) {
+      if (pending.length > MAX_LINE_BYTES) {
+        reportOversizedLine();
+      } else {
+        enqueue(pending.toString('utf8'));
+      }
+    }
+    pending = Buffer.alloc(0);
   });
 }
 
