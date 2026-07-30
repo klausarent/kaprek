@@ -13,7 +13,8 @@ import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
-import { writeHarnessSettings, ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
+import { writeHarnessSettings, mergeAskList } from '../harness/settings.mjs';
+import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -444,7 +445,16 @@ export async function runTurn({
   // this actually work against the CLI's own auto-approval at the 'Mode'
   // stage (task-7a Fix-Runde 2).
   const settingsProfile = origin === 'trigger' ? 'trigger' : 'chat';
-  const requireAskCoverage = origin === 'trigger' ? ASK_TOOLS_TRIGGER : ASK_TOOLS_CHAT;
+  // Self-learning ask-coverage (task-7a Fix-Runde 3): a hand-maintained
+  // ASK_TOOLS_* list goes stale the moment the CLI ships a new built-in
+  // tool — readKnownTools() is whatever THIS dataDir has already learned
+  // from a previous turn's coverage gap (fails closed to [] if missing/
+  // corrupt, see knownTools.mjs), merged on top of the static floor by
+  // mergeAskList() so both the --settings file's `ask` array AND this
+  // turn's own coverage check (requireAskCoverage below) agree on the exact
+  // same list — they can never drift apart.
+  const learnedTools = readKnownTools(dataDir);
+  const requireAskCoverage = mergeAskList(settingsProfile, learnedTools);
 
   let mcpConfigPath;
   let settingsPath;
@@ -457,7 +467,7 @@ export async function runTurn({
       serverScriptPath: MCP_SERVER_SCRIPT_PATH,
       tmpDir: mcpConfigDir,
     });
-    settingsPath = writeHarnessSettings({ dataDir, profile: settingsProfile });
+    settingsPath = writeHarnessSettings({ dataDir, profile: settingsProfile, learnedTools });
   } catch (err) {
     const message = `failed to prepare harness config (mcp-config/settings): ${err?.message ?? String(err)}`;
     if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath); // best-effort — writeMcpConfig() itself may have succeeded before writeHarnessSettings() threw
@@ -502,6 +512,11 @@ export async function runTurn({
       // silently (see settings.mjs's doc comment) — abort rather than run
       // ungated. A plain chat turn only warns (a human is right there).
       strictAskCoverage: origin === 'trigger',
+      // Self-heals the NEXT turn for this dataDir even though THIS one still
+      // fails closed on a gap (see requireAskCoverage's comment above and
+      // claude-code.mjs's learnUnknownTools doc comment) — additive only,
+      // never touches `allow` (see knownTools.mjs's own SECURITY note).
+      learnUnknownTools: (toolNames) => learnTools(dataDir, toolNames),
     });
   } finally {
     if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath);

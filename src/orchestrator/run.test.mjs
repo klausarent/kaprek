@@ -7,6 +7,7 @@ import { readRuns } from './runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
+import { readKnownTools } from '../harness/knownTools.mjs';
 
 let tmpDir;
 
@@ -593,6 +594,106 @@ test('a chat turn and a trigger turn for the SAME dataDir get their own settings
   const harnessDir = path.join(tmpDir, 'harness');
   expect(fs.existsSync(path.join(harnessDir, 'settings-chat.json'))).toBe(true);
   expect(fs.existsSync(path.join(harnessDir, 'settings-trigger.json'))).toBe(true);
+});
+
+// ------------------------------------------------------------- self-learning ask-coverage (task-7a Fix-Runde 3)
+
+/**
+ * A stub harness that plays claude-code.mjs's own coverage-gap protocol:
+ * reports `tools` via an init event, and — mirroring what claude-code.mjs
+ * actually does — calls the injected `learnUnknownTools` for any tool NOT
+ * already in `options.requireAskCoverage`. Lets these tests exercise
+ * run.mjs's WIRING (does the learned name actually reach knownTools.mjs
+ * and come back on the next turn?) without needing a real CLI subprocess —
+ * claude-code.test.mjs already covers the DETECTION logic itself.
+ */
+function coverageGapHarness(tools) {
+  return {
+    async startTurn(options) {
+      options.onEvent?.({ type: 'init', sessionId: 's1', tools, model: 'm', permissionMode: 'default' });
+      const unknown = tools.filter((t) => !options.requireAskCoverage.includes(t) && !t.startsWith('mcp__'));
+      if (unknown.length > 0) options.learnUnknownTools?.(unknown);
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('an unknown tool reported by the CLI is learned for this dataDir', async () => {
+  await runTurn({ dataDir: tmpDir, text: 'first trigger turn', harness: coverageGapHarness(['Bash', 'ScheduleWakeup']), origin: 'trigger', triggerId: 't1' });
+
+  expect(readKnownTools(tmpDir)).toContain('ScheduleWakeup');
+});
+
+test('the NEXT trigger turn already covers a previously-learned tool — self-healing across turns', async () => {
+  const captured = [];
+  const harness = {
+    async startTurn(options) {
+      captured.push(options);
+      return coverageGapHarness(['Bash', 'ScheduleWakeup']).startTurn(options);
+    },
+  };
+
+  await runTurn({ dataDir: tmpDir, text: 'first', harness, origin: 'trigger', triggerId: 't1' });
+  await runTurn({ dataDir: tmpDir, text: 'second', harness, origin: 'trigger', triggerId: 't1' });
+
+  // First call's own requireAskCoverage did NOT yet know about it (that's
+  // exactly what made it "unknown" and triggered learning); the second
+  // call's DOES.
+  expect(captured[0].requireAskCoverage).not.toContain('ScheduleWakeup');
+  expect(captured[1].requireAskCoverage).toContain('ScheduleWakeup');
+});
+
+test('a learned tool lands in the settings file\'s ask array, never in allow', async () => {
+  await runTurn({ dataDir: tmpDir, text: 'learn it', harness: coverageGapHarness(['Bash', 'ScheduleWakeup']), origin: 'trigger', triggerId: 't1' });
+
+  let capturedSettingsPath;
+  const harness = {
+    async startTurn(options) {
+      capturedSettingsPath = options.settingsPath;
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'second, should include it now', harness, origin: 'trigger', triggerId: 't1' });
+
+  const settings = JSON.parse(fs.readFileSync(capturedSettingsPath, 'utf8'));
+  expect(settings.permissions.ask).toContain('ScheduleWakeup');
+  expect(settings.permissions.allow).toEqual([]);
+});
+
+test('a missing/corrupt known-tools.json does not crash a turn — the static ASK_TOOLS_* floor is still used', async () => {
+  fs.mkdirSync(path.join(tmpDir, 'harness'), { recursive: true });
+  fs.writeFileSync(path.join(tmpDir, 'harness', 'known-tools.json'), '{ not valid json', 'utf8');
+
+  let captured;
+  const harness = {
+    async startTurn(options) {
+      captured = options;
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'still works', harness, origin: 'trigger', triggerId: 't1' });
+
+  expect(result.stopReason).toBe('result');
+  expect(captured.requireAskCoverage).toEqual(ASK_TOOLS_TRIGGER);
+});
+
+test('an mcp__ tool is never learned, even if a (misbehaving) harness reported it as unknown', async () => {
+  // Bypasses coverageGapHarness's own filtering to exercise run.mjs's real
+  // learnUnknownTools wiring end to end (it delegates straight to
+  // knownTools.mjs::learnTools(), whose own mcp__ filter is unit-tested in
+  // knownTools.test.mjs) — a genuinely well-behaved claude-code.mjs would
+  // never call this for an mcp__ name in the first place (isKnownTool()
+  // treats every mcp__… name as known), so this is defense in depth.
+  const harness = {
+    async startTurn(options) {
+      options.learnUnknownTools?.(['mcp__kaprek-apps__notes.write']);
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'mcp tool', harness, origin: 'trigger', triggerId: 't1' });
+
+  expect(readKnownTools(tmpDir)).not.toContain('mcp__kaprek-apps__notes.write');
 });
 
 // Regression test for task-6a review Critical #2: the harness's OWN
