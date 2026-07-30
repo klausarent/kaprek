@@ -1,17 +1,41 @@
-import { test, expect, vi, afterEach } from 'vitest';
+import { test, expect, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
+import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { spawn } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
   acquireInstanceLock,
   InstanceLockHeldError,
-  LOCK_STALE_MS,
+  LOCK_PORT_ATTEMPTS,
+  LOCK_PORT_BASE,
+  LOCK_PORT_RANGE,
+  LOCK_PORT_WINDOW,
+  lockPortFor,
 } from './instance-lock.mjs';
 
+const MODULE_URL = pathToFileURL(fileURLToPath(new URL('./instance-lock.mjs', import.meta.url))).href;
+
+// Short enough that the "accepts but never speaks" cases below cost
+// milliseconds instead of GREETING_TIMEOUT_MS each.
+const FAST_GREETING_MS = 60;
+
 let tmpDirs = [];
+let locks = [];
+let servers = [];
+let children = [];
 
 afterEach(async () => {
+  await Promise.all(locks.map((lock) => lock.release().catch(() => {})));
+  locks = [];
+  for (const child of children) {
+    if (child.exitCode === null && !child.killed) child.kill('SIGKILL');
+  }
+  children = [];
+  await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+  servers = [];
   await Promise.all(tmpDirs.map((dir) => fs.rm(dir, { recursive: true, force: true })));
   tmpDirs = [];
 });
@@ -22,291 +46,439 @@ async function tmpDataDir() {
   return dir;
 }
 
-function writeLockFile(dataDir, state) {
-  return fs.writeFile(path.join(dataDir, 'instance.lock'), JSON.stringify(state));
-}
-
-function setLockMtime(dataDir, mtimeMs) {
-  const date = new Date(mtimeMs);
-  return fs.utimes(path.join(dataDir, 'instance.lock'), date, date);
+/** True if this process can actually bind `port` right now. */
+async function isBindable(port) {
+  try {
+    const server = await listenOnce(port);
+    await closeServer(server);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Spawns a node process that exits immediately and waits for it to actually
- * be gone, then returns its PID — a real dead PID, not a guessed number that
- * might collide with something still running.
+ * A temp data dir whose first `count` candidate ports are genuinely free.
+ *
+ * Windows reserves whole blocks of the dynamic range (see the module header),
+ * and a random temp name lands in one often enough to make a test that
+ * hardcodes `basePort + 1` flaky. Retrying with a different name is cheaper
+ * and more honest than teaching every test about reserved ranges.
  */
-function deadPid() {
+async function tmpDataDirWithFreePorts(count = 2) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const dir = await tmpDataDir();
+    const base = lockPortFor(dir);
+    const ports = Array.from({ length: count }, (_, i) => base + i);
+    const free = await Promise.all(ports.map(isBindable));
+    if (free.every(Boolean)) return dir;
+  }
+  throw new Error('could not find a temp data dir with free candidate ports');
+}
+
+async function acquire(dataDir, opts = {}) {
+  const lock = await acquireInstanceLock({ greetingTimeoutMs: FAST_GREETING_MS, ...opts, dataDir });
+  locks.push(lock);
+  return lock;
+}
+
+/** Binds a plain TCP server that is NOT kaprek, to stand in for foreign software. */
+function listenForeign(port, onConnection) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
-    child.on('error', reject);
-    child.on('exit', () => resolve(child.pid));
+    const server = net.createServer(onConnection);
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => {
+      servers.push(server);
+      resolve(server);
+    });
   });
 }
 
-test('acquireInstanceLock: a second acquire on the same dataDir throws InstanceLockHeldError naming the live holder', async () => {
-  const dataDir = await tmpDataDir();
-  const first = await acquireInstanceLock({ dataDir, port: 4711 });
-  await expect(acquireInstanceLock({ dataDir, port: 4712 }))
-    .rejects.toMatchObject({ name: 'InstanceLockHeldError', port: 4711, pid: process.pid });
-  await first.release();
-});
-
-test('acquireInstanceLock: takes over a lock whose pid is dead AND whose mtime is stale', async () => {
-  const dataDir = await tmpDataDir();
-  const pid = await deadPid();
-  await writeLockFile(dataDir, { pid, port: 4711, nonce: 'x', startedAt: 0 });
-  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
-  const lock = await acquireInstanceLock({ dataDir, port: 4712 });
-  await lock.release();
-});
-
-test('acquireInstanceLock: refuses a stale-mtime lock whose pid is still alive', async () => {
-  const dataDir = await tmpDataDir();
-  await writeLockFile(dataDir, { pid: process.pid, port: 4711, nonce: 'x', startedAt: 0 });
-  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
-  await expect(acquireInstanceLock({ dataDir, port: 4712 }))
-    .rejects.toMatchObject({ name: 'InstanceLockHeldError' });
-});
-
-test('acquireInstanceLock: refuses a fresh-mtime lock whose pid is dead', async () => {
-  const dataDir = await tmpDataDir();
-  const pid = await deadPid();
-  await writeLockFile(dataDir, { pid, port: 4711, nonce: 'x', startedAt: 0 });
-  await expect(acquireInstanceLock({ dataDir, port: 4712 }))
-    .rejects.toMatchObject({ name: 'InstanceLockHeldError' });
-});
-
-test('acquireInstanceLock: a lock file that is not valid JSON is refused, never silently overwritten', async () => {
-  const dataDir = await tmpDataDir();
-  await fs.writeFile(path.join(dataDir, 'instance.lock'), '{not json');
-  await expect(acquireInstanceLock({ dataDir, port: 4712 })).rejects.toThrow();
-  // Fail-closed means untouched, not just rejected.
-  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
-  expect(raw).toBe('{not json');
-});
-
-test('acquireInstanceLock: release() only deletes the lock if it still holds our nonce', async () => {
-  const dataDir = await tmpDataDir();
-  const lock = await acquireInstanceLock({ dataDir, port: 4711 });
-  // Simulate a takeover that happened after our heartbeat lapsed: the file
-  // on disk now belongs to someone else's nonce.
-  await writeLockFile(dataDir, { pid: process.pid, port: 4712, nonce: 'someone-else', startedAt: 0 });
-  await lock.release();
-  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
-  expect(JSON.parse(raw).nonce).toBe('someone-else');
-});
-
-test('acquireInstanceLock: updatePort() rewrites the lock with the real port once known', async () => {
-  const dataDir = await tmpDataDir();
-  const lock = await acquireInstanceLock({ dataDir, port: undefined });
-  await lock.updatePort(4713);
-  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
-  const state = JSON.parse(raw);
-  expect(state.port).toBe(4713);
-  expect(state.url).toBe('http://127.0.0.1:4713');
-  await lock.release();
-});
-
-test('acquireInstanceLock: heartbeat actually refreshes mtime over several ticks', async () => {
-  const dataDir = await tmpDataDir();
-  const lockPath = path.join(dataDir, 'instance.lock');
-  const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
-  const before = (await fs.stat(lockPath)).mtimeMs;
-  // A fixed 100ms wait (< LOCK_STALE_MS) proved nothing on its own — the file
-  // is that fresh right after acquire() even with no heartbeat at all. Wait
-  // for several heartbeat ticks and assert the mtime actually moved forward.
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  const after = (await fs.stat(lockPath)).mtimeMs;
-  expect(after).toBeGreaterThan(before);
-  await lock.release();
-});
-
-test('acquireInstanceLock: heartbeat reclaims an mtime that was artificially aged, without touching content', async () => {
-  const dataDir = await tmpDataDir();
-  const lockPath = path.join(dataDir, 'instance.lock');
-  const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
-  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
-  await new Promise((resolve) => setTimeout(resolve, 100));
-  const stat = await fs.stat(lockPath);
-  expect(Date.now() - stat.mtimeMs).toBeLessThan(LOCK_STALE_MS);
-  // The heartbeat must touch mtime only — content (and in particular JSON
-  // validity) is untouched between acquire() and updatePort().
-  const raw = await fs.readFile(lockPath, 'utf8');
-  expect(JSON.parse(raw).pid).toBe(process.pid);
-  await lock.release();
-});
-
-test('acquireInstanceLock: two concurrent acquires racing the same orphaned lock never both win', async () => {
-  const dataDir = await tmpDataDir();
-  const pid = await deadPid();
-  await writeLockFile(dataDir, { pid, port: 4711, nonce: 'orphan', startedAt: 0 });
-  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
-
-  // No await between the two calls: both see the same orphaned lock and
-  // both attempt the takeover. The old unlink-then-recreate mechanism let
-  // the second unlink delete the first acquirer's freshly-created lock,
-  // then win its own create too — two live holders. The rename-based steal
-  // must leave exactly one winner.
-  const results = await Promise.allSettled([
-    acquireInstanceLock({ dataDir, port: 5001 }),
-    acquireInstanceLock({ dataDir, port: 5002 }),
-  ]);
-
-  const fulfilled = results.filter((r) => r.status === 'fulfilled');
-  const rejected = results.filter((r) => r.status === 'rejected');
-  expect(fulfilled).toHaveLength(1);
-  expect(rejected).toHaveLength(1);
-  expect(rejected[0].reason).toMatchObject({ name: 'InstanceLockHeldError' });
-
-  // Exactly one heartbeat is now writing this file — the pid on disk must
-  // agree with the one lock handle that actually won.
-  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
-  expect(JSON.parse(raw).pid).toBe(process.pid);
-
-  await fulfilled[0].value.release();
-});
-
-test('acquireInstanceLock: updatePort() only writes if the lock still holds our nonce', async () => {
-  const dataDir = await tmpDataDir();
-  const lock = await acquireInstanceLock({ dataDir, port: 4711 });
-  // Simulates the outcome of the three-party race below without paying for
-  // its full setup: our handle is live, but the file on disk now belongs to
-  // someone else (e.g. restored-and-then-re-taken-over by a third party).
-  await writeLockFile(dataDir, { pid: process.pid, port: 9999, nonce: 'someone-else', startedAt: 0 });
-  await lock.updatePort(4712);
-  const raw = await fs.readFile(path.join(dataDir, 'instance.lock'), 'utf8');
-  expect(JSON.parse(raw)).toMatchObject({ port: 9999, nonce: 'someone-else' });
-});
-
-test('acquireInstanceLock: heartbeat survives a transient ENOENT on the lock file without throwing', async () => {
-  const dataDir = await tmpDataDir();
-  const lockPath = path.join(dataDir, 'instance.lock');
-  const lock = await acquireInstanceLock({ dataDir, port: 4711, heartbeatMs: 20 });
-  // Simulates the gap in the mismatch-restore branch above, where lockPath
-  // is briefly empty between another process's rename-away and its
-  // restore. A heartbeat tick landing exactly there must not throw or leave
-  // an unhandled rejection — touch().catch(() => {}) swallows it and
-  // self-heals the moment the file exists again.
-  await fs.unlink(lockPath);
-  await new Promise((resolve) => setTimeout(resolve, 60)); // a couple of ticks while the file is gone
-  // Recreated with a foreign nonce on purpose: this test is only about the
-  // heartbeat surviving the gap, not about who it belongs to afterward —
-  // release() below must still no-op safely rather than throw.
-  await fs.writeFile(lockPath, JSON.stringify({ pid: process.pid, port: 4711, nonce: 'unrelated', startedAt: 0 }));
-  await new Promise((resolve) => setTimeout(resolve, 60)); // heartbeat resumes once the file exists again
-  const stat = await fs.stat(lockPath);
-  expect(Date.now() - stat.mtimeMs).toBeLessThan(1000);
-  await lock.release();
-});
-
-test('acquireInstanceLock: three-party race — a mismatched restore never clobbers a fourth, legitimate acquirer', async () => {
-  const dataDir = await tmpDataDir();
-  const lockPath = path.join(dataDir, 'instance.lock');
-  const deadHolderPid = await deadPid();
-  await writeLockFile(dataDir, { pid: deadHolderPid, port: 4711, nonce: 'orphan', startedAt: 0 });
-  await setLockMtime(dataDir, Date.now() - LOCK_STALE_MS - 1000);
-
-  // Forces the exact interleaving the re-review flagged, deterministically,
-  // instead of hoping a real race lands on it (a plain concurrent
-  // Promise.allSettled, like the two-party test above, has only two racers
-  // and structurally cannot produce this shape):
-  //
-  //   A  = the outer acquireInstanceLock() call below. Reads the orphaned
-  //        lock, then is about to steal-rename it away.
-  //   B  = a full, real acquireInstanceLock() completed BETWEEN A's read and
-  //        A's rename — B legitimately steals the SAME orphaned lock first
-  //        and installs its own fresh, live lock at lockPath.
-  //   C  = a full, real acquireInstanceLock() that fills the gap exactly
-  //        where A is about to restore the fresh lock it accidentally swept
-  //        away from B (lockPath is briefly empty right there).
-  //
-  // A must end up rejected, naming C — never overwriting C's real lock with
-  // B's stale, swept-away content.
-  const originalRename = fs.rename.bind(fs);
-  const originalOpen = fs.open.bind(fs);
-  let bLock;
-  let cLock;
-  let injectedB = false;
-  let readyForCInjection = false;
-  let injectedC = false;
-
-  const renameSpy = vi.spyOn(fs, 'rename').mockImplementation(async (...args) => {
-    const isOuterCall = !injectedB;
-    if (isOuterCall) {
-      injectedB = true;
-      // B's own internal fs.rename call (inside this same acquire) passes
-      // straight through this mock below, since injectedB is already true
-      // by the time B makes it — B runs for real, not simulated.
-      bLock = await acquireInstanceLock({ dataDir, port: 6002 });
-    }
-    const result = await originalRename(...args);
-    if (isOuterCall) {
-      // A's real steal-rename just executed. lockPath is empty now — B's
-      // FRESH lock (not the original orphan) just got swept into A's own
-      // steal file, because B replaced the orphan before A's rename ran.
-      readyForCInjection = true;
-    }
-    return result;
+/**
+ * Runs `source` as a real, separate node process — needed wherever the point
+ * of the test is that the OS, not this process's bookkeeping, is what holds
+ * the lock. Resolves once the child prints its first JSON line.
+ */
+function spawnChild(source) {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
-
-  const openSpy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
-    if (readyForCInjection && !injectedC) {
-      injectedC = true;
-      // C's plain wx-create succeeds for real: lockPath is genuinely empty
-      // at this exact point, no orphan handling needed on C's side.
-      cLock = await acquireInstanceLock({ dataDir, port: 6003 });
-    }
-    return originalOpen(...args);
-  });
-
-  try {
-    await expect(acquireInstanceLock({ dataDir, port: 6001 })).rejects.toMatchObject({
-      name: 'InstanceLockHeldError',
-      port: 6003, // C, the fourth acquirer — not B, whose lock got swept
+  children.push(child);
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      reject(new Error(`child never reported ready. stdout: ${stdout} stderr: ${stderr}`));
+    }, 10_000);
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+      const nl = stdout.indexOf('\n');
+      if (nl !== -1) {
+        clearTimeout(timer);
+        resolve({ child, message: JSON.parse(stdout.slice(0, nl)) });
+      }
     });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('exit', (code) => {
+      clearTimeout(timer);
+      reject(new Error(`child exited with ${code} before reporting ready. stderr: ${stderr}`));
+    });
+  });
+}
 
-    // The one file left on disk is C's, byte for byte.
-    const onDisk = JSON.parse(await fs.readFile(lockPath, 'utf8'));
-    expect(onDisk.port).toBe(6003);
+/** A child that holds the lock for `dataDir` and then stays alive until killed. */
+function holderSource(dataDir, port) {
+  return `
+import { acquireInstanceLock } from ${JSON.stringify(MODULE_URL)};
+const lock = await acquireInstanceLock({ dataDir: ${JSON.stringify(dataDir)}, port: ${port} });
+process.stdout.write(JSON.stringify({ pid: process.pid, lockPort: lock.lockPort }) + '\\n');
+setInterval(() => {}, 1000);
+`;
+}
 
-    // A's failed restore attempt cleaned up its own steal file even though
-    // it lost — no litter left behind by the failure path itself.
-    const entries = await fs.readdir(dataDir);
-    expect(entries.filter((name) => name.includes('.steal-'))).toHaveLength(0);
+function listenOnce(port) {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve(server));
+  });
+}
 
-    // B's handle never threw — from B's own point of view it's still "the
-    // holder" — but its file is gone, replaced by C's. Both updatePort()
-    // and release() must still refuse to touch C's real lock.
-    await bLock.updatePort(9999);
-    expect(JSON.parse(await fs.readFile(lockPath, 'utf8')).port).toBe(6003);
-    await bLock.release();
-    expect(JSON.parse(await fs.readFile(lockPath, 'utf8')).port).toBe(6003);
+function closeServer(server) {
+  return new Promise((resolve) => server.close(resolve));
+}
+
+// ---------------------------------------------------------------------------
+// 1. The platform assumption the whole design rests on.
+// ---------------------------------------------------------------------------
+
+test('two listen() calls on the same loopback address: the second gets EADDRINUSE', async () => {
+  const first = await listenOnce(0);
+  const port = first.address().port;
+  try {
+    await expect(listenOnce(port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
   } finally {
-    renameSpy.mockRestore();
-    openSpy.mockRestore();
-    await bLock?.release();
-    await cLock?.release();
+    await closeServer(first);
   }
 });
 
-test('acquireInstanceLock: updatePort() after release() does not resurrect the lock file', async () => {
+test('the EADDRINUSE guarantee holds across processes, not just within one', async () => {
+  // The in-process case above could in principle be Node bookkeeping rather
+  // than the OS refusing the bind. Exclusivity between two kaprek starts is
+  // always cross-process, so prove it there too.
+  const source = `
+import net from 'node:net';
+const server = net.createServer();
+server.listen(0, '127.0.0.1', () => {
+  process.stdout.write(JSON.stringify({ port: server.address().port }) + '\\n');
+});
+setInterval(() => {}, 1000);
+`;
+  const { message } = await spawnChild(source);
+  await expect(listenOnce(message.port)).rejects.toMatchObject({ code: 'EADDRINUSE' });
+});
+
+// ---------------------------------------------------------------------------
+// 2-4. Exclusivity, and the two ways it ends.
+// ---------------------------------------------------------------------------
+
+test('a second acquire on the same dataDir throws InstanceLockHeldError naming the holder', async () => {
   const dataDir = await tmpDataDir();
-  const lock = await acquireInstanceLock({ dataDir, port: 4711 });
+  await acquire(dataDir, { port: 4711 });
+  await expect(acquire(dataDir, { port: 4712 })).rejects.toMatchObject({
+    name: 'InstanceLockHeldError',
+    pid: process.pid,
+    url: 'http://127.0.0.1:4711',
+  });
+});
+
+test('the holder is reported across processes, with the real pid and url of the other process', async () => {
+  const dataDir = await tmpDataDir();
+  const { message } = await spawnChild(holderSource(dataDir, 4811));
+  await expect(acquire(dataDir, { port: 4812 })).rejects.toMatchObject({
+    name: 'InstanceLockHeldError',
+    pid: message.pid,
+    url: 'http://127.0.0.1:4811',
+  });
+  expect(message.pid).not.toBe(process.pid);
+});
+
+test('after release() the next acquire succeeds immediately, with no waiting period', async () => {
+  const dataDir = await tmpDataDir();
+  const first = await acquire(dataDir, { port: 4711 });
+  await first.release();
+  const startedAt = Date.now();
+  const second = await acquire(dataDir, { port: 4712 });
+  // The file-lease version this replaced could only reclaim a lock after
+  // LOCK_STALE_MS (15s). A closed socket is free the instant it closes.
+  expect(Date.now() - startedAt).toBeLessThan(1000);
+  expect(second.lockPort).toBe(first.lockPort);
+});
+
+test('a holder killed with SIGKILL blocks nothing: the next acquire succeeds immediately', async () => {
+  const dataDir = await tmpDataDirWithFreePorts(1);
+  const { child } = await spawnChild(holderSource(dataDir, 4911));
+  const exited = new Promise((resolve) => child.on('exit', resolve));
+  child.kill('SIGKILL');
+  await exited;
+
+  const startedAt = Date.now();
+  const lock = await acquire(dataDir, { port: 4912 });
+  // No staleness clock, no heartbeat, no takeover: the OS closed the crashed
+  // process's socket for us, so this is a plain successful bind.
+  expect(Date.now() - startedAt).toBeLessThan(1000);
+  expect(lock.lockPort).toBe(lockPortFor(dataDir));
+});
+
+// ---------------------------------------------------------------------------
+// 5-6. Foreign software sitting on the derived port.
+// ---------------------------------------------------------------------------
+
+test('foreign software that accepts but never speaks: acquire moves to the next port', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  // Accepts the connection and holds it open without sending anything — the
+  // case that would hang the start if the greeting read had no timeout.
+  await listenForeign(basePort, () => {});
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('foreign software that sends garbage: acquire moves to the next port', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  await listenForeign(basePort, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('a well-formed greeting for a DIFFERENT dataDir is not our holder either', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const other = await tmpDataDir();
+  const basePort = lockPortFor(dataDir);
+  // Shape-valid, hash wrong: another kaprek data dir that happens to collide
+  // on the derived port must not be mistaken for ours.
+  await listenForeign(basePort, (socket) => {
+    socket.end(`${JSON.stringify({ kaprek: 1, dataDirHash: 'a'.repeat(64), pid: 1, url: 'http://127.0.0.1:1' })}\n`);
+  });
+  expect(other).not.toBe(dataDir);
+  const lock = await acquire(dataDir, { port: 4711 });
+  expect(lock.lockPort).toBe(basePort + 1);
+});
+
+test('an already-running kaprek on a fallback port is found even when its base port has since freed up', async () => {
+  const dataDir = await tmpDataDirWithFreePorts();
+  const basePort = lockPortFor(dataDir);
+  const blocker = await listenForeign(basePort, () => {});
+  const first = await acquire(dataDir, { port: 4711 });
+  expect(first.lockPort).toBe(basePort + 1);
+
+  // The foreign software goes away. A naive "bind the base port, done"
+  // would now hand out a second lock for the same dataDir.
+  await closeServer(blocker);
+  servers = servers.filter((s) => s !== blocker);
+
+  await expect(acquire(dataDir, { port: 4712 })).rejects.toMatchObject({
+    name: 'InstanceLockHeldError',
+    url: 'http://127.0.0.1:4711',
+  });
+});
+
+test('every candidate port occupied by silent foreign software: acquire fails loudly', async () => {
+  const dataDir = await tmpDataDir();
+  const basePort = lockPortFor(dataDir);
+  const blocked = [];
+  for (let offset = 0; blocked.length < LOCK_PORT_ATTEMPTS && offset < LOCK_PORT_WINDOW; offset += 1) {
+    try {
+      blocked.push(await listenForeign(basePort + offset, () => {}));
+    } catch (err) {
+      // A port reserved by the OS (EACCES, see the module header) cannot be
+      // occupied here, and acquire() steps over it without spending one of
+      // its attempts. So this loop must not count it either, or a base port
+      // near a reserved block leaves acquire() a free port above the ones
+      // this test blocked — which is how this test first failed.
+      if (err.code !== 'EACCES') throw err;
+    }
+  }
+  expect(blocked).toHaveLength(LOCK_PORT_ATTEMPTS);
+  await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/could not claim/i);
+});
+
+// ---------------------------------------------------------------------------
+// 7-8. Which dataDir maps to which port.
+// ---------------------------------------------------------------------------
+
+test('two different dataDirs do not block each other', async () => {
+  const a = await tmpDataDir();
+  const b = await tmpDataDir();
+  const lockA = await acquire(a, { port: 4711 });
+  const lockB = await acquire(b, { port: 4712 });
+  expect(lockA.lockPort).not.toBe(lockB.lockPort);
+});
+
+test('the derived port stays inside the documented private range', async () => {
+  for (let i = 0; i < 200; i += 1) {
+    const port = lockPortFor(path.join(os.tmpdir(), `kaprek-port-spread-${i}`));
+    expect(port).toBeGreaterThanOrEqual(LOCK_PORT_BASE);
+    expect(port).toBeLessThan(LOCK_PORT_BASE + LOCK_PORT_RANGE);
+    // The walk must never need a port above 65535.
+    expect(port + LOCK_PORT_WINDOW + LOCK_PORT_ATTEMPTS).toBeLessThanOrEqual(65535);
+  }
+});
+
+test('different spellings of the same directory derive the same port and block each other', async () => {
+  const dataDir = await tmpDataDir();
+  const spellings = [
+    `${dataDir}${path.sep}`,
+    path.join(dataDir, 'sub', '..'),
+    ...(process.platform === 'win32' ? [dataDir.toUpperCase(), dataDir.toLowerCase()] : []),
+  ];
+  for (const spelling of spellings) {
+    expect(lockPortFor(spelling)).toBe(lockPortFor(dataDir));
+  }
+
+  await acquire(dataDir, { port: 4711 });
+  for (const spelling of spellings) {
+    await expect(acquire(spelling, { port: 4712 })).rejects.toMatchObject({
+      name: 'InstanceLockHeldError',
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Windows reserved port ranges (Hyper-V/WinNAT), verified on this machine
+// with `netsh int ipv4 show excludedportrange protocol=tcp`.
+// ---------------------------------------------------------------------------
+
+/**
+ * First reserved TCP range inside the derived-port window that this process
+ * genuinely cannot bind, or undefined.
+ *
+ * netsh also lists "managed" exclusions (marked with `*` in its output), and
+ * those turn out to be bindable anyway — verified here on 50000-50059, which
+ * binds fine. So the listing is only a shortlist; the EACCES is what counts.
+ */
+async function reservedRange() {
+  if (process.platform !== 'win32') return undefined;
+  let out;
+  try {
+    out = execFileSync('netsh', ['int', 'ipv4', 'show', 'excludedportrange', 'protocol=tcp'], {
+      encoding: 'utf8',
+    });
+  } catch {
+    return undefined;
+  }
+  for (const line of out.split(/\r?\n/)) {
+    const match = line.trim().match(/^(\d+)\s+(\d+)/);
+    if (!match) continue;
+    const start = Number(match[1]);
+    const end = Number(match[2]);
+    if (start < LOCK_PORT_BASE || end >= LOCK_PORT_BASE + LOCK_PORT_RANGE) continue;
+    if (!(await isBindable(start))) return { start, end };
+  }
+  return undefined;
+}
+
+test('a base port inside a Windows-reserved range is stepped over, not treated as a holder', async () => {
+  const range = await reservedRange();
+  if (!range) {
+    // No reserved range on this machine (or not Windows) — nothing to prove.
+    return;
+  }
+  // Find a directory name whose derived port lands exactly on the reserved
+  // range's first port. Hashing is pure, so this costs no filesystem work.
+  const parent = await tmpDataDir();
+  let dataDir;
+  for (let i = 0; i < 2_000_000 && !dataDir; i += 1) {
+    const candidate = path.join(parent, `d${i}`);
+    if (lockPortFor(candidate) === range.start) dataDir = candidate;
+  }
+  expect(dataDir, 'no directory name hashed onto the reserved port').toBeDefined();
+  await fs.mkdir(dataDir, { recursive: true });
+
+  const lock = await acquire(dataDir, { port: 4711 });
+  // listen() on a reserved port fails with EACCES, which is neither "free"
+  // nor "someone else holds the lock" — the walk has to keep going past the
+  // whole reserved block, which can be 100 ports wide.
+  expect(lock.lockPort).toBeGreaterThan(range.end);
+});
+
+// ---------------------------------------------------------------------------
+// Handle surface.
+// ---------------------------------------------------------------------------
+
+test('updatePort() is what the greeting reports once the real server port is known', async () => {
+  const dataDir = await tmpDataDir();
+  const lock = await acquire(dataDir, { port: undefined });
+  await expect(acquire(dataDir, {})).rejects.toMatchObject({
+    name: 'InstanceLockHeldError',
+    url: null,
+  });
+  await lock.updatePort(4713);
+  await expect(acquire(dataDir, {})).rejects.toMatchObject({
+    url: 'http://127.0.0.1:4713',
+  });
+});
+
+test('the lock file is written for humans to read, and removed on release', async () => {
+  const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
+  const lock = await acquire(dataDir, { port: 4711 });
+  const state = JSON.parse(await fs.readFile(lockPath, 'utf8'));
+  expect(state).toMatchObject({ pid: process.pid, port: 4711, url: 'http://127.0.0.1:4711' });
+  expect(state.lockPort).toBe(lock.lockPort);
+  await lock.release();
+  await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+test('a stale lock file left behind by a crash does not block acquiring', async () => {
+  const dataDir = await tmpDataDirWithFreePorts(1);
+  // The file is display only. Whatever it says, only the socket decides.
+  await fs.writeFile(
+    path.join(dataDir, 'instance.lock'),
+    JSON.stringify({ pid: process.pid, port: 4711, url: 'http://127.0.0.1:4711' }),
+  );
+  const lock = await acquire(dataDir, { port: 4712 });
+  expect(lock.lockPort).toBe(lockPortFor(dataDir));
+});
+
+test('a corrupt lock file does not block acquiring either', async () => {
+  const dataDir = await tmpDataDirWithFreePorts(1);
+  await fs.writeFile(path.join(dataDir, 'instance.lock'), '{not json');
+  const lock = await acquire(dataDir, { port: 4712 });
+  expect(lock.lockPort).toBe(lockPortFor(dataDir));
+});
+
+test('release() is idempotent and updatePort() after release() does not resurrect the file', async () => {
+  const dataDir = await tmpDataDir();
+  const lockPath = path.join(dataDir, 'instance.lock');
+  const lock = await acquire(dataDir, { port: 4711 });
+  await lock.release();
   await lock.release();
   await lock.updatePort(4712);
-  await expect(fs.stat(path.join(dataDir, 'instance.lock'))).rejects.toThrow();
+  lock.releaseSync();
+  await expect(fs.stat(lockPath)).rejects.toMatchObject({ code: 'ENOENT' });
 });
 
-test('acquireInstanceLock re-exports InstanceLockHeldError for instanceof checks', async () => {
+test('releaseSync() frees the port for the next acquire', async () => {
   const dataDir = await tmpDataDir();
-  const first = await acquireInstanceLock({ dataDir, port: 4711 });
-  try {
-    await acquireInstanceLock({ dataDir, port: 4712 });
-    throw new Error('expected acquireInstanceLock to throw');
-  } catch (err) {
-    expect(err).toBeInstanceOf(InstanceLockHeldError);
-  } finally {
-    await first.release();
-  }
+  const first = await acquire(dataDir, { port: 4711 });
+  first.releaseSync();
+  // releaseSync() exists for process.on('exit'), where nothing can be
+  // awaited; the close it starts still has to actually unbind.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const second = await acquire(dataDir, { port: 4712 });
+  expect(second.lockPort).toBe(first.lockPort);
+});
+
+test('acquireInstanceLock throws an InstanceLockHeldError instance, for instanceof checks in bin/cli.mjs', async () => {
+  const dataDir = await tmpDataDir();
+  await acquire(dataDir, { port: 4711 });
+  await expect(acquire(dataDir, { port: 4712 })).rejects.toBeInstanceOf(InstanceLockHeldError);
 });
