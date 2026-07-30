@@ -26,7 +26,7 @@ import { readFile as readWorkspaceFile, resolveWorkspacePath } from '../workspac
 import { readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
-import { checkLimits } from './limits.mjs';
+import { checkLimits, checkGlobalTriggerLimits } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -62,28 +62,29 @@ const TICK_DRIVEN_TYPES = ['heartbeat', 'schedule'];
 const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
 
 /**
- * Extracts the app id a qualified kaprek-apps MCP tool name belongs to, or
- * null if `toolName` isn't one of ours at all (e.g. a built-in CLI tool
- * like Bash/Write/WebFetch, or an MCP tool from some other server).
+ * Extracts the raw kaprek-apps tool id out of a qualified MCP tool name, or
+ * null if `toolName` isn't one of ours at all (e.g. a built-in CLI tool like
+ * Bash/Write/WebFetch, or an MCP tool from some other server).
  *
- * NOT verified against a live CLI run — see task-7a-review.md's "cannot
- * verify from diff" note on the exact qualified-name format a real `claude`
- * process reports. That is a deliberate, safe direction to be wrong in: if
- * this assumption is off, notifyPolicyHandler() below denies MORE than it
- * should (every tool call fails to match and gets denied), never less —
- * fail-closed either way, just possibly over-strict until verified live.
+ * A PREFILTER, not an authorization decision: it answers "is this one of our
+ * tools", never "whose tool is it". The app a tool belongs to comes from the
+ * loaded manifests (loader.mjs::resolveToolOwnership, reached through the
+ * runner's `resolveToolApp` option) — deriving it from the name would let an
+ * app named `evil` declare a tool `notes.exfiltrate` and inherit everything
+ * `notes` was granted (adversarial review Tag 3, Codex F1).
+ *
+ * Verified against a live `claude` 2.1.220 run (2026-07-30): the CLI
+ * normalizes the dots in our advertised tool id to underscores, so
+ * `notes.write` arrives as `mcp__kaprek-apps__notes_write`. Tool-id segments
+ * can never contain `_` themselves (manifest.mjs::TOOL_ID_RE allows only
+ * [a-z0-9] segments joined by dots), so mapping every `_` back to a `.` is
+ * lossless.
  */
-function appIdForMcpTool(toolName) {
+function mcpToolIdFromName(toolName) {
   if (typeof toolName !== 'string' || !toolName.startsWith(MCP_TOOL_PREFIX)) return null;
-  const toolId = toolName.slice(MCP_TOOL_PREFIX.length);
-  // Verified against a live `claude` 2.1.220 run (2026-07-30): the CLI
-  // normalizes the dots in our advertised tool id to underscores, so
-  // `notes.write` arrives as `mcp__kaprek-apps__notes_write`. Tool-id
-  // segments themselves can never contain `_` (manifest.mjs::TOOL_ID_RE
-  // allows only [a-z0-9] segments joined by dots), so the mapping is
-  // bijective and the first `.` OR `_` both mark the end of the app id.
-  const sepIndex = toolId.search(/[._]/);
-  return sepIndex > 0 ? toolId.slice(0, sepIndex) : null;
+  const raw = toolName.slice(MCP_TOOL_PREFIX.length);
+  if (raw.length === 0) return null;
+  return raw.replace(/_/g, '.');
 }
 
 // Meta-/read tools with no outward effect at all — allowed for a 'notify'
@@ -133,8 +134,9 @@ function isInsideWorkspace(cwd, candidatePath) {
 
 /**
  * The `escalation:'notify'` approval handler — a pure policy decision, no
- * human, no SSE, no timeout: allows a kaprek-apps MCP tool call whose app id
- * is in `trigger.appScope`, or a NOTIFY_READONLY_ALLOW meta-/read tool
+ * human, no SSE, no timeout: allows a kaprek-apps MCP tool call whose OWNING
+ * app (per `resolveToolApp`, i.e. per the manifests on disk — never per the
+ * tool's name) is in `trigger.appScope`, or a NOTIFY_READONLY_ALLOW meta-/read tool
  * (path-checked where it has one, see PATH_FIELD_BY_TOOL); denies literally
  * everything else (Bash, Write, Edit, WebFetch, a Read/Glob/Grep outside the
  * workspace or with no path at all, an MCP tool from an app NOT in scope,
@@ -146,7 +148,7 @@ function isInsideWorkspace(cwd, candidatePath) {
  * so `--permission-prompt-tool stdio` is always active for one (see
  * claude-code.mjs::buildArgs()).
  */
-function notifyPolicyHandler(trigger, cwd) {
+function notifyPolicyHandler(trigger, cwd, resolveToolApp) {
   return async (request) => {
     if (NOTIFY_READONLY_ALLOW.includes(request.toolName)) {
       const pathField = PATH_FIELD_BY_TOOL[request.toolName];
@@ -165,8 +167,15 @@ function notifyPolicyHandler(trigger, cwd) {
       return { behavior: 'deny', message: 'outside the workspace' };
     }
 
-    const appId = appIdForMcpTool(request.toolName);
-    if (appId !== null && trigger.appScope.includes(appId)) {
+    const toolId = mcpToolIdFromName(request.toolName);
+    if (toolId === null) {
+      return { behavior: 'deny', message: 'not permitted for notify trigger' };
+    }
+    // Ownership comes from the manifests, not from the tool's name — and a
+    // tool nobody owns (unknown, or claimed by two apps, see
+    // resolveToolOwnership) is denied rather than guessed at.
+    const appId = resolveToolApp(toolId);
+    if (appId !== null && appId !== undefined && trigger.appScope.includes(appId)) {
       return { behavior: 'allow' };
     }
     return { behavior: 'deny', message: 'not permitted for notify trigger' };
@@ -292,6 +301,12 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   pass a fake reader; no test ever spawns a real PowerShell.
  * @param {string} [options.platform] - process.platform override, for the
  *   clipboard support check (see supportStatus()).
+ * @param {(toolId: string) => string|null} [options.resolveToolApp] - which
+ *   APP provides a given kaprek tool id, per the loaded manifests (the server
+ *   wires loader.mjs::resolveToolOwnership). Defaults to "nobody owns
+ *   anything", which denies every app tool: without a real app registry the
+ *   policy cannot know whose tool it is being asked about, and guessing from
+ *   the name is exactly the hole this replaces.
  */
 export function createTriggerRunner({
   dataDir,
@@ -308,6 +323,7 @@ export function createTriggerRunner({
   createWatcher = (absPath, options, listener) => fs.watch(absPath, options, listener),
   readClipboard = readWindowsClipboard,
   platform = process.platform,
+  resolveToolApp = () => null,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -374,9 +390,34 @@ export function createTriggerRunner({
     }
   }
 
-  /** allowedTools is derived from appScope, never left unset — an empty appScope MUST mean "no tools", not "the harness's own default set" (see run.mjs's allowedTools passthrough contract). */
-  function allowedToolsFor(trigger) {
-    return [...trigger.appScope];
+  /**
+   * The heartbeat slot covering `nowMs`: the trigger's own interval, aligned
+   * to the epoch. Gives a heartbeat the SAME cross-process idempotency a
+   * schedule already had (adversarial review Tag 3, Grok P1) — two kaprek
+   * processes on one dataDir each have their own `runningIds`, so only a
+   * claim file on disk can stop them both from firing the same heartbeat.
+   * `heartbeatDue()` still decides WHETHER it is time; this only decides
+   * which window that turn belongs to.
+   */
+  function heartbeatSlot(trigger, nowMs) {
+    const windowMs = trigger.config.intervalMinutes * 60_000;
+    return new Date(Math.floor(nowMs / windowMs) * windowMs).toISOString();
+  }
+
+  /**
+   * The file-watch slot for a debounce window: the window's start, quantized
+   * to the trigger's own debounce length. Two processes watching the same
+   * directory see the same change within the same window and therefore
+   * compute the same slot, so only one of them runs a turn for it.
+   *
+   * Weaker than the schedule/heartbeat slots by nature: two processes whose
+   * windows straddle a quantum boundary land on different slots and both
+   * fire. It bounds the common case (both processes notice the same save at
+   * roughly the same moment) without pretending to be exact.
+   */
+  function fileWatchSlot(windowStartedAt, debounceMs) {
+    const quantum = Math.max(debounceMs, 1);
+    return new Date(Math.floor(windowStartedAt / quantum) * quantum).toISOString();
   }
 
   /**
@@ -544,7 +585,9 @@ export function createTriggerRunner({
     if (state.timer) return;
     // Debounce: one save produces several events (Windows produces them
     // reliably, other platforms occasionally), so the turn starts once the
-    // dust has settled — not once per event.
+    // dust has settled — not once per event. The window's start is remembered
+    // for the cross-process claim the flush takes out (see fileWatchSlot).
+    state.windowStartedAt = currentNow();
     state.timer = setTimeout(() => flushWatch(triggerId), config.debounceMs);
     if (typeof state.timer.unref === 'function') state.timer.unref();
   }
@@ -559,11 +602,12 @@ export function createTriggerRunner({
     // list leaves the runner.
     const files = [...state.pending].sort().slice(0, MAX_CONTEXT_FILES);
     const filesTruncated = state.truncated === true;
+    const windowStartedAt = state.windowStartedAt ?? currentNow();
     state.pending.clear();
     state.truncated = false;
     if (files.length === 0) return;
 
-    fireTrigger(triggerId, { cause: { origin: 'file-watch', files, filesTruncated } }).catch((err) => {
+    fireTrigger(triggerId, { cause: { origin: 'file-watch', files, filesTruncated, windowStartedAt } }).catch((err) => {
       log(`trigger ${triggerId}: file-watch fire error: ${err?.message ?? String(err)}`);
     });
   }
@@ -924,6 +968,15 @@ export function createTriggerRunner({
       return { fired: false, reason: limitCheck.reason };
     }
 
+    // The ceiling across ALL triggers together — the brake on a chain no
+    // per-trigger cap can see: A writes a file B watches, B writes back, both
+    // stay inside their own limits forever (see limits.mjs's constants).
+    const globalCheck = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    if (!globalCheck.allowed) {
+      log(`trigger ${id}: rejected (${globalCheck.reason})`);
+      return { fired: false, reason: globalCheck.reason };
+    }
+
     // Platform gate: a trigger whose type cannot work on this machine at all
     // never fires here either (only `clipboard` can be unsupported today).
     const support = supportStatus(trigger);
@@ -947,6 +1000,20 @@ export function createTriggerRunner({
         log(`trigger ${id}: rejected (${reason})`);
         return { fired: false, reason };
       }
+      // Cross-process idempotency for the TICK, exactly like a schedule slot:
+      // a second kaprek process on the same dataDir loses the claim and does
+      // not run the same heartbeat window twice. A manual fire takes no claim
+      // — it is one person pressing "run now" once, not two processes reaching
+      // the same conclusion about the same window, and refusing it because
+      // the tick already used this window would make the button lie.
+      if (cause?.origin === 'heartbeat') {
+        slot = heartbeatSlot(trigger, currentNow());
+        if (!tryClaim(id, slot)) {
+          const reason = `heartbeat window already claimed: ${slot}`;
+          log(`trigger ${id}: rejected (${reason})`);
+          return { fired: false, reason };
+        }
+      }
       reasonText = `heartbeat interval reached (every ${trigger.config.intervalMinutes}m)`;
     } else if (trigger.type === 'schedule') {
       slot = dueScheduleSlot(trigger, currentNow());
@@ -968,6 +1035,17 @@ export function createTriggerRunner({
       // just gets an empty {{files}} and says so.
       files = Array.isArray(cause?.files) ? cause.files.filter((f) => typeof f === 'string') : [];
       filesTruncated = cause?.filesTruncated === true;
+      // Same cross-process claim as heartbeat/schedule, for the debounce
+      // window the watcher collected (see fileWatchSlot). A manual fire has no
+      // window and needs no claim — it is one deliberate act by one user.
+      if (typeof cause?.windowStartedAt === 'number') {
+        slot = fileWatchSlot(cause.windowStartedAt, trigger.config.debounceMs);
+        if (!tryClaim(id, slot)) {
+          const reason = `file-watch window already claimed: ${slot}`;
+          log(`trigger ${id}: rejected (${reason})`);
+          return { fired: false, reason };
+        }
+      }
       reasonText = files.length > 0 ? `${files.length} watched path(s) changed` : 'manual fire (no file changes recorded)';
     } else if (trigger.type === 'clipboard') {
       // Only this trigger's own poller can produce a clipboard cause. A
@@ -1025,7 +1103,9 @@ export function createTriggerRunner({
       // onChatResolved). notifyPolicyHandler() needs none of this.
       let resolvedChatId = null;
       const approvalHandlerForTurn =
-        trigger.escalation === 'notify' ? notifyPolicyHandler(trigger, cwd) : (request) => makeUiApprovalHandler(resolvedChatId)(request);
+        trigger.escalation === 'notify'
+          ? notifyPolicyHandler(trigger, cwd, resolveToolApp)
+          : (request) => makeUiApprovalHandler(resolvedChatId)(request);
 
       const result = await runTurn({
         dataDir,
@@ -1034,7 +1114,16 @@ export function createTriggerRunner({
         harnessName,
         cwd,
         permissionMode,
-        allowedTools: allowedToolsFor(trigger),
+        // ALWAYS empty, for every trigger, on purpose. `appScope` is input to
+        // OUR policy (see notifyPolicyHandler) and must never become a CLI
+        // `--allowedTools` entry: a tool named there is pre-allowed by the CLI
+        // and never goes through `can_use_tool`, so the approval handler that
+        // is this layer's whole guarantee would never see the call at all
+        // (adversarial review Tag 3, Grok P0 / Codex F1 — `appScope:["Bash"]`
+        // used to mean exactly that). An empty list means claude-code.mjs
+        // passes no `--allowedTools` flag, so every tool call reaches the
+        // permission prompt and therefore our handler.
+        allowedTools: [],
         onApprovalRequest: approvalHandlerForTurn,
         onEvent,
         onChatResolved: (chatId) => {
@@ -1052,10 +1141,51 @@ export function createTriggerRunner({
       }
 
       log(`trigger ${id}: fired (chatId=${result.chatId ?? 'n/a'}, silent=${silent})`);
+      reportCapsAfterTurn(id, trigger);
       return { fired: true, chatId: result.chatId, result, silent };
     } finally {
       runningIds.delete(id);
     }
+  }
+
+  /**
+   * The post-check the preflight cannot be: a cap is checked BEFORE a turn,
+   * but the turn's own cost only exists afterwards. At $0.99 of a $1.00 cap
+   * the preflight says yes and an arbitrarily expensive turn runs — the cap
+   * was only ever "no NEW turn once the line is crossed" (adversarial review
+   * Tag 3, both peers).
+   *
+   * This cannot un-spend the money, so it does the two things that remain:
+   * say so at the moment it happens, and make sure the block that follows is
+   * a decision and not an accident. The block itself needs no state — every
+   * later preflight derives it from the same runs.jsonl (see limits.mjs's
+   * note on why nothing here keeps a parallel counter), so it survives a
+   * restart and a crash mid-turn.
+   */
+  function reportCapsAfterTurn(id, trigger) {
+    const after = checkLimits({ dataDir, trigger, now: currentNow() });
+    if (!after.allowed) {
+      log(`trigger ${id}: cap reached after this turn (${after.reason}) — no further runs today`);
+    }
+    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    if (!global.allowed) {
+      log(`trigger ${id}: ${global.reason} — no trigger fires until that window passes`);
+    }
+  }
+
+  /**
+   * Why this trigger cannot fire right now, or null. Complements
+   * approvalCapability() (which answers "can it EVER fire as configured"):
+   * this is the temporary half — its own daily cap, or the global trigger cap
+   * every trigger shares. Exposed through GET /api/triggers so a user sees
+   * "daily cost cap reached" instead of a trigger that silently does nothing.
+   */
+  function limitStatus(trigger) {
+    const own = checkLimits({ dataDir, trigger, now: currentNow() });
+    if (!own.allowed) return { blockedReason: own.reason, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
+    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    if (!global.allowed) return { blockedReason: global.reason, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
+    return { blockedReason: null, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
   }
 
   /**
@@ -1142,5 +1272,5 @@ export function createTriggerRunner({
     return runningIds.size > 0;
   }
 
-  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, approvalCapability, supportStatus };
+  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, approvalCapability, supportStatus, limitStatus };
 }

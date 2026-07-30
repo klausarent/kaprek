@@ -32,7 +32,7 @@ import { openChats, ChatNotFoundError } from '../chats/store.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
-import { loadApps } from '../apps/loader.mjs';
+import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
@@ -1034,17 +1034,34 @@ async function handleChatRoutes(req, res, segments, url, ctx) {
  * structurally never fire (no UI approval handler wired) is visible here,
  * not just a console.log line (task-7a-review.md Important #2).
  */
-function handleTriggersList(res, getTriggers, getRunner, dataDir) {
+function handleTriggersList(res, getTriggers, getRunner) {
   const runner = getRunner();
   const triggers = getTriggers()
     .list()
     .map((trigger) => {
-      const { runsToday, costToday } = checkLimits({ dataDir, trigger, now: Date.now() });
       // `supported`/`unsupportedReason` (see runner.mjs::supportStatus) is the
       // same idea as `blocked` one field over: a clipboard trigger on a
       // non-Windows machine says so here in plain text, instead of offering a
       // switch that silently does nothing.
-      return { ...trigger, runsToday, costToday, ...runner.approvalCapability(trigger), ...runner.supportStatus(trigger) };
+      const capability = runner.approvalCapability(trigger);
+      const { blockedReason, runsToday, costToday, costEstimated } = runner.limitStatus(trigger);
+      return {
+        ...trigger,
+        runsToday,
+        costToday,
+        // True when part of costToday is an estimate for a run the harness
+        // reported no cost for (see limits.mjs) — so a UI can say "estimated"
+        // instead of implying it measured the number.
+        costEstimated,
+        ...capability,
+        // A trigger that is fine as configured but capped right now (its own
+        // daily cap, or the global one shared by every trigger) reports that
+        // here rather than looking armed and doing nothing. Approval wiring
+        // still wins: a trigger that can NEVER fire is the more important of
+        // the two answers.
+        blocked: capability.blocked ?? blockedReason,
+        ...runner.supportStatus(trigger),
+      };
     });
   sendJson(res, 200, { triggers });
 }
@@ -1187,7 +1204,7 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
   // /api/triggers
   if (segments.length === 2) {
     if (req.method === 'GET') {
-      handleTriggersList(res, getTriggers, getRunner, dataDir);
+      handleTriggersList(res, getTriggers, getRunner);
       return;
     }
     if (req.method === 'POST') {
@@ -1560,11 +1577,28 @@ export function startServer({
     return openChats(dataDir);
   }
 
+  // The apps installed right now, re-read per call rather than cached: an app
+  // can be added or removed while the server runs, and both answers below are
+  // authorization inputs — a stale one would either grant a trigger an app
+  // that is gone or refuse one that was just installed. Each call reads a
+  // handful of small JSON files (see loadApps()).
+  function installedAppIds() {
+    const { apps } = loadApps({ bundledDir: bundledAppsDir, dataDir });
+    return new Set(apps.map((app) => app.manifest.id));
+  }
+
+  /** Which app truly provides a tool id, per the manifests on disk (see loader.mjs::resolveToolOwnership) — the trigger policy's authorization input, never the tool's name. */
+  function appIdForTool(toolId) {
+    const { apps } = loadApps({ bundledDir: bundledAppsDir, dataDir });
+    return resolveToolOwnership(apps).owners.get(toolId) ?? null;
+  }
+
   // Trigger registry, opened lazily like the board above (most invocations
-  // never touch it either).
+  // never touch it either). `knownAppIds` is what makes an appScope entry
+  // checkable: it may only name an app that is actually installed.
   let triggers = null;
   function getTriggers() {
-    if (!triggers) triggers = openTriggers(dataDir);
+    if (!triggers) triggers = openTriggers(dataDir, { knownAppIds: installedAppIds });
     return triggers;
   }
 
@@ -1596,6 +1630,10 @@ export function startServer({
         harnessName,
         cwd: workspaceDir,
         permissionMode,
+        // The notify policy's authorization input: which app REALLY provides a
+        // tool, read from the manifests rather than from the tool's name (see
+        // runner.mjs::notifyPolicyHandler).
+        resolveToolApp: appIdForTool,
         makeUiApprovalHandler: (chatId) =>
           makeApprovalHandler({
             chatId,

@@ -12,7 +12,9 @@ import { appendRun } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
 import { createTriggerRunner } from './runner.mjs';
+import { MAX_TRIGGER_TURNS_PER_HOUR } from './limits.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
+import { buildArgs } from '../harness/claude-code.mjs';
 
 let dataDir;
 let cwd;
@@ -61,8 +63,23 @@ function textResultScript(text, extra = {}) {
   ];
 }
 
+/**
+ * The app registry the tests pretend is installed: `notes` owns
+ * `notes.<action>`, `other-app` owns its own. Passed both to openTriggers
+ * (an appScope may only name an installed app) and to the runner (the notify
+ * policy asks which app REALLY provides a tool). A tool nobody owns resolves
+ * to null, exactly like the server's resolver would answer for it.
+ */
+const TEST_APP_IDS = new Set(['notes', 'other-app']);
+const TEST_TOOL_OWNERS = new Map([
+  ['notes.write', 'notes'],
+  ['notes.read', 'notes'],
+  ['other-app.write', 'other-app'],
+]);
+const resolveTestToolApp = (toolId) => TEST_TOOL_OWNERS.get(toolId) ?? null;
+
 function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {}, ...rest } = {}) {
-  const triggers = openTriggers(dataDir);
+  const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
   if (trigger) triggers.upsert(trigger);
   const harness = createFakeHarness({ script: script ?? textResultScript('ok') });
   const runner = createTriggerRunner({
@@ -75,6 +92,7 @@ function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.n
     now,
     log,
     makeUiApprovalHandler,
+    resolveToolApp: resolveTestToolApp,
     ...rest,
   });
   return { runner, triggers, harness };
@@ -383,31 +401,56 @@ test('escalation "notify" fires without any approval handler configured', async 
   expect(result.fired).toBe(true);
 });
 
-// ------------------------------------------------------------- appScope -> allowedTools
+// ------------------------------------------------------------- appScope is policy input, never a CLI flag
+
+/** A harness that records the options runTurn() hands it, around a normal fake turn. */
+function recordingHarness(calls) {
+  const inner = createFakeHarness({ script: textResultScript('ok') });
+  return {
+    startTurn: (opts) => {
+      calls.push(opts);
+      return inner.startTurn(opts);
+    },
+  };
+}
 
 test('appScope: [] passes an empty allowedTools list to the harness, never "all tools"', async () => {
   const calls = [];
-  const inner = createFakeHarness({ script: textResultScript('ok') });
-  const harness = { startTurn: (opts) => { calls.push(opts); return inner.startTurn(opts); } };
-  const triggers = openTriggers(dataDir);
-  triggers.upsert(scheduleTrigger({ config: { everyMinutes: 5 }, appScope: [] }));
-  const runner = createTriggerRunner({ dataDir, triggers, runTurn, harness, harnessName: 'fake', cwd, now: () => Date.now(), log: () => {} });
+  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, appScope: [] }), harness: recordingHarness(calls) });
 
   await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
   expect(calls).toHaveLength(1);
   expect(calls[0].allowedTools).toEqual([]);
 });
 
-test('appScope: [\'notes\'] passes exactly that list as allowedTools', async () => {
+test("appScope: ['notes'] is NOT passed as allowedTools — a scope authorizes our own policy, never the CLI", async () => {
   const calls = [];
-  const inner = createFakeHarness({ script: textResultScript('ok') });
-  const harness = { startTurn: (opts) => { calls.push(opts); return inner.startTurn(opts); } };
-  const triggers = openTriggers(dataDir);
-  triggers.upsert(scheduleTrigger({ config: { everyMinutes: 5 }, appScope: ['notes'] }));
-  const runner = createTriggerRunner({ dataDir, triggers, runTurn, harness, harnessName: 'fake', cwd, now: () => Date.now(), log: () => {} });
+  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, appScope: ['notes'] }), harness: recordingHarness(calls) });
 
   await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
-  expect(calls[0].allowedTools).toEqual(['notes']);
+  // A name in --allowedTools is pre-allowed by the CLI and never reaches
+  // can_use_tool, so it would skip the approval handler this whole layer is
+  // built on (adversarial review Tag 3, Grok P0 / Codex F1).
+  expect(calls[0].allowedTools).toEqual([]);
+});
+
+test('a trigger turn never passes --allowedTools to the real CLI argv, whatever its appScope says', async () => {
+  const calls = [];
+  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, appScope: ['notes'] }), harness: recordingHarness(calls) });
+  await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+
+  // The runner's contract is only half the guarantee — this is the other
+  // half: claude-code.mjs turns exactly this options object into argv.
+  const args = buildArgs({
+    sessionId: null,
+    mcpConfigPath: '/tmp/mcp.json',
+    permissionMode: 'default',
+    allowedTools: calls[0].allowedTools,
+    settingsPath: '/tmp/settings.json',
+    hasApprovalHandler: true,
+  });
+  expect(args).not.toContain('--allowedTools');
+  expect(args).toContain('--permission-prompt-tool');
 });
 
 // ------------------------------------------------------------- notify policy decider
@@ -464,6 +507,44 @@ test('notify: the underscore-normalized tool name a real CLI reports is allowed 
   const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
   expect(result.fired).toBe(true);
   expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
+test('notify: a tool whose NAMESPACE looks in-scope but whose owning app is not is denied — ownership comes from the manifest', async () => {
+  // App "evil" declaring `notes.exfiltrate` must not inherit what `notes` was
+  // granted (adversarial review Tag 3, Codex F1). The resolver here answers
+  // like the server's does: from the loaded manifests.
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__notes_exfiltrate', input: {} } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+    resolveToolApp: (toolId) => (toolId === 'notes.exfiltrate' ? 'evil' : resolveTestToolApp(toolId)),
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'deny', message: 'not permitted for notify trigger' });
+});
+
+test('notify: a tool no app owns (unknown, or contested between two apps) is denied rather than guessed at', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__notes_write', input: {} } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+    resolveToolApp: () => null, // exactly what resolveToolOwnership returns for a contested id
+  });
+
+  await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(harness.approvalLog[0].decision.behavior).toBe('deny');
 });
 
 test('notify: an underscore-normalized tool for an app NOT in appScope stays denied', async () => {
@@ -895,9 +976,25 @@ test('file-watch: a watched single file REPLACED by a rename (how editors save) 
   runner.stop();
 });
 
-/** Writes triggers.json directly, bypassing validateTrigger() — the same route a hand edit takes (readTriggersFile() deliberately does not re-validate). */
-function writeRawTriggersFile(triggers) {
-  fs.writeFileSync(path.join(dataDir, 'triggers.json'), JSON.stringify({ version: 1, triggers }, null, 2), 'utf8');
+/**
+ * A registry that hands out a trigger object the real one could never store.
+ * openTriggers() normalizes every entry on load (see registry.mjs), so a
+ * malformed config no longer reaches the runner through the FILE — this stub
+ * is how the runner's own defensive checks stay tested anyway. They are the
+ * second line of defense, for any registry instance that is not the
+ * file-backed one.
+ */
+function stubTriggers(trigger) {
+  const state = { ...trigger };
+  return {
+    list: () => [{ ...state }],
+    get: (id) => (id === state.id ? { ...state } : null),
+    setEnabled: (id, enabled) => {
+      if (id !== state.id) return null;
+      state.enabled = !!enabled;
+      return { ...state };
+    },
+  };
 }
 
 /**
@@ -1012,7 +1109,7 @@ test('file-watch: a healthy watcher survives many ticks — writing inside the w
   runner.stop();
 });
 
-test('file-watch: a hand-edited triggers.json without config.events disables that trigger instead of killing the process', async () => {
+test('file-watch: a trigger whose config.events is missing disables itself instead of killing the process', async () => {
   vi.useFakeTimers();
   makeInbox('a.md');
   const logMessages = [];
@@ -1020,9 +1117,8 @@ test('file-watch: a hand-edited triggers.json without config.events disables tha
 
   const broken = fileWatchTrigger({ escalation: 'notify', approvalRequired: false, limits: { maxRunsPerDay: 24, maxCostPerDay: 1 } });
   delete broken.config.events; // the field the listener needs and never gets
-  writeRawTriggersFile([broken]);
 
-  const triggers = openTriggers(dataDir);
+  const triggers = stubTriggers(broken);
   expect(triggers.get('watch-1').config.events).toBeUndefined();
   const runner = createTriggerRunner({
     dataDir,
@@ -1148,22 +1244,16 @@ test('clipboard: the pattern runs against a bounded PREFIX of the clipboard, not
   runner.stop();
 });
 
-test('clipboard: a hand-edited pollMs disables the trigger instead of busy-looping', () => {
+test('clipboard: an unusable pollMs disables the trigger instead of busy-looping', () => {
   vi.useFakeTimers();
   const logMessages = [];
   const reader = createFakeClipboardReader('https://example.test/a');
-  const triggers = openTriggers(dataDir);
-  triggers.upsert(clipboardTrigger());
-  // Straight to disk, past validation — the same route a hand edit takes.
-  const triggersPath = path.join(dataDir, 'triggers.json');
-  const raw = JSON.parse(fs.readFileSync(triggersPath, 'utf8'));
-  raw.triggers[0].config.pollMs = 'fast';
-  fs.writeFileSync(triggersPath, JSON.stringify(raw), 'utf8');
-
-  const reopened = openTriggers(dataDir);
+  const broken = clipboardTrigger({ escalation: 'notify', approvalRequired: false, limits: { maxRunsPerDay: 24, maxCostPerDay: 1 } });
+  broken.config.pollMs = 'fast'; // setInterval() with this would fire every millisecond
+  const triggers = stubTriggers(broken);
   const runner = createTriggerRunner({
     dataDir,
-    triggers: reopened,
+    triggers,
     runTurn,
     harness: createFakeHarness({ script: textResultScript('ok') }),
     harnessName: 'fake',
@@ -1175,7 +1265,7 @@ test('clipboard: a hand-edited pollMs disables the trigger instead of busy-loopi
   });
   runner.start();
 
-  expect(reopened.get('clip-1').enabled).toBe(false);
+  expect(triggers.get('clip-1').enabled).toBe(false);
   expect(logMessages.some((m) => m.includes('DISABLED itself') && m.includes('config.pollMs'))).toBe(true);
   expect(reader.reads).toBe(0);
   runner.stop();
@@ -1460,4 +1550,182 @@ test('a file-watch trigger enabled AFTER start() gets its watcher on the next ti
   await vi.advanceTimersByTimeAsync(1000);
   expect(watchFactory.last().closed).toBe(true);
   runner.stop();
+});
+
+// ------------------------------------------------------------- caps: post-check, global ceiling, cross-process claims
+
+test('cost cap: crossing it during a turn is reported right after that turn, and the next fire is refused', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const logMessages = [];
+  // One turn costing more than the whole cap: the preflight said yes at
+  // $0.00, and the turn itself put the day over the line.
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 1.2, usage: {}, isError: false },
+  ];
+  const { runner } = makeRunner({
+    trigger: savedPromptTrigger({ limits: { maxRunsPerDay: 50, maxCostPerDay: 1.0 } }),
+    script,
+    now: () => fixedNow,
+    log: (m) => logMessages.push(m),
+  });
+
+  const first = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(first.fired).toBe(true);
+  expect(logMessages.some((m) => m.includes('cap reached after this turn') && m.includes('daily cost limit'))).toBe(true);
+
+  const second = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(second.fired).toBe(false);
+  expect(second.reason).toMatch(/daily cost limit/);
+});
+
+test('limitStatus reports the blocking reason a UI can show, and null while the trigger is free to run', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner, triggers } = makeRunner({ trigger: savedPromptTrigger({ limits: { maxRunsPerDay: 1, maxCostPerDay: 5 } }), now: () => fixedNow });
+  expect(runner.limitStatus(triggers.get('saved-1')).blockedReason).toBeNull();
+
+  appendRun(dataDir, { ts: new Date(fixedNow).toISOString(), triggerId: 'saved-1', origin: 'trigger', costUsd: 0 });
+  const status = runner.limitStatus(triggers.get('saved-1'));
+  expect(status.blockedReason).toMatch(/daily run limit/);
+  expect(status.runsToday).toBe(1);
+});
+
+test('limitStatus reports an unknown-cost day as estimated, so a UI never presents a guess as a measurement', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner, triggers } = makeRunner({ trigger: savedPromptTrigger(), now: () => fixedNow });
+  appendRun(dataDir, { ts: new Date(fixedNow).toISOString(), triggerId: 'saved-1', origin: 'trigger', costUsd: null });
+
+  const status = runner.limitStatus(triggers.get('saved-1'));
+  expect(status.costEstimated).toBe(true);
+  expect(status.costToday).toBeGreaterThan(0);
+});
+
+test('global cap: the hourly ceiling stops EVERY trigger, not just the one that reached it', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner, triggers } = makeRunner({ trigger: savedPromptTrigger({ limits: { maxRunsPerDay: 500, maxCostPerDay: 50 } }), now: () => fixedNow });
+  // Turns of a DIFFERENT trigger fill the shared hourly ceiling.
+  for (let i = 0; i < MAX_TRIGGER_TURNS_PER_HOUR; i += 1) {
+    appendRun(dataDir, { ts: new Date(fixedNow - 60_000).toISOString(), triggerId: 'somebody-else', origin: 'trigger', costUsd: 0 });
+  }
+
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/global trigger cap reached/);
+  expect(runner.limitStatus(triggers.get('saved-1')).blockedReason).toMatch(/global trigger cap/);
+});
+
+test('global cap: a user own chat turns never push a trigger over it', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner } = makeRunner({ trigger: savedPromptTrigger(), now: () => fixedNow });
+  for (let i = 0; i < MAX_TRIGGER_TURNS_PER_HOUR + 5; i += 1) {
+    appendRun(dataDir, { ts: new Date(fixedNow - 60_000).toISOString(), triggerId: null, origin: 'user', costUsd: 0 });
+  }
+
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+});
+
+test('global cap: an A->B->A file-watch chain runs out at the hourly ceiling instead of all night', async () => {
+  vi.useFakeTimers();
+  fs.mkdirSync(path.join(cwd, 'dir-a'), { recursive: true });
+  fs.mkdirSync(path.join(cwd, 'dir-b'), { recursive: true });
+  const logMessages = [];
+  const watchFactory = createFakeWatchFactory();
+  const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  triggers.upsert(fileWatchTrigger({ id: 'watch-a', config: { path: 'dir-a', debounceMs: 100 } }));
+  triggers.upsert(fileWatchTrigger({ id: 'watch-b', config: { path: 'dir-b', debounceMs: 100 } }));
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness: createFakeHarness({ script: textResultScript('ok') }),
+    harnessName: 'fake',
+    cwd,
+    now: () => Date.now(),
+    log: (m) => logMessages.push(m),
+    createWatcher: watchFactory,
+    resolveToolApp: resolveTestToolApp,
+  });
+  runner.start();
+
+  const [watcherA, watcherB] = watchFactory.watchers;
+  // Each turn "writes" into the other trigger's directory — the loop nothing
+  // else catches: neither trigger ever exceeds its OWN cap.
+  for (let round = 0; round < MAX_TRIGGER_TURNS_PER_HOUR + 10; round += 1) {
+    const watcher = round % 2 === 0 ? watcherA : watcherB;
+    watcher.emitChange('change', `round-${round}.md`);
+    await vi.advanceTimersByTimeAsync(200);
+    await flushMicrotasks(30);
+  }
+
+  const chats = openChats(dataDir).list();
+  expect(chats.length).toBe(MAX_TRIGGER_TURNS_PER_HOUR);
+  expect(logMessages.some((m) => m.includes('global trigger cap reached'))).toBe(true);
+  runner.stop();
+});
+
+/** A second runner on the SAME dataDir — the "two kaprek processes" case, minus the process. */
+function secondRunnerOn(triggers, extra = {}) {
+  return createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness: createFakeHarness({ script: textResultScript('ok') }),
+    harnessName: 'fake',
+    cwd,
+    now: () => Date.now(),
+    log: () => {},
+    resolveToolApp: resolveTestToolApp,
+    ...extra,
+  });
+}
+
+test('two runners on one dataDir fire the same heartbeat window only ONCE (cross-process claim)', async () => {
+  fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- check the thing', 'utf8');
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const triggersA = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  triggersA.upsert(heartbeatTrigger({ config: { intervalMinutes: 30 } }));
+  const triggersB = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+
+  const runnerA = secondRunnerOn(triggersA, { now: () => fixedNow });
+  const runnerB = secondRunnerOn(triggersB, { now: () => fixedNow });
+
+  // Both processes' ticks conclude the same window is due — only one may run.
+  const [a, b] = await Promise.all([
+    runnerA.fireTrigger('heartbeat-1', { cause: { origin: 'heartbeat' } }),
+    runnerB.fireTrigger('heartbeat-1', { cause: { origin: 'heartbeat' } }),
+  ]);
+  expect([a.fired, b.fired].filter(Boolean)).toHaveLength(1);
+  expect([a, b].find((r) => !r.fired).reason).toMatch(/heartbeat window already claimed/);
+  expect(openChats(dataDir).list()).toHaveLength(1);
+});
+
+test('a manual heartbeat fire takes no claim — "run now" still works in a window the tick already used', async () => {
+  fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- check the thing', 'utf8');
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const { runner } = makeRunner({ trigger: heartbeatTrigger({ config: { intervalMinutes: 30 } }), now: () => fixedNow });
+
+  const fromTick = await runner.fireTrigger('heartbeat-1', { cause: { origin: 'heartbeat' } });
+  expect(fromTick.fired).toBe(true);
+  const manual = await runner.fireTrigger('heartbeat-1', { cause: { origin: 'user' } });
+  expect(manual.fired).toBe(true);
+});
+
+test('two runners on one dataDir fire the same file-watch debounce window only ONCE', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  makeInbox('a.md');
+  const triggersA = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  triggersA.upsert(fileWatchTrigger({ config: { path: 'inbox', debounceMs: 500 } }));
+  const triggersB = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+
+  const runnerA = secondRunnerOn(triggersA, { now: () => fixedNow });
+  const runnerB = secondRunnerOn(triggersB, { now: () => fixedNow });
+
+  // Both watchers saw the same save inside the same debounce window.
+  const cause = { origin: 'file-watch', files: ['inbox/a.md'], windowStartedAt: fixedNow };
+  const [a, b] = await Promise.all([runnerA.fireTrigger('watch-1', { cause }), runnerB.fireTrigger('watch-1', { cause })]);
+
+  expect([a.fired, b.fired].filter(Boolean)).toHaveLength(1);
+  expect([a, b].find((r) => !r.fired).reason).toMatch(/file-watch window already claimed/);
 });

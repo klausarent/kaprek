@@ -257,8 +257,14 @@ function normalizeApprovalRequest(requestId, request) {
  * `--permission-prompt-tool stdio` is only added when an approval handler is
  * actually configured — without one, a nonexistent `can_use_tool` channel
  * would just hang the CLI waiting for a control_response nobody sends.
+ *
+ * `--allowedTools` is only added for a NON-EMPTY list, and a tool named there
+ * is pre-allowed by the CLI: it never reaches `can_use_tool`, so no approval
+ * handler ever sees it. That is why a trigger turn passes an empty list (see
+ * src/triggers/runner.mjs) — exported so that guarantee can be asserted
+ * against the real argv builder rather than restated in a test.
  */
-function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler }) {
+export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler }) {
   const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose'];
   if (sessionId) args.push('--resume', sessionId);
   if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);

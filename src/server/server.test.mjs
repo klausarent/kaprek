@@ -13,6 +13,8 @@ import { EventEmitter } from 'node:events';
 import { startServer, createSseQueue } from './server.mjs';
 import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
+import { appendRun } from '../orchestrator/runs.mjs';
+import { MAX_TRIGGER_TURNS_PER_HOUR } from '../triggers/limits.mjs';
 import { openChats } from '../chats/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -2166,4 +2168,116 @@ test('token: it never reaches the chat store verbatim — a turn mentioning it i
   // Not just the API projection — the bytes on disk must not carry it either.
   const eventsRaw = fs.readFileSync(path.join(dataDir, 'chats', chatId, 'events.jsonl'), 'utf8');
   expect(eventsRaw).not.toContain(token);
+});
+
+// ------------------------------------------------------------- appScope is bound to installed apps
+
+/** Writes a minimal, valid app.json into a bundled-apps dir, so an appScope can legitimately name it. */
+function writeBundledApp(baseDir, id, tools = []) {
+  const appDir = path.join(baseDir, id);
+  fs.mkdirSync(appDir, { recursive: true });
+  const manifest = {
+    id,
+    version: '1.0.0',
+    name: id,
+    description: `${id} app for tests`,
+    tools: tools.map((toolId) => ({ id: toolId, description: `desc for ${toolId}`, inputSchema: { type: 'object' }, handler: 'handler.mjs' })),
+    policy: { fsWrite: false, dataEgress: false, externalAction: 'never', sensitivity: 'low' },
+  };
+  fs.writeFileSync(path.join(appDir, 'app.json'), JSON.stringify(manifest), 'utf8');
+  return appDir;
+}
+
+test('triggers: POST /api/triggers rejects an appScope naming a CLI tool instead of an installed app', async () => {
+  const bundledAppsDir = path.join(tmpDir, 'apps');
+  writeBundledApp(bundledAppsDir, 'notes', ['notes.write']);
+  const { url } = await boot({ bundledAppsDir });
+
+  const res = await postJson(`${url}/api/triggers`, everyMinutesTrigger({ appScope: ['Bash'] }));
+  expect(res.status).toBe(400);
+  const body = await res.json();
+  expect(body.field).toBe('appScope');
+  expect(body.error).toMatch(/unknown app id "Bash"/);
+
+  // Nothing was stored behind that 400.
+  expect((await (await fetch(`${url}/api/triggers`)).json()).triggers).toEqual([]);
+});
+
+test('triggers: POST /api/triggers accepts an appScope naming an app that IS installed', async () => {
+  const bundledAppsDir = path.join(tmpDir, 'apps');
+  writeBundledApp(bundledAppsDir, 'notes', ['notes.write']);
+  const { url } = await boot({ bundledAppsDir });
+
+  const res = await postJson(`${url}/api/triggers`, everyMinutesTrigger({ appScope: ['notes'] }));
+  expect(res.status).toBe(200);
+  expect((await res.json()).appScope).toEqual(['notes']);
+});
+
+test('triggers: a hand-edited triggers.json with appScope:["Bash"] loads with an EMPTY effective scope', async () => {
+  const bundledAppsDir = path.join(tmpDir, 'apps');
+  writeBundledApp(bundledAppsDir, 'notes', ['notes.write']);
+  // Straight to disk, past the API's validation — the route a hand edit takes.
+  fs.mkdirSync(dataDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dataDir, 'triggers.json'),
+    JSON.stringify({
+      version: 1,
+      triggers: [
+        {
+          ...everyMinutesTrigger({ appScope: ['Bash', 'notes'] }),
+          escalation: 'notify',
+          approvalRequired: false,
+          limits: { maxRunsPerDay: 24, maxCostPerDay: 1 },
+        },
+      ],
+    }),
+    'utf8',
+  );
+
+  const { url } = await boot({ bundledAppsDir });
+  const listed = (await (await fetch(`${url}/api/triggers`)).json()).triggers[0];
+  expect(listed.appScope).toEqual(['notes']); // "Bash" is gone, the trigger is not
+  expect(listed.enabled).toBe(true);
+});
+
+test('triggers: GET /api/triggers reports a capped trigger as blocked, with cost marked estimated', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ limits: { maxRunsPerDay: 1, maxCostPerDay: 5 } }));
+
+  const before = (await (await fetch(`${url}/api/triggers`)).json()).triggers[0];
+  expect(before.blocked).toBeNull();
+
+  // One run of unknown cost today: the run cap is now used up, and the cost
+  // shown is an estimate rather than a measured $0.
+  appendRun(dataDir, { ts: new Date().toISOString(), triggerId: 'nightly-sync', origin: 'trigger', costUsd: null });
+
+  const after = (await (await fetch(`${url}/api/triggers`)).json()).triggers[0];
+  expect(after.blocked).toMatch(/daily run limit/);
+  expect(after.runsToday).toBe(1);
+  expect(after.costEstimated).toBe(true);
+  expect(after.costToday).toBeGreaterThan(0);
+});
+
+test('triggers: the global trigger cap shows up as blocked on every trigger', async () => {
+  const { url } = await boot({});
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ limits: { maxRunsPerDay: 500, maxCostPerDay: 50 } }));
+  for (let i = 0; i < MAX_TRIGGER_TURNS_PER_HOUR; i += 1) {
+    appendRun(dataDir, { ts: new Date().toISOString(), triggerId: 'some-other-trigger', origin: 'trigger', costUsd: 0 });
+  }
+
+  const listed = (await (await fetch(`${url}/api/triggers`)).json()).triggers[0];
+  expect(listed.blocked).toMatch(/global trigger cap/);
+});
+
+test('triggers: a fire refused by the global cap streams the reason instead of starting a turn', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ limits: { maxRunsPerDay: 500, maxCostPerDay: 50 } }));
+  for (let i = 0; i < MAX_TRIGGER_TURNS_PER_HOUR; i += 1) {
+    appendRun(dataDir, { ts: new Date().toISOString(), triggerId: 'some-other-trigger', origin: 'trigger', costUsd: 0 });
+  }
+
+  const frames = await readSse(await postJson(`${url}/api/triggers/nightly-sync/fire`, {}));
+  const complete = frames.find((f) => f.type === 'trigger-complete');
+  expect(complete.fired).toBe(false);
+  expect(complete.reason).toMatch(/global trigger cap/);
 });
