@@ -720,3 +720,60 @@ test('runTurn resuming an EXISTING chatId does not change that chat\'s already-s
   expect(runs[1].origin).toBe('trigger');
   expect(runs[1].triggerId).toBe('ignored-since-chat-already-exists');
 });
+
+// ------------------------------------------------------------- onChatResolved (task 7a fix round 1)
+
+test('onChatResolved fires exactly once with the newly-created chatId, before the harness ever starts', async () => {
+  const seen = [];
+  const fakeHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  const startTurnSpy = vi.spyOn(fakeHarness, 'startTurn');
+
+  const result = await runTurn({
+    dataDir: tmpDir,
+    text: 'hello',
+    harness: fakeHarness,
+    harnessName: 'fake',
+    onChatResolved: (chatId) => seen.push(chatId),
+  });
+
+  expect(seen).toEqual([result.chatId]);
+  // Called before startTurn() was invoked — the only order that matters,
+  // since a caller uses this to bind an approval handler BEFORE the harness
+  // could possibly ask for one (see src/triggers/runner.mjs).
+  expect(startTurnSpy.mock.invocationCallOrder[0]).toBeGreaterThan(0);
+});
+
+test('onChatResolved fires with the EXISTING chatId when resuming a chat, not a new one', async () => {
+  const firstHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  const first = await runTurn({ dataDir: tmpDir, text: 'first', harness: firstHarness, harnessName: 'fake' });
+
+  const seen = [];
+  const secondHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  await runTurn({
+    dataDir: tmpDir,
+    chatId: first.chatId,
+    text: 'second',
+    harness: secondHarness,
+    harnessName: 'fake',
+    onChatResolved: (chatId) => seen.push(chatId),
+  });
+
+  expect(seen).toEqual([first.chatId]);
+});
+
+test('onChatResolved is never called for a caller-supplied chatId that does not exist (the turn throws first)', async () => {
+  const fakeHarness = createFakeHarness({ script: [{ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false }] });
+  const seen = [];
+
+  await expect(
+    runTurn({
+      dataDir: tmpDir,
+      chatId: '00000000-0000-0000-0000-000000000000',
+      text: 'hi',
+      harness: fakeHarness,
+      harnessName: 'fake',
+      onChatResolved: (chatId) => seen.push(chatId),
+    }),
+  ).rejects.toThrow();
+  expect(seen).toEqual([]);
+});

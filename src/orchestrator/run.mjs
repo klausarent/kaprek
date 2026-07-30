@@ -190,6 +190,14 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  * @param {boolean} [options.silent] - initial value of a newly created
  *   chat's `silent` flag (see src/chats/store.mjs::createChat) — ignored
  *   when resuming an existing chatId, since that chat already has one
+ * @param {(chatId: string) => void} [options.onChatResolved] - called ONCE,
+ *   synchronously, the moment chatId is known (created or resumed) — always
+ *   before `harness.startTurn()` runs, so before any approval request could
+ *   possibly fire. Lets a caller that didn't supply `chatId` itself (e.g.
+ *   src/triggers/runner.mjs, which lets THIS function auto-create the chat)
+ *   still learn the id early enough to bind a chatId-scoped approval handler
+ *   or stream a bootstrap SSE frame, without needing to pre-create the chat
+ *   itself and duplicate this function's own title/origin/triggerId/silent logic.
  * @returns {Promise<{chatId: string, cliSessionId: string|null, costUsd: number|null, stopReason: string, error: {message:string}|null}>}
  */
 export async function runTurn({
@@ -210,6 +218,7 @@ export async function runTurn({
   origin = 'user',
   triggerId = null,
   silent = false,
+  onChatResolved,
 } = {}) {
   const chats = openChats(dataDir);
   const startedAt = Date.now();
@@ -228,6 +237,10 @@ export async function runTurn({
   // (parse.mjs::truncateEvent() treats 'user' identically to 'assistant'/
   // 'thinking' — a pasted secret in the user's own prompt is still a secret).
   chats.appendEvent(effectiveChatId, { kind: 'user', text: sanitizeText(text, maxTextLen, redact) });
+  // Fired only once the chat is confirmed to exist (the appendEvent() above
+  // would have thrown ChatNotFoundError for a bad caller-supplied chatId
+  // otherwise) — see the onChatResolved param doc comment above.
+  onChatResolved?.(effectiveChatId);
 
   const priorMeta = readHarnessMeta(dataDir, effectiveChatId);
   const priorSessionId = priorMeta?.cliSessionId ?? undefined;
