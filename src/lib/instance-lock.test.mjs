@@ -107,12 +107,14 @@ async function isBindable(target) {
  * There is no fallback port any more, so a busy machine (or an OS-reserved
  * block) would otherwise make a test fail for a reason it is not about.
  */
-async function tmpDataDirWithFreePort() {
+async function tmpDataDirWithFreePort(count = 1) {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     const dir = await tmpDataDir();
-    if (await isBindable({ port: lockPortFor(dir) })) return dir;
+    const base = lockPortFor(dir);
+    const ports = Array.from({ length: count }, (_, i) => ({ port: base + i }));
+    if ((await Promise.all(ports.map(isBindable))).every(Boolean)) return dir;
   }
-  throw new Error('could not find a temp data dir with a free derived port');
+  throw new Error('could not find a temp data dir with free derived ports');
 }
 
 /** Binds a server that is NOT kaprek, to stand in for whatever else may hold the address. */
@@ -383,10 +385,9 @@ for (const transport of TRANSPORTS) {
     // with one that is still answering.
     await new Promise((resolve) => setTimeout(resolve, 200));
     await expect(acquire(dataDir, { port: 4612, platform })).rejects.toThrow(/Refusing to start/);
-    if (transport === TCP) {
-      // And it did not quietly settle one port over.
-      expect(await isBindable({ port: message.lockPort + 1 })).toBe(true);
-    }
+    expect(message.lockAddress).toBe(
+      transport === PIPE ? lockPipePathFor(dataDir) : `127.0.0.1:${lockPortFor(dataDir)}`,
+    );
   });
 
   test(on('two different dataDirs do not block each other'), async () => {
@@ -436,18 +437,27 @@ for (const transport of TRANSPORTS) {
     await expect(acquire(dataDir, { port: 4712, platform })).rejects.toBeInstanceOf(InstanceLockHeldError);
   });
 
-  test(on('a refused start leaves the address free for whoever should have it'), async () => {
+  /**
+   * This used to assert "and the refusing process leaves the address free",
+   * with an isBindable() check after closing the squatter. A mutant with the
+   * catch-path `shutdownServer()` removed passed it: the squatter holds the
+   * address for the whole acquire, so tryListen() fails every round and the
+   * acquirer never binds anything — the check only observed the squatter
+   * closing cleanly.
+   *
+   * That is not a fixable test but a property of the code: every refusal in
+   * claim() throws with a server that provably never bound, so the cleanup in
+   * the catch is a no-op today and nothing reachable through the public API
+   * can distinguish its presence from its absence. It stays as a guard for
+   * future paths that DO bind before refusing (the walk had one). Written
+   * down here rather than dressed up as coverage, the same way cli.test.mjs
+   * admits what its re-acquire cannot show after a process exit.
+   */
+  test(on('an occupied address refuses the start on every transport'), async () => {
     const dataDir = await tmpDataDir();
     const target = transport === PIPE ? lockPipePathFor(dataDir) : { port: lockPortFor(dataDir) };
-    const squatter = await listenForeign(target, () => {});
+    await listenForeign(target, () => {});
     await expect(acquire(dataDir, { port: 4711, platform })).rejects.toThrow(/Refusing to start/);
-
-    // In the CLI the process exit hides this, but a library caller (or a test
-    // like this one) would be left with the refusing process holding the very
-    // address it just said it could not have.
-    servers = servers.filter((s) => s !== squatter);
-    await closeServer(squatter);
-    expect(await isBindable(target)).toBe(true);
   });
 }
 
@@ -456,14 +466,17 @@ for (const transport of TRANSPORTS) {
 // every answer other than "our own instance" ends the start.
 // ---------------------------------------------------------------------------
 
-test('the probe talks to the same IP stack the holder bound, not to whatever answers on ::1', async () => {
+test('the probe talks to the same IP stack the holder bound, not to whatever answers on ::1', async (ctx) => {
   const dataDir = await tmpDataDirWithFreePort();
   const port = lockPortFor(dataDir);
   let ipv6;
   try {
     ipv6 = await listenForeign({ port, host: '::1' }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n'));
   } catch {
-    return; // no IPv6 loopback on this machine, nothing to prove
+    // ctx.skip(), not a quiet return: a test that reports itself green
+    // without having run is how a mechanism loses its cover unnoticed.
+    ctx.skip();
+    return;
   }
   expect(ipv6.address().address).toBe('::1');
 
@@ -480,7 +493,12 @@ test('the probe talks to the same IP stack the holder bound, not to whatever ans
 });
 
 test('a greeting naming another data dir ends the start, it does not move the lock', async () => {
-  const dataDir = await tmpDataDirWithFreePort();
+  // The one test that reserves the neighbouring port too, because it is the
+  // one that would notice a fallback walk coming back. The other refusal
+  // tests dropped that assertion: it defends against a mechanism that no
+  // longer exists, and it goes red for the wrong reason whenever some local
+  // service happens to hold base+1.
+  const dataDir = await tmpDataDirWithFreePort(2);
   const port = lockPortFor(dataDir);
   // Two data dir paths deriving one port used to send this start to port+1.
   // That fallback is what the two-holder races lived in, so a hash collision
@@ -495,7 +513,6 @@ test('a service that says something other than a greeting ends the start', async
   const port = lockPortFor(dataDir);
   await listenForeign({ port }, (socket) => socket.end('HTTP/1.1 200 OK\r\n\r\n<html>hi</html>'));
   await expect(acquire(dataDir, { port: 4711 })).rejects.toThrow(/not kaprek answers there/);
-  expect(await isBindable({ port: port + 1 })).toBe(true);
 });
 
 test('a peer that will not stop talking is a service too', async () => {
@@ -546,6 +563,15 @@ test('a squatter that goes away mid-question does not cost the start', async () 
   // Frees the address while the first round is still asking. The retry
   // re-runs listen(), so "the holder shut down while we were asking" ends in
   // a successful bind instead of a refusal on a free address.
+  //
+  // What this does NOT show, despite being the obvious place to look for it:
+  // that REFUSED has a retry budget separate from the silent one. Here the
+  // squatter is simply gone by round 2, which one shared budget would survive
+  // just as well. Hitting the REFUSED branch on purpose means closing the
+  // address in the window between one round's failed listen() and that same
+  // round's probe — a window this test cannot address, since nothing outside
+  // acquire() can observe where it is. The separation is therefore argued at
+  // the code (see claim()) and untested; the report says so.
   setTimeout(() => {
     servers = servers.filter((s) => s !== squatter);
     squatter.close();
@@ -553,6 +579,17 @@ test('a squatter that goes away mid-question does not cost the start', async () 
   const lock = await acquire(dataDir, { port: 4711 });
   expect(lock.lockPort).toBe(port);
 });
+
+// There is no test for the second `released` check in updatePort() (the one
+// after the await, which removes a lock file a late write resurrected). The
+// obvious candidate — start updatePort(), do not await it, run release(),
+// then assert no file — was written and then thrown away: a mutant with that
+// check deleted passed it eight times out of eight, because release()'s
+// unlink reliably lands after the in-flight write on this platform. Making it
+// discriminate would need control over when the write completes, which
+// nothing outside the module has. The check stays as one line of tidiness for
+// a file that decides nothing; claiming coverage for it would be the same
+// mistake as the refusal test above.
 
 test.skipIf(process.platform !== 'win32')(
   'the pipe transport refuses the same way, with no second name to try',
@@ -615,6 +652,21 @@ test('the derived port stays inside the documented range, clear of both ephemera
   }
 });
 
+test('the same directory name in NFD and NFC spelling derives one lock', async () => {
+  // Runs on every platform, deliberately on a path that does NOT exist: the
+  // ENOENT fallback in normalizeDataDir skips realpath, so what is left under
+  // test is the NFC pass alone. macOS hands out NFD-encoded paths, and
+  // without that pass the same directory would derive two locks there —
+  // where none of this is ever exercised. Deleting `.normalize('NFC')` turns
+  // this red anywhere.
+  const base = path.join(os.tmpdir(), `kaprek-nfc-${process.pid}-ä-ö-does-not-exist`);
+  const nfd = base.normalize('NFD');
+  const nfc = base.normalize('NFC');
+  expect(nfd).not.toBe(nfc);
+  expect(lockPortFor(nfd)).toBe(lockPortFor(nfc));
+  expect(lockPipePathFor(nfd)).toBe(lockPipePathFor(nfc));
+});
+
 test('the pipe name carries the hash, not the path', async () => {
   const dataDir = await tmpDataDir();
   const name = lockPipePathFor(dataDir);
@@ -627,13 +679,14 @@ test('the pipe name carries the hash, not the path', async () => {
 
 test.skipIf(process.platform !== 'win32')(
   'a junction to the same directory derives the same lock and blocks it',
-  async () => {
+  async (ctx) => {
     const dataDir = await tmpDataDir();
     const link = path.join(await tmpDataDir(), 'link');
     try {
       execFileSync('cmd', ['/c', 'mklink', '/J', link, dataDir], { stdio: 'ignore' });
     } catch {
-      return; // junctions not creatable here, nothing to prove
+      ctx.skip(); // junctions not creatable here — visible, not silently green
+      return;
     }
     // Two names for one physical directory used to derive two locks and let
     // both start — a launcher shortcut using the short name is enough.
@@ -679,11 +732,13 @@ async function reservedRange() {
   return undefined;
 }
 
-test('a lock port the OS has reserved is refused with that as the reason', async () => {
+test('a lock port the OS has reserved is refused with that as the reason', async (ctx) => {
   const range = await reservedRange();
   if (!range) {
     // No reserved range inside 23000-31999 on this machine (the range was
-    // chosen partly to avoid them), so there is nothing to exercise here.
+    // chosen partly to avoid them). Reported as a skip so the gap is visible
+    // in the run instead of counting as a pass.
+    ctx.skip();
     return;
   }
   const parent = await tmpDataDir();

@@ -139,6 +139,14 @@ test('the instance lock only ever talks to 127.0.0.1', () => {
   const hosts = [...content.matchAll(/\bhost:\s*([^,\s}]+)/g)].map((match) => match[1]);
   expect(hosts.length).toBeGreaterThan(0);
   expect([...new Set(hosts)]).toEqual(['LOCK_HOST']);
+
+  // Both pins, separately. The set check above survives losing either one as
+  // long as the other remains — and losing the probe's pin is exactly the
+  // defect this file is here to prevent. The behavioural proof lives in
+  // instance-lock.test.mjs ("the probe talks to the same IP stack the holder
+  // bound"); these two lines make the static guard fail for the same reason.
+  expect(content).toMatch(/net\.connect\([^;]*host:\s*LOCK_HOST/);
+  expect(content).toMatch(/\.listen\([^;]*host:\s*LOCK_HOST/);
 });
 
 test('root package.json declares no runtime dependencies', () => {

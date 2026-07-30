@@ -262,6 +262,13 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  *
  * Callers must not route silence through here — "no bytes at all" proves
  * nothing and stays SILENT.
+ *
+ * `kaprek: 1` is a protocol version, and versions meet across upgrades: while
+ * one is installed over another, a running holder can be older than the
+ * starter asking. A future bump must therefore EXTEND this greeting rather
+ * than replace the field — a v1 starter facing a `kaprek: 2` holder would
+ * land in SPOKEN here and refuse with "a program that is not kaprek", which
+ * is fail-closed but a lie. Keep `kaprek: 1` and add alongside it.
  */
 function classifySpokenData(raw, dataDirHash) {
   let parsed;
@@ -415,6 +422,10 @@ export async function acquireInstanceLock({
   async function claim() {
     let silentRounds = 0;
     let refusedRounds = 0;
+    // Remembered across rounds, not read off the last one: the rounds can
+    // disagree. Two EPERM answers followed by a plain timeout would otherwise
+    // print the generic message and drop the one detail that explains it.
+    let sawAccessDenied = false;
 
     while (refusedRounds < GREETING_ATTEMPTS) {
       const failure = await tryListen(server, target);
@@ -446,9 +457,10 @@ export async function acquireInstanceLock({
       }
 
       silentRounds += 1;
+      if (answer.code === 'EPERM' || answer.code === 'EACCES') sawAccessDenied = true;
       if (silentRounds >= GREETING_ATTEMPTS) {
         throw refuse(
-          answer.code === 'EPERM' || answer.code === 'EACCES'
+          sawAccessDenied
             ? 'something holds it that this user account may not talk to — most likely another account ' +
               'on this machine running kaprek against the same data directory.'
             : `something holds it that did not answer in ${GREETING_ATTEMPTS} attempts. That is what a ` +
@@ -507,6 +519,12 @@ export async function acquireInstanceLock({
       if (released) return;
       currentPort = newPort;
       await writeLockFile();
+      // Checked again on the far side of the await: release() can run to
+      // completion while that write is in flight, and its unlink then happens
+      // before our write lands. The file would come back as a corpse naming a
+      // pid that has stopped holding anything. It decides nothing either way
+      // (see the module header), so this is tidiness, not safety.
+      if (released) await fs.unlink(lockPath).catch(() => {});
     },
 
     async release() {
