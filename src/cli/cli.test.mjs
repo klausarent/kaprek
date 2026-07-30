@@ -8,6 +8,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { getPackageName } from '../lib/appdir.mjs';
+import { acquireInstanceLock } from '../lib/instance-lock.mjs';
 import { ensureInstanceToken, TOKEN_HEADER } from '../server/token.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -138,7 +139,7 @@ test('a second start on the same dataDir refuses instead of silently falling bac
   first.kill();
 });
 
-test('a failed startServer() releases the instance lock instead of leaving it stuck for LOCK_STALE_MS', async () => {
+test('a failed startServer() releases the instance lock instead of leaving the port claimed', async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-test-'));
   const port = 20000 + Math.floor(Math.random() * 20000);
 
@@ -163,6 +164,13 @@ test('a failed startServer() releases the instance lock instead of leaving it st
 
     const lockPath = path.join(childDataDir, 'instance.lock');
     expect(fs.existsSync(lockPath)).toBe(false);
+
+    // What actually holds the lock is the socket, not that file (see
+    // src/lib/instance-lock.mjs), so the file being gone proves nothing on
+    // its own: the next acquire has to go through, or a failed start blocks
+    // every retry with nothing running.
+    const relock = await acquireInstanceLock({ dataDir: childDataDir });
+    await relock.release();
   } finally {
     await Promise.all(blockers.map((blocker) => new Promise((resolve) => blocker.close(resolve))));
   }
