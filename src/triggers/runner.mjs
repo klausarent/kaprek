@@ -13,10 +13,61 @@ import path from 'node:path';
 import { openChats } from '../chats/store.mjs';
 import { readFile as readWorkspaceFile } from '../workspace/fs.mjs';
 import { readRuns } from '../orchestrator/runs.mjs';
+import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
 import { checkLimits } from './limits.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const HEARTBEAT_OK_MARKER = 'heartbeat_ok';
+
+// Claude Code's documented convention for an MCP-provided tool's qualified
+// name is `mcp__<server-name>__<tool-name>` (see mcp-config.mjs's
+// `mcpServers` key, the same 'kaprek-apps' as MCP_SERVER_NAME here). A
+// kaprek app's own tool id is itself "<app-id>.<action>" (see
+// manifest.mjs's TOOL_ID_RE), so the app id a qualified tool name belongs
+// to is the FIRST dot-segment after stripping this prefix.
+const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`;
+
+/**
+ * Extracts the app id a qualified kaprek-apps MCP tool name belongs to, or
+ * null if `toolName` isn't one of ours at all (e.g. a built-in CLI tool
+ * like Bash/Write/WebFetch, or an MCP tool from some other server).
+ *
+ * NOT verified against a live CLI run — see task-7a-review.md's "cannot
+ * verify from diff" note on the exact qualified-name format a real `claude`
+ * process reports. That is a deliberate, safe direction to be wrong in: if
+ * this assumption is off, notifyPolicyHandler() below denies MORE than it
+ * should (every tool call fails to match and gets denied), never less —
+ * fail-closed either way, just possibly over-strict until verified live.
+ */
+function appIdForMcpTool(toolName) {
+  if (typeof toolName !== 'string' || !toolName.startsWith(MCP_TOOL_PREFIX)) return null;
+  const toolId = toolName.slice(MCP_TOOL_PREFIX.length);
+  const dotIndex = toolId.indexOf('.');
+  return dotIndex > 0 ? toolId.slice(0, dotIndex) : null;
+}
+
+/**
+ * The `escalation:'notify'` approval handler — a pure policy decision, no
+ * human, no SSE, no timeout: allows ONLY a kaprek-apps MCP tool call whose
+ * app id is in `trigger.appScope`; denies literally everything else (Bash,
+ * Write, Edit, WebFetch, a Read outside the scoped apps, an MCP tool from an
+ * app NOT in scope, ...). This is what makes "kein Trigger erzeugt
+ * Außenwirkung ohne Freigabe" true for the DEFAULT escalation level by
+ * kaprek's own code, instead of depending on whatever the underlying CLI
+ * happens to do when no `--permission-prompt-tool` is wired at all (see
+ * task-7a-review.md Critical #2) — this handler is ALWAYS passed to
+ * runTurn() for a 'notify' trigger, so `--permission-prompt-tool stdio` is
+ * always active for one (see claude-code.mjs::buildArgs()).
+ */
+function notifyPolicyHandler(trigger) {
+  return async (request) => {
+    const appId = appIdForMcpTool(request.toolName);
+    if (appId !== null && trigger.appScope.includes(appId)) {
+      return { behavior: 'allow' };
+    }
+    return { behavior: 'deny', message: 'not permitted for notify trigger' };
+  };
+}
 
 function pad2(n) {
   return String(n).padStart(2, '0');
@@ -86,13 +137,19 @@ function buildPrompt(trigger, { reason, checklist }) {
  * @param {() => number} [options.now] - injectable clock (default Date.now); tests never sleep
  * @param {(message: string) => void} [options.log] - every accept/reject decision is logged through this (default console.log)
  * @param {number} [options.tickMs] - setInterval period for start() (default 60_000)
- * @param {(request: import('../harness/adapter.mjs').ApprovalRequest) => Promise<import('../harness/adapter.mjs').ApprovalDecision>} [options.onApprovalRequest] -
- *   forwarded to runTurn() for a trigger whose `approvalRequired` is true.
- *   Omitted entirely means such a trigger never fires (fail-closed) — see
- *   fireTrigger()'s step 4. The server wires this up to the same
- *   makeApprovalHandler() a normal chat turn uses once a live UI exists for
- *   it (task 8); until then this stays undefined in production, which is
- *   itself the correct, safe default for 'question'/'review' triggers.
+ * @param {(chatId: string) => (request: import('../harness/adapter.mjs').ApprovalRequest) => Promise<import('../harness/adapter.mjs').ApprovalDecision>} [options.makeUiApprovalHandler] -
+ *   a FACTORY, not a handler — called with the trigger turn's own chatId
+ *   (known only once runTurn() resolves it, see run.mjs's onChatResolved)
+ *   to build the actual per-turn handler. Used ONLY for `escalation:
+ *   'question'|'review'` — a 'notify' trigger never needs this at all, it
+ *   always gets its own self-contained notifyPolicyHandler() instead (see
+ *   above). The server wires this to the SAME makeApprovalHandler() a
+ *   normal chat turn uses (src/server/server.mjs), so a question/review
+ *   trigger's approval surfaces over SSE if a client happens to be
+ *   streaming that chatId, and auto-denies after the same timeout
+ *   otherwise — see fireTrigger()'s escalation gate below for what happens
+ *   when this option is omitted entirely (a runner built without it, e.g.
+ *   in an isolated test).
  */
 export function createTriggerRunner({
   dataDir,
@@ -105,7 +162,7 @@ export function createTriggerRunner({
   now = Date.now,
   log = (message) => console.log(message),
   tickMs = 60_000,
-  onApprovalRequest,
+  makeUiApprovalHandler,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -176,11 +233,34 @@ export function createTriggerRunner({
   }
 
   /**
-   * fireTrigger(id, {cause}) -> {fired, reason?, chatId?, result?, silent?}.
+   * A trigger's approval-wiring status — used both by fireTrigger()'s own
+   * gate below and exposed to callers (GET /api/triggers, see
+   * server.mjs::handleTriggersList) so a 'question'/'review' trigger that
+   * structurally can never fire is visible via the API, not just a
+   * console.log line (task-7a-review.md Important #2).
+   */
+  function approvalCapability(trigger) {
+    if (trigger.escalation === 'notify') {
+      return { approvalPath: 'policy', blocked: null };
+    }
+    if (typeof makeUiApprovalHandler !== 'function') {
+      return { approvalPath: 'ui', blocked: 'no UI approval handler configured for this escalation level' };
+    }
+    return { approvalPath: 'ui', blocked: null };
+  }
+
+  /**
+   * fireTrigger(id, {cause, onEvent, onChatId}) -> {fired, reason?, chatId?, result?, silent?}.
    * See the module doc comment for the fail-closed posture; the checks
    * below run in the exact order the task brief specifies.
+   *
+   * `onEvent`/`onChatId` (both optional) are forwarded straight through to
+   * runTurn() — a caller that wants to stream a manually-fired trigger's
+   * turn live (see server.mjs's SSE fire route) gets the exact same live
+   * hooks a normal chat turn gets; a tick-driven background fire simply
+   * omits them.
    */
-  async function fireTrigger(id, { cause } = {}) {
+  async function fireTrigger(id, { cause, onEvent, onChatId } = {}) {
     // 1/2. Loop guard, part 1: a run CAUSED by a trigger must never itself
     // fire another trigger — checked before even looking the trigger up, so
     // no trigger-shape detail can influence this decision.
@@ -243,23 +323,42 @@ export function createTriggerRunner({
       reasonText = `schedule slot due: ${slot}`;
     }
 
-    // Escalation gate: 'question'/'review' REQUIRE a live approval handler.
-    // Without one the trigger does not fire at all — never "fires but
-    // auto-denies every tool call", which would just be a confusing silent
-    // failure deep inside the turn instead of a clear, logged rejection here.
-    if (trigger.approvalRequired && typeof onApprovalRequest !== 'function') {
-      const reason = 'approval required but no approval handler configured';
-      log(`trigger ${id}: rejected (${reason})`);
-      return { fired: false, reason };
+    // Escalation gate: EVERY trigger turn gets a real approval handler, no
+    // exceptions — a 'notify' trigger always has one (its own self-contained
+    // notifyPolicyHandler(), built below, needs nothing external). Only
+    // 'question'/'review' can actually be unfireable here: they need
+    // makeUiApprovalHandler wired (see approvalCapability() above); without
+    // it the trigger does not fire at all — never "fires but auto-denies
+    // every tool call", which would just be a confusing silent failure deep
+    // inside the turn instead of a clear, logged rejection here.
+    const capability = approvalCapability(trigger);
+    if (capability.blocked) {
+      log(`trigger ${id}: rejected (${capability.blocked})`);
+      return { fired: false, reason: capability.blocked };
     }
 
     // Everything past this point is synchronous up to the `await runTurn`
     // call below, so runningIds.add() here is what makes the "already
     // running" check above race-free against a second fireTrigger() call
     // issued before this one's first await (see the module doc comment).
+    // It also backs isAnyTriggerRunning() (server-level loop-guard layer 2,
+    // see server.mjs's fire route) — runningIds.size > 0 means SOME
+    // trigger-origin turn is currently in flight, not just this one.
     runningIds.add(id);
     try {
       const prompt = buildPrompt(trigger, { reason: reasonText, checklist });
+
+      // A question/review handler needs the turn's chatId in its closure
+      // (makeUiApprovalHandler(chatId) -> handler), but chatId is only
+      // known once runTurn() resolves/creates it — resolvedChatId is filled
+      // in by onChatResolved below, called synchronously BEFORE
+      // harness.startTurn() ever runs, so strictly before any approval
+      // request could possibly arrive (see run.mjs's own doc comment on
+      // onChatResolved). notifyPolicyHandler() needs none of this.
+      let resolvedChatId = null;
+      const approvalHandlerForTurn =
+        trigger.escalation === 'notify' ? notifyPolicyHandler(trigger) : (request) => makeUiApprovalHandler(resolvedChatId)(request);
+
       const result = await runTurn({
         dataDir,
         text: prompt,
@@ -268,7 +367,12 @@ export function createTriggerRunner({
         cwd,
         permissionMode,
         allowedTools: allowedToolsFor(trigger),
-        onApprovalRequest: trigger.approvalRequired ? onApprovalRequest : undefined,
+        onApprovalRequest: approvalHandlerForTurn,
+        onEvent,
+        onChatResolved: (chatId) => {
+          resolvedChatId = chatId;
+          onChatId?.(chatId);
+        },
         origin: 'trigger',
         triggerId: id,
         silent: false,
@@ -286,7 +390,15 @@ export function createTriggerRunner({
     }
   }
 
-  /** If the chat's last assistant reply is exactly HEARTBEAT_OK (trimmed, case-insensitive), hides it from the visible chat list. Returns whether it was silenced. */
+  /**
+   * A heartbeat run is only "silent" (hidden from the visible chat list by
+   * default) if BOTH hold: the final reply is exactly HEARTBEAT_OK (trimmed,
+   * case-insensitive) AND no tool ran during the turn at all. The text alone
+   * is not trustworthy — a turn that ran e.g. a WebFetch/Read and still
+   * happened to answer "HEARTBEAT_OK" did something real and must stay
+   * visible regardless of what its final reply claims (task-7a-review.md
+   * Important #1).
+   */
   function maybeSilenceHeartbeatChat(chatId) {
     const chats = openChats(dataDir);
     let events;
@@ -295,6 +407,7 @@ export function createTriggerRunner({
     } catch {
       return false; // best-effort — a lookup failure here must not fail an already-completed turn
     }
+    if (events.some((e) => e.kind === 'tool')) return false;
     const lastAssistant = [...events].reverse().find((e) => e.kind === 'assistant');
     const text = typeof lastAssistant?.text === 'string' ? lastAssistant.text.trim().toLowerCase() : null;
     if (text !== HEARTBEAT_OK_MARKER) return false;
@@ -331,5 +444,17 @@ export function createTriggerRunner({
     timer = null;
   }
 
-  return { fireTrigger, tick, start, stop };
+  /**
+   * Loop-guard layer 2 (see server.mjs's fire route doc comment for layer
+   * 1/3): true while ANY trigger-origin turn is in flight, not just a
+   * specific id. Deliberately coarse — a manual user fire briefly blocked by
+   * an unrelated already-running heartbeat is an acceptable false positive;
+   * an unnoticed trigger-A-fires-trigger-B-fires-trigger-A chain over HTTP
+   * is not.
+   */
+  function isAnyTriggerRunning() {
+    return runningIds.size > 0;
+  }
+
+  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, approvalCapability };
 }

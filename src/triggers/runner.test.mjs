@@ -60,7 +60,7 @@ function textResultScript(text, extra = {}) {
   ];
 }
 
-function makeRunner({ trigger, script, onApprovalRequest, now = () => Date.now(), log = () => {} } = {}) {
+function makeRunner({ trigger, script, makeUiApprovalHandler, now = () => Date.now(), log = () => {} } = {}) {
   const triggers = openTriggers(dataDir);
   if (trigger) triggers.upsert(trigger);
   const harness = createFakeHarness({ script: script ?? textResultScript('ok') });
@@ -73,7 +73,7 @@ function makeRunner({ trigger, script, onApprovalRequest, now = () => Date.now()
     cwd,
     now,
     log,
-    onApprovalRequest,
+    makeUiApprovalHandler,
   });
   return { runner, triggers, harness };
 }
@@ -148,6 +148,27 @@ test('heartbeat: a real answer produces a visible (non-silent) chat', async () =
   expect(chat.silent).toBe(false);
 });
 
+test('heartbeat: a tool call during the turn keeps the chat visible even when the final reply is exactly HEARTBEAT_OK', async () => {
+  fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- check backups');
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'tool-start', id: 't1', name: 'Read', input: { path: 'backups.log' } },
+    { type: 'tool-end', id: 't1', result: 'backup ran fine', isError: false },
+    { type: 'text', text: 'HEARTBEAT_OK' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner } = makeRunner({ trigger: heartbeatTrigger(), script });
+
+  const result = await runner.fireTrigger('heartbeat-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  // The reply text alone would have said "silent", but a tool actually ran
+  // during the turn — that must win (task-7a-review.md Important #1).
+  expect(result.silent).toBe(false);
+
+  const chat = openChats(dataDir).get(result.chatId);
+  expect(chat.silent).toBe(false);
+});
+
 test('heartbeat: the checklist text and reason reach the prompt via {{checklist}}/{{reason}}', async () => {
   fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- water the plants');
   const harness = createFakeHarness({ script: textResultScript('ok') });
@@ -213,18 +234,22 @@ test('schedule (everyMinutes): the NEXT window is a fresh slot and fires again',
 
 // ------------------------------------------------------------- escalation / approval gate
 
-test('escalation "review" without a configured approval handler never fires (fail-closed)', async () => {
-  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }), onApprovalRequest: undefined });
+test('escalation "review" without a configured UI approval handler factory never fires (fail-closed)', async () => {
+  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }) });
   const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
   expect(result.fired).toBe(false);
   expect(result.reason).toMatch(/approval/);
 });
 
-test('escalation "review" WITH a configured approval handler fires and the handler is consulted', async () => {
+test('escalation "review" WITH a configured UI approval handler factory fires, and the factory is called with the turn\'s own chatId', async () => {
   const decisions = [];
-  const onApprovalRequest = async (request) => {
-    decisions.push(request);
-    return { behavior: 'allow' };
+  const chatIdsSeen = [];
+  const makeUiApprovalHandler = (chatId) => {
+    chatIdsSeen.push(chatId);
+    return async (request) => {
+      decisions.push(request);
+      return { behavior: 'allow' };
+    };
   };
   const script = [
     { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
@@ -232,11 +257,36 @@ test('escalation "review" WITH a configured approval handler fires and the handl
     { type: 'text', text: 'done' },
     { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
   ];
-  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }), script, onApprovalRequest });
+  const { runner } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }), script, makeUiApprovalHandler });
 
   const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
   expect(result.fired).toBe(true);
   expect(decisions).toHaveLength(1);
+  // The factory must see the SAME chatId the turn actually resolved to —
+  // not undefined/null (see run.mjs's onChatResolved and the timing
+  // guarantee in runner.mjs's fireTrigger doc comment).
+  expect(chatIdsSeen).toEqual([result.chatId]);
+  expect(typeof result.chatId).toBe('string');
+});
+
+test('escalation "notify" never uses makeUiApprovalHandler even when one is configured — it always uses its own self-contained policy decider', async () => {
+  const makeUiApprovalHandler = () => {
+    throw new Error('should never be called for a notify trigger');
+  };
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Bash', input: { command: 'echo hi' } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script, makeUiApprovalHandler });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  // The Bash approval was auto-denied by notifyPolicyHandler (Bash isn't a
+  // scoped MCP app tool), never even reaching makeUiApprovalHandler.
+  expect(harness.approvalLog).toHaveLength(1);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'deny', message: 'not permitted for notify trigger' });
 });
 
 test('escalation "notify" fires without any approval handler configured', async () => {
@@ -270,6 +320,58 @@ test('appScope: [\'notes\'] passes exactly that list as allowedTools', async () 
 
   await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
   expect(calls[0].allowedTools).toEqual(['notes']);
+});
+
+// ------------------------------------------------------------- notify policy decider
+
+test('notify: a Bash tool-use request is automatically denied, no human/SSE involved', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'Bash', input: { command: 'echo hi' } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({ trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify' }), script });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog).toHaveLength(1);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'deny', message: 'not permitted for notify trigger' });
+});
+
+test('notify: a qualified MCP tool call for an app IN appScope is automatically allowed', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__notes.write', input: { title: 'x' } } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog).toHaveLength(1);
+  expect(harness.approvalLog[0].decision).toEqual({ behavior: 'allow' });
+});
+
+test('notify: a qualified MCP tool call for an app NOT in appScope is automatically denied', async () => {
+  const script = [
+    { type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' },
+    { approval: { toolName: 'mcp__kaprek-apps__other-app.write', input: {} } },
+    { type: 'text', text: 'done' },
+    { type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false },
+  ];
+  const { runner, harness } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'notify', appScope: ['notes'] }),
+    script,
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(true);
+  expect(harness.approvalLog[0].decision.behavior).toBe('deny');
 });
 
 // ------------------------------------------------------------- disabled / unknown / limits

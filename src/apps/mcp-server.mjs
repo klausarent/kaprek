@@ -34,7 +34,14 @@ import { readFile as wsReadFile, writeFile as wsWriteFile, listFiles as wsListFi
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 const PROTOCOL_VERSION = '2025-06-18';
-const SERVER_NAME = 'kaprek-apps';
+// Exported (not just a local const) so anything that needs to recognize a
+// tool call as belonging to THIS MCP server from the outside — e.g.
+// src/triggers/runner.mjs's notify-escalation policy decider, matching a
+// harness's qualified `mcp__<server>__<tool>` tool name — can reference the
+// single source of truth instead of duplicating the literal a third time
+// (mcp-config.mjs's `mcpServers` key is the second, unavoidable copy: it's
+// JSON, not code, so it can't import this).
+export const SERVER_NAME = 'kaprek-apps';
 
 // A hung/misbehaving handler must not hold a request (and the client
 // waiting on it) forever — see withTimeout()'s use in tools/call below.
