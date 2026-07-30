@@ -31,9 +31,17 @@ const SMOKE_TIMEOUT_MS = 30_000;
 /** Files/directories copied into the zip, relative to the repo root. Mirrors package.json's `files`, plus the two start documents generated below. */
 const INCLUDE = ['bin', 'src', 'apps', 'package.json', 'LICENSE', 'README.md', path.join('web', 'dist')];
 
-/** Never shipped: tests and their fixtures are dead weight in a release and fixtures can carry sample transcripts. */
+/**
+ * Never shipped: tests and their fixtures are dead weight in a release and
+ * fixtures can carry sample transcripts. Matches the fixtures DIRECTORY itself
+ * too, not only paths inside it — a trailing-slash-only check left three empty
+ * `fixtures/` directories in the zip.
+ */
 function isExcluded(relPath) {
-  const normalized = relPath.split(path.sep).join('/');
+  const segments = relPath.split(path.sep);
+  const name = segments[segments.length - 1];
+  if (name === 'fixtures' || name === '__pycache__') return true;
+  const normalized = segments.join('/');
   return normalized.endsWith('.test.mjs') || normalized.includes('/fixtures/') || normalized.includes('/__pycache__/');
 }
 
@@ -205,32 +213,61 @@ function stage() {
   fs.writeFileSync(path.join(STAGING_DIR, 'README-start.md'), START_README, 'utf8');
 }
 
+/**
+ * Runs a PowerShell one-liner whose paths arrive through the ENVIRONMENT, never
+ * interpolated into the `-Command` string.
+ *
+ * A path containing `'` would otherwise terminate the single-quoted string it
+ * was pasted into. Reading `$env:…` inside PowerShell sidesteps quoting
+ * entirely — the variable's value is data, never syntax.
+ */
+function powershell(command, env) {
+  return run('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+    env: { ...process.env, ...env },
+  });
+}
+
+/**
+ * PowerShell's zip cmdlets go through its PATH provider, which treats `[` and
+ * `]` as wildcard syntax. `Compress-Archive` at least has `-LiteralPath` for its
+ * source, but neither cmdlet has a literal variant for `-DestinationPath` — so a
+ * checkout (or temp dir) named `kaprek [2]` makes Expand-Archive fail to see the
+ * directory it was pointed at and try to create it, and makes Compress-Archive
+ * write to a path nobody asked for.
+ *
+ * `System.IO.Compression.ZipFile` takes plain filesystem paths with no glob
+ * layer in between. It is part of the .NET Framework that ships with Windows, so
+ * this is still the dependency-free route — just the one that treats a path as a
+ * path. The assembly load is needed for Windows PowerShell 5.1, which
+ * `powershell.exe` always is.
+ */
+const LOAD_ZIP_ASSEMBLY = 'Add-Type -AssemblyName System.IO.Compression.FileSystem;';
+
 async function zip() {
   fs.rmSync(ZIP_PATH, { force: true });
-  await run('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-Command',
-    `Compress-Archive -Path '${path.join(STAGING_DIR, '*')}' -DestinationPath '${ZIP_PATH}' -Force`,
-  ]);
-  if (!fs.existsSync(ZIP_PATH)) throw new Error('Compress-Archive reported success but produced no zip');
+  if (fs.readdirSync(STAGING_DIR).length === 0) throw new Error('staging directory is empty');
+  // CreateFromDirectory packs the directory's CONTENTS with paths relative to
+  // it, which is exactly the layout wanted: bin/, src/, start-kaprek.cmd at the
+  // zip root, no extra wrapper directory.
+  await powershell(
+    `${LOAD_ZIP_ASSEMBLY} [System.IO.Compression.ZipFile]::CreateFromDirectory($env:KAPREK_PACK_SRC, $env:KAPREK_PACK_OUT)`,
+    { KAPREK_PACK_SRC: STAGING_DIR, KAPREK_PACK_OUT: ZIP_PATH },
+  );
+  if (!fs.existsSync(ZIP_PATH)) throw new Error('zip creation reported success but produced no file');
 }
 
 async function unzipTo(target) {
   fs.mkdirSync(target, { recursive: true });
-  await run('powershell.exe', [
-    '-NoProfile',
-    '-NonInteractive',
-    '-ExecutionPolicy',
-    'Bypass',
-    '-Command',
-    `Expand-Archive -Path '${ZIP_PATH}' -DestinationPath '${target}' -Force`,
-  ]);
+  // Two arguments only: the overwrite overload is .NET Core and up, and
+  // powershell.exe is always .NET Framework. Nothing to overwrite anyway — the
+  // caller always hands over a freshly created directory.
+  await powershell(`${LOAD_ZIP_ASSEMBLY} [System.IO.Compression.ZipFile]::ExtractToDirectory($env:KAPREK_PACK_IN, $env:KAPREK_PACK_DEST)`, {
+    KAPREK_PACK_IN: ZIP_PATH,
+    KAPREK_PACK_DEST: target,
+  });
 }
 
-/** Asks the OS for a free port and releases it again. A tiny race, but the alternative is hardcoding a port a developer machine may well be using. */
+/** Asks the OS for a free port and releases it again — the starting point, not a guarantee (see waitForServerUrl()). */
 function freePort() {
   return new Promise((resolve, reject) => {
     const server = net.createServer();
@@ -242,22 +279,40 @@ function freePort() {
   });
 }
 
-function waitForServer(url, deadlineMs) {
+/**
+ * Waits for the URL the server PRINTS, rather than polling the port we asked
+ * for. freePort() releases its port before the child claims it, and
+ * bin/cli.mjs walks up to ten ports higher on EADDRINUSE — polling the original
+ * port would then fail on a healthy build. The child's own stdout is the only
+ * thing that knows where it actually landed.
+ */
+function waitForServerUrl(child, timeoutMs) {
   return new Promise((resolve, reject) => {
-    const attempt = async () => {
-      try {
-        const res = await fetch(url);
-        resolve(res);
-        return;
-      } catch {
-        if (Date.now() > deadlineMs) {
-          reject(new Error(`server did not answer on ${url} within the timeout`));
-          return;
-        }
-        setTimeout(attempt, 200);
-      }
+    let buffer = '';
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`server printed no URL within ${timeoutMs} ms; output so far:\n${buffer}`));
+    }, timeoutMs);
+
+    const onData = (chunk) => {
+      buffer += chunk;
+      const match = buffer.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+      if (!match) return;
+      cleanup();
+      resolve(match[0]);
     };
-    void attempt();
+    const onExit = (code) => {
+      cleanup();
+      reject(new Error(`server exited with code ${code} before printing a URL; output:\n${buffer}`));
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      child.stdout.off('data', onData);
+      child.off('exit', onExit);
+    }
+
+    child.stdout.on('data', onData);
+    child.once('exit', onExit);
   });
 }
 
@@ -291,8 +346,8 @@ async function smokeTest(extractedDir) {
   const exited = new Promise((resolve) => child.once('exit', (code) => resolve(code)));
   const failures = [];
   try {
-    const base = `http://127.0.0.1:${port}`;
-    const index = await waitForServer(`${base}/`, Date.now() + SMOKE_TIMEOUT_MS);
+    const base = await waitForServerUrl(child, SMOKE_TIMEOUT_MS);
+    const index = await fetch(`${base}/`);
     if (index.status !== 200) failures.push(`GET / answered ${index.status}, expected 200`);
     const html = await index.text();
     if (!/<meta name="kaprek-token" content="[0-9a-f]{64}">/.test(html)) {
@@ -336,7 +391,11 @@ async function main() {
   console.log(`      ${ZIP_PATH} (${(zipBytes / 1024 / 1024).toFixed(2)} MB, ${zipBytes} bytes)`);
 
   console.log('4/5 extracting it again…');
-  const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-smoke-'));
+  // The directory name deliberately contains an apostrophe and square brackets:
+  // those are exactly the characters that broke an interpolated -Path (quote
+  // escape, wildcard syntax), so every run now proves the -LiteralPath route
+  // handles them — and that the server starts from such a path at all.
+  const extractRoot = fs.mkdtempSync(path.join(os.tmpdir(), "kaprek smoke [o'brien] "));
   try {
     await unzipTo(extractRoot);
     console.log('5/5 smoke-testing the extracted copy…');
