@@ -166,6 +166,196 @@ test('stdin stays open after the prompt is written (regression anthropics/claude
   expect(child.stdinEnded).toBe(true);
 });
 
+// Regression test for task-6a review Critical #1: measured against the real
+// CLI, `claude -p --input-format stream-json` does NOT exit on its own once
+// it has written `result` — it keeps waiting on stdin for more turns until
+// EOF. The old code only ever called endStdin() from finish(), which itself
+// was only ever reached from child.on('close') — a circular wait: we wait
+// for 'close', the (real) CLI waits for stdin EOF, neither happens first.
+// This fake child mirrors that exact real behavior: it deliberately never
+// emits 'close' on its own, only in reaction to its OWN stdin.end() being
+// called — so this test can only pass if the harness closes stdin as soon
+// as it has SEEN the result event, not once the process later exits.
+test('stdin is closed as soon as a result event arrives, not only once the process later closes (regression: hung stdin blocks the CLI from ever exiting)', async () => {
+  const child = new EventEmitter();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  let stdinEnded = false;
+  child.stdin = {
+    write: () => true,
+    end: () => {
+      stdinEnded = true;
+      // A well-behaved CLI only exits once stdin reaches EOF — simulated
+      // here as a reaction to end(), never fired independently.
+      queueMicrotask(() => child.emit('close', 0));
+    },
+  };
+  child.kill = () => {};
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, spawnFn: () => child });
+
+  writeLine(child, RESULT_LINE);
+  // Deliberately NOT calling closeChild()/emitting 'close' ourselves here —
+  // see this test's own doc comment above.
+
+  const result = await turn;
+  expect(stdinEnded).toBe(true);
+  expect(result.stopReason).toBe('result');
+});
+
+// Regression test for task-6a review Important #6: DEFAULT_TIMEOUT_MS is a
+// hard turn-level budget, but the separate approval-specific auto-deny (the
+// CALLER's job — see src/server/server.mjs's approvalTimeoutMs, default 10
+// minutes) is meant to be the thing that actually times out a slow human
+// decision. Without pausing the turn timeout while an approval is pending,
+// the turn's own (much shorter) timeoutMs would kill the process out from
+// under a user who is still deciding, long before the approval's own,
+// intentionally more generous timeout ever gets a chance to fire.
+test('a pending approval pauses the turn timeout — deciding longer than timeoutMs does not kill the turn', async () => {
+  const child = makeControllableChild();
+  const onApprovalRequest = vi.fn(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return { behavior: 'allow' };
+  });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, timeoutMs: 50, spawnFn: () => child });
+
+  writeLine(child, { type: 'control_request', request_id: 'req-pause', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
+  // Long enough to exceed timeoutMs (50ms) while the approval is still pending.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.stopReason).toBe('result'); // NOT 'timeout'
+  expect(child.killed).toBeFalsy();
+});
+
+test('the turn timeout resumes once the last pending approval resolves — a turn that idles too long AFTER deciding still times out', async () => {
+  const child = makeControllableChild();
+  const onApprovalRequest = vi.fn(async () => ({ behavior: 'allow' }));
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, timeoutMs: 60, spawnFn: () => child });
+
+  writeLine(child, { type: 'control_request', request_id: 'req-resume', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } });
+  // Let the (near-instant) decision resolve and the timer resume, then idle
+  // well past timeoutMs WITHOUT ever sending a result — the resumed timer
+  // must still be able to fire.
+  await new Promise((resolve) => setTimeout(resolve, 200));
+
+  const result = await turn;
+  expect(result.stopReason).toBe('timeout');
+}, 5000);
+
+// Regression test for task-6a review Important #5: `pendingApprovals` was
+// written to but never read — a repeated control_request line for the SAME
+// request_id (a duplicated stdout line, or a misbehaving CLI) would be
+// processed twice, producing two control_response writes and, downstream,
+// two approval prompts for the exact same request.
+test('a duplicate control_request for the same request_id is answered only once', async () => {
+  const child = makeControllableChild();
+  const onApprovalRequest = vi.fn(async () => ({ behavior: 'allow' }));
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, spawnFn: () => child });
+
+  const line = { type: 'control_request', request_id: 'req-dup', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } };
+  writeLine(child, line);
+  writeLine(child, line); // exact duplicate, same tick
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  await turn;
+
+  expect(onApprovalRequest).toHaveBeenCalledTimes(1);
+  const responses = child.stdinWrites.slice(1).map((w) => JSON.parse(w));
+  expect(responses).toHaveLength(1);
+});
+
+// Regression test for task-6a review Minor (a): an oversized control_request
+// (over MAX_LINE_BYTES) is dropped by the size guard before it is ever
+// parsed — without an explicit fallback, the CLI is left waiting on a
+// control_response that will never arrive, blocking the whole turn until
+// timeoutMs. A short PREFIX of the line is still enough to recognize the
+// shape and recover the request_id without ever JSON.parse'ing the full
+// oversized payload.
+test('an oversized can_use_tool control_request is answered with a fail-closed deny instead of leaving the CLI hanging', async () => {
+  const child = makeControllableChild();
+  const requestId = 'req-huge';
+  const hugeInput = 'x'.repeat(9 * 1024 * 1024);
+  const hugeLine = JSON.stringify({
+    type: 'control_request',
+    request_id: requestId,
+    request: { subtype: 'can_use_tool', tool_name: 'Write', input: { content: hugeInput } },
+  });
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onEvent: () => {}, spawnFn: () => child });
+
+  child.stdout.write(`${hugeLine}\n`);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(result.droppedLines).toBe(1);
+  expect(result.stopReason).toBe('result');
+  const responses = child.stdinWrites.slice(1).map((w) => JSON.parse(w));
+  expect(responses).toEqual([
+    { type: 'control_response', response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message: 'request too large to process', interrupt: false } } },
+  ]);
+});
+
+// Regression test for task-6a review Minor (b): answering with a missing/
+// invalid request_id is worse than not answering — the CLI could never
+// match such a response back to its own request anyway, so this must be a
+// no-op (recorded as a warning), not a response with request_id:undefined.
+test('a can_use_tool control_request with no request_id is ignored (recorded as a warning), never answered', async () => {
+  const child = makeControllableChild();
+  const onApprovalRequest = vi.fn(async () => ({ behavior: 'allow' }));
+
+  const turn = startTurn({ cwd: '.', prompt: 'hi', onApprovalRequest, onEvent: () => {}, spawnFn: () => child });
+
+  writeLine(child, { type: 'control_request', request: { subtype: 'can_use_tool', tool_name: 'Bash', input: {} } }); // no request_id at all
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+
+  const result = await turn;
+  expect(onApprovalRequest).not.toHaveBeenCalled();
+  expect(child.stdinWrites).toHaveLength(1); // only the prompt line — no control_response at all
+  expect(result.warnings.some((w) => w.includes('request_id'))).toBe(true);
+});
+
+// Regression test for task-6a review Minor (d): the argv positive case
+// (both flags present together, WITH a handler configured) was previously
+// only proven by omission — every existing argv test never passed
+// onApprovalRequest/settingsPath, so their absence proved nothing about
+// their presence when actually configured.
+test('argv: --permission-prompt-tool stdio and --settings <path> are both added when onApprovalRequest/settingsPath are given', async () => {
+  let capturedArgs;
+  const child = makeControllableChild();
+  const turn = startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    onApprovalRequest: async () => ({ behavior: 'deny', message: 'n/a' }),
+    settingsPath: 'C:\\Users\\testuser\\.kaprek\\harness\\settings.json',
+    onEvent: () => {},
+    spawnFn: (command, args) => {
+      capturedArgs = args;
+      return child;
+    },
+  });
+
+  writeLine(child, RESULT_LINE);
+  closeChild(child);
+  await turn;
+
+  expect(capturedArgs).toContain('--permission-prompt-tool');
+  expect(capturedArgs[capturedArgs.indexOf('--permission-prompt-tool') + 1]).toBe('stdio');
+  expect(capturedArgs).toContain('--settings');
+  expect(capturedArgs[capturedArgs.indexOf('--settings') + 1]).toBe('C:\\Users\\testuser\\.kaprek\\harness\\settings.json');
+});
+
 test('two concurrent control_requests from different agents are each answered with their own decision, never serialized', async () => {
   const child = makeControllableChild();
   const seenIds = [];
@@ -195,6 +385,13 @@ test('two concurrent control_requests from different agents are each answered wi
   expect(byId['req-a']).toEqual({ behavior: 'deny', message: 'not now', interrupt: false });
   expect(byId['req-b']).toEqual({ behavior: 'allow', updatedInput: {}, toolUseID: null });
   expect(seenIds.sort()).toEqual(['req-a', 'req-b']);
+  // The actual non-serialization proof: req-b's control_response is WRITTEN
+  // before req-a's, even though req-a's control_request line arrived first
+  // — req-a's slower (40ms) decision never blocked req-b's faster one from
+  // going out. Correlation alone (both eventually answered) would also pass
+  // if the two were fully serialized behind one another; only the write
+  // ORDER distinguishes the two.
+  expect(responses.map((r) => r.response.request_id)).toEqual(['req-b', 'req-a']);
 });
 
 test('ANSI escapes in decision_reason are stripped before the request reaches onApprovalRequest', async () => {

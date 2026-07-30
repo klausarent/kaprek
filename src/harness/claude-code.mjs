@@ -307,10 +307,49 @@ export async function startTurn({
     let killReason = null;
     let killGiveUpTimer = null;
     let timeoutTimer = null;
-    // Tracks request_ids currently awaiting onApprovalRequest — bookkeeping
-    // only (each in-flight request is otherwise a self-contained async call,
-    // see handleApprovalRequest() below); cleared on turn end so a decision
-    // that resolves after the turn already finished is recognizable as stale.
+    // Time BUDGET left on the turn timeout, and when the currently-running
+    // timeoutTimer (if any) was (re)started — together these let the timer
+    // be PAUSED (see pauseTimeoutTimer()/startTimeoutTimer() below) while an
+    // approval is pending and resumed with the remaining budget once it
+    // resolves, instead of the wait counting against timeoutMs. Without
+    // this, a user taking a few minutes to decide a prompt could get their
+    // whole turn killed by DEFAULT_TIMEOUT_MS well before the separate,
+    // much longer approval-specific auto-deny (owned by the caller, e.g.
+    // src/server/server.mjs's approvalTimeoutMs) ever gets a chance to fire
+    // — two different timeouts with two different jobs must not fight over
+    // the same clock (see task-6a review).
+    let timeoutRemainingMs = Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : null;
+    let timeoutStartedAt = null;
+    // Number of can_use_tool requests currently awaiting a decision — the
+    // turn timeout is paused whenever this is > 0 (see handleApprovalRequest()).
+    let pendingApprovalCount = 0;
+
+    const pauseTimeoutTimer = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      if (timeoutRemainingMs !== null && timeoutStartedAt !== null) {
+        timeoutRemainingMs = Math.max(0, timeoutRemainingMs - (Date.now() - timeoutStartedAt));
+        timeoutStartedAt = null;
+      }
+    };
+
+    const startTimeoutTimer = () => {
+      // Never start (or restart) a timer once the turn has already resolved
+      // — an approval that finishes its round-trip after finish() already
+      // ran (e.g. the turn ended via abort while it was pending) must not
+      // leave a dangling setTimeout behind.
+      if (resolved || timeoutRemainingMs === null) return;
+      timeoutStartedAt = Date.now();
+      timeoutTimer = setTimeout(() => requestKill('timeout'), timeoutRemainingMs);
+    };
+
+    // Tracks request_ids currently awaiting onApprovalRequest — dedups a
+    // repeated control_request for the SAME request_id (a duplicate stdout
+    // line, or a misbehaving CLI) so it is never answered/processed twice,
+    // and doubles as the bookkeeping the turn-end paths clear so a decision
+    // resolving after the turn already finished is recognizable as stale.
     const pendingApprovals = new Map();
     // stdin must stay open until the turn actually ends (result/error/abort/
     // timeout), NOT right after the prompt is written — closing it early is
@@ -363,56 +402,69 @@ export async function startTurn({
     const handleApprovalRequest = async (requestId, rawRequest) => {
       const request = normalizeApprovalRequest(requestId, rawRequest);
       pendingApprovals.set(requestId, true);
+      pendingApprovalCount += 1;
+      // Pause the turn timeout the MOMENT the first approval becomes
+      // pending — the wait for a user decision must not count against it
+      // (see timeoutRemainingMs's doc comment above).
+      if (pendingApprovalCount === 1) pauseTimeoutTimer();
       safeEmit({ type: 'approval', phase: 'requested', ...request });
 
-      if (typeof onApprovalRequest !== 'function') {
-        // Fail-closed: no handler configured means every request is denied,
-        // never silently allowed.
+      try {
+        if (typeof onApprovalRequest !== 'function') {
+          // Fail-closed: no handler configured means every request is denied,
+          // never silently allowed.
+          writeControlResponse(requestId, {
+            subtype: 'success',
+            request_id: requestId,
+            response: { behavior: 'deny', message: 'no approval handler configured', interrupt: false },
+          });
+          safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'deny' });
+          return;
+        }
+
+        let decision;
+        try {
+          decision = await onApprovalRequest(request);
+        } catch (err) {
+          // A throwing/rejecting handler is our own bug, not a reason to kill
+          // the CLI's turn — report it as a control-response error and let the
+          // turn keep running (see adapter.mjs's onApprovalRequest contract).
+          writeControlResponse(requestId, {
+            subtype: 'error',
+            request_id: requestId,
+            error: err?.message ?? String(err),
+          });
+          safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'error' });
+          return;
+        }
+
+        if (decision?.behavior === 'allow') {
+          writeControlResponse(requestId, {
+            subtype: 'success',
+            request_id: requestId,
+            response: {
+              behavior: 'allow',
+              updatedInput: decision.updatedInput ?? request.input,
+              toolUseID: request.toolUseId,
+            },
+          });
+          safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'allow' });
+          return;
+        }
+
         writeControlResponse(requestId, {
           subtype: 'success',
           request_id: requestId,
-          response: { behavior: 'deny', message: 'no approval handler configured', interrupt: false },
+          response: { behavior: 'deny', message: decision?.message ?? 'denied', interrupt: false },
         });
         safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'deny' });
-        return;
+      } finally {
+        pendingApprovalCount -= 1;
+        // Only resume once every currently-pending approval has been
+        // answered — a second, still-outstanding request must keep the
+        // timeout paused.
+        if (pendingApprovalCount === 0) startTimeoutTimer();
       }
-
-      let decision;
-      try {
-        decision = await onApprovalRequest(request);
-      } catch (err) {
-        // A throwing/rejecting handler is our own bug, not a reason to kill
-        // the CLI's turn — report it as a control-response error and let the
-        // turn keep running (see adapter.mjs's onApprovalRequest contract).
-        writeControlResponse(requestId, {
-          subtype: 'error',
-          request_id: requestId,
-          error: err?.message ?? String(err),
-        });
-        safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'error' });
-        return;
-      }
-
-      if (decision?.behavior === 'allow') {
-        writeControlResponse(requestId, {
-          subtype: 'success',
-          request_id: requestId,
-          response: {
-            behavior: 'allow',
-            updatedInput: decision.updatedInput ?? request.input,
-            toolUseID: request.toolUseId,
-          },
-        });
-        safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'allow' });
-        return;
-      }
-
-      writeControlResponse(requestId, {
-        subtype: 'success',
-        request_id: requestId,
-        response: { behavior: 'deny', message: decision?.message ?? 'denied', interrupt: false },
-      });
-      safeEmit({ type: 'approval', phase: 'resolved', id: requestId, toolName: request.toolName, behavior: 'deny' });
     };
 
     const finish = (result) => {
@@ -448,9 +500,7 @@ export async function startTurn({
     const onAbort = () => requestKill('aborted');
     if (signal) signal.addEventListener('abort', onAbort);
 
-    if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
-      timeoutTimer = setTimeout(() => requestKill('timeout'), timeoutMs);
-    }
+    startTimeoutTimer();
 
     child.on('error', (err) => {
       finishError(err.message);
@@ -481,6 +531,27 @@ export async function startTurn({
       // must not be able to grow this process's memory via one giant line.
       if (Buffer.byteLength(rawLine, 'utf8') > MAX_LINE_BYTES) {
         droppedLines += 1;
+        // A dropped line could be an oversized can_use_tool request (e.g. a
+        // huge proposed Write input) — if so, the CLI is now waiting on a
+        // control_response that will never come, blocking the whole turn
+        // until timeoutMs. Never JSON.parse the oversized payload itself
+        // (that's exactly what this guard exists to avoid), but a cheap
+        // regex over a small PREFIX is enough to recognize the shape and
+        // recover the (short, near-the-front) request_id, so we can still
+        // answer fail-closed instead of leaving the CLI hanging.
+        const prefix = rawLine.slice(0, 4096);
+        if (prefix.includes('"control_request"') && prefix.includes('"can_use_tool"')) {
+          const match = /"request_id"\s*:\s*"([^"]+)"/.exec(prefix);
+          if (match) {
+            writeControlResponse(match[1], {
+              subtype: 'success',
+              request_id: match[1],
+              response: { behavior: 'deny', message: 'request too large to process', interrupt: false },
+            });
+          } else {
+            onEventErrors.push('dropped an oversized can_use_tool control_request with no readable request_id');
+          }
+        }
         return;
       }
       const line = rawLine.trim();
@@ -499,10 +570,21 @@ export async function startTurn({
       // any other subtype is ignored but recorded as a warning, never
       // crashes the turn.
       if (obj.type === 'control_request') {
-        if (obj.request?.subtype === 'can_use_tool') {
-          handleApprovalRequest(obj.request_id, obj.request);
-        } else {
+        const requestId = obj.request_id;
+        if (obj.request?.subtype !== 'can_use_tool') {
           onEventErrors.push(`ignored control_request subtype: ${obj.request?.subtype ?? 'unknown'}`);
+        } else if (typeof requestId !== 'string' || requestId.length === 0) {
+          // Answering without a request_id the CLI can match back to its own
+          // request is worse than not answering at all — it would never be
+          // recognized, so the CLI stays blocked either way; just warn.
+          onEventErrors.push('ignored can_use_tool control_request with a missing/invalid request_id');
+        } else if (pendingApprovals.has(requestId)) {
+          // Dedup: a repeated line for a request_id already in flight (CLI
+          // resend, duplicated stdout line) must not be answered/processed
+          // twice — see pendingApprovals' doc comment above.
+          onEventErrors.push(`ignored duplicate can_use_tool control_request for request_id ${requestId}`);
+        } else {
+          handleApprovalRequest(requestId, obj.request);
         }
         return;
       }
@@ -517,6 +599,14 @@ export async function startTurn({
           if (event.sessionId) latestSessionId = event.sessionId;
           costUsd = event.costUsd;
           usage = event.usage;
+          // stdin must be closed as soon as we've SEEN the result event —
+          // not only once the process later closes (see endStdin()'s doc
+          // comment / task-6a review Critical #1): a well-behaved CLI that
+          // waits for stdin EOF before exiting would otherwise never see
+          // that EOF, and this harness would wait on 'close' that never
+          // comes until DEFAULT_TIMEOUT_MS kills it — a turn that actually
+          // succeeded would incorrectly resolve as 'timeout'.
+          endStdin();
         }
         safeEmit(event);
       }

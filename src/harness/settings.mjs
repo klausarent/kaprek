@@ -13,7 +13,18 @@ import path from 'node:path';
 /**
  * Writes `<dataDir>/harness/settings.json` (atomic tmp+rename, matching
  * src/orchestrator/run.mjs::writeHarnessMeta) and returns its absolute path.
- * Idempotent — safe to call again on every turn, always overwrites.
+ * Idempotent — safe to call again on every turn.
+ *
+ * This is ONE fixed path shared across every turn for a given dataDir (see
+ * run.mjs's busy-check: only turns for DIFFERENT chats can ever call this
+ * concurrently for the same dataDir). Content is fully deterministic, so
+ * once the file holds the right bytes there is never a reason to touch it
+ * again — a real, observed failure mode (task-6a review) is a concurrent
+ * turn's tmp+rename racing another's, which on Windows can throw EPERM when
+ * a rename targets a destination another handle still has open. Comparing
+ * first and skipping the write entirely when nothing would change turns
+ * every turn after the very first one into a pure read with zero mutation,
+ * closing that race window rather than papering over it with a try/catch.
  */
 export function writeHarnessSettings({ dataDir }) {
   if (!dataDir) throw new Error('writeHarnessSettings requires dataDir');
@@ -24,10 +35,17 @@ export function writeHarnessSettings({ dataDir }) {
     hooks: {},
     permissions: { defaultMode: 'default', allow: [], deny: [] },
   };
+  const content = `${JSON.stringify(settings, null, 2)}\n`;
+
+  try {
+    if (fs.readFileSync(settingsPath, 'utf8') === content) return settingsPath;
+  } catch {
+    // ENOENT (first turn for this dataDir) or unreadable — fall through and write.
+  }
 
   fs.mkdirSync(dir, { recursive: true });
   const tmpPath = path.join(dir, `.settings.json.tmp-${process.pid}-${Date.now()}`);
-  fs.writeFileSync(tmpPath, `${JSON.stringify(settings, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(tmpPath, content, 'utf8');
   fs.renameSync(tmpPath, settingsPath);
 
   return settingsPath;
