@@ -67,18 +67,52 @@
  * @property {string|null} sessionId - the CLI's session id (from the init or result event)
  * @property {number|null} costUsd - total_cost_usd from the result event, if any
  * @property {object|null} usage - usage object from the result event, if any
- * @property {'result'|'aborted'|'error'|'timeout'} stopReason - how the turn ended; 'timeout'
- *   means the harness's own timeoutMs elapsed and the child process was killed
+ * @property {'result'|'aborted'|'error'|'timeout'} stopReason - how the turn ended. 'timeout'
+ *   means one of the four independent clocks in src/harness/timeout.mjs (idle, tool-lease,
+ *   active-total, absolute — see createTurnClocks()) elapsed and the child process was
+ *   killed; WHICH one is named in `timeoutClock` below, not folded into this string, so a
+ *   caller checking `stopReason === 'timeout'` (pre-task-2 code, e.g. an existing
+ *   `result.stopReason` comparison) keeps working unchanged
+ * @property {'idle'|'tool-lease'|'active-total'|'absolute'} [timeoutClock] - present only
+ *   when stopReason is 'timeout'; names which clock fired (see timeout.mjs's own doc
+ *   comment on what each one measures). idle/tool-lease/active-total all exclude time
+ *   spent waiting on a human approval decision — that SINGLE wait is bounded separately
+ *   by the caller's own approval timeout, e.g. src/server/server.mjs's
+ *   DEFAULT_APPROVAL_TIMEOUT_MS, which auto-denies one pending request but does not stop
+ *   the agent from immediately asking again. 'absolute' is deliberately the ONE exception:
+ *   a raw, never-paused wall clock that counts approval-wait time in full, because it is
+ *   the backstop against a CHAIN of such round-trips (see timeout.mjs's ABSOLUTE_MS doc
+ *   comment). Its right value is therefore CONTEXT-DEPENDENT, not a fixed default:
+ *     - Interactive chat (a human is watching, can always just answer sooner): the
+ *       ABSOLUTE_MS default (60 minutes) is fine as-is.
+ *     - An unattended trigger turn relying on task-3's overnight approval inbox: the
+ *       caller MUST override absoluteTimeoutMs to at least the inbox's own approval
+ *       deadline + ACTIVE_TOTAL_MS + a buffer — otherwise this raw wall clock kills the
+ *       very overnight wait the inbox exists to allow, regardless of how much of that
+ *       time was legitimately spent waiting on a human to check the inbox.
  * @property {{message: string}|null} error - set when stopReason is 'error', otherwise null
+ *   (including for stopReason 'timeout' — a clock elapsing is not itself an error)
  * @property {number} [droppedLines] - count of oversized CLI output lines refused before
  *   parsing (harness-specific safety limit, see claude-code.mjs::MAX_LINE_BYTES); absent
  *   or 0 when nothing was dropped
  * @property {string[]} [warnings] - non-fatal problems during the turn, e.g. an onEvent
  *   consumer that threw (see claude-code.mjs's safeEmit()) — the turn still ran to
  *   completion despite these
- * @property {boolean} [orphaned] - true only when stopReason is 'aborted'/'timeout' and the
- *   harness gave up waiting for the child process to actually exit (see
- *   claude-code.mjs::DEFAULT_KILL_GRACE_MS) — the child may still be running
+ * @property {boolean} [orphaned] - true when the harness gave up waiting for the child
+ *   process to actually exit within its own grace period (see
+ *   claude-code.mjs::DEFAULT_KILL_GRACE_MS) after already trying to kill the whole process
+ *   tree (see claude-code.mjs::killChildTree()/killChildTreeHard()) — despite the name, this
+ *   is NOT only "the child may still be running": by the time this is set the harness has
+ *   already sent SIGKILL (POSIX: process-group-wide), so it usually means "reaping the tree
+ *   itself may still be in flight", not that no kill was attempted. Can occur with ANY
+ *   stopReason, not only 'aborted'/'timeout' (panel review Fix-Runde 3, minor, correcting
+ *   this doc comment's own pre-task-2 claim) — e.g. a well-behaved CLI whose stdout/stderr
+ *   pipe stayed open past 'result' because it left an unrelated background process (a dev
+ *   server) running that inherited it: the turn itself succeeded (stopReason 'result', or
+ *   'error' if the result itself was one) and is finished in every way that matters, but
+ *   'close' never came within the same grace period, so the leftover process tree is killed
+ *   and orphaned is set anyway — see claude-code.mjs::armResultCloseGrace() and its own
+ *   regression test (approval.test.mjs) for the concrete scenario
  */
 
 /**
