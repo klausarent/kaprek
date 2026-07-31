@@ -27,6 +27,7 @@ import { readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
+import { isAskCoverageGap } from '../harness/claude-code.mjs';
 import { APPROVAL_INBOX_TTL_MS, canonicalInput } from '../server/approval-store.mjs';
 import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
@@ -1520,8 +1521,14 @@ export function createTriggerRunner({
     try {
       const matchable = entry.input !== null && entry.input !== undefined && entry.input?._truncated !== true;
       const wanted = matchable ? canonicalInput(entry.input) : null;
+      // A truncated input can never be matched, so there is nothing to spend:
+      // the turn will ask again and the user, who is right there, answers.
+      // Treating that as "already spent" is what keeps the reopen logic below
+      // from reopening a question that was never going to be replayed anyway.
       let preApprovalSpent = !matchable;
 
+      // Shared across BOTH attempts on purpose: the approval is good for one
+      // execution, not one attempt.
       const handler = (request) => {
         if (!preApprovalSpent && request.toolName === entry.toolName && canonicalInput(request.input ?? null) === wanted) {
           preApprovalSpent = true;
@@ -1530,23 +1537,60 @@ export function createTriggerRunner({
         return makeUiApprovalHandler(chatId, { mode: 'deferred', triggerId })(request);
       };
 
+      const runOnce = () =>
+        runTurn({
+          dataDir,
+          chatId,
+          text: followUpPromptFor(entry),
+          harness,
+          harnessName,
+          cwd,
+          permissionMode,
+          allowedTools: [],
+          absoluteTimeoutMs: ABSOLUTE_MS,
+          onApprovalRequest: handler,
+          origin: 'trigger',
+          triggerId,
+          // What makes this run identifiable as a replay in runs.jsonl rather
+          // than as a second ordinary run of the same trigger.
+          replayOf: entry.id,
+          silent: false,
+        });
+
       log(`trigger ${triggerId ?? 'unknown'}: running an approved action in a follow-up turn (chat ${chatId})`);
-      const result = await runTurn({
-        dataDir,
-        chatId,
-        text: followUpPromptFor(entry),
-        harness,
-        harnessName,
-        cwd,
-        permissionMode,
-        allowedTools: [],
-        absoluteTimeoutMs: ABSOLUTE_MS,
-        onApprovalRequest: handler,
-        origin: 'trigger',
-        triggerId,
-        silent: false,
-      });
-      return { fired: true, chatId, result };
+      let result = await runOnce();
+
+      // ONE retry, and only for a coverage gap. That failure is special in a
+      // way no other is: the CLI reported tools this harness had never seen,
+      // the turn was killed BEFORE running anything, and the tools were
+      // learned on the way out (see claude-code.mjs's learnUnknownTools). The
+      // next turn therefore usually succeeds, which is exactly what a human
+      // firing a trigger by hand does when they see that error - press it
+      // again. Doing it here spares the user's approval, which would
+      // otherwise be spent on a turn that never got as far as the action.
+      if (!preApprovalSpent && isAskCoverageGap(result)) {
+        log(`trigger ${triggerId ?? 'unknown'}: follow-up hit an ask-policy coverage gap, retrying once now that the tools are learned`);
+        result = await runOnce();
+      }
+
+      // THE APPROVAL IS ONLY SPENT ONCE THE ACTION RAN. If the turn ended
+      // without ever reaching the approved call, putting the entry back is
+      // the only honest outcome: the user authorised something that did not
+      // happen, and without this they could neither see that nor approve it
+      // again (found by a live run - the entry sat at decided/allow while the
+      // command had never executed).
+      if (!preApprovalSpent && approvalStore) {
+        const why = result?.error?.message ?? `the follow-up turn ended as ${result?.stopReason ?? 'unknown'} without running it`;
+        try {
+          await approvalStore.reopen(entry.id, { reason: why });
+          log(`trigger ${triggerId ?? 'unknown'}: the approved action never ran (${why}) - the question is open again`);
+        } catch (err) {
+          log(`trigger ${triggerId ?? 'unknown'}: the approved action never ran AND the question could not be reopened (${err?.message ?? String(err)})`);
+        }
+        return { fired: true, chatId, result, replayed: false };
+      }
+
+      return { fired: true, chatId, result, replayed: preApprovalSpent };
     } finally {
       runningIds.delete(guardId);
       runningChatIds.delete(chatId);

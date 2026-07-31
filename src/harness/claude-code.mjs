@@ -90,6 +90,21 @@ const DEFAULT_TOOL_LEASE_MS = TOOL_LEASE_MS;
 const DEFAULT_TIMEOUT_MS = ACTIVE_TOTAL_MS;
 const DEFAULT_ABSOLUTE_TIMEOUT_MS = ABSOLUTE_MS;
 
+/**
+ * How a coverage-gap failure names itself. Exported because it is the ONE
+ * turn-level error a caller can do something about rather than merely report:
+ * the unknown tools have just been learned for this dataDir, so the very next
+ * turn generally succeeds (see learnUnknownTools). src/triggers/runner.mjs
+ * uses it to retry a follow-up turn once instead of burning a user's approval
+ * on a turn that failed before it ran anything.
+ */
+export const ASK_COVERAGE_GAP_PREFIX = 'ask-policy coverage gap';
+
+/** Whether a TurnResult failed on a coverage gap (see ASK_COVERAGE_GAP_PREFIX). */
+export function isAskCoverageGap(result) {
+  return typeof result?.error?.message === 'string' && result.error.message.startsWith(ASK_COVERAGE_GAP_PREFIX);
+}
+
 // How often the turn polls its own clocks even when no stream-json event
 // arrives to trigger a check — the whole reason idle/tool-lease/active-total
 // alone would not catch a genuinely silent CLI (see the model comment
@@ -991,7 +1006,7 @@ export async function startTurn({
               } catch {
                 // best-effort — see learnUnknownTools's own doc comment
               }
-              const message = `ask-policy coverage gap: CLI reports tool(s) not in the ask list: ${unknownTools.join(', ')} (learned for future turns)`;
+              const message = `${ASK_COVERAGE_GAP_PREFIX}: CLI reports tool(s) not in the ask list: ${unknownTools.join(', ')} (learned for future turns)`;
               if (strictAskCoverage) {
                 // Fail-closed, not fail-open: a tool this harness doesn't
                 // recognize could be one that skips permissions.ask entirely

@@ -197,6 +197,11 @@ function writeHarnessMeta(dataDir, chatId, meta) {
  *   only caller that passes 'trigger'
  * @param {string|null} [options.triggerId] - which trigger, when origin is
  *   'trigger'; ignored (forced null) otherwise
+ * @param {string|null} [options.replayOf] - the approval key this turn is
+ *   replaying, for a follow-up turn started by an approval (see
+ *   runner.mjs::fireFollowUp). Written to runs.jsonl and nowhere else: it is
+ *   what makes a replay identifiable as one rather than as a second ordinary
+ *   run of the same trigger.
  * @param {boolean} [options.silent] - initial value of a newly created
  *   chat's `silent` flag (see src/chats/store.mjs::createChat) — ignored
  *   when resuming an existing chatId, since that chat already has one
@@ -235,6 +240,7 @@ export async function runTurn({
   redact = true,
   origin = 'user',
   triggerId = null,
+  replayOf = null,
   silent = false,
   onChatResolved,
 } = {}) {
@@ -590,6 +596,7 @@ export async function runTurn({
       error: turnResult.error,
       origin,
       triggerId,
+      replayOf,
     });
   } catch {
     // best-effort — see comment above

@@ -244,6 +244,7 @@ export function storableInput(input) {
  * @returns {{
  *   put: (entry: object) => Promise<object>,
  *   decide: (id: string, decision: {behavior: 'allow'|'deny', message?: string}) => Promise<object>,
+ *   reopen: (id: string, options?: {reason?: string}) => Promise<object>,
  *   listPending: () => Promise<object[]>,
  *   get: (id: string) => Promise<object|null>,
  * }}
@@ -714,6 +715,59 @@ export function createApprovalStore({
     });
   }
 
+  /**
+   * Puts an ALLOWED question back on the queue because the run it authorised
+   * never happened.
+   *
+   * A live run found the hole this closes. Approving a deferred question marks
+   * it decided and starts a follow-up turn; if that turn dies before it gets
+   * to the approved call - the real case was an ask-policy coverage gap, which
+   * kills a turn before ANY tool runs - the approval was spent on nothing. The
+   * command never ran, the entry read `decided/allow`, and nobody could
+   * approve it again. The user believes they authorised something that did not
+   * happen, which is the worst of the three possible outcomes.
+   *
+   * So the decision is only final once the action was actually consumed. This
+   * reverses it, records WHY on the entry (`replayFailedAt`/`replayFailedReason`,
+   * which the UI can show), and gives it a fresh deadline: the question is
+   * genuinely open again, so its clock starts again.
+   *
+   * Deliberately narrow. Only a deferred, allowed entry can be reopened - a
+   * deny stands (nothing ran, nothing to retry), and an interactive entry
+   * belongs to a turn that is long gone.
+   */
+  function reopen(id, { reason } = {}) {
+    return serialized(async () => {
+      const entry = entries.get(id);
+      if (!entry) throw new Error(`unknown approval: ${id}`);
+      if (entry.mode !== 'deferred') throw new Error(`approval ${id} is not a deferred question and cannot be reopened`);
+      if (entry.status !== 'decided' || entry.decision?.behavior !== 'allow') {
+        throw new Error(`approval ${id} is ${entry.status}, only an allowed one can be reopened`);
+      }
+
+      const reopened = {
+        ...entry,
+        status: 'pending',
+        decision: null,
+        decidedAt: null,
+        replayFailedAt: now(),
+        replayFailedReason: reason ?? 'the follow-up turn ended without running it',
+        deadlineAt: now() + APPROVAL_INBOX_TTL_MS,
+      };
+      entries.set(id, reopened);
+      // Ownership is irrelevant for a deferred entry (see decide()), but keep
+      // the marker consistent for the process that has it in hand.
+      try {
+        await persist();
+      } catch (err) {
+        entries.set(id, entry);
+        log(`approvals: could not reopen ${id} (${err.message}); it stays recorded as allowed even though nothing ran`);
+        throw err;
+      }
+      return reopened;
+    });
+  }
+
   /** Every entry still waiting for an answer, oldest first — the inbox, in the order it should be worked. */
   function listPending() {
     return serialized(async () =>
@@ -728,5 +782,5 @@ export function createApprovalStore({
     return serialized(async () => entries.get(id) ?? null);
   }
 
-  return { put, decide, listPending, get };
+  return { put, decide, reopen, listPending, get };
 }

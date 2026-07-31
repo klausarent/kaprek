@@ -2959,3 +2959,120 @@ test('deferred: a trigger fired over its own HTTP route defers too — the route
   expect(entry).toMatchObject({ mode: 'deferred', status: 'pending', toolName: 'Bash' });
   expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
 });
+
+// ------------------------------------------ the replay must actually replay
+//
+// A live run found the hole these cover: approving marked the entry decided
+// and started a follow-up turn, that turn died on an ask-policy coverage gap
+// BEFORE running anything, and the approval was gone. The command never ran,
+// the entry read decided/allow, and nobody could approve it again.
+
+/**
+ * A harness whose follow-up turn fails with a coverage gap for its first
+ * `failures` attempts, exactly as the real CLI does when it reports a tool the
+ * ask list has never seen (the tools are learned on the way out, so the next
+ * attempt normally succeeds).
+ */
+function coverageGapHarness({ failures }) {
+  let turns = 0;
+  const attempts = [];
+  return {
+    get turns() {
+      return turns;
+    },
+    attempts,
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      turns += 1;
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      if (turns === 1) {
+        // Turn 1: the trigger's own turn, which files its question.
+        attempts.push({ turn: turns, decision: await onApprovalRequest({ id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }) });
+        onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+        return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+      }
+
+      const replayAttempt = turns - 1;
+      if (replayAttempt <= failures) {
+        // Killed before any tool call, which is the whole point: the approved
+        // action cannot have run.
+        return {
+          sessionId: 's1',
+          costUsd: null,
+          usage: null,
+          stopReason: 'error',
+          error: { message: 'ask-policy coverage gap: CLI reports tool(s) not in the ask list: ListMcpResources (learned for future turns)' },
+        };
+      }
+      attempts.push({ turn: turns, decision: await onApprovalRequest({ id: `f-${replayAttempt}`, toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }) });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('replay: a coverage gap on the first attempt is retried at once, and the approved action still runs', async () => {
+  const harness = coverageGapHarness({ failures: 1 });
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  const filed = (await (await fetch(`${url}/api/approvals`)).json()).approvals[0];
+  expect(await postJson(`${url}/api/approvals/${filed.id}`, { chatId: filed.chatId, behavior: 'allow' })).toMatchObject({ status: 200 });
+
+  // Three turns in total: the trigger's own, the one that hit the gap, and the
+  // retry that got through.
+  await vi.waitFor(() => expect(harness.turns).toBe(3), { timeout: 4_000 });
+  const replayDecision = harness.attempts.find((a) => a.turn === 3);
+  expect(replayDecision.decision).toEqual({ behavior: 'allow' });
+
+  // The approval was consumed by a run that happened, so it stays decided.
+  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'q-1');
+  expect(entry).toMatchObject({ status: 'decided', decision: { behavior: 'allow' } });
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+
+  // And the replay is identifiable as one in the run log.
+  const runs = fs
+    .readFileSync(path.join(dataDir, 'runs.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const replays = runs.filter((run) => run.replayOf);
+  expect(replays.length).toBeGreaterThanOrEqual(1);
+  expect(replays.every((run) => run.replayOf === `${filed.chatId}:q-1`)).toBe(true);
+  // The trigger's own turn is not marked as a replay of anything.
+  expect(runs[0].replayOf).toBeNull();
+});
+
+test('replay: when both attempts die before the action, the approval is handed back instead of burnt', async () => {
+  // Without this the user has authorised something that never happened, with
+  // no way to see it and no way to approve it again.
+  const harness = coverageGapHarness({ failures: 2 });
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  const filed = (await (await fetch(`${url}/api/approvals`)).json()).approvals[0];
+  expect(await postJson(`${url}/api/approvals/${filed.id}`, { chatId: filed.chatId, behavior: 'allow' })).toMatchObject({ status: 200 });
+
+  await vi.waitFor(() => expect(harness.turns).toBe(3), { timeout: 4_000 });
+
+  // Back on the queue, answerable again, and carrying the reason it came back.
+  const reopened = await vi.waitFor(
+    async () => {
+      const list = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+      expect(list).toHaveLength(1);
+      return list[0];
+    },
+    { timeout: 4_000 },
+  );
+  expect(reopened.id).toBe('q-1');
+
+  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'q-1');
+  expect(entry).toMatchObject({ status: 'pending', decision: null });
+  expect(entry.replayFailedReason).toMatch(/coverage gap/);
+  expect(typeof entry.replayFailedAt).toBe('number');
+
+  // And approving it again is accepted, rather than 409 'already decided'.
+  const second = await postJson(`${url}/api/approvals/q-1`, { chatId: filed.chatId, behavior: 'allow' });
+  expect(second.status).toBe(200);
+});

@@ -48,6 +48,12 @@ export function appendRun(dataDir, entry = {}) {
     // backfill), so a reader must treat a missing origin as 'user'.
     origin: entry.origin ?? 'user',
     triggerId: entry.triggerId ?? null,
+    // Set only on a FOLLOW-UP turn: the approval key whose approved action
+    // this turn exists to run (see runner.mjs::fireFollowUp). Without it a
+    // replay is indistinguishable from an ordinary second run of the same
+    // trigger in the same chat, which is exactly what an operator (or an
+    // acceptance script) needs to tell apart. Null on every other turn.
+    replayOf: entry.replayOf ?? null,
   };
   fs.mkdirSync(dataDir, { recursive: true });
   fs.appendFileSync(runsPath, `${JSON.stringify(line)}\n`, 'utf8');
