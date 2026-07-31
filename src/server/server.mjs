@@ -736,14 +736,46 @@ function makeApprovalHandler({
     const key = approvalKey(chatId, request.id);
     const requestedAt = Date.now();
     const { deadlineAt, cappedByTurn } = effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDeadlineAt);
+    // WHICH limit produced deadlineAt. A countdown that is suddenly two
+    // minutes on an eight-hour question is not wrong, but it is unexplained
+    // unless the client can say why (Haertung r3, A5 / Fix-Runde-2 Bedenken 1).
+    const deadlineSource = cappedByTurn ? 'turn' : 'question';
     const timeoutMessage = cappedByTurn
       ? 'approval timed out: the turn ran out of time before this question could be answered'
       : 'approval timed out';
 
-    // Written down BEFORE the promise is returned, and awaited: from here on
-    // the CLI is blocked, and a GET /api/approvals arriving one millisecond
-    // later must already find this question. A store write that fails is
-    // fail-closed, not "carry on and hope someone is streaming" — a question
+    // ORDER MATTERS, and a test caught it the moment persist() became async
+    // (Haertung r3): the pending entry is registered BEFORE the store write is
+    // awaited. cleanupApprovalsForChat() resolves whatever it finds in this
+    // map when a turn ends, so a question registered only AFTER the write
+    // would escape that cleanup entirely if the turn happened to end during
+    // the write - left pending in the file forever, with an armed timer and a
+    // promise nobody would ever resolve. Registering first also puts the
+    // store's put() into its queue ahead of any decide() the cleanup makes,
+    // so the two land in the right order.
+    let resolveDecision;
+    const decided = new Promise((resolve) => {
+      resolveDecision = resolve;
+    });
+    const timer = setTimeout(() => {
+      const entry = pendingApprovals.get(key);
+      if (!entry || entry.decided) return;
+      entry.decided = true;
+      pendingApprovals.delete(key);
+      recordDecision(approvalStore, key, { behavior: 'deny', message: timeoutMessage });
+      resolveDecision({ behavior: 'deny', message: timeoutMessage });
+      // Fires at the EFFECTIVE deadline, not at approvalTimeoutMs: when the
+      // wall clock is the nearer limit, the question must end at its own deny,
+      // so the turn gets a decision it can react to rather than being cut off
+      // mid-wait by a clock, with the CLI killed and the record left saying
+      // the question was still open.
+    }, Math.max(0, deadlineAt - requestedAt));
+    pendingApprovals.set(key, { chatId, decided: false, resolve: resolveDecision, timer, createdAt: requestedAt });
+
+    // Written down before the question is shown anywhere, and awaited: from
+    // here on the CLI is blocked, and a GET /api/approvals arriving one
+    // millisecond later must already find it. A store write that fails is
+    // fail-closed, not "carry on and hope someone is streaming" - a question
     // that was never recorded is one nobody can look up.
     if (approvalStore) {
       try {
@@ -760,39 +792,34 @@ function makeApprovalHandler({
           agentId: request.agentId ?? null,
           requestedAt,
           deadlineAt,
+          deadlineSource,
         });
       } catch (err) {
-        return { behavior: 'deny', message: `approval could not be recorded: ${err.message}` };
+        // Take the registration back, unless the turn already ended during
+        // the write and resolved it for us.
+        const entry = pendingApprovals.get(key);
+        if (entry && !entry.decided) {
+          entry.decided = true;
+          clearTimeout(entry.timer);
+          pendingApprovals.delete(key);
+          return { behavior: 'deny', message: `approval could not be recorded: ${err.message}` };
+        }
+        return decided;
       }
     }
 
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        const entry = pendingApprovals.get(key);
-        if (!entry || entry.decided) return;
-        pendingApprovals.delete(key);
-        recordDecision(approvalStore, key, { behavior: 'deny', message: timeoutMessage });
-        resolve({ behavior: 'deny', message: timeoutMessage });
-        // Fires at the EFFECTIVE deadline, not at approvalTimeoutMs: when the
-        // wall clock is the nearer limit, the question must end at its own
-        // deny — so the turn gets a decision it can react to — rather than
-        // being cut off mid-wait by a clock, with the CLI killed and the
-        // record left saying the question was still open.
-      }, Math.max(0, deadlineAt - requestedAt));
+    // Fire-and-forget, like every other onEvent->enqueue call in this file
+    // (see handleChatTurn's own comment on the same pattern), but explicitly
+    // caught here (never actually rejects today; writeSseFrame itself swallows
+    // write errors) so a future change to that guarantee can't turn this into
+    // an unhandled rejection on the approval path. `source` says WHERE the
+    // question comes from (which trigger, or which chat). It matters because
+    // an approval is delivered to whatever stream is open, not only to the one
+    // watching this chat - a user shown "allow Bash?" out of nowhere has to be
+    // able to see what asked, or they are granting rights blind.
 
-      pendingApprovals.set(key, { chatId, decided: false, resolve, timer, createdAt: requestedAt });
-      // Fire-and-forget, like every other onEvent->enqueue call in this
-      // file (see handleChatTurn's own comment on the same pattern) — but
-      // explicitly caught here (never actually rejects today; writeSseFrame
-      // itself swallows write errors) so a future change to that guarantee
-      // can't turn this into an unhandled rejection on the approval path.
-      // `source` says WHERE the question comes from (which trigger, or which
-      // chat). It matters because an approval is now delivered to whatever
-      // stream is open, not only to the one watching this chat — a user shown
-      // "allow Bash?" out of nowhere has to be able to see what asked, or they
-      // are granting rights blind.
-      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt }).catch(() => {});
-    });
+      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt, deadlineSource }).catch(() => {});
+    return decided;
   };
 }
 
@@ -937,6 +964,10 @@ async function handleApprovalsList(res, approvalStore) {
     agentId: entry.agentId,
     requestedAt: entry.requestedAt,
     deadlineAt: entry.deadlineAt,
+    // 'turn' when the turn's own wall clock, not the approval deadline, is
+    // what will end this question. Older records carry no such field; the web
+    // treats a missing one as 'question' (see lib/api.ts).
+    deadlineSource: entry.deadlineSource ?? 'question',
   }));
   sendJson(res, 200, { approvals });
 }

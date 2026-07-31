@@ -2517,7 +2517,19 @@ test('triggers: a fire refused by the global cap streams the reason instead of s
 // Four mechanisms the first round shipped without a test, each of them found by
 // a mutant that survived the whole suite (panel findings I2, I4, M6/M7, M10).
 
-/** Reads the durable inbox straight off disk — the record is what these tests are about, not the in-memory map. */
+/**
+ * Waits for the store to have finished writing, then reads the file. The
+ * store persists on its own queue (see approval-store.mjs::serialized), so a
+ * decision made a moment ago may not be on disk yet; every public store call
+ * joins that queue, and GET /api/approvals is one, so a response to it means
+ * everything queued before it has landed.
+ */
+async function settledApprovalsFile(url) {
+  await (await fetch(`${url}/api/approvals`)).json();
+  return readApprovalsFile();
+}
+
+/** Reads the durable inbox straight off disk, for a point where nothing is still queued. */
 function readApprovalsFile() {
   const raw = fs.readFileSync(path.join(dataDir, 'approvals.json'), 'utf8');
   return JSON.parse(raw).approvals;
@@ -2596,7 +2608,7 @@ test('approvals: the auto-deny timer records the denial on disk, so the post-mor
   const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
   expect(result.fired).toBe(true);
 
-  const entry = readApprovalsFile().find((e) => e.requestId === 'lapse-1');
+  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'lapse-1');
   expect(entry).toMatchObject({ status: 'decided', decision: { behavior: 'deny', message: 'approval timed out' } });
   expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
 });
@@ -2625,7 +2637,7 @@ test('approvals: a trigger turn that ends with its question still open releases 
   expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
   const late = await postJson(`${url}/api/approvals/abandoned-1`, { chatId: result.chatId, behavior: 'allow' });
   expect(late.status).not.toBe(200);
-  expect(readApprovalsFile().find((e) => e.requestId === 'abandoned-1')).toMatchObject({
+  expect((await settledApprovalsFile(url)).find((e) => e.requestId === 'abandoned-1')).toMatchObject({
     status: 'decided',
     decision: { behavior: 'deny', message: 'turn ended' },
   });
@@ -2726,7 +2738,11 @@ test('approvals: a question raised late in a turn is never advertised past the t
   const secondEntry = secondInbox[0];
 
   // Both are pinned to the same instant: the turn's death, not each
-  // question's own clock. Exact equality is the point — two questions asked
+  // question's own clock. And both say WHERE that instant came from, so the
+  // UI can explain a two-minute countdown on an hours-long question.
+  expect(firstEntry.deadlineSource).toBe('turn');
+  expect(secondEntry.deadlineSource).toBe('turn');
+  // Exact equality is the point — two questions asked
   // 120ms apart with a 60s deadline could not otherwise share a deadline.
   expect(secondEntry.deadlineAt).toBe(firstEntry.deadlineAt);
   // And the second one is demonstrably shorter than its nominal deadline.
@@ -2756,7 +2772,7 @@ test('approvals: when the wall clock is the nearer limit, the question ends at t
   expect(result.fired).toBe(true);
   expect(Date.now() - startedAt).toBeLessThan(3_000);
 
-  const entry = readApprovalsFile().find((e) => e.requestId === 'capped-1');
+  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'capped-1');
   expect(entry.status).toBe('decided');
   expect(entry.decision.behavior).toBe('deny');
   // The reason names the real cause: the turn ran out of time, the user did
@@ -2786,6 +2802,8 @@ test('approvals: the cap only ever shortens — a question whose own deadline is
   });
 
   expect(approvalFrame.deadlineAt).toBeGreaterThanOrEqual(before + 60_000);
+  // Nothing was capped, so the frame says the deadline is the question's own.
+  expect(approvalFrame.deadlineSource).toBe('question');
 });
 
 test('effectiveApprovalDeadline: the earlier of the two limits wins, and says which one it was', () => {

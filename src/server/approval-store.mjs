@@ -77,6 +77,46 @@ export const APPROVAL_HISTORY_RETENTION_MS = 7 * 24 * 60 * 60_000;
 /** Hard cap on entries in the file, newest first, applied after the age prune. Bounds a pathological trigger loop from growing the inbox without limit. */
 export const MAX_STORED_APPROVALS = 500;
 
+/**
+ * Cap on how many questions may be waiting AT ONCE. MAX_STORED_APPROVALS
+ * prunes finished entries only — a pending one is by definition still live and
+ * cannot be dropped, so without this the inbox has no upper bound at all: a
+ * looping agent that raises a question per tool call would grow the file (and
+ * every rewrite of it) without limit. A put() over the cap THROWS rather than
+ * being dropped quietly, so the CLI gets its fail-closed deny immediately
+ * instead of blocking on a question nothing recorded (Härtung r3, Codex #5b).
+ */
+export const MAX_PENDING_APPROVALS = 50;
+
+/**
+ * Cap on the JSON size of one stored `input`. A can_use_tool request can carry
+ * megabytes (a Write of a whole file), and this store rewrites its ENTIRE file
+ * on every put and every decision — an unbounded input turns each of those
+ * into a multi-megabyte write. The chat store's own copy is already truncated
+ * (run.mjs::sanitizeToolInput, 1500 chars), but the object handed to the
+ * approval handler deliberately is not: the person approving has to see what
+ * they are approving. So the LIVE path keeps the full input and only the
+ * stored copy is capped (Härtung r3, Codex #5a).
+ */
+export const MAX_STORED_INPUT_BYTES = 64 * 1024;
+
+/** How much of an oversized input is kept as a human-readable preview. Enough to recognise the call, far too little to matter for file size. */
+export const STORED_INPUT_PREVIEW_CHARS = 2048;
+
+/**
+ * Backoff before retrying a write that failed with a TRANSIENT error. On
+ * Windows an antivirus scanner or the search indexer can hold approvals.json
+ * open for a few hundred milliseconds, and rename() then fails with EPERM or
+ * EBUSY. Without a retry that surfaces as put() throwing, which the approval
+ * handler turns into a fail-closed deny — a legitimate overnight question
+ * refused because a scanner blinked, in exactly the case this feature exists
+ * for (Härtung r3, Grok #4). Three attempts, then the error stands.
+ */
+export const WRITE_RETRY_DELAYS_MS = [50, 150, 400];
+
+/** Error codes worth retrying: someone else holds the file for a moment. A full disk (ENOSPC) or a missing directory is not transient and must fail at once. */
+const TRANSIENT_WRITE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES', 'EMFILE', 'ENFILE']);
+
 const FILE_NAME = 'approvals.json';
 
 /** The one reason a loaded entry can never be answered — see this module's own doc comment (2). Kept as a single string because there is only one truthful answer here: whoever owned that wait is unreachable from this process. */
@@ -96,6 +136,34 @@ function isFinished(entry) {
  */
 function finishedAt(entry) {
   return entry.decidedAt ?? entry.expiredAt ?? entry.requestedAt ?? 0;
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * The version of `input` that goes on disk: the original when it is small
+ * enough, otherwise a marked stub carrying the first
+ * STORED_INPUT_PREVIEW_CHARS characters of its JSON. The stub is deliberately
+ * self-describing (`_truncated: true`) rather than silently shortened — an
+ * inbox entry showing half a command with no sign that it is half would be
+ * worse than one that says so.
+ *
+ * Only the STORED copy. The live SSE frame and the decision itself keep the
+ * whole thing; see MAX_STORED_INPUT_BYTES.
+ */
+export function storableInput(input) {
+  if (input === null || input === undefined) return null;
+  let json;
+  try {
+    json = JSON.stringify(input);
+  } catch {
+    // Cyclic or otherwise unserialisable: it could not have been written
+    // either, so record that rather than throwing on the approval path.
+    return { _truncated: true, preview: '(input could not be serialised)' };
+  }
+  if (json === undefined) return null;
+  if (Buffer.byteLength(json, 'utf8') <= MAX_STORED_INPUT_BYTES) return input;
+  return { _truncated: true, preview: json.slice(0, STORED_INPUT_PREVIEW_CHARS) };
 }
 
 /**
@@ -159,6 +227,9 @@ export function createApprovalStore({
    * boundary.
    */
   const ownedIds = new Set();
+
+  /** Tail of the operation queue, see serialized(). */
+  let queue = Promise.resolve();
 
   /**
    * Moves a corrupt file out of the way so the next persist() cannot silently
@@ -245,7 +316,7 @@ export function createApprovalStore({
     return [...pending, ...finished];
   }
 
-  function persist() {
+  async function persist() {
     const approvals = pruned();
     entries.clear();
     for (const entry of approvals) entries.set(entry.id, entry);
@@ -257,28 +328,65 @@ export function createApprovalStore({
     }
 
     fsImpl.mkdirSync(dataDir, { recursive: true });
+    const body = `${JSON.stringify({ version: 1, approvals }, null, 2)}
+`;
+
+    // ASYNC (Haertung r3, Codex #5c). This used to be writeFileSync +
+    // renameSync, which blocks the ENTIRE event loop for the length of the
+    // write. With a large inbox that stalls in-flight approval HTTP, the
+    // harness's own clock polling, and the instance lock's greeting server,
+    // whose silence makes a second start refuse fail-closed. Nothing here
+    // needs to be synchronous: every caller is already async.
+    //
     // Temp file in the SAME directory, then rename: rename is atomic within a
     // filesystem, so a reader (or a crash) either sees the whole previous file
     // or the whole new one, never a truncated inbox. The pid+timestamp in the
     // temp name keeps two writers from colliding on it even though there
     // should only ever be one.
     const tmpPath = path.join(dataDir, `${TMP_PREFIX}${pid}-${now()}`);
-    try {
-      fsImpl.writeFileSync(tmpPath, `${JSON.stringify({ version: 1, approvals }, null, 2)}\n`, 'utf8');
-      fsImpl.renameSync(tmpPath, filePath);
-    } catch (err) {
-      // A half-written temp file is exactly what the rename was there to keep
-      // out of approvals.json; leaving it on disk would only accumulate
-      // (panel Fix-Runde 1, M4). Removing it is best-effort — if even the
-      // unlink fails there is nothing left to try, and the caller's own error
-      // is the one worth reporting.
+    for (let attempt = 0; ; attempt += 1) {
       try {
-        fsImpl.unlinkSync(tmpPath);
-      } catch {
-        // best-effort
+        await fsImpl.promises.writeFile(tmpPath, body, 'utf8');
+        await fsImpl.promises.rename(tmpPath, filePath);
+        return;
+      } catch (err) {
+        // A half-written temp file is exactly what the rename was there to
+        // keep out of approvals.json; leaving it on disk would only
+        // accumulate (panel Fix-Runde 1, M4). Best-effort: if even the unlink
+        // fails there is nothing left to try, and the caller's own error is
+        // the one worth reporting.
+        try {
+          await fsImpl.promises.unlink(tmpPath);
+        } catch {
+          // best-effort
+        }
+        if (!TRANSIENT_WRITE_CODES.has(err?.code) || attempt >= WRITE_RETRY_DELAYS_MS.length) throw err;
+        // Someone else is holding the file for a moment (see
+        // WRITE_RETRY_DELAYS_MS). Waiting is strictly better than turning a
+        // scanner's half-second into a denied approval.
+        await sleep(WRITE_RETRY_DELAYS_MS[attempt]);
       }
-      throw err;
     }
+  }
+
+  /**
+   * Every public method runs through this one queue, in call order.
+   *
+   * Two jobs. It keeps two persist() calls from interleaving their
+   * write/rename pairs now that they are async: the later one must not
+   * overtake the earlier and leave the file describing an older state. And it
+   * preserves what the synchronous version got for free, a check-and-set
+   * ("is this id already pending?", "has this been decided?") that no other
+   * operation can slip inside. A previous failure does not poison the queue:
+   * each entry runs regardless of how the one before it ended.
+   */
+  function serialized(work) {
+    const run = queue.then(work, work);
+    queue = run.then(
+      () => {},
+      () => {},
+    );
+    return run;
   }
 
   /** Sweeps temp files a previous run left behind (a crash between write and rename). Best-effort and silent: they are junk, not evidence. */
@@ -301,15 +409,15 @@ export function createApprovalStore({
 
   cleanupStaleTempFiles();
   if (loadFromDisk()) {
-    try {
-      persist();
-    } catch (err) {
-      // The write-back is bookkeeping: it makes the 'process gone' marking
-      // durable. Failing it costs an accurate file, not correctness — the
-      // ownership gate refuses those entries either way — so it must not cost
-      // the boot (panel Fix-Runde 1, C1).
+    // Queued rather than awaited: the constructor cannot await, and every
+    // public method below goes through the same queue, so the first of them
+    // already waits for this write-back. The write-back is bookkeeping (it
+    // makes the 'process gone' marking durable); failing it costs an accurate
+    // file, not correctness, since the ownership gate refuses those entries
+    // either way. It must not cost the boot (panel Fix-Runde 1, C1).
+    serialized(() => persist()).catch((err) => {
       log(`approvals: could not record expired entries in ${filePath} (${err.message}); they are refused in memory regardless`);
-    }
+    });
   }
 
   /**
@@ -333,11 +441,19 @@ export function createApprovalStore({
    * 'already pending' and auto-deny. The caller (server.mjs's approval
    * handler) turns the rethrow into a fail-closed deny for this ONE question.
    */
-  async function put(entry) {
+  function put(entry) {
+    return serialized(async () => {
     const id = entry?.id;
     if (typeof id !== 'string' || id.length === 0) throw new Error('approval entry needs a non-empty string id');
     const existing = entries.get(id);
     if (existing && !isFinished(existing)) throw new Error(`approval ${id} is already pending`);
+    // Pending cap (Haertung r3, Codex #5b). Counted BEFORE the entry is
+    // added, and only against entries this process is really waiting on:
+    // finished ones are the retention window's problem, not a live limit.
+    const pendingCount = [...entries.values()].filter((e) => e.status === 'pending' && ownedIds.has(e.id)).length;
+    if (pendingCount >= MAX_PENDING_APPROVALS) {
+      throw new Error(`too many approvals already waiting (${pendingCount}/${MAX_PENDING_APPROVALS})`);
+    }
 
     const record = {
       chatId: null,
@@ -353,6 +469,9 @@ export function createApprovalStore({
       deadlineAt: null,
       ...entry,
       id,
+      // Only the stored copy is capped; the caller keeps the full object for
+      // the dialog and the decision (see MAX_STORED_INPUT_BYTES).
+      input: storableInput(entry.input ?? null),
       requestedAt: entry.requestedAt ?? now(),
       pid,
       status: 'pending',
@@ -364,7 +483,7 @@ export function createApprovalStore({
     entries.set(id, record);
     ownedIds.add(id);
     try {
-      persist();
+      await persist();
     } catch (err) {
       // Exactly back to the state before this call: the replaced entry
       // restored (or none), and the ownership marker as it was.
@@ -375,6 +494,7 @@ export function createApprovalStore({
       throw err;
     }
     return record;
+    });
   }
 
   /**
@@ -387,7 +507,8 @@ export function createApprovalStore({
    * The caller is expected to turn these into a 404/409/410 rather than a
    * silent success.
    */
-  async function decide(id, decision) {
+  function decide(id, decision) {
+    return serialized(async () => {
     const entry = entries.get(id);
     if (!entry) throw new Error(`unknown approval: ${id}`);
     // ORDER MATTERS, and a mutant found it: 'already decided' is checked
@@ -421,7 +542,7 @@ export function createApprovalStore({
     // instead, along with the entry itself.
     entries.set(id, decided);
     try {
-      persist();
+      await persist();
     } catch (err) {
       // Deliberately NOT rolled back and NOT rethrown, the opposite of put()
       // above (panel Fix-Runde 1, M1). By the time a decision reaches this
@@ -434,18 +555,21 @@ export function createApprovalStore({
       log(`approvals: ${id} was decided (${behavior}) but the record could not be written (${err.message}); the decision stands, the file is now out of date`);
     }
     return decided;
+    });
   }
 
   /** Every entry still waiting for an answer, oldest first — the inbox, in the order it should be worked. */
-  async function listPending() {
-    return [...entries.values()]
-      .filter((entry) => entry.status === 'pending' && ownedIds.has(entry.id))
-      .sort((a, b) => (a.requestedAt ?? 0) - (b.requestedAt ?? 0));
+  function listPending() {
+    return serialized(async () =>
+      [...entries.values()]
+        .filter((entry) => entry.status === 'pending' && ownedIds.has(entry.id))
+        .sort((a, b) => (a.requestedAt ?? 0) - (b.requestedAt ?? 0)),
+    );
   }
 
   /** One entry by id, whatever its status — including expired ones, so a caller can say WHY an id is no longer answerable. Null when it was never recorded or has been pruned. */
-  async function get(id) {
-    return entries.get(id) ?? null;
+  function get(id) {
+    return serialized(async () => entries.get(id) ?? null);
   }
 
   return { put, decide, listPending, get };

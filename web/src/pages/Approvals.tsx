@@ -50,14 +50,23 @@ export function relativeTime(fromMs: number, nowMs: number): string {
  * for an entry with no deadline recorded (an older file, or a caller that did
  * not set one) — better no line than an invented one.
  */
-export function deadlineLabel(deadlineAt: number | null, nowMs: number): string | null {
+export function deadlineLabel(
+  deadlineAt: number | null,
+  nowMs: number,
+  deadlineSource: "question" | "turn" = "question",
+): string | null {
   if (deadlineAt === null || deadlineAt === undefined) return null;
+  // WHY the suffix: when the turn's own wall clock is the nearer limit, an
+  // eight-hour question can show two minutes left. The number is true, but
+  // without the reason it reads as a bug or as a deadline someone shortened
+  // (see server.mjs::effectiveApprovalDeadline).
+  const because = deadlineSource === "turn" ? " This is limited by the turn's own time budget, not by the approval deadline." : "";
   const remaining = deadlineAt - nowMs;
-  if (remaining <= 0) return "Denied automatically by now — the server's own timer has passed.";
+  if (remaining <= 0) return `Denied automatically by now — the server's own timer has passed.${because}`;
   const minutes = Math.round(remaining / 60_000);
-  if (minutes < 60) return `Denied automatically in about ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+  if (minutes < 60) return `Denied automatically in about ${minutes} minute${minutes === 1 ? "" : "s"}.${because}`;
   const hours = Math.round(minutes / 60);
-  return `Denied automatically in about ${hours} hour${hours === 1 ? "" : "s"}.`;
+  return `Denied automatically in about ${hours} hour${hours === 1 ? "" : "s"}.${because}`;
 }
 
 export function ApprovalInboxItem({
@@ -75,7 +84,7 @@ export function ApprovalInboxItem({
   // No currentChatId here: an inbox entry belongs to a chat this page is not
   // showing by definition, so its origin is always worth naming.
   const sourceLabel = approvalSourceLabel(approval, undefined);
-  const deadline = deadlineLabel(approval.deadlineAt, nowMs);
+  const deadline = deadlineLabel(approval.deadlineAt, nowMs, approval.deadlineSource ?? "question");
 
   return (
     <div className="approval-dialog approval-inbox-item">

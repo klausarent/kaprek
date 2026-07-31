@@ -12,9 +12,14 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import {
   createApprovalStore,
+  storableInput,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_DEADLINE_UNATTENDED_MS,
   APPROVAL_HISTORY_RETENTION_MS,
+  MAX_PENDING_APPROVALS,
+  MAX_STORED_INPUT_BYTES,
+  STORED_INPUT_PREVIEW_CHARS,
+  WRITE_RETRY_DELAYS_MS,
 } from './approval-store.mjs';
 
 const createdDirs = [];
@@ -49,8 +54,13 @@ function readApprovalFile(dataDir) {
  * check what the store does about a failure it cannot prevent (a read-only
  * file, a full disk) rather than only checking the happy path.
  */
-function fsWith(overrides) {
-  return { ...fs, ...overrides };
+function fsWith(overrides = {}, promiseOverrides = {}) {
+  return { ...fs, ...overrides, promises: { ...fs.promises, ...promiseOverrides } };
+}
+
+/** Waits for everything the store has queued (see its serialized()), so a test can read the file at a defined point. */
+async function settled(store) {
+  await store.listPending();
 }
 
 /** Collects the store's warnings so a test can assert the failure was ANNOUNCED, not merely survived. */
@@ -135,7 +145,9 @@ test('approval store: an entry whose recorded pid is ALIVE is still not decidabl
 test('approval store: the expiry is written back to disk, so the record says what happened instead of looking pending forever', async () => {
   const dataDir = await tmpDataDir();
   await seedApprovalFile(dataDir, [{ id: 'old', pid: deadPid, toolName: 'Bash', requestedAt: 0 }]);
-  createApprovalStore({ dataDir });
+  // The write-back runs on the store's own queue; any public call is a
+  // barrier for it (see settled()).
+  await settled(createApprovalStore({ dataDir }));
 
   const onDisk = readApprovalFile(dataDir).approvals;
   expect(onDisk).toHaveLength(1);
@@ -281,13 +293,14 @@ test('approval store: a failing write-back of expired entries costs the record, 
   const dataDir = await tmpDataDir();
   await seedApprovalFile(dataDir, [{ id: 'old', toolName: 'Bash', requestedAt: 0 }]);
   const log = collectingLog();
-  const fsImpl = fsWith({
-    writeFileSync: () => {
+  const fsImpl = fsWith({}, {
+    writeFile: async () => {
       throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
     },
   });
 
   const store = createApprovalStore({ dataDir, log, fsImpl });
+  await settled(store);
   expect(log.joined()).toMatch(/could not record expired entries/);
   // The marking still holds in memory, which is where it decides anything.
   await expect(store.decide('old', { behavior: 'allow' })).rejects.toThrow(/process gone/);
@@ -302,10 +315,10 @@ test('approval store: a put() whose write fails is rolled back — no ghost entr
   const dataDir = await tmpDataDir();
   const log = collectingLog();
   let failWrites = false;
-  const fsImpl = fsWith({
-    writeFileSync: (target, data, encoding) => {
+  const fsImpl = fsWith({}, {
+    writeFile: async (target, data, encoding) => {
       if (failWrites) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
-      return fs.writeFileSync(target, data, encoding);
+      return fs.promises.writeFile(target, data, encoding);
     },
   });
   const store = createApprovalStore({ dataDir, log, fsImpl });
@@ -325,10 +338,10 @@ test('approval store: a put() whose write fails is rolled back — no ghost entr
 test('approval store: a put() rollback restores the entry it replaced rather than dropping the history', async () => {
   const dataDir = await tmpDataDir();
   let failWrites = false;
-  const fsImpl = fsWith({
-    writeFileSync: (target, data, encoding) => {
+  const fsImpl = fsWith({}, {
+    writeFile: async (target, data, encoding) => {
       if (failWrites) throw new Error('EIO: write failed');
-      return fs.writeFileSync(target, data, encoding);
+      return fs.promises.writeFile(target, data, encoding);
     },
   });
   const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
@@ -349,11 +362,11 @@ test('approval store: the write is genuinely atomic — a write that dies halfwa
   // still be the complete previous version.
   const dataDir = await tmpDataDir();
   let truncateNextWrite = false;
-  const fsImpl = fsWith({
-    writeFileSync: (target, data, encoding) => {
-      if (!truncateNextWrite) return fs.writeFileSync(target, data, encoding);
+  const fsImpl = fsWith({}, {
+    writeFile: async (target, data, encoding) => {
+      if (!truncateNextWrite) return fs.promises.writeFile(target, data, encoding);
       const half = String(data).slice(0, Math.floor(String(data).length / 2));
-      fs.writeFileSync(target, half, encoding); // the bytes that DID land
+      await fs.promises.writeFile(target, half, encoding); // the bytes that DID land
       throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
     },
   });
@@ -378,10 +391,10 @@ test('approval store: a decision whose write fails still stands, and says so lou
   const dataDir = await tmpDataDir();
   const log = collectingLog();
   let failWrites = false;
-  const fsImpl = fsWith({
-    writeFileSync: (target, data, encoding) => {
+  const fsImpl = fsWith({}, {
+    writeFile: async (target, data, encoding) => {
       if (failWrites) throw new Error('EIO: write failed');
-      return fs.writeFileSync(target, data, encoding);
+      return fs.promises.writeFile(target, data, encoding);
     },
   });
   const store = createApprovalStore({ dataDir, log, fsImpl });
@@ -443,4 +456,159 @@ test('approval store: temp files left by a crashed run are swept at startup', as
   const left = fs.readdirSync(dataDir);
   expect(left.filter((name) => name.includes('.tmp-'))).toEqual([]);
   expect(left).toContain('unrelated.json');
+});
+
+// ------------------------------------------------------------ hardening r3
+//
+// Bounds and blocking: what happens when the inputs get big, the queue gets
+// long, another program holds the file for a moment, or two writes race.
+
+test('approval store: an oversized input is stored as a marked stub, not verbatim', async () => {
+  const dataDir = await tmpDataDir();
+  const store = createApprovalStore({ dataDir, log: collectingLog() });
+  const huge = { command: 'x'.repeat(MAX_STORED_INPUT_BYTES + 5_000) };
+
+  await store.put({ id: 'big', toolName: 'Bash', input: huge, requestedAt: 0 });
+
+  const stored = (await store.get('big')).input;
+  expect(stored._truncated).toBe(true);
+  expect(stored.preview.length).toBe(STORED_INPUT_PREVIEW_CHARS);
+  // The preview is the START of what was asked, so the entry is still
+  // recognisable rather than an empty marker.
+  expect(stored.preview).toContain('command');
+  // And the file it went into stays small, which is the point of the cap:
+  // every later put rewrites this file in full.
+  const bytes = fs.statSync(path.join(dataDir, 'approvals.json')).size;
+  expect(bytes).toBeLessThan(MAX_STORED_INPUT_BYTES);
+});
+
+test('approval store: an input under the cap is stored exactly as given', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  const input = { command: 'git status', nested: { list: [1, 2, 3] } };
+  await store.put({ id: 'small', toolName: 'Bash', input, requestedAt: 0 });
+  expect((await store.get('small')).input).toEqual(input);
+});
+
+test('storableInput: the cap is on serialised bytes, and an unserialisable input says so instead of throwing', () => {
+  expect(storableInput(null)).toBeNull();
+  expect(storableInput({ a: 1 })).toEqual({ a: 1 });
+  expect(storableInput({ a: 'x'.repeat(MAX_STORED_INPUT_BYTES) })._truncated).toBe(true);
+
+  const cyclic = { name: 'loop' };
+  cyclic.self = cyclic;
+  // A cyclic input could never have been written; recording that is better
+  // than throwing on the approval path, which would deny the question.
+  expect(storableInput(cyclic)).toEqual({ _truncated: true, preview: '(input could not be serialised)' });
+});
+
+test('approval store: the pending queue is capped, and the refusal is loud rather than a silent drop', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  for (let i = 0; i < MAX_PENDING_APPROVALS; i += 1) {
+    await store.put({ id: `q-${i}`, toolName: 'Bash', requestedAt: i });
+  }
+
+  await expect(store.put({ id: 'one-too-many', toolName: 'Bash', requestedAt: 999 })).rejects.toThrow(/too many approvals/);
+  expect(await store.get('one-too-many')).toBeNull();
+  expect(await store.listPending()).toHaveLength(MAX_PENDING_APPROVALS);
+
+  // Answering one frees exactly one slot: the cap counts what is WAITING, not
+  // what has ever been asked.
+  await store.decide('q-0', { behavior: 'allow' });
+  await store.put({ id: 'now-it-fits', toolName: 'Bash', requestedAt: 1000 });
+  expect((await store.listPending()).map((e) => e.id)).toContain('now-it-fits');
+});
+
+test('approval store: a rename held by another program is retried, not turned into a denied approval', async () => {
+  // The Windows case (Grok #4): an antivirus scanner or the search indexer
+  // holds approvals.json for a moment, rename fails EPERM, and without a retry
+  // put() throws, which the approval handler turns into a fail-closed deny. A
+  // legitimate overnight question refused because a scanner blinked.
+  const dataDir = await tmpDataDir();
+  let renameAttempts = 0;
+  const fsImpl = fsWith(
+    {},
+    {
+      rename: async (from, to) => {
+        renameAttempts += 1;
+        if (renameAttempts === 1) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+        return fs.promises.rename(from, to);
+      },
+    },
+  );
+  const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
+
+  await expect(store.put({ id: 'scanned', toolName: 'Bash', requestedAt: 0 })).resolves.toMatchObject({ id: 'scanned' });
+  expect(renameAttempts).toBe(2);
+  expect(readApprovalFile(dataDir).approvals.map((e) => e.id)).toEqual(['scanned']);
+});
+
+test('approval store: a non-transient write error is not retried, because a full disk will not un-fill itself', async () => {
+  const dataDir = await tmpDataDir();
+  let writeAttempts = 0;
+  const fsImpl = fsWith(
+    {},
+    {
+      writeFile: async () => {
+        writeAttempts += 1;
+        throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      },
+    },
+  );
+  const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
+
+  await expect(store.put({ id: 'doomed', toolName: 'Bash', requestedAt: 0 })).rejects.toThrow(/ENOSPC/);
+  expect(writeAttempts).toBe(1);
+});
+
+test('approval store: a transient failure that never clears gives up after the configured attempts', async () => {
+  const dataDir = await tmpDataDir();
+  let renameAttempts = 0;
+  const fsImpl = fsWith(
+    {},
+    {
+      rename: async () => {
+        renameAttempts += 1;
+        throw Object.assign(new Error('EBUSY: resource busy or locked'), { code: 'EBUSY' });
+      },
+    },
+  );
+  const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
+
+  await expect(store.put({ id: 'stuck', toolName: 'Bash', requestedAt: 0 })).rejects.toThrow(/EBUSY/);
+  // One initial attempt plus one per configured backoff, then the error stands.
+  expect(renameAttempts).toBe(WRITE_RETRY_DELAYS_MS.length + 1);
+});
+
+test('approval store: concurrent writes are serialised, so the file ends up describing all of them and not a mix', async () => {
+  // With persist() async, two puts started in the same tick could otherwise
+  // interleave write/rename and leave the file describing the older state.
+  const dataDir = await tmpDataDir();
+  const store = createApprovalStore({ dataDir, log: collectingLog() });
+
+  await Promise.all([
+    store.put({ id: 'a', toolName: 'Bash', requestedAt: 1 }),
+    store.put({ id: 'b', toolName: 'Bash', requestedAt: 2 }),
+    store.put({ id: 'c', toolName: 'Bash', requestedAt: 3 }),
+  ]);
+
+  expect(readApprovalFile(dataDir).approvals.map((e) => e.id).sort()).toEqual(['a', 'b', 'c']);
+  expect((await store.listPending()).map((e) => e.id)).toEqual(['a', 'b', 'c']);
+});
+
+test('approval store: two decisions for the same id racing in one tick still produce exactly one', async () => {
+  // The synchronous version got this for free. With awaits inside decide(),
+  // only the queue keeps a second answer from slipping between the status
+  // check and the write.
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'contested', toolName: 'Bash', requestedAt: 0 });
+
+  const results = await Promise.allSettled([
+    store.decide('contested', { behavior: 'allow' }),
+    store.decide('contested', { behavior: 'deny' }),
+  ]);
+
+  expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+  expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
+  expect(results.find((r) => r.status === 'rejected').reason.message).toMatch(/already decided/);
+  expect((await store.get('contested')).decision.behavior).toBe('allow');
 });
