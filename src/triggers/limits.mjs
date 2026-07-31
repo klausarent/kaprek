@@ -29,6 +29,23 @@ export const UNKNOWN_COST_ESTIMATE_USD = 0.25;
 export const MAX_TRIGGER_TURNS_PER_HOUR = 20;
 export const MAX_TRIGGER_TURNS_PER_DAY = 100;
 
+/**
+ * How many trigger turns may be IN FLIGHT at once, across all triggers.
+ *
+ * The caps above count finished turns; this one bounds the live ones. It
+ * became necessary with the approval inbox: a tick starts every due trigger at
+ * once, and each one that raises a question now parks for up to its unattended
+ * deadline (hours), holding a `claude` subprocess the whole time. Ten triggers
+ * coming due at 3am used to mean ten short turns; it can now mean ten parked
+ * processes until morning.
+ *
+ * Three is deliberately small. A turn that is merely working finishes and
+ * frees its slot in minutes; a turn that is parked on a question is waiting
+ * for a person, and queueing the rest behind it is the honest response to
+ * "nobody has answered the first three yet".
+ */
+export const MAX_CONCURRENT_TRIGGER_TURNS = 3;
+
 const HOUR_MS = 60 * 60 * 1000;
 
 /** Midnight (local time) of the calendar day containing `now`, as epoch ms. */
@@ -71,7 +88,7 @@ function estimatedUnitCost(runsForTrigger) {
  * `costEstimated` says whether any of today's total came from that estimate,
  * so a caller can show "$0.75 (estimated)" instead of implying a measurement.
  */
-export function checkLimits({ dataDir, trigger, now = Date.now() }) {
+export function checkLimits({ dataDir, trigger, now = Date.now(), inFlightRuns = 0 }) {
   const dayStart = startOfLocalDay(now);
   const dayEndExclusive = dayStart + 24 * 60 * 60 * 1000;
 
@@ -81,7 +98,14 @@ export function checkLimits({ dataDir, trigger, now = Date.now() }) {
     return Number.isFinite(ts) && ts >= dayStart && ts < dayEndExclusive;
   });
 
-  const runsToday = todaysRuns.length;
+  // A turn that is still running has written no runs.jsonl line yet, so
+  // without this it is invisible to every cap it will eventually count
+  // against. With the approval inbox a turn can be in flight for HOURS, which
+  // turns "invisible for a few minutes" into "a trigger can start its second
+  // and third run while the first is still parked on a question" (Grok #1).
+  // Counted as a run but at zero cost: the run slot is certain, the cost is
+  // not known until the turn ends, and inventing one would be a different lie.
+  const runsToday = todaysRuns.length + inFlightRuns;
   const unitCost = estimatedUnitCost(runsForTrigger);
   let costEstimated = false;
   const costToday = todaysRuns.reduce((sum, run) => {
@@ -116,13 +140,16 @@ export function checkLimits({ dataDir, trigger, now = Date.now() }) {
  * throttled by this. A line without `origin` predates the field and is a user
  * turn by definition (see runs.mjs), so it does not count either.
  */
-export function checkGlobalTriggerLimits({ dataDir, now = Date.now() }) {
+export function checkGlobalTriggerLimits({ dataDir, now = Date.now(), inFlightRuns = 0 }) {
   const dayStart = startOfLocalDay(now);
   const dayEndExclusive = dayStart + 24 * HOUR_MS;
   const hourStart = now - HOUR_MS;
 
-  let turnsLastHour = 0;
-  let turnsToday = 0;
+  // In-flight turns count against both windows, for the reason in
+  // checkLimits() above: they have not been logged yet, and with the inbox
+  // they can stay unlogged for hours.
+  let turnsLastHour = inFlightRuns;
+  let turnsToday = inFlightRuns;
   for (const run of readRuns(dataDir)) {
     if (run.origin !== 'trigger') continue;
     const ts = Date.parse(run.ts);

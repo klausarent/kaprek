@@ -12,7 +12,7 @@ import { appendRun } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
 import { createTriggerRunner, UNATTENDED_ABSOLUTE_TIMEOUT_MS, unattendedAbsoluteTimeoutMs } from './runner.mjs';
-import { MAX_TRIGGER_TURNS_PER_HOUR } from './limits.mjs';
+import { MAX_TRIGGER_TURNS_PER_HOUR, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { buildArgs } from '../harness/claude-code.mjs';
 import { createTurnClocks, IDLE_MS, TOOL_LEASE_MS, ACTIVE_TOTAL_MS, ABSOLUTE_MS } from '../harness/timeout.mjs';
@@ -2033,4 +2033,135 @@ test('two runners on one dataDir fire the same file-watch debounce window only O
 
   expect([a.fired, b.fired].filter(Boolean)).toHaveLength(1);
   expect([a, b].find((r) => !r.fired).reason).toMatch(/file-watch window already claimed/);
+});
+
+// ------------------------------------------------- hardening r3: live turns count
+//
+// Both caps read runs.jsonl, which a turn only writes when it ENDS. That was a
+// few minutes of blindness before the inbox and is hours of it now: a turn
+// parked on an overnight question is, as far as every limit is concerned, a
+// turn that never happened.
+
+/** A harness that never returns until the test releases it, so a turn can be held in flight. */
+function parkingHarness() {
+  let release;
+  let markStarted;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
+  });
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  return {
+    started,
+    release: () => release(),
+    async startTurn({ onEvent } = {}) {
+      markStarted();
+      await gate;
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('global cap: a turn that is still parked counts against the ceiling, not only finished ones', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const harness = parkingHarness();
+  const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  triggers.upsert(scheduleTrigger({ id: 'parker', config: { everyMinutes: 5 } }));
+  triggers.upsert(savedPromptTrigger());
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness,
+    harnessName: 'fake',
+    cwd,
+    now: () => fixedNow,
+    log: () => {},
+    resolveToolApp: resolveTestToolApp,
+  });
+
+  // One short of the ceiling on the log, so the ONLY thing that can push it
+  // over is the live turn below.
+  for (let i = 0; i < MAX_TRIGGER_TURNS_PER_HOUR - 1; i += 1) {
+    appendRun(dataDir, { ts: new Date(fixedNow - 60_000).toISOString(), triggerId: 'somebody-else', origin: 'trigger', costUsd: 0 });
+  }
+  expect((await runner.limitStatus(triggers.get('saved-1'))).blockedReason).toBeNull();
+
+  const parked = runner.fireTrigger('parker', { cause: { origin: 'schedule' } });
+  await harness.started;
+
+  const result = await runner.fireTrigger('saved-1', { cause: { origin: 'user' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toMatch(/global trigger cap reached/);
+  // And the trigger page says the same thing rather than looking armed.
+  expect(runner.limitStatus(triggers.get('saved-1')).blockedReason).toMatch(/global trigger cap/);
+
+  harness.release();
+  await parked;
+});
+
+test('per-trigger cap: a parked turn occupies its own daily run slot too', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const harness = parkingHarness();
+  const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  triggers.upsert(scheduleTrigger({ id: 'parker', config: { everyMinutes: 5 }, limits: { maxRunsPerDay: 1, maxCostPerDay: 1 } }));
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness,
+    harnessName: 'fake',
+    cwd,
+    now: () => fixedNow,
+    log: () => {},
+    resolveToolApp: resolveTestToolApp,
+  });
+
+  const parked = runner.fireTrigger('parker', { cause: { origin: 'schedule' } });
+  await harness.started;
+
+  // Nothing is in runs.jsonl yet, so only the in-flight count can produce this.
+  expect(runner.limitStatus(triggers.get('parker'))).toMatchObject({ runsToday: 1, blockedReason: expect.stringMatching(/daily run limit/) });
+
+  harness.release();
+  await parked;
+});
+
+test('the tick starts at most MAX_CONCURRENT_TRIGGER_TURNS turns, and defers the rest instead of dropping them', async () => {
+  const fixedNow = new Date(2026, 6, 30, 9, 0, 0).getTime();
+  const harness = parkingHarness();
+  const triggers = openTriggers(dataDir, { knownAppIds: TEST_APP_IDS, log: () => {} });
+  const due = MAX_CONCURRENT_TRIGGER_TURNS + 2;
+  for (let i = 0; i < due; i += 1) {
+    triggers.upsert(scheduleTrigger({ id: `every-${i}`, config: { everyMinutes: 5 } }));
+  }
+  const lines = [];
+  const runner = createTriggerRunner({
+    dataDir,
+    triggers,
+    runTurn,
+    harness,
+    harnessName: 'fake',
+    cwd,
+    now: () => fixedNow,
+    log: (message) => lines.push(message),
+    resolveToolApp: resolveTestToolApp,
+  });
+
+  runner.tick();
+  await harness.started;
+
+  // Every one of them was due; only the cap decided how many actually started.
+  const chats = openChats(dataDir).list();
+  expect(chats).toHaveLength(MAX_CONCURRENT_TRIGGER_TURNS);
+  const deferred = lines.filter((line) => line.includes('deferred'));
+  expect(deferred).toHaveLength(due - MAX_CONCURRENT_TRIGGER_TURNS);
+  // Deferred, not dropped: the line says why, and the trigger is still enabled
+  // and still due for the next tick.
+  expect(deferred[0]).toMatch(/trigger turns already running/);
+  expect(triggers.list().every((t) => t.enabled)).toBe(true);
+
+  harness.release();
 });

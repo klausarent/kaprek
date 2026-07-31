@@ -28,7 +28,7 @@ import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
 import { ACTIVE_TOTAL_MS } from '../harness/timeout.mjs';
 import { APPROVAL_DEADLINE_UNATTENDED_MS } from '../server/approval-store.mjs';
-import { checkLimits, checkGlobalTriggerLimits } from './limits.mjs';
+import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1087,7 +1087,9 @@ export function createTriggerRunner({
       return { fired: false, reason };
     }
 
-    const limitCheck = checkLimits({ dataDir, trigger, now: currentNow() });
+    // The turn about to start is not in runningIds yet (that happens further
+    // down, after every check), so nothing is double-counted here.
+    const limitCheck = checkLimits({ dataDir, trigger, now: currentNow(), inFlightRuns: runningIds.has(id) ? 1 : 0 });
     if (!limitCheck.allowed) {
       log(`trigger ${id}: rejected (${limitCheck.reason})`);
       return { fired: false, reason: limitCheck.reason };
@@ -1096,7 +1098,7 @@ export function createTriggerRunner({
     // The ceiling across ALL triggers together — the brake on a chain no
     // per-trigger cap can see: A writes a file B watches, B writes back, both
     // stay inside their own limits forever (see limits.mjs's constants).
-    const globalCheck = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    const globalCheck = checkGlobalTriggerLimits({ dataDir, now: currentNow(), inFlightRuns: inFlightRuns() });
     if (!globalCheck.allowed) {
       log(`trigger ${id}: rejected (${globalCheck.reason})`);
       return { fired: false, reason: globalCheck.reason };
@@ -1335,11 +1337,11 @@ export function createTriggerRunner({
    * restart and a crash mid-turn.
    */
   function reportCapsAfterTurn(id, trigger) {
-    const after = checkLimits({ dataDir, trigger, now: currentNow() });
+    const after = checkLimits({ dataDir, trigger, now: currentNow(), inFlightRuns: 0 });
     if (!after.allowed) {
       log(`trigger ${id}: cap reached after this turn (${after.reason}) — no further runs today`);
     }
-    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow(), inFlightRuns: inFlightRuns(id) });
     if (!global.allowed) {
       log(`trigger ${id}: ${global.reason} — no trigger fires until that window passes`);
     }
@@ -1353,9 +1355,9 @@ export function createTriggerRunner({
    * "daily cost cap reached" instead of a trigger that silently does nothing.
    */
   function limitStatus(trigger) {
-    const own = checkLimits({ dataDir, trigger, now: currentNow() });
+    const own = checkLimits({ dataDir, trigger, now: currentNow(), inFlightRuns: runningIds.has(trigger.id) ? 1 : 0 });
     if (!own.allowed) return { blockedReason: own.reason, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
-    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow() });
+    const global = checkGlobalTriggerLimits({ dataDir, now: currentNow(), inFlightRuns: inFlightRuns() });
     if (!global.allowed) return { blockedReason: global.reason, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
     return { blockedReason: null, runsToday: own.runsToday, costToday: own.costToday, costEstimated: own.costEstimated };
   }
@@ -1400,6 +1402,19 @@ export function createTriggerRunner({
       if (!TICK_DRIVEN_TYPES.includes(trigger.type)) continue;
       const due = trigger.type === 'heartbeat' ? heartbeatDue(trigger, nowMs) : dueScheduleSlot(trigger, nowMs) !== null;
       if (!due) continue;
+      // CONCURRENCY CEILING (Grok #2). A tick used to start every due trigger
+      // at once, which was fine while turns were short. With the approval
+      // inbox a turn can park on a question for hours, each one holding its
+      // own CLI subprocess, so ten triggers due at 3am could mean ten parked
+      // processes until morning. Over the cap the trigger is DEFERRED, not
+      // dropped: it stays due and the next tick (60s later) tries again, for
+      // as long as its window is open. A schedule slot whose window closes
+      // while the cap is full is genuinely missed, and the log says so rather
+      // than pretending it ran.
+      if (runningIds.size >= MAX_CONCURRENT_TRIGGER_TURNS) {
+        log(`trigger ${trigger.id}: deferred (${runningIds.size} trigger turns already running, cap ${MAX_CONCURRENT_TRIGGER_TURNS})`);
+        continue;
+      }
       const cause = { origin: trigger.type };
       fireTrigger(trigger.id, { cause }).catch((err) => {
         log(`trigger ${trigger.id}: tick error: ${err?.message ?? String(err)}`);
@@ -1442,6 +1457,21 @@ export function createTriggerRunner({
    */
   function isAnyTriggerRunning() {
     return runningIds.size > 0;
+  }
+
+  /**
+   * How many trigger turns are in flight right now, for the cap checks
+   * (limits.mjs's `inFlightRuns`). `exclude` leaves one id out: after a turn
+   * has finished, runs.jsonl already carries its line while runningIds still
+   * holds its id until the finally block, and counting it in both places
+   * would charge one turn twice.
+   */
+  function inFlightRuns(exclude = null) {
+    let count = 0;
+    for (const runningId of runningIds) {
+      if (runningId !== exclude) count += 1;
+    }
+    return count;
   }
 
   /**
