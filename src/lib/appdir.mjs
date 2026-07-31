@@ -43,9 +43,18 @@ export function getAppDir({ homedir = os.homedir(), env = process.env } = {}) {
   return path.join(homedir, `.${name}`);
 }
 
-/** Resolves the app's data directory and creates it (recursively) if missing. */
+/**
+ * Resolves the app's data directory, creates it (recursively) if missing, and
+ * returns its CANONICAL path (symlinks/junctions resolved). The instance lock
+ * hashes the canonical path (see src/lib/instance-lock.mjs::normalizeDataDir);
+ * if the server then kept writing through the original link path, retargeting
+ * that link mid-run would split the lock's identity from the directory
+ * actually being written — two instances on one real directory (Codex day-4
+ * review, finding 3). Returning the resolved path makes lock and writers
+ * agree on the same real directory for the whole process lifetime.
+ */
 export function ensureAppDir(options) {
   const dir = getAppDir(options);
   fs.mkdirSync(dir, { recursive: true });
-  return dir;
+  return fs.realpathSync.native(dir);
 }

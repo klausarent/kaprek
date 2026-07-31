@@ -245,9 +245,21 @@ async function main() {
   });
 
   function shutdown() {
+    // server.close() alone waits for open connections to drain, and kaprek
+    // essentially always has one: SSE streams (chat, approvals) stay open
+    // for hours. Without destroying them the close callback never runs, the
+    // SIGINT handler has already swallowed the signal, and the process —
+    // still holding the instance lock — can no longer be ended from the
+    // keyboard at all (Codex day-4 review, finding 2). Destroy the
+    // connections, and keep a short force-exit as the backstop for anything
+    // that still refuses to drain; the 'exit' handler above releases the
+    // lock synchronously on every one of these paths.
     server.close(() => {
       lock.release().finally(() => process.exit(0));
     });
+    server.closeAllConnections?.();
+    const force = setTimeout(() => process.exit(0), 2000);
+    if (typeof force.unref === 'function') force.unref();
   }
 
   process.on('SIGINT', shutdown);

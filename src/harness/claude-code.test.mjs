@@ -288,3 +288,41 @@ test('A6: an is_error result carries subtype and result text in error.message', 
   expect(result.error.message).toContain('error_during_execution');
   expect(result.error.message).toContain('boom something failed');
 }, 10000);
+
+test('A15: a duplicated assistant line re-announcing an open tool_use id does not leak a lease — after the single tool_result the idle clock, not tool-lease, ends the turn', async () => {
+  const toolUse = {
+    type: 'assistant',
+    message: { content: [{ type: 'tool_use', id: 'toolu_dup', name: 'Bash', input: { command: 'echo hi' } }] },
+  };
+  const toolResult = {
+    type: 'user',
+    message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_dup', content: 'hi' }] },
+  };
+  const lines = [
+    { type: 'system', subtype: 'init', session_id: 's1', tools: [], model: 'm' },
+    toolUse,
+    toolUse, // the same line twice — a retransmit, not a second tool
+    toolResult,
+  ];
+  const script = [
+    ...lines.map((l) => `console.log(${JSON.stringify(JSON.stringify(l))});`),
+    'setTimeout(() => {}, 30000);', // no result line: some clock has to end this turn
+  ].join('\n');
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => spawnNodeScript(script),
+    idleMs: 400,
+    toolLeaseMs: 8000,
+    timeoutMs: 8000,
+  });
+
+  // With the duplicate counted twice, the one tool_result leaves a phantom
+  // lease open, idle never applies, and the turn dies much later as a bogus
+  // 'tool-lease' timeout. Mutant that resurrects the bug (count tool-start
+  // unconditionally): this test goes red with timeoutClock 'tool-lease'.
+  expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('idle');
+  expect(result.warnings.some((w) => w.includes('already-open id'))).toBe(true);
+}, 10000);

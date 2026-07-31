@@ -1008,8 +1008,20 @@ export async function startTurn({
           }
         }
         if (event.type === 'tool-start') {
-          openToolUseIds.add(event.id);
-          clocks.onProgress('tool-start');
+          // Symmetric to the tool-end guard below: a duplicated assistant
+          // line re-announcing an already-open id must not grow the lease
+          // count a second time — Set.add() is idempotent but the clock's
+          // counter is not, and the single real tool_result then leaves a
+          // phantom lease open, turning a 120s idle exit into a 25min
+          // tool-lease one (Codex day-4 review, finding 6). An id-less
+          // event cannot be deduplicated and keeps counting as before.
+          const isDuplicate = event.id != null && openToolUseIds.has(event.id);
+          if (isDuplicate) {
+            onEventErrors.push(`ignored a tool-start for an already-open id (duplicated assistant line): ${event.id}`);
+          } else {
+            openToolUseIds.add(event.id);
+            clocks.onProgress('tool-start');
+          }
         }
         // Panel review Fix-Runde 2, minor: only a tool-end for an id THIS
         // harness itself opened counts as closing a lease — a duplicated or

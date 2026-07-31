@@ -4,11 +4,22 @@
 // Loopback is NOT an authenticator: 127.0.0.1 keeps the network out, and the
 // `x-app-request` CSRF header keeps a foreign WEB PAGE out (it forces a CORS
 // preflight this server never answers), but any local process can set that
-// header itself. Since kaprek's server starts agent turns on request (see
-// src/triggers/runner.mjs), "any local process" is too wide a door. The
-// pattern is Goose's (ui/desktop/src/goosed.ts + crates/goose-server/src/
-// auth.rs): a random secret generated at first start, stored next to the data
-// it protects, required on every API request, compared in constant time.
+// header itself. The pattern is Goose's (ui/desktop/src/goosed.ts +
+// crates/goose-server/src/auth.rs): a random secret generated at first start,
+// stored next to the data it protects, required on every API request,
+// compared in constant time.
+//
+// Be honest about what that buys AGAINST LOCAL PROCESSES: nothing. The token
+// reaches the browser by being injected into the served index.html, and any
+// local process can GET / and read it there, exactly like the UI does. What
+// the token actually does: it keeps foreign web pages out even where the
+// CSRF header alone would not (DNS rebinding serves an attacker's page on a
+// host that passes the Host check), and it stops cross-instance confusion
+// (a stale tab of one data dir cannot act on another's server). The boundary
+// against local software is the OS user account, not this token — the README
+// says so, and with the approval inbox holding decisions open for hours (see
+// approval-store.mjs) that boundary is worth restating here rather than
+// implying this file closes it.
 //
 // About the file mode: `0o600` is honest only on POSIX. On Windows — kaprek's
 // main platform — Node maps it to the read-only attribute and nothing else, so
