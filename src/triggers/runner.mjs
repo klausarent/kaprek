@@ -1214,13 +1214,25 @@ export function createTriggerRunner({
     try {
       const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, filesTruncated, clipboard });
 
-      // Unattended turns FILE their questions instead of waiting on them (see
-      // server.mjs's makeDeferringApprovalHandler): nothing is held open, so
-      // the turn runs under the harness's ordinary clocks and simply ends.
-      // A manual fire is the other case - a person pressed the button and is
-      // looking at the dialog - and keeps the live 10-minute path, cap and
-      // all.
-      const approvalMode = unattended && approvalStore ? 'deferred' : 'interactive';
+      // EVERY trigger turn files its questions rather than waiting on them
+      // (see server.mjs's makeDeferringApprovalHandler): nothing is held open,
+      // so the turn runs under the harness's ordinary clocks and simply ends.
+      //
+      // NOT conditional on cause.origin, and a live run proved why. The one
+      // route a person can press, POST /api/triggers/<id>/fire, passes
+      // cause.origin 'user' - so keying the mode off that field sent exactly
+      // the human-triggered path back into parking: the turn blocked on its
+      // question, its SSE stream never finished, and the entry was filed as
+      // 'interactive'. The distinction that matters is not "who pressed the
+      // button" but "is a turn WAITING on this answer", and no trigger turn
+      // does any more. It also matches what this runner already reports about
+      // itself: approvalCapability() answers 'inbox' with a store wired,
+      // attended or not.
+      //
+      // The interactive path is the CHAT path (server.mjs::handleChatTurn),
+      // where someone typed the turn and is looking at the dialog. A runner
+      // without a store keeps the old behaviour untouched.
+      const approvalMode = approvalStore ? 'deferred' : 'interactive';
       // Passed explicitly, not assumed: the interactive cap measures a
       // published deadline against this exact number (see
       // server.mjs::effectiveApprovalDeadline), and capping against a clock

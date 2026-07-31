@@ -1923,38 +1923,37 @@ test('triggers: an approval for a chat nobody streams is delivered to whatever s
   expect(approval.chatId).not.toBe(seen[0].chatId);
 });
 
-test('triggers: a "question" escalation trigger fires (the server always wires a UI approval handler), and its approval question appears live in the SSE stream and is answerable via POST /api/approvals/<id>', async () => {
-  const { url } = await boot({
-    harness: approvalHarness({ request: { id: 'trigger-approve-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
-    harnessName: 'fake',
-  });
+test('triggers: a "question" trigger fired over HTTP streams its question live AND files it, and the answer runs in a follow-up turn', async () => {
+  // The live frame is still sent — a tab that happens to be open sees the
+  // question immediately. What changed is what the turn does about it: it is
+  // told the action is filed and finishes, so the frame is an FYI rather than
+  // a prompt the turn is blocked on. Answering therefore comes AFTER the turn
+  // ends, and starts a second one.
+  const harness = askingHarness([
+    [{ id: 'trigger-approve-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }],
+    [{ id: 'follow-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }],
+  ]);
+  const { url } = await boot({ harness, harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
 
-  const listRes = await fetch(`${url}/api/triggers`);
-  const listed = (await listRes.json()).triggers.find((t) => t.id === 'ask-me');
-  // 'inbox', not 'ui': the server wires the durable store, so a question is
-  // recorded as well as pushed — and nothing is blocked by whether a stream
-  // happens to be open right now.
-  expect(listed.approvalPath).toBe('inbox');
-  expect(listed.blocked).toBeNull();
+  const listed = (await (await fetch(`${url}/api/triggers`)).json()).triggers.find((t) => t.id === 'ask-me');
+  expect(listed).toMatchObject({ approvalPath: 'inbox', blocked: null });
 
   const res = await fetch(`${url}/api/triggers/ask-me/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
+  const frames = await readSse(res);
 
-  let approvalFrame = null;
-  const frames = await readSse(res, async (frame) => {
-    if (frame.type === 'approval' && approvalFrame === null) {
-      approvalFrame = frame;
-      const decideRes = await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'allow' });
-      expect(decideRes.status).toBe(200);
-    }
-  });
-
-  expect(approvalFrame).toMatchObject({ type: 'approval', id: 'trigger-approve-1', toolName: 'Bash' });
+  const approvalFrame = frames.find((f) => f.type === 'approval');
+  expect(approvalFrame).toMatchObject({ id: 'trigger-approve-1', toolName: 'Bash', mode: 'deferred' });
   expect(approvalFrame.chatId).toBe(frames[0].chatId);
-  const textFrame = frames.find((f) => f.type === 'text');
-  expect(textFrame.text).toBe('decision was allow');
-  const complete = frames.find((f) => f.type === 'trigger-complete');
-  expect(complete.fired).toBe(true);
+  expect(frames.find((f) => f.type === 'trigger-complete')).toMatchObject({ fired: true });
+
+  // Answering it now — the turn is over, so the follow-up can start.
+  const decideRes = await postJson(`${url}/api/approvals/trigger-approve-1`, { chatId: approvalFrame.chatId, behavior: 'allow' });
+  expect(decideRes.status).toBe(200);
+  expect(await decideRes.json()).toMatchObject({ followUp: true });
+  await vi.waitFor(() => expect(harness.turns).toBe(2), { timeout: 4_000 });
+  // The approved call ran without asking again.
+  expect(harness.decisions.find((d) => d.turn === 2).decision).toEqual({ behavior: 'allow' });
 });
 
 test('triggers: GET /api/triggers reports approvalPath:"policy" for a "notify" trigger, with blocked:null', async () => {
@@ -2623,9 +2622,6 @@ test('a deferred question OUTLIVES its turn, while an interactive one is still r
   };
   const { url, runner } = await boot({ harness: abandoningHarness, harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
-  // A second trigger for the manual half: the first one's schedule slot is
-  // claimed by the run below, and a claimed slot is a different refusal.
-  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me-live', escalation: 'question' }));
 
   // Unattended: filed, and still there after the turn is long over.
   const scheduled = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
@@ -2634,14 +2630,17 @@ test('a deferred question OUTLIVES its turn, while an interactive one is still r
   expect(inbox.map((e) => e.id)).toEqual(['abandoned-1']);
   expect(inbox[0].mode).toBe('deferred');
 
-  // Manual fire: a person is watching, so this one is a live wait - and when
-  // the turn abandons it, it is released rather than left dangling with an
-  // armed timer.
-  const manual = await runner.fireTrigger('ask-me-live', { cause: { origin: 'user' } });
-  expect(manual.fired).toBe(true);
-  const stillThere = (await settledApprovalsFile(url)).filter((e) => e.chatId === manual.chatId);
-  expect(stillThere).toHaveLength(1);
-  expect(stillThere[0]).toMatchObject({ mode: 'interactive', status: 'decided', decision: { behavior: 'deny', message: 'turn ended' } });
+  // A CHAT turn is the interactive case: somebody typed it and is looking at
+  // the dialog, so its question IS a live wait. When that turn abandons it,
+  // it is released rather than left dangling with an armed timer. (A manual
+  // trigger fire is NOT this case: it still runs a trigger turn, which files
+  // its questions - see the HTTP-route test further down.)
+  const chatRes = await postJson(`${url}/api/chat/turn`, { text: 'ask me something' });
+  const chatFrames = await readSse(chatRes);
+  const chatId = chatFrames[0].chatId;
+  const chatEntries = (await settledApprovalsFile(url)).filter((e) => e.chatId === chatId);
+  expect(chatEntries).toHaveLength(1);
+  expect(chatEntries[0]).toMatchObject({ mode: 'interactive', status: 'decided', decision: { behavior: 'deny', message: 'turn ended' } });
 });
 
 test('approvals: the SSE frame carries the server\'s own deadlineAt, so the client never has to guess which of the two deadlines applies', async () => {
@@ -2921,3 +2920,42 @@ test('deferred: a question filed by a previous process is still answerable after
   expect(res.status).toBe(200);
 });
 
+test('deferred: a trigger fired over its own HTTP route defers too — the route a person actually presses', async () => {
+  // THE GAP THE LIVE RUN FOUND. Every deferred test so far drove
+  // runner.fireTrigger() directly with cause.origin 'schedule'. The real
+  // route, POST /api/triggers/<id>/fire, passes cause.origin 'user' — and the
+  // mode was decided from exactly that field, so the one path a person can
+  // actually take was still the parking path. The turn blocked on its
+  // question, the SSE stream never finished, and the entry landed as
+  // 'interactive'.
+  //
+  // Driven through the HTTP route on purpose: the runner-level tests cannot
+  // see this, because the wiring that was wrong lives between the route and
+  // the handler.
+  const asked = [];
+  const harness = {
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      asked.push(await onApprovalRequest({ id: 'http-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }));
+      onEvent?.({ type: 'text', text: 'carried on' });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  // The stream has to END. Under the bug it stayed open until the client gave
+  // up, because the turn was parked on an answer nobody was going to give.
+  const res = await fetch(`${url}/api/triggers/ask-me/fire`, { method: 'POST', headers: APP_JSON_HEADERS });
+  const frames = await readSse(res);
+  expect(frames.find((f) => f.type === 'trigger-complete')).toMatchObject({ fired: true });
+
+  // The turn was told to carry on rather than left waiting.
+  expect(asked[0]).toMatchObject({ behavior: 'deny', message: DEFERRAL_MESSAGE });
+
+  // And the entry is a filed question, not a live wait.
+  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'http-1');
+  expect(entry).toMatchObject({ mode: 'deferred', status: 'pending', toolName: 'Bash' });
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
+});
