@@ -363,6 +363,13 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   to start (see approvalCapability()) and runs under a much longer wall
  *   clock (see UNATTENDED_ABSOLUTE_TIMEOUT_MS). Defaults to null, which keeps
  *   every gate below exactly as it was.
+ * @param {number|null} [options.absoluteTimeoutMs] - overrides the wall clock
+ *   an inbox turn runs under. Default null derives it from
+ *   approvalDeadlineMs (see unattendedAbsoluteTimeoutMs), which is what any
+ *   real caller wants. Setting it BELOW the approval deadline is allowed and
+ *   no longer dishonest: every published deadline is capped to this clock
+ *   (server.mjs::effectiveApprovalDeadline), so a question simply lapses when
+ *   the turn does instead of advertising time the turn does not have.
  * @param {number} [options.approvalDeadlineMs] - the deadline the SERVER will
  *   auto-deny an unattended approval at (startServer's
  *   `unattendedApprovalTimeoutMs`). The runner does not enforce it; it needs
@@ -394,8 +401,14 @@ export function createTriggerRunner({
   hasApprovalClient = () => false,
   approvalStore = null,
   approvalDeadlineMs = APPROVAL_DEADLINE_UNATTENDED_MS,
+  absoluteTimeoutMs = null,
   releaseApprovals = () => {},
 }) {
+  // Computed once: the wall clock every inbox turn from this runner gets, and
+  // the number the approval handler's own cap is measured against. Derived
+  // from the deadline unless a caller overrode it — see both options' doc
+  // comments.
+  const effectiveAbsoluteTimeoutMs = absoluteTimeoutMs ?? unattendedAbsoluteTimeoutMs(approvalDeadlineMs);
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
   // again by an overlapping tick or a manual fire while it's still in
@@ -1225,10 +1238,24 @@ export function createTriggerRunner({
     try {
       const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, filesTruncated, clipboard });
 
+      // The wall clock this turn will actually run under, and the instant it
+      // therefore dies. Only the inbox path sets one (see below); everything
+      // else keeps the harness's own default, which this layer does not know
+      // and must not pretend to.
+      //
+      // Date.now(), NOT currentNow(): `now` is injected to control trigger
+      // SCHEDULING (slots, caps, windows) and a test may hold it at a fixed
+      // or historical instant. The wall clock inside the harness runs on real
+      // time, and so does the approval timer in server.mjs that this number is
+      // compared against — mixing the two time bases would cap a question
+      // against a deadline from another decade.
+      const turnAbsoluteTimeoutMs = capability.approvalPath === 'inbox' ? effectiveAbsoluteTimeoutMs : null;
+      const turnDeadlineAt = turnAbsoluteTimeoutMs === null ? null : Date.now() + turnAbsoluteTimeoutMs;
+
       const approvalHandlerForTurn =
         trigger.escalation === 'notify'
           ? notifyPolicyHandler(trigger, cwd, resolveToolApp)
-          : (request) => makeUiApprovalHandler(resolvedChatId)(request);
+          : (request) => makeUiApprovalHandler(resolvedChatId, { turnDeadlineAt })(request);
 
       const result = await runTurn({
         dataDir,
@@ -1252,7 +1279,7 @@ export function createTriggerRunner({
         // passes nothing here and keeps running under exactly the budgets it
         // ran under before (see UNATTENDED_ABSOLUTE_TIMEOUT_MS's doc comment
         // for why the inbox cannot).
-        ...(capability.approvalPath === 'inbox' ? { absoluteTimeoutMs: unattendedAbsoluteTimeoutMs(approvalDeadlineMs) } : {}),
+        ...(turnAbsoluteTimeoutMs === null ? {} : { absoluteTimeoutMs: turnAbsoluteTimeoutMs }),
         onApprovalRequest: approvalHandlerForTurn,
         onEvent,
         onChatResolved: (chatId) => {

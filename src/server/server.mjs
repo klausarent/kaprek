@@ -41,6 +41,7 @@ import {
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_DEADLINE_UNATTENDED_MS,
 } from './approval-store.mjs';
+import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 
 // The apps/ directory shipped with kaprek, resolved the same way
 // src/apps/mcp-server.mjs resolves it (this file lives in src/server/).
@@ -57,6 +58,18 @@ const CHAT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const TRIGGER_ID_RE = /^[a-z0-9-]{1,64}$/;
 const DEFAULT_HARNESS_NAME = 'claude-code';
 const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
+
+/**
+ * The never-pausing wall clock a CHAT turn runs under. Identical to the
+ * harness's own default (claude-code.mjs's DEFAULT_ABSOLUTE_TIMEOUT_MS, which
+ * is timeout.mjs's ABSOLUTE_MS), and passed EXPLICITLY rather than left
+ * implicit: an approval's published deadline is capped to the turn's clock
+ * (see effectiveApprovalDeadline), and capping against a number this file
+ * merely assumed the harness would use would be a guess dressed as a
+ * guarantee. Unattended turns get their own, much larger clock from the
+ * runner (see runner.mjs::unattendedAbsoluteTimeoutMs).
+ */
+const CHAT_ABSOLUTE_TIMEOUT_MS = ABSOLUTE_MS;
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -653,6 +666,40 @@ function approvalKey(chatId, requestId) {
 }
 
 /**
+ * When this question really lapses: the EARLIER of its own deadline and the
+ * instant its turn dies regardless (`turnDeadlineAt` — the turn's absolute
+ * wall clock, see timeout.mjs's ABSOLUTE_MS).
+ *
+ * WHY THE MINIMUM MATTERS (found independently by both external reviewers,
+ * Fix-Runde 2). An unattended turn runs under a wall clock of roughly
+ * deadline + 45 minutes. Its first question lapses at the deadline and is
+ * auto-denied — which ends that ONE question, not the turn, so the agent may
+ * immediately ask again. Question two used to be published with a fresh full
+ * deadline: eight more hours, in the API, in the SSE frame and in the inbox.
+ * The turn was in fact killed by its wall clock some 45 minutes later, and
+ * cleanupApprovalsForChat() denied the question as 'turn ended' with more
+ * than seven hours still showing on it. The inbox was promising time that did
+ * not exist — the one thing this feature must never do, because a person
+ * decides whether to answer now or later BASED on that number.
+ *
+ * Capping is honest in both directions: it never extends a question past its
+ * own deadline, and never past its turn's life. `turnDeadlineAt` of null
+ * means the caller has no wall clock to speak of, and nothing is capped —
+ * inventing a limit would be the same lie in the other direction.
+ *
+ * @returns {{deadlineAt: number, cappedByTurn: boolean}} `cappedByTurn` tells
+ *   the caller which limit won, so the eventual auto-deny can say what really
+ *   ended the question instead of blaming the person who did not answer.
+ */
+export function effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDeadlineAt) {
+  const ownDeadlineAt = requestedAt + approvalTimeoutMs;
+  if (!Number.isFinite(turnDeadlineAt) || turnDeadlineAt >= ownDeadlineAt) {
+    return { deadlineAt: ownDeadlineAt, cappedByTurn: false };
+  }
+  return { deadlineAt: turnDeadlineAt, cappedByTurn: true };
+}
+
+/**
  * Builds this turn's onApprovalRequest handler (passed to runTurn(), see
  * src/orchestrator/run.mjs), closing over the SSE `enqueue()` already open
  * for this turn's response. Per approval request:
@@ -669,11 +716,29 @@ function approvalKey(chatId, requestId) {
  *      cancel/disconnect (see cleanupApprovalsForChat()).
  * Never rejects: every path resolves with an ApprovalDecision, deny being
  * the fail-closed default.
+ *
+ * `turnDeadlineAt` is the instant this TURN dies no matter what — its
+ * never-pausing wall clock (timeout.mjs's `absolute`, which counts
+ * approval-wait time in full). Every deadline this handler publishes is
+ * capped to it; see effectiveApprovalDeadline() for why that is a
+ * correctness issue and not a nicety.
  */
-function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, approvalStore = null, describeSource = () => null }) {
+function makeApprovalHandler({
+  chatId,
+  enqueue,
+  pendingApprovals,
+  approvalTimeoutMs,
+  approvalStore = null,
+  turnDeadlineAt = null,
+  describeSource = () => null,
+}) {
   return async (request) => {
     const key = approvalKey(chatId, request.id);
     const requestedAt = Date.now();
+    const { deadlineAt, cappedByTurn } = effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDeadlineAt);
+    const timeoutMessage = cappedByTurn
+      ? 'approval timed out: the turn ran out of time before this question could be answered'
+      : 'approval timed out';
 
     // Written down BEFORE the promise is returned, and awaited: from here on
     // the CLI is blocked, and a GET /api/approvals arriving one millisecond
@@ -694,7 +759,7 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
           reason: request.reason ?? null,
           agentId: request.agentId ?? null,
           requestedAt,
-          deadlineAt: requestedAt + approvalTimeoutMs,
+          deadlineAt,
         });
       } catch (err) {
         return { behavior: 'deny', message: `approval could not be recorded: ${err.message}` };
@@ -706,9 +771,14 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
         const entry = pendingApprovals.get(key);
         if (!entry || entry.decided) return;
         pendingApprovals.delete(key);
-        recordDecision(approvalStore, key, { behavior: 'deny', message: 'approval timed out' });
-        resolve({ behavior: 'deny', message: 'approval timed out' });
-      }, approvalTimeoutMs);
+        recordDecision(approvalStore, key, { behavior: 'deny', message: timeoutMessage });
+        resolve({ behavior: 'deny', message: timeoutMessage });
+        // Fires at the EFFECTIVE deadline, not at approvalTimeoutMs: when the
+        // wall clock is the nearer limit, the question must end at its own
+        // deny — so the turn gets a decision it can react to — rather than
+        // being cut off mid-wait by a clock, with the CLI killed and the
+        // record left saying the question was still open.
+      }, Math.max(0, deadlineAt - requestedAt));
 
       pendingApprovals.set(key, { chatId, decided: false, resolve, timer, createdAt: requestedAt });
       // Fire-and-forget, like every other onEvent->enqueue call in this
@@ -721,7 +791,7 @@ function makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeou
       // stream is open, not only to the one watching this chat — a user shown
       // "allow Bash?" out of nowhere has to be able to see what asked, or they
       // are granting rights blind.
-      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt: requestedAt + approvalTimeoutMs }).catch(() => {});
+      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt }).catch(() => {});
     });
   };
 }
@@ -970,6 +1040,10 @@ async function handleChatTurn(
   const workspaceDir = path.join(dataDir, 'workspace');
   fs.mkdirSync(workspaceDir, { recursive: true });
 
+  // Read before runTurn() rather than inside it, so the approval handler and
+  // the harness are talking about the same turn start.
+  const turnStartedAt = Date.now();
+
   const controller = new AbortController();
   chatAbortControllers.set(chatId, controller);
   // Listens on `res`, not `req`: by the time this handler runs, the request
@@ -1024,7 +1098,16 @@ async function handleChatTurn(
       // so the response is only ended once every enqueued frame, including
       // this one, has actually reached the socket.
       onEvent: (event) => enqueue(event),
-      onApprovalRequest: makeApprovalHandler({ chatId, enqueue, pendingApprovals, approvalTimeoutMs, approvalStore, describeSource }),
+      absoluteTimeoutMs: CHAT_ABSOLUTE_TIMEOUT_MS,
+      onApprovalRequest: makeApprovalHandler({
+        chatId,
+        enqueue,
+        pendingApprovals,
+        approvalTimeoutMs,
+        approvalStore,
+        turnDeadlineAt: turnStartedAt + CHAT_ABSOLUTE_TIMEOUT_MS,
+        describeSource,
+      }),
       signal: controller.signal,
     });
     await enqueue({ type: 'turn-complete', ...result });
@@ -1713,6 +1796,11 @@ export function startServer({
   allowedTools = null,
   approvalTimeoutMs = APPROVAL_DEADLINE_INTERACTIVE_MS,
   unattendedApprovalTimeoutMs = APPROVAL_DEADLINE_UNATTENDED_MS,
+  // Null derives it from the deadline above (runner.mjs::
+  // unattendedAbsoluteTimeoutMs). Overriding it is safe now that every
+  // published deadline is capped to this clock — see
+  // effectiveApprovalDeadline().
+  unattendedAbsoluteTimeoutMs = null,
   bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
@@ -1866,10 +1954,15 @@ export function startServer({
         // leave the wall clock at 8h45m, which would kill the turn before its
         // own approval could ever lapse (panel Fix-Runde 1, M5).
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
+        absoluteTimeoutMs: unattendedAbsoluteTimeoutMs,
         releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
-        makeUiApprovalHandler: (chatId) =>
+        makeUiApprovalHandler: (chatId, { turnDeadlineAt = null } = {}) =>
           makeApprovalHandler({
             chatId,
+            // The instant this turn's wall clock kills it, handed down by the
+            // runner because only it knows when the turn started. Caps every
+            // deadline this handler publishes (see effectiveApprovalDeadline).
+            turnDeadlineAt,
             enqueue: (frame) => deliverApprovalFrame(chatId, frame),
             pendingApprovals,
             // A trigger question waits the UNATTENDED deadline, not the chat

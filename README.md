@@ -83,6 +83,8 @@ Two deadlines bound the waiting, both fail-closed — a question nobody answers 
 - a question from a chat turn you typed yourself: 10 minutes;
 - a question from a trigger that fired on its own: 8 hours.
 
+The countdown you see is the shorter of that deadline and the time its own turn has left. A turn dies at its wall clock whatever its questions say, so a question raised late in a long turn is shown — and denied — at the earlier moment rather than advertising hours that no longer exist. The number in the inbox is the one you can actually act on.
+
 **A pending approval does not survive restarting kaprek.** This is the limit to know, and it is not a bug that will be fixed by a bigger file. A waiting question means a `claude` CLI subprocess is parked on it, blocked on a response that kaprek's server process holds. Stop the server and that child dies with it. On the next start, kaprek reads `<dataDir>/approvals.json`, marks every entry that was still pending as `process gone`, and refuses to answer it — the record is there so you can see what was lost, not so kaprek can pretend to redeem it. Answering such an entry from a browser tab left open across the restart gets you a `410` that says so.
 
 What the inbox buys, precisely: a question survives the browser tab that would have shown it, not the process that raised it.

@@ -10,7 +10,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
-import { startServer, createSseQueue } from './server.mjs';
+import { startServer, createSseQueue, effectiveApprovalDeadline } from './server.mjs';
 import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
@@ -2655,4 +2655,155 @@ test('approvals: the SSE frame carries the server\'s own deadlineAt, so the clie
 
   expect(approvalFrame.deadlineAt).toBeGreaterThanOrEqual(before + 60_000);
   expect(approvalFrame.deadlineAt).toBeLessThanOrEqual(after + 60_000);
+});
+
+// -------------------------------------------------- approval inbox, Fix-Runde 2
+//
+// One finding, found independently by both external reviewers: a published
+// deadline the turn cannot keep. The turn's own wall clock (never paused, see
+// timeout.mjs's ABSOLUTE_MS) can be the nearer of the two limits, and every
+// question raised late in a turn used to be advertised with the full approval
+// deadline anyway — API, SSE frame and inbox all showing hours that did not
+// exist.
+
+/** Raises two approvals in one turn: the first answered by the test, the second `gapMs` later. */
+function twoQuestionHarness(gapMs = 120) {
+  let markFirst;
+  let markSecond;
+  const first = new Promise((resolve) => {
+    markFirst = resolve;
+  });
+  const second = new Promise((resolve) => {
+    markSecond = resolve;
+  });
+  return {
+    first,
+    second,
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      const one = onApprovalRequest({ id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      markFirst();
+      await one;
+      await new Promise((resolve) => setTimeout(resolve, gapMs));
+      const two = onApprovalRequest({ id: 'q-2', toolName: 'Write', displayName: 'Write', input: { path: 'x' } });
+      markSecond();
+      const decision = await two;
+      onEvent?.({ type: 'text', text: `second decision was ${decision.behavior}` });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('approvals: a question raised late in a turn is never advertised past the turn\'s own wall clock', async () => {
+  // The sequence both reviewers walked: question 1 lapses, the agent asks
+  // again, and question 2 is published with a fresh full deadline even though
+  // the turn itself is killed by its never-pausing wall clock long before
+  // that. Here the wall clock is 400ms and the approval deadline a full
+  // minute, so BOTH questions have to be capped to the same instant — the
+  // moment the turn dies. If either one advertised requestedAt + 60s, the
+  // inbox would be promising time the turn does not have.
+  const harness = twoQuestionHarness(120);
+  const { url, runner } = await boot({
+    harness,
+    harnessName: 'fake',
+    unattendedApprovalTimeoutMs: 60_000,
+    unattendedAbsoluteTimeoutMs: 400,
+  });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const firing = runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  await harness.first;
+
+  const firstInbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+  expect(firstInbox).toHaveLength(1);
+  const firstEntry = firstInbox[0];
+  await postJson(`${url}/api/approvals/q-1`, { chatId: firstEntry.chatId, behavior: 'allow' });
+
+  await harness.second;
+  const secondInbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+  expect(secondInbox).toHaveLength(1);
+  const secondEntry = secondInbox[0];
+
+  // Both are pinned to the same instant: the turn's death, not each
+  // question's own clock. Exact equality is the point — two questions asked
+  // 120ms apart with a 60s deadline could not otherwise share a deadline.
+  expect(secondEntry.deadlineAt).toBe(firstEntry.deadlineAt);
+  // And the second one is demonstrably shorter than its nominal deadline.
+  expect(secondEntry.deadlineAt - secondEntry.requestedAt).toBeLessThan(60_000);
+
+  await firing;
+});
+
+test('approvals: when the wall clock is the nearer limit, the question ends at the auto-deny — not at the clock', async () => {
+  // The other half of the same fix: capping only what is DISPLAYED would
+  // leave the timer running for the full minute while the turn dies at 400ms.
+  // The question has to be resolved by its own deny, so the turn gets an
+  // answer to react to rather than being cut off mid-wait. Nothing in this
+  // test waits a minute; if the timer were not capped it would hang here
+  // until vitest's own timeout, which is the assertion.
+  const harness = parkingApprovalHarness({ id: 'capped-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+  const { url, runner } = await boot({
+    harness,
+    harnessName: 'fake',
+    unattendedApprovalTimeoutMs: 60_000,
+    unattendedAbsoluteTimeoutMs: 300,
+  });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const startedAt = Date.now();
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(true);
+  expect(Date.now() - startedAt).toBeLessThan(3_000);
+
+  const entry = readApprovalsFile().find((e) => e.requestId === 'capped-1');
+  expect(entry.status).toBe('decided');
+  expect(entry.decision.behavior).toBe('deny');
+  // The reason names the real cause: the turn ran out of time, the user did
+  // not simply fail to answer within the advertised deadline.
+  expect(entry.decision.message).toMatch(/turn/);
+});
+
+test('approvals: the cap only ever shortens — a question whose own deadline is the nearer limit keeps it in full', async () => {
+  // The cap must not quietly shorten a question that fits inside its turn.
+  // A chat turn's clock is the harness default, which the server now passes
+  // explicitly so that capping is measured against a fact rather than an
+  // assumption; one minute into a 60-minute budget nothing is near it.
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'uncapped-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
+    harnessName: 'fake',
+    approvalTimeoutMs: 60_000,
+  });
+
+  const before = Date.now();
+  const res = await postJson(`${url}/api/chat/turn`, { text: 'no cap here' });
+  let approvalFrame = null;
+  await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && approvalFrame === null) {
+      approvalFrame = frame;
+      await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'allow' });
+    }
+  });
+
+  expect(approvalFrame.deadlineAt).toBeGreaterThanOrEqual(before + 60_000);
+});
+
+test('effectiveApprovalDeadline: the earlier of the two limits wins, and says which one it was', () => {
+  // The arithmetic on its own, without a server: three cases and the two
+  // degenerate ones a caller can actually produce.
+  const asked = 1_000_000;
+
+  // The question fits inside the turn — its own deadline stands, untouched.
+  expect(effectiveApprovalDeadline(asked, 60_000, asked + 500_000)).toEqual({ deadlineAt: asked + 60_000, cappedByTurn: false });
+  // The turn dies first — capped, and the caller is told so it can name the
+  // real cause in the deny.
+  expect(effectiveApprovalDeadline(asked, 60_000, asked + 5_000)).toEqual({ deadlineAt: asked + 5_000, cappedByTurn: true });
+  // Exactly equal is not a cap: nothing is being shortened.
+  expect(effectiveApprovalDeadline(asked, 60_000, asked + 60_000)).toEqual({ deadlineAt: asked + 60_000, cappedByTurn: false });
+  // No wall clock known — inventing one would be the same lie in reverse.
+  expect(effectiveApprovalDeadline(asked, 60_000, null)).toEqual({ deadlineAt: asked + 60_000, cappedByTurn: false });
+  // A turn already past its clock caps to that instant; the caller turns the
+  // resulting non-positive delay into an immediate deny rather than a wait
+  // nobody can win.
+  expect(effectiveApprovalDeadline(asked, 60_000, asked - 10)).toEqual({ deadlineAt: asked - 10, cappedByTurn: true });
 });
