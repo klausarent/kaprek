@@ -2260,7 +2260,12 @@ export function startServer({
       instanceToken,
       bundledAppsDir,
     }).catch((err) => {
-      sendJson(res, 500, { error: 'internal error', message: err.message });
+      // The message stays out of the response body: an internal error can
+      // carry filesystem paths or whatever a dependency put in its throw,
+      // and this is the one route where ANY unhandled error surfaces. Log
+      // locally, answer generically (launch review, low finding).
+      console.error('[kaprek] internal error:', err);
+      sendJson(res, 500, { error: 'internal error' });
     });
   });
 
