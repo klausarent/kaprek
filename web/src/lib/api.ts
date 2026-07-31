@@ -441,14 +441,6 @@ export type ApprovalFrame = {
    * server; lib/approvals.ts falls back when it is missing.
    */
   deadlineAt?: number | null;
-  /**
-   * Which of the two limits produced `deadlineAt`: the question's own
-   * approval deadline, or the turn's never-pausing wall clock. Only the
-   * second one needs explaining in the UI (a question can show minutes left
-   * when its nominal deadline is hours away). Absent on a frame from an older
-   * server, which is treated as 'question'.
-   */
-  deadlineSource?: "question" | "turn";
 };
 
 export type ChatStreamEvent =

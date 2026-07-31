@@ -13,6 +13,7 @@ import { spawn } from 'node:child_process';
 import {
   createApprovalStore,
   storableInput,
+  inputPreview,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_DEADLINE_UNATTENDED_MS,
   APPROVAL_HISTORY_RETENTION_MS,
@@ -472,6 +473,9 @@ test('approval store: an oversized input is stored as a marked stub, not verbati
 
   const stored = (await store.get('big')).input;
   expect(stored._truncated).toBe(true);
+  // The replay path needs the real input, so the cap is deliberately high (a
+  // megabyte); what it stops is a pathological write, not a large-ish call.
+  expect(MAX_STORED_INPUT_BYTES).toBe(1024 * 1024);
   expect(stored.preview.length).toBe(STORED_INPUT_PREVIEW_CHARS);
   // The preview is the START of what was asked, so the entry is still
   // recognisable rather than an empty marker.
@@ -480,6 +484,21 @@ test('approval store: an oversized input is stored as a marked stub, not verbati
   // every later put rewrites this file in full.
   const bytes = fs.statSync(path.join(dataDir, 'approvals.json')).size;
   expect(bytes).toBeLessThan(MAX_STORED_INPUT_BYTES);
+});
+
+test('approval store: every entry carries a short preview, capped input or not', async () => {
+  // What a list view renders from. It exists so that showing one line never
+  // means loading a megabyte of tool input, and it is present even when the
+  // full input was small enough to keep.
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'small', toolName: 'Bash', input: { command: 'git status' }, requestedAt: 0 });
+  await store.put({ id: 'huge', toolName: 'Write', input: { body: 'y'.repeat(MAX_STORED_INPUT_BYTES + 10) }, requestedAt: 1 });
+
+  expect((await store.get('small')).inputPreview).toContain('git status');
+  const bigPreview = (await store.get('huge')).inputPreview;
+  expect(bigPreview.length).toBe(STORED_INPUT_PREVIEW_CHARS);
+  expect(bigPreview).toContain('body');
+  expect(inputPreview(null)).toBeNull();
 });
 
 test('approval store: an input under the cap is stored exactly as given', async () => {

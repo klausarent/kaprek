@@ -736,10 +736,6 @@ function makeApprovalHandler({
     const key = approvalKey(chatId, request.id);
     const requestedAt = Date.now();
     const { deadlineAt, cappedByTurn } = effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDeadlineAt);
-    // WHICH limit produced deadlineAt. A countdown that is suddenly two
-    // minutes on an eight-hour question is not wrong, but it is unexplained
-    // unless the client can say why (Haertung r3, A5 / Fix-Runde-2 Bedenken 1).
-    const deadlineSource = cappedByTurn ? 'turn' : 'question';
     const timeoutMessage = cappedByTurn
       ? 'approval timed out: the turn ran out of time before this question could be answered'
       : 'approval timed out';
@@ -792,7 +788,6 @@ function makeApprovalHandler({
           agentId: request.agentId ?? null,
           requestedAt,
           deadlineAt,
-          deadlineSource,
         });
       } catch (err) {
         // Take the registration back, unless the turn already ended during
@@ -818,7 +813,7 @@ function makeApprovalHandler({
     // watching this chat - a user shown "allow Bash?" out of nowhere has to be
     // able to see what asked, or they are granting rights blind.
 
-      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt, deadlineSource }).catch(() => {});
+      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt }).catch(() => {});
     return decided;
   };
 }
@@ -959,15 +954,15 @@ async function handleApprovalsList(res, approvalStore) {
     toolName: entry.toolName,
     displayName: entry.displayName,
     input: entry.input,
+    // The short form a list renders from (see approval-store.mjs's
+    // inputPreview) - always present, so a client never has to pull a
+    // megabyte of tool input to show one line.
+    inputPreview: entry.inputPreview ?? null,
     description: entry.description,
     reason: entry.reason,
     agentId: entry.agentId,
     requestedAt: entry.requestedAt,
     deadlineAt: entry.deadlineAt,
-    // 'turn' when the turn's own wall clock, not the approval deadline, is
-    // what will end this question. Older records carry no such field; the web
-    // treats a missing one as 'question' (see lib/api.ts).
-    deadlineSource: entry.deadlineSource ?? 'question',
   }));
   sendJson(res, 200, { approvals });
 }

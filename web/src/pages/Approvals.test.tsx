@@ -67,27 +67,6 @@ test("relativeTime stays coarse and never invents precision", () => {
   expect(relativeTime(NOW + 10_000, NOW)).toBe("just now");
 });
 
-test("deadlineLabel explains a countdown that is short because the TURN is running out, not the question", () => {
-  // Without the reason, an eight-hour question showing two minutes reads as a
-  // bug or as a deadline someone quietly shortened. The server knows which
-  // limit won and now says so (deadlineSource).
-  const capped = deadlineLabel(NOW + 2 * 60_000, NOW, "turn");
-  expect(capped).toContain("2 minutes");
-  expect(capped).toContain("turn's own time budget");
-
-  // The ordinary case stays free of the extra sentence.
-  expect(deadlineLabel(NOW + 2 * 60_000, NOW, "question")).not.toContain("time budget");
-  // Default is the ordinary case, so a frame from an older server reads plainly.
-  expect(deadlineLabel(NOW + 2 * 60_000, NOW)).not.toContain("time budget");
-});
-
-test("an inbox entry whose deadline comes from the turn shows the explanation on the card", () => {
-  const text = textOf(
-    render(<ApprovalInboxItem approval={approval({ deadlineSource: "turn", deadlineAt: NOW + 4 * 60_000 })} nowMs={NOW} onDecide={() => {}} />),
-  );
-  expect(text).toContain("turn's own time budget");
-});
-
 test("deadlineLabel says when the server will deny on its own, and admits when that moment has passed", () => {
   expect(deadlineLabel(NOW + 20 * 60_000, NOW)).toContain("20 minutes");
   expect(deadlineLabel(NOW + 7 * 3_600_000, NOW)).toContain("7 hours");

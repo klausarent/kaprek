@@ -91,16 +91,19 @@ export const MAX_PENDING_APPROVALS = 50;
 /**
  * Cap on the JSON size of one stored `input`. A can_use_tool request can carry
  * megabytes (a Write of a whole file), and this store rewrites its ENTIRE file
- * on every put and every decision — an unbounded input turns each of those
- * into a multi-megabyte write. The chat store's own copy is already truncated
- * (run.mjs::sanitizeToolInput, 1500 chars), but the object handed to the
- * approval handler deliberately is not: the person approving has to see what
- * they are approving. So the LIVE path keeps the full input and only the
- * stored copy is capped (Härtung r3, Codex #5a).
+ * on every put and every decision, so an unbounded input turns each of those
+ * into a multi-megabyte write.
+ *
+ * Why it is a megabyte and not something tighter: the stored input is not just
+ * a record. It is what a deferred question is REPLAYED from - an approval
+ * granted tomorrow morning re-runs exactly this call, and a truncated input
+ * could not be re-run at all, only described. So the cap is set where it stops
+ * pathological writes rather than where it would keep the file small, and the
+ * short version the UI needs lives beside it in `inputPreview`.
  */
-export const MAX_STORED_INPUT_BYTES = 64 * 1024;
+export const MAX_STORED_INPUT_BYTES = 1024 * 1024;
 
-/** How much of an oversized input is kept as a human-readable preview. Enough to recognise the call, far too little to matter for file size. */
+/** Length of `inputPreview`: enough to recognise the call in a list, small enough that a UI never has to load the full input to render one. */
 export const STORED_INPUT_PREVIEW_CHARS = 2048;
 
 /**
@@ -151,6 +154,18 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * Only the STORED copy. The live SSE frame and the decision itself keep the
  * whole thing; see MAX_STORED_INPUT_BYTES.
  */
+export function inputPreview(input) {
+  if (input === null || input === undefined) return null;
+  let json;
+  try {
+    json = JSON.stringify(input);
+  } catch {
+    return '(input could not be serialised)';
+  }
+  if (json === undefined) return null;
+  return json.slice(0, STORED_INPUT_PREVIEW_CHARS);
+}
+
 export function storableInput(input) {
   if (input === null || input === undefined) return null;
   let json;
@@ -462,6 +477,7 @@ export function createApprovalStore({
       toolName: null,
       displayName: null,
       input: null,
+      inputPreview: null,
       description: null,
       reason: null,
       agentId: null,
@@ -472,6 +488,10 @@ export function createApprovalStore({
       // Only the stored copy is capped; the caller keeps the full object for
       // the dialog and the decision (see MAX_STORED_INPUT_BYTES).
       input: storableInput(entry.input ?? null),
+      // Always present, whether or not `input` was capped: a list view (and
+      // the floating question box) renders from this and never has to pull a
+      // megabyte of tool input to show one line.
+      inputPreview: inputPreview(entry.input ?? null),
       requestedAt: entry.requestedAt ?? now(),
       pid,
       status: 'pending',

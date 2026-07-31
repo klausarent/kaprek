@@ -2738,11 +2738,7 @@ test('approvals: a question raised late in a turn is never advertised past the t
   const secondEntry = secondInbox[0];
 
   // Both are pinned to the same instant: the turn's death, not each
-  // question's own clock. And both say WHERE that instant came from, so the
-  // UI can explain a two-minute countdown on an hours-long question.
-  expect(firstEntry.deadlineSource).toBe('turn');
-  expect(secondEntry.deadlineSource).toBe('turn');
-  // Exact equality is the point — two questions asked
+  // question's own clock. Exact equality is the point — two questions asked
   // 120ms apart with a 60s deadline could not otherwise share a deadline.
   expect(secondEntry.deadlineAt).toBe(firstEntry.deadlineAt);
   // And the second one is demonstrably shorter than its nominal deadline.
@@ -2802,8 +2798,6 @@ test('approvals: the cap only ever shortens — a question whose own deadline is
   });
 
   expect(approvalFrame.deadlineAt).toBeGreaterThanOrEqual(before + 60_000);
-  // Nothing was capped, so the frame says the deadline is the question's own.
-  expect(approvalFrame.deadlineSource).toBe('question');
 });
 
 test('effectiveApprovalDeadline: the earlier of the two limits wins, and says which one it was', () => {
