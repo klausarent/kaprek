@@ -14,8 +14,10 @@ import {
   createApprovalStore,
   storableInput,
   inputPreview,
+  canonicalInput,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_DEADLINE_UNATTENDED_MS,
+  APPROVAL_INBOX_TTL_MS,
   APPROVAL_HISTORY_RETENTION_MS,
   MAX_PENDING_APPROVALS,
   MAX_STORED_INPUT_BYTES,
@@ -252,10 +254,16 @@ test('approval store: finished entries are pruned once they are older than the r
   expect(await store.get('fresh')).toMatchObject({ status: 'pending' });
 });
 
-test('approval store: the two deadlines are named constants, and the unattended one is the longer wait by hours', () => {
+test('approval store: the two windows are named constants, and the inbox one is a whole day', () => {
+  // They measure different things now. The interactive one is how long a
+  // person in front of a dialog has; the inbox one is how long a filed
+  // question stays answerable while nothing at all is blocked on it.
   expect(APPROVAL_DEADLINE_INTERACTIVE_MS).toBe(10 * 60_000);
-  expect(APPROVAL_DEADLINE_UNATTENDED_MS).toBe(8 * 60 * 60_000);
-  expect(APPROVAL_DEADLINE_UNATTENDED_MS).toBeGreaterThan(APPROVAL_DEADLINE_INTERACTIVE_MS);
+  expect(APPROVAL_INBOX_TTL_MS).toBe(24 * 60 * 60_000);
+  expect(APPROVAL_INBOX_TTL_MS).toBeGreaterThan(APPROVAL_DEADLINE_INTERACTIVE_MS);
+  // The old name still resolves, so an external reference does not break in
+  // silence.
+  expect(APPROVAL_DEADLINE_UNATTENDED_MS).toBe(APPROVAL_INBOX_TTL_MS);
 });
 
 // ---------------------------------------------------------------- failure paths
@@ -630,4 +638,136 @@ test('approval store: two decisions for the same id racing in one tick still pro
   expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1);
   expect(results.find((r) => r.status === 'rejected').reason.message).toMatch(/already decided/);
   expect((await store.get('contested')).decision.behavior).toBe('allow');
+});
+
+// ---------------------------------------------------------- deferred model (C)
+//
+// A deferred entry is a filed question, not a live wait. Nothing is blocked on
+// it, so it outlives the turn that raised it AND the process that filed it,
+// and it is redeemed by starting a new turn rather than by resolving a promise
+// somebody is holding.
+
+/** The shape server.mjs files for an unattended question. */
+function deferredEntry(overrides = {}) {
+  // Real timestamps unless a test says otherwise: the store sweeps lapsed
+  // entries against its own clock, so an epoch-era deadline would be stale
+  // before the test began.
+  const asked = Date.now();
+  return {
+    id: 'chat-1:req-1',
+    requestId: 'req-1',
+    chatId: 'chat-1',
+    triggerId: 'nightly',
+    mode: 'deferred',
+    toolName: 'Bash',
+    input: { command: 'git status' },
+    requestedAt: asked,
+    deadlineAt: asked + APPROVAL_INBOX_TTL_MS,
+    ...overrides,
+  };
+}
+
+test('deferred: a filed question survives a restart and is still answerable', async () => {
+  // The one thing the park model could never do. There is no process to be
+  // gone: the turn that asked was told to carry on and ended, and approving
+  // starts a fresh turn.
+  const dataDir = await tmpDataDir();
+  const first = createApprovalStore({ dataDir, log: collectingLog() });
+  await first.put(deferredEntry());
+
+  const second = createApprovalStore({ dataDir, log: collectingLog() });
+  expect((await second.listPending()).map((e) => e.id)).toEqual(['chat-1:req-1']);
+  await expect(second.decide('chat-1:req-1', { behavior: 'allow' })).resolves.toMatchObject({ decision: { behavior: 'allow' } });
+});
+
+test('deferred: an INTERACTIVE entry still dies with its process, and the two are told apart by mode', async () => {
+  // The ownership rule is not gone, it is now scoped to the only entries it
+  // was ever true for: a live dialog's question, whose answer had to reach a
+  // promise in the process that asked.
+  const dataDir = await tmpDataDir();
+  const first = createApprovalStore({ dataDir, log: collectingLog() });
+  await first.put({ id: 'chat-9:req-1', requestId: 'req-1', chatId: 'chat-9', toolName: 'Bash', requestedAt: Date.now(), deadlineAt: Date.now() + 600_000 });
+  await first.put(deferredEntry());
+
+  const second = createApprovalStore({ dataDir, log: collectingLog() });
+  expect((await second.listPending()).map((e) => e.id)).toEqual(['chat-1:req-1']);
+  await expect(second.decide('chat-9:req-1', { behavior: 'allow' })).rejects.toThrow(/process gone/);
+  expect(await second.get('chat-9:req-1')).toMatchObject({ status: 'expired', expired: 'process gone' });
+});
+
+test('deferred: asking the same question again updates the entry instead of adding a second card', async () => {
+  // A nightly trigger asks again on every fire, deliberately. Twenty identical
+  // cards by morning would be the cost of that if nothing deduped them.
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  const asked = Date.now();
+  await store.put(deferredEntry({ requestedAt: asked }));
+  await store.put(deferredEntry({ id: 'chat-1:req-7', requestId: 'req-7', requestedAt: asked + 90_000 }));
+
+  const pending = await store.listPending();
+  expect(pending).toHaveLength(1);
+  expect(pending[0]).toMatchObject({ id: 'chat-1:req-1', askedCount: 2, requestedAt: asked + 90_000 });
+  // The id it keeps is the FIRST one, so an answer already on its way from a
+  // browser that saw the original card still lands.
+  expect(await store.get('chat-1:req-7')).toBeNull();
+});
+
+test('deferred: a different input is a different question, and so is the same one after a decision', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put(deferredEntry());
+  // One byte apart: a separate question, separate card.
+  await store.put(deferredEntry({ id: 'chat-1:req-2', requestId: 'req-2', input: { command: 'git status ' } }));
+  expect(await store.listPending()).toHaveLength(2);
+
+  await store.decide('chat-1:req-1', { behavior: 'deny' });
+  // Asking again after a deny is a new question, not a revival of the old one.
+  await store.put(deferredEntry({ id: 'chat-1:req-3', requestId: 'req-3' }));
+  const pending = await store.listPending();
+  expect(pending.map((e) => e.id).sort()).toEqual(['chat-1:req-2', 'chat-1:req-3']);
+  expect(pending.find((e) => e.id === 'chat-1:req-3').askedCount).toBe(1);
+});
+
+test('deferred: key order in the input does not make a new question', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put(deferredEntry({ input: { a: 1, b: { x: 1, y: 2 } } }));
+  await store.put(deferredEntry({ id: 'chat-1:req-9', requestId: 'req-9', input: { b: { y: 2, x: 1 }, a: 1 } }));
+  expect(await store.listPending()).toHaveLength(1);
+});
+
+test('canonicalInput: same content in any key order is one string, different content is not', () => {
+  expect(canonicalInput({ b: 2, a: 1 })).toBe(canonicalInput({ a: 1, b: 2 }));
+  expect(canonicalInput({ a: [1, { z: 1, y: 2 }] })).toBe(canonicalInput({ a: [1, { y: 2, z: 1 }] }));
+  expect(canonicalInput({ a: 1 })).not.toBe(canonicalInput({ a: 2 }));
+  // Arrays are ordered data, not a set: reordering them IS a different call.
+  expect(canonicalInput({ a: [1, 2] })).not.toBe(canonicalInput({ a: [2, 1] }));
+  expect(canonicalInput(null)).toBe('null');
+});
+
+test('deferred: an entry past its deadline lapses silently and can no longer be decided', async () => {
+  let clock = 1_000;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog(), now: () => clock });
+  await store.put(deferredEntry({ requestedAt: clock, deadlineAt: clock + APPROVAL_INBOX_TTL_MS }));
+
+  clock += APPROVAL_INBOX_TTL_MS + 1;
+  expect(await store.listPending()).toEqual([]);
+  expect(await store.get('chat-1:req-1')).toMatchObject({ status: 'lapsed' });
+  await expect(store.decide('chat-1:req-1', { behavior: 'allow' })).rejects.toThrow(/lapsed/);
+});
+
+test('deferred: lapsing is written down, so a restart does not resurrect the question', async () => {
+  const dataDir = await tmpDataDir();
+  let clock = 1_000;
+  const store = createApprovalStore({ dataDir, log: collectingLog(), now: () => clock });
+  await store.put(deferredEntry({ requestedAt: clock, deadlineAt: clock + 5_000 }));
+  clock += 6_000;
+  await store.listPending();
+
+  expect(readApprovalFile(dataDir).approvals[0]).toMatchObject({ status: 'lapsed' });
+});
+
+test('deferred: an entry inside its deadline is untouched by the sweep', async () => {
+  let clock = 1_000;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog(), now: () => clock });
+  await store.put(deferredEntry({ requestedAt: clock, deadlineAt: clock + 10_000 }));
+  clock += 9_999;
+  expect(await store.listPending()).toHaveLength(1);
 });

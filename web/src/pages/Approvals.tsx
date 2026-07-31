@@ -82,6 +82,7 @@ export function ApprovalInboxItem({
       <div className="approval-dialog-head">
         <span className="approval-dialog-title">🔐 {toolLabel}</span>
         <span className="badge badge-muted">asked {relativeTime(approval.requestedAt, nowMs)}</span>
+        {(approval.askedCount ?? 1) > 1 && <span className="badge badge-muted">asked {approval.askedCount} times</span>}
       </div>
 
       {sourceLabel && <div className="approval-dialog-source">{sourceLabel}</div>}
@@ -90,11 +91,18 @@ export function ApprovalInboxItem({
 
       <pre className="approval-dialog-input">{formatInput(approval.input)}</pre>
 
+      {(approval.input as { _truncated?: boolean } | null)?._truncated === true && (
+        <p className="approval-dialog-note">
+          The full input was too large to keep, so approving this will start a turn that asks again before it runs — you will
+          be here to answer that one.
+        </p>
+      )}
+
       {deadline && <div className="approval-dialog-countdown">{deadline}</div>}
 
       <div className="approval-dialog-actions">
         <button type="button" className="btn" disabled={busy} onClick={() => onDecide(approval, "allow")}>
-          Allow
+          Approve &amp; run now
         </button>
         <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onDecide(approval, "deny")}>
           Deny
@@ -146,9 +154,10 @@ export default function Approvals() {
       <header className="page-header">
         <h1>Approvals</h1>
         <p className="page-subtitle">
-          Questions raised by a running turn, including one a trigger started while you were away. They wait here instead of
-          needing you to be watching when they are asked. A question does <strong>not</strong> survive a restart of kaprek:
-          the agent process it belongs to dies with the server, and the entry is dropped as unanswerable.
+          Questions an agent could not answer for itself. A trigger running on its own does not wait for you: it files the
+          question here, is told to carry on, and finishes its turn. Approve one and kaprek runs that single action in a
+          follow-up turn; deny it, or leave it, and nothing happens. Unanswered questions lapse after a day, and a trigger
+          that still wants the answer simply asks again.
         </p>
       </header>
 

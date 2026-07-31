@@ -39,7 +39,7 @@ import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token
 import {
   createApprovalStore,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
-  APPROVAL_DEADLINE_UNATTENDED_MS,
+  APPROVAL_INBOX_TTL_MS,
 } from './approval-store.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 
@@ -70,6 +70,40 @@ const DEFAULT_HARNESS = { startTurn: claudeCodeStartTurn };
  * runner (see runner.mjs::unattendedAbsoluteTimeoutMs).
  */
 const CHAT_ABSOLUTE_TIMEOUT_MS = ABSOLUTE_MS;
+
+/**
+ * What an unattended turn is told when it asks for something only a human can
+ * grant. It is a deny, because the tool call does not happen now, but the
+ * wording is doing real work and is not decoration.
+ *
+ * A bare "denied" reads to a capable agent as a verdict: it stops trying, or
+ * it decides the whole task is impossible and abandons work it could have
+ * finished. So this says three things instead. The action was FILED, not
+ * refused. It may still run later, so there is no point retrying it now (a
+ * retry loop would file the same question again and again). And everything
+ * that does not depend on it should still be done before the turn ends.
+ */
+export const DEFERRAL_MESSAGE =
+  'kaprek: this action needs human approval and none is available right now. ' +
+  'The request has been filed to the approval inbox; if approved later, kaprek will run it in a follow-up turn ' +
+  '- do NOT retry it in this turn. Continue with everything that does not need this approval and finish the turn normally.';
+
+/** The follow-up turn's prompt. Deliberately narrow: this turn exists to run ONE approved action, not to resume the original work. */
+export function followUpPrompt({ toolName, input }) {
+  const rendered = (() => {
+    try {
+      return JSON.stringify(input ?? null, null, 2);
+    } catch {
+      return '(input could not be displayed)';
+    }
+  })();
+  return [
+    `Your earlier request to run ${toolName ?? 'a tool'} with the input below was just approved by the user.`,
+    'Execute exactly that action now, report the result briefly, and do nothing else beyond what finishing this action requires.',
+    '',
+    rendered,
+  ].join('\n');
+}
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -730,8 +764,13 @@ function makeApprovalHandler({
   approvalTimeoutMs,
   approvalStore = null,
   turnDeadlineAt = null,
+  mode = 'interactive',
+  triggerId = null,
   describeSource = () => null,
 }) {
+  if (mode === 'deferred') {
+    return makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approvalTimeoutMs, triggerId, describeSource });
+  }
   return async (request) => {
     const key = approvalKey(chatId, request.id);
     const requestedAt = Date.now();
@@ -819,6 +858,71 @@ function makeApprovalHandler({
 }
 
 /**
+ * The unattended half of makeApprovalHandler: file the question and let the
+ * turn get on with its work.
+ *
+ * WHY THIS REPLACED PARKING. The first version of the inbox kept the CLI
+ * blocked on `can_use_tool` until someone answered, for up to eight hours.
+ * That one decision produced most of this feature's problems: a `claude`
+ * subprocess held open all night, the trigger's chat locked and every manual
+ * fire refused for as long, caps that could not see a turn that had not ended,
+ * and a wall clock that had to be stretched around the wait and then lied
+ * about how long a question really had. None of that is inherent to asking a
+ * human; it came from making the agent WAIT for the answer.
+ *
+ * So the turn is told, immediately, that the action is filed and that it
+ * should carry on (DEFERRAL_MESSAGE). The entry outlives the turn on purpose -
+ * that is what makes it redeemable later, by a follow-up turn that runs the
+ * one approved action (see handleApprovalDecision). Nothing is registered in
+ * `pendingApprovals` and no timer is armed, because nothing is waiting.
+ */
+function makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approvalTimeoutMs, triggerId, describeSource }) {
+  return async (request) => {
+    const requestedAt = Date.now();
+    let entry;
+    try {
+      entry = await approvalStore.put({
+        id: approvalKey(chatId, request.id),
+        requestId: request.id,
+        chatId,
+        triggerId,
+        mode: 'deferred',
+        source: describeSource(chatId),
+        toolName: request.toolName ?? null,
+        displayName: request.displayName ?? null,
+        input: request.input ?? null,
+        description: request.description ?? null,
+        reason: request.reason ?? null,
+        agentId: request.agentId ?? null,
+        requestedAt,
+        deadlineAt: requestedAt + approvalTimeoutMs,
+      });
+    } catch (err) {
+      // Fail-closed, and say why: a question that could not be filed is one
+      // nobody will ever see, so promising a follow-up would be a lie.
+      return { behavior: 'deny', message: `kaprek: this action needs human approval, and the request could not be filed (${err.message}). Continue without it.` };
+    }
+
+    // The frame carries the ENTRY's identity, not the raw request's: a
+    // repeated question is deduped onto the existing entry (see the store's
+    // put()), and an answer has to name the id that actually exists.
+    enqueue({
+      type: 'approval',
+      chatId: entry.chatId,
+      source: entry.source ?? null,
+      ...request,
+      id: entry.requestId,
+      mode: 'deferred',
+      askedCount: entry.askedCount ?? 1,
+      requestedAt: entry.requestedAt,
+      deadlineAt: entry.deadlineAt,
+    }).catch(() => {});
+
+    return { behavior: 'deny', message: DEFERRAL_MESSAGE };
+  };
+}
+
+/**
  * Records an already-made decision in the durable inbox. Best-effort BY
  * DESIGN, and the direction matters: the in-memory entry in `pendingApprovals`
  * is what actually unblocks the CLI, so a store that cannot write must not
@@ -876,7 +980,7 @@ function cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore = null)
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -900,6 +1004,19 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   const key = approvalKey(chatId, id);
   const entry = pendingApprovals.get(key);
   if (!entry) {
+    // DEFERRED entries live only in the store: nothing in this process is
+    // waiting on them, which is exactly why they can still be answered hours
+    // later and across a restart. Answering one is not "resolving a promise",
+    // it is a decision plus, for an allow, a fresh turn that runs the action.
+    const filed = approvalStore ? await approvalStore.get(key) : null;
+    if (filed?.mode === 'deferred' && filed.status === 'pending') {
+      await decideDeferredApproval(res, { key, entry: filed, behavior, message: body.data?.message, approvalStore, getRunner });
+      return;
+    }
+    if (filed?.status === 'lapsed') {
+      sendJson(res, 410, { error: 'approval lapsed: nobody answered it before its deadline' });
+      return;
+    }
     // Nothing is waiting in THIS process. The durable record can still say
     // why, and the two reasons are worth telling apart: a question that died
     // with a previous process (410 — answering it is impossible, no amount of
@@ -926,6 +1043,57 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   recordDecision(approvalStore, key, decision);
   entry.resolve(decision);
   sendJson(res, 200, { ok: true });
+}
+
+/**
+ * Answers a DEFERRED question: record the decision, and on an allow start the
+ * follow-up turn that actually runs the action.
+ *
+ * Order matters. The follow-up is gated BEFORE the decision is recorded, so a
+ * refusal (another turn is running in that chat) leaves the question exactly
+ * as it was — still pending, still answerable in a minute — instead of burning
+ * it on a turn that never started. There is deliberately no queueing: kaprek
+ * would otherwise be promising to run something at an unknown later time,
+ * which is the promise this whole redesign exists to stop making.
+ *
+ * The turn itself is NOT awaited. It can take minutes, and the browser is
+ * waiting for an answer to "did my approval land", not for the work to finish.
+ */
+async function decideDeferredApproval(res, { key, entry, behavior, message, approvalStore, getRunner }) {
+  if (behavior === 'deny') {
+    try {
+      await approvalStore.decide(key, { behavior: 'deny', message: typeof message === 'string' ? message : 'denied by user' });
+    } catch (err) {
+      sendJson(res, 409, { error: err.message });
+      return;
+    }
+    sendJson(res, 200, { ok: true, followUp: false });
+    return;
+  }
+
+  const runner = getRunner ? getRunner() : null;
+  if (!runner) {
+    sendJson(res, 503, { error: 'cannot run the approved action right now' });
+    return;
+  }
+  const gate = runner.canStartFollowUp(entry.chatId);
+  if (!gate.allowed) {
+    // The question survives untouched, which is the point of checking first.
+    sendJson(res, 409, { error: `${gate.reason} — approve again when the current turn is done` });
+    return;
+  }
+
+  try {
+    await approvalStore.decide(key, { behavior: 'allow' });
+  } catch (err) {
+    sendJson(res, 409, { error: err.message });
+    return;
+  }
+
+  // Fire-and-forget: errors reach the log and the chat transcript, not this
+  // response (which is long sent by the time the turn ends).
+  runner.fireFollowUp({ entry }).catch(() => {});
+  sendJson(res, 200, { ok: true, followUp: true });
 }
 
 /**
@@ -963,6 +1131,16 @@ async function handleApprovalsList(res, approvalStore) {
     agentId: entry.agentId,
     requestedAt: entry.requestedAt,
     deadlineAt: entry.deadlineAt,
+    // 'deferred' questions are the ones the floating box shows: nothing is
+    // waiting on them, they outlive their turn, and answering one starts a
+    // follow-up turn. 'interactive' ones belong to a live dialog and are
+    // already on screen wherever they matter.
+    mode: entry.mode ?? 'interactive',
+    triggerId: entry.triggerId ?? null,
+    // How often the trigger has asked this same question (see the store's
+    // dedupe). Worth showing: a question asked five times is a different kind
+    // of pending than one asked once.
+    askedCount: entry.askedCount ?? 1,
   }));
   sendJson(res, 200, { approvals });
 }
@@ -1006,6 +1184,7 @@ async function handleChatTurn(
     allowedTools,
     pendingApprovals,
     approvalTimeoutMs,
+    chatAbsoluteTimeoutMs = CHAT_ABSOLUTE_TIMEOUT_MS,
     approvalStore,
     getRunner,
     chatSseQueues,
@@ -1124,14 +1303,14 @@ async function handleChatTurn(
       // so the response is only ended once every enqueued frame, including
       // this one, has actually reached the socket.
       onEvent: (event) => enqueue(event),
-      absoluteTimeoutMs: CHAT_ABSOLUTE_TIMEOUT_MS,
+      absoluteTimeoutMs: chatAbsoluteTimeoutMs,
       onApprovalRequest: makeApprovalHandler({
         chatId,
         enqueue,
         pendingApprovals,
         approvalTimeoutMs,
         approvalStore,
-        turnDeadlineAt: turnStartedAt + CHAT_ABSOLUTE_TIMEOUT_MS,
+        turnDeadlineAt: turnStartedAt + chatAbsoluteTimeoutMs,
         describeSource,
       }),
       signal: controller.signal,
@@ -1619,6 +1798,7 @@ async function handleRequest(
     allowedTools,
     pendingApprovals,
     approvalTimeoutMs,
+    chatAbsoluteTimeoutMs,
     getApprovalStore,
     getTriggers,
     getRunner,
@@ -1714,6 +1894,7 @@ async function handleRequest(
         allowedTools,
         pendingApprovals,
         approvalTimeoutMs,
+        chatAbsoluteTimeoutMs,
         approvalStore: getApprovalStore(),
         getRunner,
         chatSseQueues,
@@ -1731,7 +1912,7 @@ async function handleRequest(
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore());
+      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner);
       return;
     }
     if (segments.length === 2 && segments[1] === 'approvals') {
@@ -1821,12 +2002,13 @@ export function startServer({
   permissionMode = 'default',
   allowedTools = null,
   approvalTimeoutMs = APPROVAL_DEADLINE_INTERACTIVE_MS,
-  unattendedApprovalTimeoutMs = APPROVAL_DEADLINE_UNATTENDED_MS,
-  // Null derives it from the deadline above (runner.mjs::
-  // unattendedAbsoluteTimeoutMs). Overriding it is safe now that every
-  // published deadline is capped to this clock — see
-  // effectiveApprovalDeadline().
-  unattendedAbsoluteTimeoutMs = null,
+  unattendedApprovalTimeoutMs = APPROVAL_INBOX_TTL_MS,
+  // The wall clock a CHAT turn runs under, and therefore the ceiling every
+  // interactive deadline is capped to (see effectiveApprovalDeadline).
+  // Overridable because that cap is only checkable end to end if a test can
+  // make the clock the nearer of the two limits; the default is exactly what
+  // the harness would have used anyway.
+  chatAbsoluteTimeoutMs = CHAT_ABSOLUTE_TIMEOUT_MS,
   bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
@@ -1980,23 +2162,26 @@ export function startServer({
         // leave the wall clock at 8h45m, which would kill the turn before its
         // own approval could ever lapse (panel Fix-Runde 1, M5).
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
-        absoluteTimeoutMs: unattendedAbsoluteTimeoutMs,
         releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
-        makeUiApprovalHandler: (chatId, { turnDeadlineAt = null } = {}) =>
+        makeUiApprovalHandler: (chatId, { turnDeadlineAt = null, mode = 'interactive', triggerId = null } = {}) =>
           makeApprovalHandler({
             chatId,
+            mode,
+            triggerId,
             // The instant this turn's wall clock kills it, handed down by the
             // runner because only it knows when the turn started. Caps every
-            // deadline this handler publishes (see effectiveApprovalDeadline).
+            // deadline an INTERACTIVE handler publishes (see
+            // effectiveApprovalDeadline); a deferred question outlives the
+            // turn by design and is not capped to it.
             turnDeadlineAt,
             enqueue: (frame) => deliverApprovalFrame(chatId, frame),
             pendingApprovals,
-            // A trigger question waits the UNATTENDED deadline, not the chat
-            // one: nobody typed this turn, so "answer within ten minutes" is
-            // a rule about a person who was never there. See
-            // approval-store.mjs's APPROVAL_DEADLINE_UNATTENDED_MS for why it
-            // is hours rather than unbounded.
-            approvalTimeoutMs: unattendedApprovalTimeoutMs,
+            // Two different meanings behind one parameter. Deferred: how long
+            // the filed question stays answerable in the inbox, nothing is
+            // waiting (APPROVAL_INBOX_TTL_MS). Interactive, which for a
+            // trigger means someone pressed "run now" and is watching the
+            // dialog: the ordinary ten minutes a person gets.
+            approvalTimeoutMs: mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs,
             approvalStore: getApprovalStore(),
             describeSource: describeApprovalSource,
           }),
@@ -2065,6 +2250,7 @@ export function startServer({
       allowedTools,
       pendingApprovals,
       approvalTimeoutMs,
+      chatAbsoluteTimeoutMs,
       getApprovalStore,
       getTriggers,
       getRunner,

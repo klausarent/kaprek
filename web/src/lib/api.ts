@@ -441,6 +441,12 @@ export type ApprovalFrame = {
    * server; lib/approvals.ts falls back when it is missing.
    */
   deadlineAt?: number | null;
+  /** Present on a deferred frame: the question was filed, not waited on (see server.mjs's DEFERRAL_MESSAGE). */
+  mode?: "interactive" | "deferred";
+  askedCount?: number;
+  requestedAt?: number;
+  inputPreview?: string | null;
+  triggerId?: string | null;
 };
 
 export type ChatStreamEvent =
@@ -676,6 +682,13 @@ export async function answerApproval(
 export type InboxApproval = ApprovalFrame & {
   requestedAt: number;
   deadlineAt: number | null;
+  /** A one-line form of `input`, so a list never has to load a megabyte of tool arguments (see approval-store.mjs::inputPreview). */
+  inputPreview?: string | null;
+  /** 'deferred' questions were filed by an unattended turn and outlive it; 'interactive' ones belong to a live dialog. */
+  mode?: "interactive" | "deferred";
+  /** How often the trigger has asked this same question (see the store's dedupe). */
+  askedCount?: number;
+  triggerId?: string | null;
 };
 
 export function fetchApprovalInbox(): Promise<{ approvals: InboxApproval[] }> {

@@ -11,12 +11,11 @@ import { runTurn } from '../orchestrator/run.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
-import { createTriggerRunner, UNATTENDED_ABSOLUTE_TIMEOUT_MS, unattendedAbsoluteTimeoutMs } from './runner.mjs';
+import { createTriggerRunner } from './runner.mjs';
 import { MAX_TRIGGER_TURNS_PER_HOUR, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { buildArgs } from '../harness/claude-code.mjs';
 import { createTurnClocks, IDLE_MS, TOOL_LEASE_MS, ACTIVE_TOTAL_MS, ABSOLUTE_MS } from '../harness/timeout.mjs';
-import { APPROVAL_DEADLINE_UNATTENDED_MS } from '../server/approval-store.mjs';
 
 let dataDir;
 let cwd;
@@ -544,80 +543,164 @@ test('an inbox store does NOT override the missing-handler refusal — with noth
   expect(result.reason).toBe('no UI approval handler configured for this escalation level');
 });
 
-test('an inbox turn gets an absolute wall clock sized to outlast the unattended approval deadline', async () => {
-  const seen = [];
+test('a runner WITHOUT a store still refuses an unattended question turn — and starts nothing at all', async () => {
+  // The fail-closed default, restated as the inbox's own boundary: the store
+  // is what lifts the gate, so a runner that has none must behave exactly as
+  // it did before this feature existed. Stronger than the reason string
+  // alone — it also pins that NOTHING ran: no startTurn, no chat, no bill.
+  const started = [];
   const { runner } = makeRunner({
     trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
     makeUiApprovalHandler: allowingApprovalHandler,
-    approvalStore: fakeApprovalStore(),
+    hasApprovalClient: () => false,
     wrapHarness: (harness) => ({
       startTurn: (options) => {
-        seen.push(options);
+        started.push(options);
         return harness.startTurn(options);
       },
     }),
   });
 
-  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
-  expect(seen).toHaveLength(1);
-  // The contract from adapter.mjs's TurnResult.timeoutClock doc comment: at
-  // least the inbox deadline plus the turn's own active budget plus a buffer.
-  expect(seen[0].absoluteTimeoutMs).toBe(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
-  expect(seen[0].absoluteTimeoutMs).toBeGreaterThanOrEqual(APPROVAL_DEADLINE_UNATTENDED_MS + ACTIVE_TOTAL_MS);
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+  expect(started).toEqual([]);
+  expect(openChats(dataDir).list()).toEqual([]);
 });
 
-test('a longer approval deadline moves the wall clock with it — the two cannot drift apart', async () => {
-  // The deadline is configurable (startServer's unattendedApprovalTimeoutMs).
-  // With a hardcoded wall clock, setting it to 12 hours would mean the turn is
-  // killed at 8h45m — three hours BEFORE its own approval could lapse, which
-  // is precisely the failure the sizing exists to prevent, and silent.
-  const twelveHours = 12 * 60 * 60_000;
-  const seen = [];
+test('an inbox store does NOT override the missing-handler refusal — with nothing to raise the question with, writing it down changes nothing', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    approvalStore: fakeApprovalStore(),
+  });
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('no UI approval handler configured for this escalation level');
+});
+
+test('a runner WITHOUT a store still refuses an unattended question turn — and starts nothing at all', async () => {
+  // The fail-closed default, restated as the inbox's own boundary: the store
+  // is what lifts the gate, so a runner that has none must behave exactly as
+  // it did before this feature existed. Stronger than the reason string
+  // alone — it also pins that NOTHING ran: no startTurn, no chat, no bill.
+  const started = [];
   const { runner } = makeRunner({
     trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
     makeUiApprovalHandler: allowingApprovalHandler,
-    approvalStore: fakeApprovalStore(),
-    approvalDeadlineMs: twelveHours,
+    hasApprovalClient: () => false,
     wrapHarness: (harness) => ({
       startTurn: (options) => {
-        seen.push(options);
+        started.push(options);
         return harness.startTurn(options);
       },
     }),
   });
 
-  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
-  expect(seen[0].absoluteTimeoutMs).toBe(unattendedAbsoluteTimeoutMs(twelveHours));
-  expect(seen[0].absoluteTimeoutMs).toBeGreaterThan(twelveHours + ACTIVE_TOTAL_MS);
-  // …and it is genuinely bigger than the default, not the constant in disguise.
-  expect(seen[0].absoluteTimeoutMs).toBeGreaterThan(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+  expect(started).toEqual([]);
+  expect(openChats(dataDir).list()).toEqual([]);
 });
 
-test('a nonsensical deadline falls back to the default rather than disabling the wall clock', () => {
-  // A zero/NaN/negative budget disables a clock entirely in timeout.mjs
-  // (normalizeBudget), so passing one straight through would silently remove
-  // the backstop instead of shortening it.
-  for (const bad of [0, -1, NaN, undefined, null]) {
-    expect(unattendedAbsoluteTimeoutMs(bad)).toBe(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
+test('an inbox store does NOT override the missing-handler refusal — with nothing to raise the question with, writing it down changes nothing', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    approvalStore: fakeApprovalStore(),
+  });
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('no UI approval handler configured for this escalation level');
+});
+
+test('a runner WITHOUT a store still refuses an unattended question turn — and starts nothing at all', async () => {
+  // The fail-closed default, restated as the inbox's own boundary: the store
+  // is what lifts the gate, so a runner that has none must behave exactly as
+  // it did before this feature existed. Stronger than the reason string
+  // alone — it also pins that NOTHING ran: no startTurn, no chat, no bill.
+  const started = [];
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    hasApprovalClient: () => false,
+    wrapHarness: (harness) => ({
+      startTurn: (options) => {
+        started.push(options);
+        return harness.startTurn(options);
+      },
+    }),
+  });
+
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result).toEqual({ fired: false, reason: 'needs an open UI to ask for approval' });
+  expect(started).toEqual([]);
+  expect(openChats(dataDir).list()).toEqual([]);
+});
+
+test('an inbox store does NOT override the missing-handler refusal — with nothing to raise the question with, writing it down changes nothing', async () => {
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'review' }),
+    approvalStore: fakeApprovalStore(),
+  });
+  const result = await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(false);
+  expect(result.reason).toBe('no UI approval handler configured for this escalation level');
+});
+
+test('an unattended turn runs under the ordinary wall clock again - nothing is stretched around a wait', () => {
+  // The park model needed absoluteTimeoutMs sized to outlast an eight-hour
+  // approval wait. There is no wait any more, so the budget is the harness's
+  // own: idle, tool-lease, active-total and a one-hour wall clock, exactly as
+  // for a turn that never asks anything.
+  const clock = fakeClock();
+  const startedAt = clock.now();
+  const clocks = createTurnClocks({
+    idleMs: IDLE_MS,
+    toolLeaseMs: TOOL_LEASE_MS,
+    activeTotalMs: ACTIVE_TOTAL_MS,
+    absoluteMs: ABSOLUTE_MS,
+    nowFn: clock.now,
+  });
+  clocks.onProgress('init');
+
+  // Twenty minutes of ordinary work: well inside every budget.
+  for (let minute = 0; minute < 20; minute += 1) {
+    clocks.onProgress('assistant-message');
+    clock.advance(60_000);
+    expect(clocks.check()).toBeNull();
   }
+  // And the ordinary budgets still end a turn that overruns them. Kept busy
+  // right up to the line, so it is the turn's own active budget that reports
+  // it and not an idle gap - the point being that these are the SAME limits
+  // any other turn runs under, with nothing stretched around a wait.
+  while (clock.now() < startedAt + ACTIVE_TOTAL_MS) {
+    clocks.onProgress('assistant-message');
+    clock.advance(60_000);
+  }
+  expect(clocks.check()).toMatchObject({ clock: 'active-total' });
 });
 
-test('a trigger turn WITHOUT a store passes no absoluteTimeoutMs at all — the interactive default stays untouched', async () => {
-  const seen = [];
-  const { runner } = makeRunner({
-    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
-    makeUiApprovalHandler: allowingApprovalHandler,
-    hasApprovalClient: () => true,
-    wrapHarness: (harness) => ({
-      startTurn: (options) => {
-        seen.push(options);
-        return harness.startTurn(options);
-      },
-    }),
-  });
+test('a trigger turn passes the ordinary wall clock explicitly, store or no store', async () => {
+  // Explicit rather than implicit, because the interactive cap measures a
+  // published deadline against this exact number.
+  for (const approvalStore of [null, fakeApprovalStore()]) {
+    const seen = [];
+    const { runner } = makeRunner({
+      trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+      makeUiApprovalHandler: allowingApprovalHandler,
+      hasApprovalClient: () => true,
+      approvalStore,
+      wrapHarness: (harness) => ({
+        startTurn: (options) => {
+          seen.push(options);
+          return harness.startTurn(options);
+        },
+      }),
+    });
 
-  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
-  expect(seen[0].absoluteTimeoutMs).toBeUndefined();
+    expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'user' } })).fired).toBe(true);
+    expect(seen[0].absoluteTimeoutMs).toBe(ABSOLUTE_MS);
+    fs.rmSync(dataDir, { recursive: true, force: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+  }
 });
 
 /** A hand-driven time source for the clock arithmetic below — no timers, no waiting. */
@@ -629,51 +712,6 @@ function fakeClock(start = 1_000_000) {
 function inboxTurnClocks(absoluteMs, nowFn) {
   return createTurnClocks({ idleMs: IDLE_MS, toolLeaseMs: TOOL_LEASE_MS, activeTotalMs: ACTIVE_TOTAL_MS, absoluteMs, nowFn });
 }
-
-test('an overnight inbox approval outlives every clock — and the interactive default absoluteMs would have killed exactly it', () => {
-  const clock = fakeClock();
-  const inbox = inboxTurnClocks(UNATTENDED_ABSOLUTE_TIMEOUT_MS, clock.now);
-  // The same turn under the DEFAULT wall clock, driven in lockstep, is the
-  // control: it is what proves the override is load-bearing rather than
-  // decorative.
-  const withDefault = inboxTurnClocks(ABSOLUTE_MS, clock.now);
-
-  for (const clocks of [inbox, withDefault]) {
-    clocks.onProgress('init');
-    clocks.onApprovalStart();
-  }
-  // Overnight: eight hours minus a minute of a human not being awake.
-  clock.advance(APPROVAL_DEADLINE_UNATTENDED_MS - 60_000);
-
-  expect(inbox.check()).toBeNull();
-  // absolute is the ONE clock that keeps ticking through an approval wait
-  // (see timeout.mjs's ABSOLUTE_MS doc comment) — which is why sizing it is
-  // not optional for this path.
-  expect(withDefault.check()).toMatchObject({ clock: 'absolute' });
-});
-
-test('an inbox approval that outlasts its deadline ends at the auto-deny, not at a clock — and the turn still has room to finish afterwards', () => {
-  const clock = fakeClock();
-  const clocks = inboxTurnClocks(UNATTENDED_ABSOLUTE_TIMEOUT_MS, clock.now);
-  clocks.onProgress('init');
-  clocks.onApprovalStart();
-
-  // The exact moment server.mjs's own timer gives up on this question
-  // (APPROVAL_DEADLINE_UNATTENDED_MS, see approval-store.mjs). Nothing else
-  // may have fired before it, or the auto-deny would be dead code.
-  clock.advance(APPROVAL_DEADLINE_UNATTENDED_MS);
-  expect(clocks.check()).toBeNull();
-
-  // Auto-denied: the wait ends, the turn resumes and works on for another
-  // twenty minutes. It must not die a second later on the wall clock — that
-  // is what the ACTIVE_TOTAL_MS + buffer part of the budget is for.
-  clocks.onApprovalEnd();
-  for (let minute = 0; minute < 20; minute += 1) {
-    clocks.onProgress('assistant-message');
-    clock.advance(60_000);
-    expect(clocks.check()).toBeNull();
-  }
-});
 
 test('escalation "notify" never uses makeUiApprovalHandler even when one is configured — it always uses its own self-contained policy decider', async () => {
   const makeUiApprovalHandler = () => {

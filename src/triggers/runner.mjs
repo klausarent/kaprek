@@ -26,51 +26,38 @@ import { readFile as readWorkspaceFile, resolveWorkspacePath } from '../workspac
 import { readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
-import { ACTIVE_TOTAL_MS } from '../harness/timeout.mjs';
-import { APPROVAL_DEADLINE_UNATTENDED_MS } from '../server/approval-store.mjs';
+import { ABSOLUTE_MS } from '../harness/timeout.mjs';
+import { APPROVAL_INBOX_TTL_MS, canonicalInput } from '../server/approval-store.mjs';
 import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /**
- * Slack on top of "deadline + the turn's own active budget", so the wall clock
- * cannot land on the exact millisecond the auto-deny does. Ten minutes is
- * enough for the CLI to receive the denial, react to it and finish the turn.
+ * The follow-up turn's prompt. Deliberately narrow: this turn exists to run
+ * the ONE action the user approved, not to resume whatever the original turn
+ * was doing. A broader prompt would turn a single approval into a licence for
+ * a whole second turn of work.
  */
-export const UNATTENDED_ABSOLUTE_BUFFER_MS = 10 * 60_000;
-
-/**
- * The `absoluteTimeoutMs` an INBOX turn runs under (see adapter.mjs's
- * TurnResult.timeoutClock doc comment, which makes this the caller's duty).
- *
- * timeout.mjs's `absolute` is the one clock that does NOT pause for an
- * approval wait — deliberately, as the backstop against a chain of
- * round-trips. Left at its 60-minute default, it would therefore kill an
- * overnight inbox approval after an hour and report `timeoutClock: 'absolute'`
- * for a turn that did nothing wrong except wait for the human the inbox exists
- * to wait for. So the trigger path raises it to cover the full wait plus the
- * turn's own active budget plus a buffer.
- *
- * Note the direction of control: the approval deadline is the primary limit on
- * waiting (see APPROVAL_DEADLINE_UNATTENDED_MS's own doc comment) and this
- * value follows from it. Raising this one alone buys nothing — the auto-deny
- * still fires first; that is the intended order.
- *
- * It is a FUNCTION of the deadline, not a fixed number, because the deadline
- * is configurable (startServer's `unattendedApprovalTimeoutMs`). A hardcoded
- * 8h45m and a caller-set 12-hour deadline would mean the wall clock kills the
- * turn three hours before the auto-deny it was sized to outlast — the exact
- * failure this whole mechanism exists to prevent, and silent (panel Fix-Runde
- * 1, M5). Deriving it makes that unrepresentable instead of merely warned about.
- */
-export function unattendedAbsoluteTimeoutMs(approvalDeadlineMs = APPROVAL_DEADLINE_UNATTENDED_MS) {
-  const deadline = Number.isFinite(approvalDeadlineMs) && approvalDeadlineMs > 0 ? approvalDeadlineMs : APPROVAL_DEADLINE_UNATTENDED_MS;
-  return deadline + ACTIVE_TOTAL_MS + UNATTENDED_ABSOLUTE_BUFFER_MS;
+function followUpPromptFor(entry) {
+  let rendered;
+  try {
+    rendered = JSON.stringify(entry.input ?? null, null, 2);
+  } catch {
+    rendered = '(input could not be displayed)';
+  }
+  return [
+    `Your earlier request to run ${entry.toolName ?? 'a tool'} with the input below was just approved by the user.`,
+    'Execute exactly that action now, report the result briefly, and do nothing else beyond what finishing this action requires.',
+    '',
+    rendered,
+  ].join('\n');
 }
 
-/** The wall clock for the DEFAULT unattended deadline. A caller that changes the deadline gets its own value from unattendedAbsoluteTimeoutMs() above rather than this constant. */
-export const UNATTENDED_ABSOLUTE_TIMEOUT_MS = unattendedAbsoluteTimeoutMs(APPROVAL_DEADLINE_UNATTENDED_MS);
+// The park model's absolute-wall-clock sizing lived here (Fix-Runde 2). It is
+// gone with the parking: an unattended turn no longer waits on a human at all
+// (see server.mjs's DEFERRAL_MESSAGE), so it needs no budget stretched around
+// a wait, and runs under the harness's ordinary clocks like any other turn.
 const HEARTBEAT_OK_MARKER = 'heartbeat_ok';
 
 // A file-watch turn gets a bounded list of paths, never "everything that
@@ -363,18 +350,10 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   to start (see approvalCapability()) and runs under a much longer wall
  *   clock (see UNATTENDED_ABSOLUTE_TIMEOUT_MS). Defaults to null, which keeps
  *   every gate below exactly as it was.
- * @param {number|null} [options.absoluteTimeoutMs] - overrides the wall clock
- *   an inbox turn runs under. Default null derives it from
- *   approvalDeadlineMs (see unattendedAbsoluteTimeoutMs), which is what any
- *   real caller wants. Setting it BELOW the approval deadline is allowed and
- *   no longer dishonest: every published deadline is capped to this clock
- *   (server.mjs::effectiveApprovalDeadline), so a question simply lapses when
- *   the turn does instead of advertising time the turn does not have.
- * @param {number} [options.approvalDeadlineMs] - the deadline the SERVER will
- *   auto-deny an unattended approval at (startServer's
- *   `unattendedApprovalTimeoutMs`). The runner does not enforce it; it needs
- *   it only to size the turn's wall clock around it — see
- *   unattendedAbsoluteTimeoutMs(). Defaults to APPROVAL_DEADLINE_UNATTENDED_MS.
+ * @param {number} [options.approvalDeadlineMs] - how long a filed question
+ *   stays answerable in the inbox (startServer's
+ *   `unattendedApprovalTimeoutMs`). The runner does not enforce it; it hands
+ *   it to the approval handler it builds. Defaults to APPROVAL_INBOX_TTL_MS.
  * @param {(chatId: string) => void} [options.releaseApprovals] - called with
  *   the turn's chatId once a trigger turn has ENDED, so the server can resolve
  *   anything still pending for it (server.mjs::cleanupApprovalsForChat — the
@@ -400,15 +379,9 @@ export function createTriggerRunner({
   resolveToolApp = () => null,
   hasApprovalClient = () => false,
   approvalStore = null,
-  approvalDeadlineMs = APPROVAL_DEADLINE_UNATTENDED_MS,
-  absoluteTimeoutMs = null,
+  approvalDeadlineMs = APPROVAL_INBOX_TTL_MS,
   releaseApprovals = () => {},
 }) {
-  // Computed once: the wall clock every inbox turn from this runner gets, and
-  // the number the approval handler's own cap is measured against. Derived
-  // from the deadline unless a caller overrode it — see both options' doc
-  // comments.
-  const effectiveAbsoluteTimeoutMs = absoluteTimeoutMs ?? unattendedAbsoluteTimeoutMs(approvalDeadlineMs);
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
   // again by an overlapping tick or a manual fire while it's still in
@@ -1124,7 +1097,8 @@ export function createTriggerRunner({
     // `unattended` is what separates a tick/watcher/clipboard cause from a
     // manual fire: only cause.origin 'user' means a person is demonstrably at
     // the other end and can answer the question this turn may raise.
-    const capability = approvalCapability(trigger, { unattended: cause?.origin !== 'user' });
+    const unattended = cause?.origin !== 'user';
+    const capability = approvalCapability(trigger, { unattended });
     if (capability.blocked) {
       log(`trigger ${id}: rejected (${capability.blocked})`);
       return { fired: false, reason: capability.blocked };
@@ -1240,24 +1214,24 @@ export function createTriggerRunner({
     try {
       const prompt = buildPrompt(trigger, { reason: reasonText, checklist, files, filesTruncated, clipboard });
 
-      // The wall clock this turn will actually run under, and the instant it
-      // therefore dies. Only the inbox path sets one (see below); everything
-      // else keeps the harness's own default, which this layer does not know
-      // and must not pretend to.
-      //
-      // Date.now(), NOT currentNow(): `now` is injected to control trigger
-      // SCHEDULING (slots, caps, windows) and a test may hold it at a fixed
-      // or historical instant. The wall clock inside the harness runs on real
-      // time, and so does the approval timer in server.mjs that this number is
-      // compared against — mixing the two time bases would cap a question
-      // against a deadline from another decade.
-      const turnAbsoluteTimeoutMs = capability.approvalPath === 'inbox' ? effectiveAbsoluteTimeoutMs : null;
-      const turnDeadlineAt = turnAbsoluteTimeoutMs === null ? null : Date.now() + turnAbsoluteTimeoutMs;
+      // Unattended turns FILE their questions instead of waiting on them (see
+      // server.mjs's makeDeferringApprovalHandler): nothing is held open, so
+      // the turn runs under the harness's ordinary clocks and simply ends.
+      // A manual fire is the other case - a person pressed the button and is
+      // looking at the dialog - and keeps the live 10-minute path, cap and
+      // all.
+      const approvalMode = unattended && approvalStore ? 'deferred' : 'interactive';
+      // Passed explicitly, not assumed: the interactive cap measures a
+      // published deadline against this exact number (see
+      // server.mjs::effectiveApprovalDeadline), and capping against a clock
+      // this layer only guessed the harness would use would be a guess
+      // dressed as a guarantee.
+      const turnDeadlineAt = Date.now() + ABSOLUTE_MS;
 
       const approvalHandlerForTurn =
         trigger.escalation === 'notify'
           ? notifyPolicyHandler(trigger, cwd, resolveToolApp)
-          : (request) => makeUiApprovalHandler(resolvedChatId, { turnDeadlineAt })(request);
+          : (request) => makeUiApprovalHandler(resolvedChatId, { mode: approvalMode, triggerId: id, turnDeadlineAt })(request);
 
       const result = await runTurn({
         dataDir,
@@ -1276,12 +1250,12 @@ export function createTriggerRunner({
         // passes no `--allowedTools` flag, so every tool call reaches the
         // permission prompt and therefore our handler.
         allowedTools: [],
+        absoluteTimeoutMs: ABSOLUTE_MS,
         // Only the inbox path needs a wall clock longer than the harness's own
         // default, and only the inbox path gets one: a runner without a store
         // passes nothing here and keeps running under exactly the budgets it
         // ran under before (see UNATTENDED_ABSOLUTE_TIMEOUT_MS's doc comment
         // for why the inbox cannot).
-        ...(turnAbsoluteTimeoutMs === null ? {} : { absoluteTimeoutMs: turnAbsoluteTimeoutMs }),
         onApprovalRequest: approvalHandlerForTurn,
         onEvent,
         onChatResolved: (chatId) => {
@@ -1490,5 +1464,99 @@ export function createTriggerRunner({
     return runningChatIds.has(chatId);
   }
 
-  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, isChatRunning, approvalCapability, supportStatus, limitStatus };
+  /**
+   * Whether a follow-up turn for an approved question could start right now.
+   * Asked BEFORE the approval is recorded, so a "no" costs nothing: the
+   * question stays pending and the user can approve again in a minute.
+   */
+  function canStartFollowUp(chatId) {
+    if (isChatRunning(chatId)) return { allowed: false, reason: 'a turn is already running in this chat' };
+    if (runningIds.size >= MAX_CONCURRENT_TRIGGER_TURNS) {
+      return { allowed: false, reason: `${runningIds.size} trigger turns are already running` };
+    }
+    return { allowed: true, reason: null };
+  }
+
+  /**
+   * Runs ONE approved action in a fresh turn on the original chat.
+   *
+   * The turn carries a one-shot pre-approval: the first request whose
+   * (toolName, canonical input) matches what the user approved is allowed
+   * without asking again, and everything else in that turn goes through the
+   * normal path. Two properties matter and are tested separately. It is
+   * ONE-SHOT, so an agent cannot repeat the approved call ten times on one
+   * approval. And it is EXACT, so an approval for one command cannot
+   * authorise a neighbouring one - the input is compared canonically (key
+   * order does not matter, content does).
+   *
+   * A truncated stored input (see approval-store.mjs's MAX_STORED_INPUT_BYTES)
+   * cannot be matched, so it gets no pre-approval at all: the turn runs and
+   * asks again. That is honest rather than convenient - the alternative would
+   * be pre-approving a call kaprek cannot fully see.
+   */
+  async function fireFollowUp({ entry }) {
+    const triggerId = entry.triggerId ?? null;
+    const chatId = entry.chatId;
+    if (!chatId) return { fired: false, reason: 'the approved question has no chat to run in' };
+
+    const gate = canStartFollowUp(chatId);
+    if (!gate.allowed) return { fired: false, reason: gate.reason };
+
+    const guardId = `follow-up:${triggerId ?? 'unknown'}`;
+    runningIds.add(guardId);
+    runningChatIds.add(chatId);
+    try {
+      const matchable = entry.input !== null && entry.input !== undefined && entry.input?._truncated !== true;
+      const wanted = matchable ? canonicalInput(entry.input) : null;
+      let preApprovalSpent = !matchable;
+
+      const handler = (request) => {
+        if (!preApprovalSpent && request.toolName === entry.toolName && canonicalInput(request.input ?? null) === wanted) {
+          preApprovalSpent = true;
+          return Promise.resolve({ behavior: 'allow' });
+        }
+        return makeUiApprovalHandler(chatId, { mode: 'deferred', triggerId })(request);
+      };
+
+      log(`trigger ${triggerId ?? 'unknown'}: running an approved action in a follow-up turn (chat ${chatId})`);
+      const result = await runTurn({
+        dataDir,
+        chatId,
+        text: followUpPromptFor(entry),
+        harness,
+        harnessName,
+        cwd,
+        permissionMode,
+        allowedTools: [],
+        absoluteTimeoutMs: ABSOLUTE_MS,
+        onApprovalRequest: handler,
+        origin: 'trigger',
+        triggerId,
+        silent: false,
+      });
+      return { fired: true, chatId, result };
+    } finally {
+      runningIds.delete(guardId);
+      runningChatIds.delete(chatId);
+      try {
+        releaseApprovals(chatId);
+      } catch (err) {
+        log(`follow-up turn: could not release pending approvals: ${err?.message ?? String(err)}`);
+      }
+    }
+  }
+
+  return {
+    fireTrigger,
+    fireFollowUp,
+    canStartFollowUp,
+    tick,
+    start,
+    stop,
+    isAnyTriggerRunning,
+    isChatRunning,
+    approvalCapability,
+    supportStatus,
+    limitStatus,
+  };
 }

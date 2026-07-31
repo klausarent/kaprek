@@ -35,12 +35,12 @@ test("an inbox entry says how long ago it was asked — an entry here is usually
   expect(text).toContain("asked 3 hours ago");
 });
 
-test("Allow and Deny each fire the decision with their own behavior", () => {
+test("Approve and Deny each fire the decision with their own behavior", () => {
   const onDecide = vi.fn();
   const entry = approval();
   const tree = render(<ApprovalInboxItem approval={entry} nowMs={NOW} onDecide={onDecide} />);
 
-  click(findOneByText(tree, "button", "Allow"));
+  click(findOneByText(tree, "button", "Approve & run now"));
   click(findOneByText(tree, "button", "Deny"));
 
   expect(onDecide.mock.calls.map(([, behavior]) => behavior)).toEqual(["allow", "deny"]);

@@ -10,7 +10,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
-import { startServer, createSseQueue, effectiveApprovalDeadline } from './server.mjs';
+import { startServer, createSseQueue, effectiveApprovalDeadline, DEFERRAL_MESSAGE } from './server.mjs';
 import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
@@ -2555,92 +2555,93 @@ function parkingApprovalHarness(request = { id: 'park-1', toolName: 'Bash', disp
   };
 }
 
-test('approvals: a chat turn is refused 409 while a trigger turn is parked on an approval in that same chat', async () => {
-  // I2: the trigger turn holds no entry in chatAbortControllers (it never came
-  // through the chat route), so the existing busy gate did not see it. A chat
-  // turn posted into that chat would run a second CLI against one transcript,
-  // and its finally block's cleanupApprovalsForChat(chatId) would deny the
-  // parked question on the way out — an overnight approval destroyed by an
-  // unrelated message.
-  const harness = parkingApprovalHarness();
-  const { url, runner } = await boot({ harness, harnessName: 'fake', unattendedApprovalTimeoutMs: 60_000 });
-  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+test('a chat turn is refused 409 while a trigger turn is running in that same chat', async () => {
+  // The gate that keeps two CLIs off one transcript. It used to matter for
+  // hours at a time, because an unattended turn parked on its question; now it
+  // lasts as long as the turn actually works, which is the point of the
+  // deferred model. The rule itself is unchanged and still needed - a
+  // follow-up turn is a trigger turn like any other.
+  const harness = holdingHarness();
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'busy-one', escalation: 'notify' }));
 
-  const firing = runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  await harness.asked;
+  const firing = runner.fireTrigger('busy-one', { cause: { origin: 'schedule' } });
+  await harness.started;
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
 
-  const inbox = await (await fetch(`${url}/api/approvals`)).json();
-  expect(inbox.approvals).toHaveLength(1);
-  const parked = inbox.approvals[0];
-
-  const res = await postJson(`${url}/api/chat/turn`, { chatId: parked.chatId, text: 'unrelated message' });
+  const res = await postJson(`${url}/api/chat/turn`, { chatId, text: 'unrelated message' });
   expect(res.status).toBe(409);
   expect((await res.json()).error).toMatch(/trigger turn/);
 
-  // The question is untouched: still listed, still answerable.
-  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
-  const decided = await postJson(`${url}/api/approvals/${parked.id}`, { chatId: parked.chatId, behavior: 'allow' });
-  expect(decided.status).toBe(200);
-  expect((await firing).fired).toBe(true);
+  harness.release();
+  await firing;
 
-  // Once the trigger turn is over, the chat takes turns again — the gate is a
-  // gate, not a permanent lock on a chat a trigger ever touched.
-  const after = await postJson(`${url}/api/chat/turn`, { chatId: parked.chatId, text: 'now it is free' });
+  // Once it is over, the chat takes turns again.
+  const after = await postJson(`${url}/api/chat/turn`, { chatId, text: 'now it is free' });
   expect(after.status).toBe(200);
-  // This harness parks on every turn, so answer the second question too rather
-  // than leaving the stream open until the test times out.
-  await readSse(after, async (frame) => {
-    if (frame.type === 'approval') {
-      await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'deny' });
-    }
+  await readSse(after);
+});
+
+/** A harness that holds its turn open until the test releases it, without involving an approval. */
+function holdingHarness() {
+  let markStarted;
+  let release;
+  const started = new Promise((resolve) => {
+    markStarted = resolve;
   });
-});
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  return {
+    started,
+    release: () => release(),
+    async startTurn({ onEvent } = {}) {
+      markStarted();
+      await gate;
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
 
-test('approvals: the auto-deny timer records the denial on disk, so the post-mortem does not report it as still pending', async () => {
-  // I4: removing recordDecision() from the timer left the whole suite green.
-  // The consequence in the field is a file that says 'pending' for a question
-  // the server denied hours ago — and on the next start that reads as
-  // 'process gone', which blames a restart for a decision the server made.
-  const harness = parkingApprovalHarness({ id: 'lapse-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
-  const { url, runner } = await boot({ harness, harnessName: 'fake', unattendedApprovalTimeoutMs: 40 });
-  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
-
-  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  expect(result.fired).toBe(true);
-
-  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'lapse-1');
-  expect(entry).toMatchObject({ status: 'decided', decision: { behavior: 'deny', message: 'approval timed out' } });
-  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
-});
-
-test('approvals: a trigger turn that ends with its question still open releases it, and the stale id can no longer be answered', async () => {
-  // M6/M7: only chat turns had an end-of-turn cleanup. A trigger turn that
-  // ended some other way (CLI died, turn errored) left the entry pending with
-  // an armed timer — hours of one, at the unattended deadline — and answering
-  // it returned 200 as if someone were still listening.
+test('a deferred question OUTLIVES its turn, while an interactive one is still released when the turn ends', async () => {
+  // Two opposite rules, and the difference is the whole redesign. An
+  // interactive question belongs to a live wait: when the turn ends there is
+  // nobody to answer and nothing to answer into, so it is resolved and
+  // recorded. A deferred question was never a wait - outliving the turn is
+  // exactly what it is for, and releasing it would throw away the thing the
+  // user is supposed to answer tomorrow.
   const abandoningHarness = {
     async startTurn({ onEvent, onApprovalRequest } = {}) {
       onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
-      // Raised and deliberately NOT awaited: the turn walks away from it.
+      // Raised and deliberately not awaited: the turn walks away from it.
       onApprovalRequest({ id: 'abandoned-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
       await Promise.resolve();
       onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
       return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
     },
   };
-  const { url, runner } = await boot({ harness: abandoningHarness, harnessName: 'fake', unattendedApprovalTimeoutMs: 60_000 });
+  const { url, runner } = await boot({ harness: abandoningHarness, harnessName: 'fake' });
   await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+  // A second trigger for the manual half: the first one's schedule slot is
+  // claimed by the run below, and a claimed slot is a different refusal.
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me-live', escalation: 'question' }));
 
-  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  expect(result.fired).toBe(true);
+  // Unattended: filed, and still there after the turn is long over.
+  const scheduled = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(scheduled.fired).toBe(true);
+  const inbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+  expect(inbox.map((e) => e.id)).toEqual(['abandoned-1']);
+  expect(inbox[0].mode).toBe('deferred');
 
-  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
-  const late = await postJson(`${url}/api/approvals/abandoned-1`, { chatId: result.chatId, behavior: 'allow' });
-  expect(late.status).not.toBe(200);
-  expect((await settledApprovalsFile(url)).find((e) => e.requestId === 'abandoned-1')).toMatchObject({
-    status: 'decided',
-    decision: { behavior: 'deny', message: 'turn ended' },
-  });
+  // Manual fire: a person is watching, so this one is a live wait - and when
+  // the turn abandons it, it is released rather than left dangling with an
+  // armed timer.
+  const manual = await runner.fireTrigger('ask-me-live', { cause: { origin: 'user' } });
+  expect(manual.fired).toBe(true);
+  const stillThere = (await settledApprovalsFile(url)).filter((e) => e.chatId === manual.chatId);
+  expect(stillThere).toHaveLength(1);
+  expect(stillThere[0]).toMatchObject({ mode: 'interactive', status: 'decided', decision: { behavior: 'deny', message: 'turn ended' } });
 });
 
 test('approvals: the SSE frame carries the server\'s own deadlineAt, so the client never has to guess which of the two deadlines applies', async () => {
@@ -2707,75 +2708,6 @@ function twoQuestionHarness(gapMs = 120) {
   };
 }
 
-test('approvals: a question raised late in a turn is never advertised past the turn\'s own wall clock', async () => {
-  // The sequence both reviewers walked: question 1 lapses, the agent asks
-  // again, and question 2 is published with a fresh full deadline even though
-  // the turn itself is killed by its never-pausing wall clock long before
-  // that. Here the wall clock is 400ms and the approval deadline a full
-  // minute, so BOTH questions have to be capped to the same instant — the
-  // moment the turn dies. If either one advertised requestedAt + 60s, the
-  // inbox would be promising time the turn does not have.
-  const harness = twoQuestionHarness(120);
-  const { url, runner } = await boot({
-    harness,
-    harnessName: 'fake',
-    unattendedApprovalTimeoutMs: 60_000,
-    unattendedAbsoluteTimeoutMs: 400,
-  });
-  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
-
-  const firing = runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  await harness.first;
-
-  const firstInbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
-  expect(firstInbox).toHaveLength(1);
-  const firstEntry = firstInbox[0];
-  await postJson(`${url}/api/approvals/q-1`, { chatId: firstEntry.chatId, behavior: 'allow' });
-
-  await harness.second;
-  const secondInbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
-  expect(secondInbox).toHaveLength(1);
-  const secondEntry = secondInbox[0];
-
-  // Both are pinned to the same instant: the turn's death, not each
-  // question's own clock. Exact equality is the point — two questions asked
-  // 120ms apart with a 60s deadline could not otherwise share a deadline.
-  expect(secondEntry.deadlineAt).toBe(firstEntry.deadlineAt);
-  // And the second one is demonstrably shorter than its nominal deadline.
-  expect(secondEntry.deadlineAt - secondEntry.requestedAt).toBeLessThan(60_000);
-
-  await firing;
-});
-
-test('approvals: when the wall clock is the nearer limit, the question ends at the auto-deny — not at the clock', async () => {
-  // The other half of the same fix: capping only what is DISPLAYED would
-  // leave the timer running for the full minute while the turn dies at 400ms.
-  // The question has to be resolved by its own deny, so the turn gets an
-  // answer to react to rather than being cut off mid-wait. Nothing in this
-  // test waits a minute; if the timer were not capped it would hang here
-  // until vitest's own timeout, which is the assertion.
-  const harness = parkingApprovalHarness({ id: 'capped-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
-  const { url, runner } = await boot({
-    harness,
-    harnessName: 'fake',
-    unattendedApprovalTimeoutMs: 60_000,
-    unattendedAbsoluteTimeoutMs: 300,
-  });
-  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
-
-  const startedAt = Date.now();
-  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
-  expect(result.fired).toBe(true);
-  expect(Date.now() - startedAt).toBeLessThan(3_000);
-
-  const entry = (await settledApprovalsFile(url)).find((e) => e.requestId === 'capped-1');
-  expect(entry.status).toBe('decided');
-  expect(entry.decision.behavior).toBe('deny');
-  // The reason names the real cause: the turn ran out of time, the user did
-  // not simply fail to answer within the advertised deadline.
-  expect(entry.decision.message).toMatch(/turn/);
-});
-
 test('approvals: the cap only ever shortens — a question whose own deadline is the nearer limit keeps it in full', async () => {
   // The cap must not quietly shorten a question that fits inside its turn.
   // A chat turn's clock is the harness default, which the server now passes
@@ -2819,3 +2751,173 @@ test('effectiveApprovalDeadline: the earlier of the two limits wins, and says wh
   // nobody can win.
   expect(effectiveApprovalDeadline(asked, 60_000, asked - 10)).toEqual({ deadlineAt: asked - 10, cappedByTurn: true });
 });
+
+// ------------------------------------------------ deferred approvals (Paket C)
+//
+// An unattended question is FILED and the turn carries on. Nothing waits, so
+// none of the park model's costs (a held subprocess, an hours-long chat lock,
+// a stretched wall clock) apply any more.
+
+test('deferred: an unattended question is filed and the turn is told to carry on, in one step', async () => {
+  const seen = [];
+  const harness = {
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      const decision = await onApprovalRequest({ id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      seen.push(decision);
+      // The turn keeps working and ends normally, which is the entire point.
+      onEvent?.({ type: 'text', text: 'carried on and finished' });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const startedAt = Date.now();
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+
+  expect(result.fired).toBe(true);
+  // No parking: the turn did not wait for anybody.
+  expect(Date.now() - startedAt).toBeLessThan(3_000);
+  expect(seen[0].behavior).toBe('deny');
+  expect(seen[0].message).toBe(DEFERRAL_MESSAGE);
+  // The wording has to keep the agent working rather than reading a refusal.
+  expect(seen[0].message).toMatch(/do NOT retry it in this turn/);
+  expect(seen[0].message).toMatch(/finish the turn normally/);
+
+  // And the question is waiting, hours after its turn ended if need be.
+  const inbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+  expect(inbox).toHaveLength(1);
+  expect(inbox[0]).toMatchObject({ id: 'q-1', toolName: 'Bash', mode: 'deferred', askedCount: 1 });
+});
+
+/** A harness whose turn asks for `requests` in order and reports what it was told. */
+function askingHarness(requests) {
+  const decisions = [];
+  let turns = 0;
+  return {
+    decisions,
+    get turns() {
+      return turns;
+    },
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      turns += 1;
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      for (const request of requests[Math.min(turns, requests.length) - 1] ?? []) {
+        decisions.push({ turn: turns, request, decision: await onApprovalRequest(request) });
+      }
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('deferred: approving runs the action in a follow-up turn, with a one-shot pre-approval for exactly that call', async () => {
+  const approved = { id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'git push' } };
+  const harness = askingHarness([
+    [approved],
+    // The follow-up turn: the approved call, then the SAME call again (a
+    // one-shot approval must not become a licence to repeat it), then a
+    // different one.
+    [
+      { id: 'f-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'git push' } },
+      { id: 'f-2', toolName: 'Bash', displayName: 'Bash', input: { command: 'git push' } },
+      { id: 'f-3', toolName: 'Bash', displayName: 'Bash', input: { command: 'rm -rf /' } },
+    ],
+  ]);
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const first = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  const filed = (await (await fetch(`${url}/api/approvals`)).json()).approvals[0];
+
+  const res = await postJson(`${url}/api/approvals/${filed.id}`, { chatId: filed.chatId, behavior: 'allow' });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ ok: true, followUp: true });
+
+  await vi.waitFor(() => expect(harness.turns).toBe(2), { timeout: 4_000 });
+  await vi.waitFor(() => expect(harness.decisions.filter((d) => d.turn === 2)).toHaveLength(3), { timeout: 4_000 });
+
+  const followUp = harness.decisions.filter((d) => d.turn === 2);
+  // Exactly the approved call runs without asking again.
+  expect(followUp[0].decision).toEqual({ behavior: 'allow' });
+  // The second identical call does NOT: one approval, one execution.
+  expect(followUp[1].decision.behavior).toBe('deny');
+  expect(followUp[1].decision.message).toBe(DEFERRAL_MESSAGE);
+  // And a different call is nowhere near covered by it.
+  expect(followUp[2].decision.behavior).toBe('deny');
+
+  // Same chat, so the transcript reads as one story.
+  const chats = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
+  expect(chats.chats.map((c) => c.id)).toEqual([first.chatId]);
+});
+
+test('deferred: the pre-approval matches on content, not on tool name', async () => {
+  const harness = askingHarness([
+    [{ id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'echo one' } }],
+    // Same tool, one byte different. This must NOT be waved through.
+    [{ id: 'f-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'echo one ' } }],
+  ]);
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  const filed = (await (await fetch(`${url}/api/approvals`)).json()).approvals[0];
+  await postJson(`${url}/api/approvals/${filed.id}`, { chatId: filed.chatId, behavior: 'allow' });
+
+  await vi.waitFor(() => expect(harness.decisions.filter((d) => d.turn === 2)).toHaveLength(1), { timeout: 4_000 });
+  expect(harness.decisions.find((d) => d.turn === 2).decision.behavior).toBe('deny');
+});
+
+test('deferred: denying records the decision and starts nothing', async () => {
+  const harness = askingHarness([[{ id: 'q-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }]]);
+  const { url, runner } = await boot({ harness, harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  const filed = (await (await fetch(`${url}/api/approvals`)).json()).approvals[0];
+
+  const res = await postJson(`${url}/api/approvals/${filed.id}`, { chatId: filed.chatId, behavior: 'deny' });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ ok: true, followUp: false });
+  expect(harness.turns).toBe(1);
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+});
+
+test('deferred: a question filed by a previous process is still answerable after a restart', async () => {
+  // The park model could not do this at all: the answer had to reach a promise
+  // in a process that no longer existed. A filed question has no such tether.
+  const chatId = '11111111-2222-3333-4444-555555555555';
+  const requestedAt = Date.now();
+  fs.writeFileSync(
+    path.join(dataDir, 'approvals.json'),
+    JSON.stringify({
+      version: 1,
+      approvals: [
+        {
+          id: `${chatId}:old-1`,
+          requestId: 'old-1',
+          chatId,
+          triggerId: 'ask-me',
+          mode: 'deferred',
+          status: 'pending',
+          toolName: 'Bash',
+          input: { command: 'ls' },
+          requestedAt,
+          deadlineAt: requestedAt + 60_000,
+          askedCount: 1,
+        },
+      ],
+    }),
+    'utf8',
+  );
+  const { url } = await boot({});
+
+  const inbox = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+  expect(inbox.map((e) => e.id)).toEqual(['old-1']);
+  // Denying needs no turn and must simply work.
+  const res = await postJson(`${url}/api/approvals/old-1`, { chatId, behavior: 'deny' });
+  expect(res.status).toBe(200);
+});
+

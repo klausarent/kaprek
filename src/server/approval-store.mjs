@@ -46,25 +46,24 @@ import path from 'node:path';
 export const APPROVAL_DEADLINE_INTERACTIVE_MS = 10 * 60_000;
 
 /**
- * How long ONE approval question raised by an UNATTENDED turn (a trigger that
- * fired on its own) may wait in the inbox before it is auto-denied.
+ * How long a DEFERRED question stays answerable in the inbox before it lapses.
  *
- * This is the PRIMARY bound on waiting, and the reason it is not simply
- * "forever": every second of it is a `claude` CLI subprocess held open with a
- * blocked tool call, plus this trigger's slot in the runner's loop guard (see
- * runner.mjs::isAnyTriggerRunning — while it waits, POST
- * /api/triggers/<id>/fire answers 429). Eight hours is the shortest span that
- * covers the case the inbox is built for: a trigger fires at night, the user
- * sees it the next morning. It is deliberately not 24h — a question nobody
- * answered by the next working morning is stale, and holding a CLI process for
- * a day to ask again is worse than denying and letting the trigger re-fire.
+ * This used to be the length of a wait: the CLI sat blocked on the question
+ * for up to eight hours. It is not a wait any more. An unattended question is
+ * filed and the turn is told to carry on (see server.mjs's DEFERRAL_MESSAGE),
+ * so nothing is held open while the entry sits here, and the only cost of a
+ * longer window is a slightly longer list. Hence 24 hours rather than eight:
+ * a question raised on Friday evening is still answerable on Saturday, and
+ * "the run I approve now happens now" stays true because approving starts a
+ * fresh follow-up turn rather than un-blocking an old one.
  *
- * The turn's own wall clock must be sized around this, not the other way
- * round: src/harness/timeout.mjs's `absolute` clock counts approval-wait time
- * in full and would otherwise kill the very overnight wait this constant
- * allows. See runner.mjs::UNATTENDED_ABSOLUTE_TIMEOUT_MS.
+ * After it, the entry becomes 'lapsed' - silently, since nobody is waiting on
+ * an answer that never came.
  */
-export const APPROVAL_DEADLINE_UNATTENDED_MS = 8 * 60 * 60_000;
+export const APPROVAL_INBOX_TTL_MS = 24 * 60 * 60_000;
+
+/** @deprecated The old name for APPROVAL_INBOX_TTL_MS, from when this was how long a turn PARKED on a question. Kept so an external reference does not break silently. */
+export const APPROVAL_DEADLINE_UNATTENDED_MS = APPROVAL_INBOX_TTL_MS;
 
 /**
  * How long an entry that is FINISHED (decided, timed out, or expired with its
@@ -138,10 +137,44 @@ function isFinished(entry) {
  * requestedAt only for a record that somehow finished without either stamp.
  */
 function finishedAt(entry) {
-  return entry.decidedAt ?? entry.expiredAt ?? entry.requestedAt ?? 0;
+  return entry.decidedAt ?? entry.expiredAt ?? entry.lapsedAt ?? entry.requestedAt ?? 0;
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * A stable string for one tool input: JSON with object keys sorted at every
+ * level, so two inputs that differ only in key order are the same input.
+ *
+ * Used for two things that must agree exactly: deciding whether a repeated
+ * question is the SAME question (dedupe, see put()), and deciding whether the
+ * call a follow-up turn is making is the one that was approved (the one-shot
+ * pre-approval in runner.mjs). A mismatch in either direction is a bug with
+ * teeth - the first would hide a different question behind an old entry, the
+ * second would let an approval for `rm a.txt` authorise `rm b.txt`.
+ */
+export function canonicalInput(input) {
+  const seen = new WeakSet();
+  const walk = (value) => {
+    if (value === null || typeof value !== 'object') return value;
+    if (seen.has(value)) return '[circular]';
+    seen.add(value);
+    if (Array.isArray(value)) return value.map(walk);
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = walk(value[key]);
+    return out;
+  };
+  try {
+    return JSON.stringify(walk(input) ?? null);
+  } catch {
+    return null;
+  }
+}
+
+/** Identity of a REPEATED question: same trigger, same tool, same input. Two fires of a nightly trigger asking the same thing are one inbox entry, not two (see put()). */
+function questionFingerprint(entry) {
+  return `${entry.triggerId ?? ''}\u0000${entry.toolName ?? ''}\u0000${canonicalInput(entry.input ?? null) ?? ''}`;
+}
 
 /**
  * The version of `input` that goes on disk: the original when it is small
@@ -302,8 +335,20 @@ export function createApprovalStore({
     const expiredAt = now();
     for (const entry of list) {
       if (!entry || typeof entry.id !== 'string') continue;
+      if (entry.status === 'pending' && entry.mode === 'deferred') {
+        // A DEFERRED entry hangs on no process at all. Nothing is blocked on
+        // it: the turn that raised it was told to carry on and ended long ago,
+        // and approving it starts a FRESH follow-up turn. So it survives a
+        // restart intact and stays answerable, which is the whole point of
+        // filing questions instead of parking on them.
+        entries.set(entry.id, entry);
+        continue;
+      }
       if (entry.status === 'pending') {
-        // Everything read from disk was put by another store instance — in
+        // An INTERACTIVE entry, though, was a live wait: some other process
+        // was holding a CLI blocked on it. That is what cannot survive.
+        //
+        // Everything read from disk was put by another store instance, in
         // practice a previous process, since one data dir means one kaprek
         // (src/lib/instance-lock.mjs). The turn it belonged to is gone, the
         // CLI it blocked is gone, and the promise that carried the answer went
@@ -396,12 +441,51 @@ export function createApprovalStore({
    * each entry runs regardless of how the one before it ended.
    */
   function serialized(work) {
-    const run = queue.then(work, work);
+    // The sweep runs inside the queue, ahead of the work, so no operation can
+    // observe an entry that should already have lapsed.
+    const swept = async () => {
+      if (sweepLapsed()) {
+        try {
+          await persist();
+        } catch (err) {
+          log(`approvals: could not record lapsed entries (${err.message}); they are refused in memory regardless`);
+        }
+      }
+      return work();
+    };
+    const run = queue.then(swept, swept);
     queue = run.then(
       () => {},
       () => {},
     );
     return run;
+  }
+
+  /**
+   * Marks every pending entry whose deadline has passed as 'lapsed'. Cheap
+   * (one pass over an in-memory map, capped at MAX_STORED_APPROVALS) and run
+   * at the head of every operation, so nobody ever sees an entry that is
+   * offering buttons its deadline already took away.
+   *
+   * Silent by design: a question nobody answered is the ordinary outcome of
+   * asking someone who was not there, not an incident. It is the store's
+   * equivalent of a letter going unanswered, and the trigger will ask again
+   * on its next fire if it still wants to.
+   *
+   * @returns {boolean} whether anything changed and the file needs rewriting
+   */
+  function sweepLapsed() {
+    const nowMs = now();
+    let changed = false;
+    for (const [id, entry] of entries) {
+      if (entry.status !== 'pending') continue;
+      const deadline = entry.deadlineAt;
+      if (!Number.isFinite(deadline) || deadline > nowMs) continue;
+      entries.set(id, { ...entry, status: 'lapsed', lapsedAt: nowMs });
+      ownedIds.delete(id);
+      changed = true;
+    }
+    return changed;
   }
 
   /** Sweeps temp files a previous run left behind (a crash between write and rename). Best-effort and silent: they are junk, not evidence. */
@@ -465,15 +549,57 @@ export function createApprovalStore({
     // Pending cap (Haertung r3, Codex #5b). Counted BEFORE the entry is
     // added, and only against entries this process is really waiting on:
     // finished ones are the retention window's problem, not a live limit.
-    const pendingCount = [...entries.values()].filter((e) => e.status === 'pending' && ownedIds.has(e.id)).length;
+    const pendingCount = [...entries.values()].filter((e) => e.status === 'pending' && (e.mode === 'deferred' || ownedIds.has(e.id))).length;
     if (pendingCount >= MAX_PENDING_APPROVALS) {
       throw new Error(`too many approvals already waiting (${pendingCount}/${MAX_PENDING_APPROVALS})`);
+    }
+
+    // DEDUPE (C3). A periodic trigger asks the same thing again on its next
+    // fire, and that is deliberate: a question nobody answered is meant to
+    // come back. What must not come back is a second inbox entry for it, or a
+    // nightly trigger would leave twenty identical cards by morning. Same
+    // trigger, same tool, same input (canonically compared) as something
+    // already waiting means the SAME question - refresh its clock, count the
+    // ask, keep its id so an answer already on its way still lands.
+    //
+    // Only against PENDING entries: asking again after a deny is a new
+    // question, and the old decision stays on the record as what it was.
+    if (entry.mode === 'deferred') {
+      const fingerprint = questionFingerprint(entry);
+      const twin = [...entries.values()].find(
+        (candidate) => candidate.status === 'pending' && candidate.mode === 'deferred' && questionFingerprint(candidate) === fingerprint,
+      );
+      if (twin) {
+        const refreshed = {
+          ...twin,
+          askedCount: (twin.askedCount ?? 1) + 1,
+          requestedAt: entry.requestedAt ?? now(),
+          deadlineAt: entry.deadlineAt ?? twin.deadlineAt,
+          lastAskedAt: entry.requestedAt ?? now(),
+        };
+        entries.set(twin.id, refreshed);
+        try {
+          await persist();
+        } catch (err) {
+          entries.set(twin.id, twin);
+          log(`approvals: could not record a repeat of ${twin.id} (${err.message})`);
+          throw err;
+        }
+        return refreshed;
+      }
     }
 
     const record = {
       chatId: null,
       requestId: id,
       triggerId: null,
+      // 'interactive' (a human is at the other end of a live dialog, the turn
+      // waits) or 'deferred' (nobody is there, the turn was told to carry on
+      // and this entry can be redeemed later by a follow-up turn). The
+      // difference decides whether the entry survives a restart - see
+      // loadFromDisk().
+      mode: 'interactive',
+      askedCount: 1,
       toolName: null,
       displayName: null,
       input: null,
@@ -541,7 +667,17 @@ export function createApprovalStore({
     if (entry.status === 'decided') {
       throw new Error(`approval ${id} was already decided (${entry.decision?.behavior ?? 'unknown'})`);
     }
-    if (entry.status === 'expired' || !ownedIds.has(id)) {
+    if (entry.status === 'lapsed') {
+      throw new Error(`approval ${id} lapsed: nobody answered it before its deadline, and the agent has moved on`);
+    }
+    // The ownership gate is for INTERACTIVE entries only. A deferred entry is
+    // redeemed by starting a new turn, not by resolving a promise this process
+    // happens to hold, so "which process filed it" is not a limit on who can
+    // answer it (see loadFromDisk()).
+    if (entry.status === 'expired') {
+      throw new Error(`approval ${id} cannot be decided: ${EXPIRED_PROCESS_GONE} - the turn that asked it died with the process that started it`);
+    }
+    if (entry.mode !== 'deferred' && !ownedIds.has(id)) {
       throw new Error(`approval ${id} cannot be decided: ${EXPIRED_PROCESS_GONE} — the turn that asked it died with the process that started it`);
     }
     const behavior = decision?.behavior;
@@ -582,7 +718,7 @@ export function createApprovalStore({
   function listPending() {
     return serialized(async () =>
       [...entries.values()]
-        .filter((entry) => entry.status === 'pending' && ownedIds.has(entry.id))
+        .filter((entry) => entry.status === 'pending' && (entry.mode === 'deferred' || ownedIds.has(entry.id)))
         .sort((a, b) => (a.requestedAt ?? 0) - (b.requestedAt ?? 0)),
     );
   }

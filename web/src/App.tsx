@@ -20,6 +20,7 @@ import Chat from "./pages/Chat";
 import ChatList from "./pages/ChatList";
 import Triggers from "./pages/Triggers";
 import Approvals from "./pages/Approvals";
+import QuestionBox from "./components/QuestionBox";
 import Apps from "./pages/Apps";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
@@ -332,6 +333,10 @@ export default function App() {
           <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} />
         )}
       </main>
+      {/* Global on purpose: a question an unattended agent filed at 3am has to
+          be visible on whatever page you open at 9am, not only on #/approvals
+          (which you would have to think to visit). */}
+      <QuestionBox />
     </div>
   );
 }

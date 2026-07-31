@@ -13,6 +13,7 @@ import {
   type ChatStreamEvent,
   type DigestEvent,
 } from "../lib/api";
+import { upsertQuestion } from "../lib/questions";
 import {
   addApproval,
   buildApprovalAnswer,
@@ -234,6 +235,14 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
         setRateLimitHint("Rate limit signal received from the CLI — this turn may be slower or get throttled.");
         break;
       case "approval":
+        // A DEFERRED question was filed, not asked of whoever happens to be
+        // on this page: the turn already carried on without an answer. It
+        // belongs in the floating box (visible on every route), not in this
+        // turn's modal dialog, which exists for questions a turn is waiting on.
+        if (event.mode === "deferred") {
+          upsertQuestion({ ...event, requestedAt: event.requestedAt ?? seenAt, deadlineAt: event.deadlineAt ?? null });
+          break;
+        }
         setNowMs(seenAt);
         setApprovals((prev) => addApproval(prev, event, seenAt));
         break;
