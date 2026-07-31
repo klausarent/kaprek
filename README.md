@@ -6,9 +6,11 @@ kaprek is a local agent workspace built around the Claude Code CLI you already h
 
 kaprek itself has no server and no account. Your prompts still go to Anthropic, because the `claude` CLI sends them — see [What leaves your machine](#what-leaves-your-machine).
 
-**Status: pre-release, not yet published.**
+**Status: early preview.** Built and tested on Windows first; macOS/Linux should work but have seen less real use — [issues](https://github.com/klausarent/kaprek/issues) welcome.
 
-<!-- TODO: add screenshot before launch (docs/screenshot.png) -->
+![kaprek's thread view — a session rendered as a conversation, with tool calls](docs/screenshot.png)
+
+*The screenshot shows synthetic demo data, not a real session.*
 
 ## Quickstart
 

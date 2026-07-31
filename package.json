@@ -1,11 +1,18 @@
 {
   "name": "kaprek",
-  "version": "0.0.1",
-  "private": true,
-  "description": "Local viewer for Claude Code session transcripts. Read-only, redacted by default, no network.",
+  "version": "0.1.0",
+  "description": "Local agent workspace around the Claude Code CLI you already have: session viewer with search, chat turns, scheduled triggers, and a deferred approval inbox. No API key, no account, no network of its own.",
   "type": "module",
   "license": "Apache-2.0",
-  "keywords": ["claude-code", "session-viewer", "transcripts", "local-first"],
+  "keywords": [
+    "claude-code",
+    "agent",
+    "session-viewer",
+    "transcripts",
+    "triggers",
+    "approvals",
+    "local-first"
+  ],
   "author": "Klaus Arent",
   "engines": {
     "node": ">=22"
@@ -33,5 +40,13 @@
   },
   "devDependencies": {
     "vitest": "^3.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/klausarent/kaprek.git"
+  },
+  "homepage": "https://github.com/klausarent/kaprek#readme",
+  "bugs": {
+    "url": "https://github.com/klausarent/kaprek/issues"
   }
 }
