@@ -1278,11 +1278,14 @@ async function handleTriggerToggle(req, res, getTriggers, id) {
  * before opening any stream at all. Deliberately coarse (see that method's
  * own doc comment) — the simplest thing that makes an unnoticed
  * trigger-A-fires-trigger-B-fires-trigger-A chain over HTTP structurally
- * impossible: at most one trigger-origin turn can ever be in flight,
- * system-wide, so a second trigger can never even reach fireTrigger() while
- * a first one (however it started) is still running. A manual user fire
- * briefly blocked by an unrelated already-running heartbeat is an
- * acceptable false positive for that guarantee.
+ * impossible: no fire that arrives OVER THIS ROUTE can start while any
+ * trigger-origin turn (however it started) is still running. The guarantee
+ * is route-scoped, not system-wide: the scheduler tick in runner.mjs calls
+ * fireTrigger() directly and its own loop guard is per-trigger, so several
+ * triggers coming due in the same tick still run concurrently (the README's
+ * Known-gaps section says the same). A manual user fire briefly blocked by
+ * an unrelated already-running heartbeat is an acceptable false positive
+ * for the HTTP-chain guarantee.
  */
 async function handleTriggerFire(res, getRunner, id, chatSseQueues, approvalStreams) {
   if (!isSafeId(id)) {
@@ -1888,10 +1891,13 @@ export function startServer({
   // SSE request currently streaming that chat's turn.
   const chatAbortControllers = new Map();
 
-  // One entry per in-flight tool-use approval, keyed by the CLI's own
-  // request_id — server-WIDE (not per-chat), since POST /api/approvals/<id>
-  // carries no chatId of its own; see makeApprovalHandler()/
-  // handleApprovalDecision()/cleanupApprovalsForChat() above.
+  // One entry per in-flight tool-use approval, keyed by
+  // approvalKey(chatId, request_id) — server-WIDE (not per-chat), and the
+  // key is composite because the CLI numbers requests from 1 per turn, so
+  // bare request_ids collide across chats. POST /api/approvals/<id>
+  // requires chatId in its body for the same reason; see
+  // makeApprovalHandler()/handleApprovalDecision()/
+  // cleanupApprovalsForChat() above.
   const pendingApprovals = new Map();
 
   // One live SSE enqueue() function per chatId currently being streamed by

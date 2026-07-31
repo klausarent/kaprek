@@ -653,8 +653,10 @@ export async function startTurn({
       } finally {
         pendingApprovalCount -= 1;
         // Only end the exemption once every currently-pending approval has
-        // been answered — a second, still-outstanding request must keep all
-        // four clocks paused.
+        // been answered — a second, still-outstanding request must keep the
+        // exempted clocks (idle, active-total) paused. `absolute` never
+        // pauses, approval or not: it is the backstop against approval
+        // chains (see timeout.mjs).
         if (pendingApprovalCount === 0) clocks.onApprovalEnd();
       }
     };
