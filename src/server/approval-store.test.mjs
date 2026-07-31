@@ -43,6 +43,25 @@ function readApprovalFile(dataDir) {
   return JSON.parse(fs.readFileSync(path.join(dataDir, 'approvals.json'), 'utf8'));
 }
 
+/**
+ * A real `fs` with one method sabotaged. Everything the store touches goes
+ * through here, so a test can make exactly one write fail — the only way to
+ * check what the store does about a failure it cannot prevent (a read-only
+ * file, a full disk) rather than only checking the happy path.
+ */
+function fsWith(overrides) {
+  return { ...fs, ...overrides };
+}
+
+/** Collects the store's warnings so a test can assert the failure was ANNOUNCED, not merely survived. */
+function collectingLog() {
+  const lines = [];
+  const log = (message) => lines.push(message);
+  log.lines = lines;
+  log.joined = () => lines.join('\n');
+  return log;
+}
+
 // A pid that is REALLY gone: a child process started and awaited here, not a
 // number guessed to be free. Computed once — spawning a node process per test
 // would dominate this file's runtime.
@@ -224,4 +243,204 @@ test('approval store: the two deadlines are named constants, and the unattended 
   expect(APPROVAL_DEADLINE_INTERACTIVE_MS).toBe(10 * 60_000);
   expect(APPROVAL_DEADLINE_UNATTENDED_MS).toBe(8 * 60 * 60_000);
   expect(APPROVAL_DEADLINE_UNATTENDED_MS).toBeGreaterThan(APPROVAL_DEADLINE_INTERACTIVE_MS);
+});
+
+// ---------------------------------------------------------------- failure paths
+//
+// Everything below is about what happens when the DISK does not cooperate.
+// The store is a record of questions a CLI is currently blocked on: a record
+// that cannot be written must never be able to stop kaprek from starting, and
+// must never leave a question in a state where the inbox offers buttons that
+// can only fail. Added in Fix-Runde 1 (panel findings C1, I1, I3, M1-M4).
+
+test('approval store: an unreadable approvals.json degrades to an empty inbox instead of taking the process down', async () => {
+  // C1's repro without needing real file permissions: an EACCES on read (what
+  // a read-only file with a hostile ACL, an EIO, or a locked file produce).
+  // The constructor runs from startServer's listen callback, outside any
+  // promise chain, so a throw here used to be an uncaught exception on EVERY
+  // start — the same broken data dir, forever.
+  const dataDir = await tmpDataDir();
+  await seedApprovalFile(dataDir, [{ id: 'a1', toolName: 'Bash', requestedAt: 0 }]);
+  const log = collectingLog();
+  const fsImpl = fsWith({
+    readFileSync: () => {
+      throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    },
+  });
+
+  const store = createApprovalStore({ dataDir, log, fsImpl });
+  expect(await store.listPending()).toEqual([]);
+  expect(log.joined()).toMatch(/failed to read/);
+  // And it still works for new questions — a lost file is a lost record, not a
+  // dead store.
+  await store.put({ id: 'fresh', toolName: 'Bash', requestedAt: 1 });
+  expect((await store.listPending()).map((e) => e.id)).toEqual(['fresh']);
+});
+
+test('approval store: a failing write-back of expired entries costs the record, not the boot', async () => {
+  const dataDir = await tmpDataDir();
+  await seedApprovalFile(dataDir, [{ id: 'old', toolName: 'Bash', requestedAt: 0 }]);
+  const log = collectingLog();
+  const fsImpl = fsWith({
+    writeFileSync: () => {
+      throw Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    },
+  });
+
+  const store = createApprovalStore({ dataDir, log, fsImpl });
+  expect(log.joined()).toMatch(/could not record expired entries/);
+  // The marking still holds in memory, which is where it decides anything.
+  await expect(store.decide('old', { behavior: 'allow' })).rejects.toThrow(/process gone/);
+});
+
+test('approval store: a put() whose write fails is rolled back — no ghost entry, and the id stays usable', async () => {
+  // I1: without the rollback the entry stays pending+owned in memory forever.
+  // The inbox would list a question whose buttons can only 404, AND the key
+  // stays taken — a CLI numbers its requests from 1 on every turn, so
+  // `chatId:1` would then auto-deny the first approval of every later turn in
+  // that chat for the rest of the process's life.
+  const dataDir = await tmpDataDir();
+  const log = collectingLog();
+  let failWrites = false;
+  const fsImpl = fsWith({
+    writeFileSync: (target, data, encoding) => {
+      if (failWrites) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+      return fs.writeFileSync(target, data, encoding);
+    },
+  });
+  const store = createApprovalStore({ dataDir, log, fsImpl });
+
+  failWrites = true;
+  await expect(store.put({ id: 'chat-1:1', toolName: 'Bash', requestedAt: 0 })).rejects.toThrow(/ENOSPC/);
+  expect(await store.listPending()).toEqual([]);
+  expect(await store.get('chat-1:1')).toBeNull();
+  expect(log.joined()).toMatch(/could not record/);
+
+  // The next turn reuses request id 1 in the same chat. It must work.
+  failWrites = false;
+  await store.put({ id: 'chat-1:1', toolName: 'Write', requestedAt: 10 });
+  expect((await store.listPending()).map((e) => e.toolName)).toEqual(['Write']);
+});
+
+test('approval store: a put() rollback restores the entry it replaced rather than dropping the history', async () => {
+  const dataDir = await tmpDataDir();
+  let failWrites = false;
+  const fsImpl = fsWith({
+    writeFileSync: (target, data, encoding) => {
+      if (failWrites) throw new Error('EIO: write failed');
+      return fs.writeFileSync(target, data, encoding);
+    },
+  });
+  const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
+  await store.put({ id: 'req-1', toolName: 'Bash', requestedAt: 0 });
+  await store.decide('req-1', { behavior: 'allow' });
+
+  failWrites = true;
+  await expect(store.put({ id: 'req-1', toolName: 'Write', requestedAt: 10 })).rejects.toThrow(/EIO/);
+  // The answered entry is still the answered entry, not a half-replaced one.
+  expect(await store.get('req-1')).toMatchObject({ toolName: 'Bash', status: 'decided', decision: { behavior: 'allow' } });
+});
+
+test('approval store: the write is genuinely atomic — a write that dies halfway leaves the PREVIOUS file whole', async () => {
+  // I3: the old test only checked that no temp file was left lying around,
+  // which a naive writeFileSync(filePath, ...) passes just as easily. This one
+  // fails a write AFTER it has already put half the bytes on disk — the exact
+  // shape of a crash or a full disk — and then requires approvals.json to
+  // still be the complete previous version.
+  const dataDir = await tmpDataDir();
+  let truncateNextWrite = false;
+  const fsImpl = fsWith({
+    writeFileSync: (target, data, encoding) => {
+      if (!truncateNextWrite) return fs.writeFileSync(target, data, encoding);
+      const half = String(data).slice(0, Math.floor(String(data).length / 2));
+      fs.writeFileSync(target, half, encoding); // the bytes that DID land
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    },
+  });
+  const store = createApprovalStore({ dataDir, log: collectingLog(), fsImpl });
+  await store.put({ id: 'survivor', toolName: 'Bash', requestedAt: 0 });
+
+  truncateNextWrite = true;
+  await expect(store.put({ id: 'doomed', toolName: 'Write', requestedAt: 1 })).rejects.toThrow(/ENOSPC/);
+
+  // Whole, parseable, and the version from before the failed write.
+  const onDisk = readApprovalFile(dataDir);
+  expect(onDisk.approvals.map((e) => e.id)).toEqual(['survivor']);
+  // And the half-written temp file did not survive to litter the data dir.
+  expect(fs.readdirSync(dataDir).filter((name) => name.includes('.tmp-'))).toEqual([]);
+});
+
+test('approval store: a decision whose write fails still stands, and says so loudly', async () => {
+  // M1: the opposite call from put(). By this point the caller has already
+  // resolved the CLI's control request — the tool ran or it did not. Rolling
+  // back would make the store disagree with reality; staying silent would let
+  // the next start report an answered question as 'process gone'.
+  const dataDir = await tmpDataDir();
+  const log = collectingLog();
+  let failWrites = false;
+  const fsImpl = fsWith({
+    writeFileSync: (target, data, encoding) => {
+      if (failWrites) throw new Error('EIO: write failed');
+      return fs.writeFileSync(target, data, encoding);
+    },
+  });
+  const store = createApprovalStore({ dataDir, log, fsImpl });
+  await store.put({ id: 'a1', toolName: 'Bash', requestedAt: 0 });
+
+  failWrites = true;
+  await expect(store.decide('a1', { behavior: 'allow' })).resolves.toMatchObject({ decision: { behavior: 'allow' } });
+  expect(await store.get('a1')).toMatchObject({ status: 'decided' });
+  expect(await store.listPending()).toEqual([]);
+  expect(log.joined()).toMatch(/the decision stands/);
+});
+
+test('approval store: expired entries from a dead process survive later writes, so the post-mortem is still there tomorrow', async () => {
+  // M2: the file promises to say what died. That promise is only kept if
+  // ordinary later activity — a new question, an answer — rewrites the file
+  // WITH those entries rather than over them.
+  const dataDir = await tmpDataDir();
+  await seedApprovalFile(dataDir, [{ id: 'from-last-night', toolName: 'Bash', requestedAt: 1 }]);
+  const store = createApprovalStore({ dataDir, log: collectingLog() });
+
+  await store.put({ id: 'new-1', toolName: 'Write', requestedAt: 2 });
+  await store.decide('new-1', { behavior: 'allow' });
+
+  const onDisk = readApprovalFile(dataDir).approvals;
+  expect(onDisk.find((e) => e.id === 'from-last-night')).toMatchObject({ status: 'expired', expired: 'process gone' });
+  expect(await store.get('from-last-night')).toMatchObject({ expired: 'process gone' });
+});
+
+test('approval store: a corrupt file that cannot be renamed aside is copied aside instead', async () => {
+  // M3: without the fallback the evidence is gone at the next write, silently.
+  const dataDir = await tmpDataDir();
+  await fsp.writeFile(path.join(dataDir, 'approvals.json'), '{ half a file', 'utf8');
+  const log = collectingLog();
+  const fsImpl = fsWith({
+    renameSync: (from, to) => {
+      if (String(from).endsWith('approvals.json')) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
+      return fs.renameSync(from, to);
+    },
+  });
+
+  const store = createApprovalStore({ dataDir, log, fsImpl });
+  expect(await store.listPending()).toEqual([]);
+  const copies = fs.readdirSync(dataDir).filter((name) => name.startsWith('approvals.corrupt-'));
+  expect(copies).toHaveLength(1);
+  expect(fs.readFileSync(path.join(dataDir, copies[0]), 'utf8')).toBe('{ half a file');
+  expect(log.joined()).toMatch(/copied to/);
+});
+
+test('approval store: temp files left by a crashed run are swept at startup', async () => {
+  // M4: a crash between write and rename leaves one behind, and nobody else in
+  // kaprek knows the name pattern, so nobody else can clean it up.
+  const dataDir = await tmpDataDir();
+  fs.writeFileSync(path.join(dataDir, '.approvals.json.tmp-999-1'), 'junk', 'utf8');
+  fs.writeFileSync(path.join(dataDir, '.approvals.json.tmp-999-2'), 'junk', 'utf8');
+  fs.writeFileSync(path.join(dataDir, 'unrelated.json'), '{}', 'utf8');
+
+  createApprovalStore({ dataDir, log: collectingLog() });
+
+  const left = fs.readdirSync(dataDir);
+  expect(left.filter((name) => name.includes('.tmp-'))).toEqual([]);
+  expect(left).toContain('unrelated.json');
 });

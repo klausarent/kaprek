@@ -11,7 +11,7 @@ import { runTurn } from '../orchestrator/run.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
-import { createTriggerRunner, UNATTENDED_ABSOLUTE_TIMEOUT_MS } from './runner.mjs';
+import { createTriggerRunner, UNATTENDED_ABSOLUTE_TIMEOUT_MS, unattendedAbsoluteTimeoutMs } from './runner.mjs';
 import { MAX_TRIGGER_TURNS_PER_HOUR } from './limits.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { buildArgs } from '../harness/claude-code.mjs';
@@ -564,6 +564,42 @@ test('an inbox turn gets an absolute wall clock sized to outlast the unattended 
   // least the inbox deadline plus the turn's own active budget plus a buffer.
   expect(seen[0].absoluteTimeoutMs).toBe(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
   expect(seen[0].absoluteTimeoutMs).toBeGreaterThanOrEqual(APPROVAL_DEADLINE_UNATTENDED_MS + ACTIVE_TOTAL_MS);
+});
+
+test('a longer approval deadline moves the wall clock with it — the two cannot drift apart', async () => {
+  // The deadline is configurable (startServer's unattendedApprovalTimeoutMs).
+  // With a hardcoded wall clock, setting it to 12 hours would mean the turn is
+  // killed at 8h45m — three hours BEFORE its own approval could lapse, which
+  // is precisely the failure the sizing exists to prevent, and silent.
+  const twelveHours = 12 * 60 * 60_000;
+  const seen = [];
+  const { runner } = makeRunner({
+    trigger: scheduleTrigger({ config: { everyMinutes: 5 }, escalation: 'question' }),
+    makeUiApprovalHandler: allowingApprovalHandler,
+    approvalStore: fakeApprovalStore(),
+    approvalDeadlineMs: twelveHours,
+    wrapHarness: (harness) => ({
+      startTurn: (options) => {
+        seen.push(options);
+        return harness.startTurn(options);
+      },
+    }),
+  });
+
+  expect((await runner.fireTrigger('schedule-1', { cause: { origin: 'schedule' } })).fired).toBe(true);
+  expect(seen[0].absoluteTimeoutMs).toBe(unattendedAbsoluteTimeoutMs(twelveHours));
+  expect(seen[0].absoluteTimeoutMs).toBeGreaterThan(twelveHours + ACTIVE_TOTAL_MS);
+  // …and it is genuinely bigger than the default, not the constant in disguise.
+  expect(seen[0].absoluteTimeoutMs).toBeGreaterThan(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
+});
+
+test('a nonsensical deadline falls back to the default rather than disabling the wall clock', () => {
+  // A zero/NaN/negative budget disables a clock entirely in timeout.mjs
+  // (normalizeBudget), so passing one straight through would silently remove
+  // the backstop instead of shortening it.
+  for (const bad of [0, -1, NaN, undefined, null]) {
+    expect(unattendedAbsoluteTimeoutMs(bad)).toBe(UNATTENDED_ABSOLUTE_TIMEOUT_MS);
+  }
 });
 
 test('a trigger turn WITHOUT a store passes no absoluteTimeoutMs at all — the interactive default stays untouched', async () => {

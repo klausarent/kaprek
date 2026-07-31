@@ -52,12 +52,25 @@ export const UNATTENDED_ABSOLUTE_BUFFER_MS = 10 * 60_000;
  * to wait for. So the trigger path raises it to cover the full wait plus the
  * turn's own active budget plus a buffer.
  *
- * Note the direction of control: APPROVAL_DEADLINE_UNATTENDED_MS is the
- * primary limit on waiting (see its own doc comment) and this value follows
- * from it. Raising this one alone buys nothing — the auto-deny still fires
- * first; that is the intended order.
+ * Note the direction of control: the approval deadline is the primary limit on
+ * waiting (see APPROVAL_DEADLINE_UNATTENDED_MS's own doc comment) and this
+ * value follows from it. Raising this one alone buys nothing — the auto-deny
+ * still fires first; that is the intended order.
+ *
+ * It is a FUNCTION of the deadline, not a fixed number, because the deadline
+ * is configurable (startServer's `unattendedApprovalTimeoutMs`). A hardcoded
+ * 8h45m and a caller-set 12-hour deadline would mean the wall clock kills the
+ * turn three hours before the auto-deny it was sized to outlast — the exact
+ * failure this whole mechanism exists to prevent, and silent (panel Fix-Runde
+ * 1, M5). Deriving it makes that unrepresentable instead of merely warned about.
  */
-export const UNATTENDED_ABSOLUTE_TIMEOUT_MS = APPROVAL_DEADLINE_UNATTENDED_MS + ACTIVE_TOTAL_MS + UNATTENDED_ABSOLUTE_BUFFER_MS;
+export function unattendedAbsoluteTimeoutMs(approvalDeadlineMs = APPROVAL_DEADLINE_UNATTENDED_MS) {
+  const deadline = Number.isFinite(approvalDeadlineMs) && approvalDeadlineMs > 0 ? approvalDeadlineMs : APPROVAL_DEADLINE_UNATTENDED_MS;
+  return deadline + ACTIVE_TOTAL_MS + UNATTENDED_ABSOLUTE_BUFFER_MS;
+}
+
+/** The wall clock for the DEFAULT unattended deadline. A caller that changes the deadline gets its own value from unattendedAbsoluteTimeoutMs() above rather than this constant. */
+export const UNATTENDED_ABSOLUTE_TIMEOUT_MS = unattendedAbsoluteTimeoutMs(APPROVAL_DEADLINE_UNATTENDED_MS);
 const HEARTBEAT_OK_MARKER = 'heartbeat_ok';
 
 // A file-watch turn gets a bounded list of paths, never "everything that
@@ -350,6 +363,11 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   to start (see approvalCapability()) and runs under a much longer wall
  *   clock (see UNATTENDED_ABSOLUTE_TIMEOUT_MS). Defaults to null, which keeps
  *   every gate below exactly as it was.
+ * @param {number} [options.approvalDeadlineMs] - the deadline the SERVER will
+ *   auto-deny an unattended approval at (startServer's
+ *   `unattendedApprovalTimeoutMs`). The runner does not enforce it; it needs
+ *   it only to size the turn's wall clock around it — see
+ *   unattendedAbsoluteTimeoutMs(). Defaults to APPROVAL_DEADLINE_UNATTENDED_MS.
  * @param {(chatId: string) => void} [options.releaseApprovals] - called with
  *   the turn's chatId once a trigger turn has ENDED, so the server can resolve
  *   anything still pending for it (server.mjs::cleanupApprovalsForChat — the
@@ -375,6 +393,7 @@ export function createTriggerRunner({
   resolveToolApp = () => null,
   hasApprovalClient = () => false,
   approvalStore = null,
+  approvalDeadlineMs = APPROVAL_DEADLINE_UNATTENDED_MS,
   releaseApprovals = () => {},
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
@@ -382,6 +401,13 @@ export function createTriggerRunner({
   // again by an overlapping tick or a manual fire while it's still in
   // flight. Cleared in the `finally` below, so it can never leak a stuck id.
   const runningIds = new Set();
+  // The chatIds those turns are writing into, for the SECOND half of the same
+  // guard: a chat whose trigger turn is parked on an inbox approval must not
+  // also accept a typed chat turn (see isChatRunning() and
+  // server.mjs::handleChatTurn's 409). Kept separate from runningIds because a
+  // trigger's chatId is only known once runTurn() resolves it, strictly after
+  // the trigger id is claimed.
+  const runningChatIds = new Set();
   let timer = null;
 
   // One entry per ACTIVE file-watch trigger: {configKey, watcher, timer,
@@ -1226,11 +1252,12 @@ export function createTriggerRunner({
         // passes nothing here and keeps running under exactly the budgets it
         // ran under before (see UNATTENDED_ABSOLUTE_TIMEOUT_MS's doc comment
         // for why the inbox cannot).
-        ...(capability.approvalPath === 'inbox' ? { absoluteTimeoutMs: UNATTENDED_ABSOLUTE_TIMEOUT_MS } : {}),
+        ...(capability.approvalPath === 'inbox' ? { absoluteTimeoutMs: unattendedAbsoluteTimeoutMs(approvalDeadlineMs) } : {}),
         onApprovalRequest: approvalHandlerForTurn,
         onEvent,
         onChatResolved: (chatId) => {
           resolvedChatId = chatId;
+          runningChatIds.add(chatId);
           onChatId?.(chatId);
         },
         origin: 'trigger',
@@ -1256,6 +1283,7 @@ export function createTriggerRunner({
       // equivalent before, which only became visible once a deadline stopped
       // being ten minutes.
       if (resolvedChatId) {
+        runningChatIds.delete(resolvedChatId);
         try {
           releaseApprovals(resolvedChatId);
         } catch (err) {
@@ -1389,5 +1417,21 @@ export function createTriggerRunner({
     return runningIds.size > 0;
   }
 
-  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, approvalCapability, supportStatus, limitStatus };
+  /**
+   * Whether a TRIGGER turn is currently writing into this chat. The chat-turn
+   * route needs it to refuse a second turn on the same chat (panel Fix-Runde
+   * 1, I2): a trigger turn parked on an inbox approval can sit there for
+   * hours, and a chat turn started on its chat meanwhile would run a second
+   * CLI against one transcript AND destroy the parked question on its way out
+   * (handleChatTurn's finally calls cleanupApprovalsForChat for the whole
+   * chat, which cannot tell whose approval it is denying).
+   *
+   * Separate from isAnyTriggerRunning(): that one is the coarse system-wide
+   * loop guard for trigger fires, this one is per chat.
+   */
+  function isChatRunning(chatId) {
+    return runningChatIds.has(chatId);
+  }
+
+  return { fireTrigger, tick, start, stop, isAnyTriggerRunning, isChatRunning, approvalCapability, supportStatus, limitStatus };
 }

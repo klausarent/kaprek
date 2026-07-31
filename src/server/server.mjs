@@ -911,6 +911,7 @@ async function handleChatTurn(
     pendingApprovals,
     approvalTimeoutMs,
     approvalStore,
+    getRunner,
     chatSseQueues,
     approvalStreams,
     describeSource,
@@ -950,6 +951,19 @@ async function handleChatTurn(
 
   if (chatAbortControllers.has(chatId)) {
     sendJson(res, 409, { error: 'chat busy' });
+    return;
+  }
+
+  // Same gate, other half: a TRIGGER turn writing into this chat holds no
+  // entry in chatAbortControllers (it never came through this route). Without
+  // this check, a chat turn posted into a trigger chat would run a second CLI
+  // against one transcript, and its finally block's
+  // cleanupApprovalsForChat(chatId) would deny the trigger's parked
+  // question on the way out — an overnight approval destroyed by an unrelated
+  // message (panel Fix-Runde 1, I2). Hours-long parks are exactly what the
+  // inbox made possible, so this stopped being a theoretical race.
+  if (getRunner && getRunner().isChatRunning(chatId)) {
+    sendJson(res, 409, { error: 'chat busy: a trigger turn is running in this chat' });
     return;
   }
 
@@ -1589,6 +1603,7 @@ async function handleRequest(
         pendingApprovals,
         approvalTimeoutMs,
         approvalStore: getApprovalStore(),
+        getRunner,
         chatSseQueues,
         approvalStreams,
         describeSource,
@@ -1841,6 +1856,13 @@ export function startServer({
         // asked what it would do WITHOUT one, and the SSE broadcast below is
         // still the fastest path to a browser that happens to be open.
         approvalStore: getApprovalStore(),
+        // The deadline the handler below actually enforces, so the runner can
+        // size the turn's never-pausing wall clock around THIS number rather
+        // than around the default constant. Passing a longer
+        // unattendedApprovalTimeoutMs used to move only the auto-deny and
+        // leave the wall clock at 8h45m, which would kill the turn before its
+        // own approval could ever lapse (panel Fix-Runde 1, M5).
+        approvalDeadlineMs: unattendedApprovalTimeoutMs,
         releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
         makeUiApprovalHandler: (chatId) =>
           makeApprovalHandler({

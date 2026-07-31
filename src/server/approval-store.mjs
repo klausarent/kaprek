@@ -104,10 +104,27 @@ function finishedAt(entry) {
  * synchronously here, so a caller holding the returned object can trust that
  * nothing pending is left claiming to be answerable.
  *
+ * NOTHING here throws on the way in. A data dir whose approvals.json is
+ * unreadable, unwritable or corrupt starts EMPTY and says so on stderr — same
+ * posture as registry.mjs::readTriggersFile(), and for the same reason: this
+ * file is a record, and a record that cannot be read must not be able to stop
+ * kaprek from starting. It used to throw out of the constructor, which is
+ * called from startServer()'s listen callback — outside any promise — so a
+ * read-only approvals.json took the whole process down on every start
+ * (panel Fix-Runde 1, C1).
+ *
  * @param {object} options
  * @param {string} options.dataDir
  * @param {() => number} [options.now] - injectable clock (default Date.now); tests never sleep
  * @param {number} [options.pid] - recorded on every entry, for the record only — see the ownership note in loadFromDisk()
+ * @param {(message: string) => void} [options.log] - where degraded-start and
+ *   failed-write warnings go (default console.warn). Injectable so a test can
+ *   assert that a failure was ANNOUNCED, not only survived.
+ * @param {typeof import('node:fs')} [options.fsImpl] - the fs used for every
+ *   read and write here. Injected ONLY by approval-store.test.mjs's atomicity
+ *   test, which needs a write that fails halfway through to prove the
+ *   temp-file+rename dance actually protects the file (a test that cannot fail
+ *   a write can only assert that atomic code looks atomic).
  * @returns {{
  *   put: (entry: object) => Promise<object>,
  *   decide: (id: string, decision: {behavior: 'allow'|'deny', message?: string}) => Promise<object>,
@@ -115,8 +132,15 @@ function finishedAt(entry) {
  *   get: (id: string) => Promise<object|null>,
  * }}
  */
-export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid } = {}) {
+export function createApprovalStore({
+  dataDir,
+  now = Date.now,
+  pid = process.pid,
+  log = (message) => console.warn(message),
+  fsImpl = fs,
+} = {}) {
   const filePath = path.join(dataDir, FILE_NAME);
+  const TMP_PREFIX = `.${FILE_NAME}.tmp-`;
 
   /** id -> entry. Insertion order is not meaningful; listPending() sorts by requestedAt. */
   const entries = new Map();
@@ -136,28 +160,54 @@ export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid
    */
   const ownedIds = new Set();
 
+  /**
+   * Moves a corrupt file out of the way so the next persist() cannot silently
+   * overwrite the only evidence of what was pending. Three levels, each one a
+   * fallback for the one before (panel Fix-Runde 1, M3): rename it, else copy
+   * it aside and let the original be overwritten, else say loudly that the
+   * evidence is about to be lost. Never throws — see this module's constructor
+   * doc comment.
+   */
+  function setCorruptFileAside(raw) {
+    const asidePath = path.join(dataDir, `approvals.corrupt-${now()}.json`);
+    try {
+      fsImpl.renameSync(filePath, asidePath);
+      log(`approvals: ${filePath} was not readable JSON; moved to ${asidePath} and starting from an empty inbox`);
+      return;
+    } catch (renameErr) {
+      try {
+        fsImpl.writeFileSync(asidePath, raw, 'utf8');
+        log(`approvals: ${filePath} was not readable JSON and could not be moved (${renameErr.message}); copied to ${asidePath} instead`);
+        return;
+      } catch (copyErr) {
+        log(
+          `approvals: ${filePath} was not readable JSON, and it could be neither moved (${renameErr.message}) nor copied aside (${copyErr.message}) — its contents will be LOST on the next write`,
+        );
+      }
+    }
+  }
+
   function loadFromDisk() {
     let raw;
     try {
-      raw = fs.readFileSync(filePath, 'utf8');
+      raw = fsImpl.readFileSync(filePath, 'utf8');
     } catch (err) {
-      if (err.code === 'ENOENT') return false;
-      throw err;
+      // ENOENT is the ordinary first start. Anything else (EACCES on a file
+      // someone marked read-only, EBUSY, EIO) degrades to an empty inbox with
+      // a warning rather than taking the process down on every start — the
+      // ownership gate refuses foreign entries anyway, so an unread file
+      // costs a post-mortem, not safety.
+      if (err.code !== 'ENOENT') {
+        log(`approvals: failed to read ${filePath} (${err.message}); starting from an empty inbox`);
+      }
+      return false;
     }
 
     let parsed;
     try {
       parsed = JSON.parse(raw);
     } catch {
-      // Set the file aside rather than deleting it or writing straight over
-      // it: it is the only record of what was pending, and a human may want
-      // to look. Starting empty is the honest fallback — an unreadable inbox
-      // holds nothing this process can answer either way.
-      try {
-        fs.renameSync(filePath, path.join(dataDir, `approvals.corrupt-${now()}.json`));
-      } catch {
-        // best-effort — a failed rename must not stop the server from starting
-      }
+      setCorruptFileAside(raw);
       return false;
     }
 
@@ -206,18 +256,61 @@ export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid
       if (!entries.has(id)) ownedIds.delete(id);
     }
 
-    fs.mkdirSync(dataDir, { recursive: true });
+    fsImpl.mkdirSync(dataDir, { recursive: true });
     // Temp file in the SAME directory, then rename: rename is atomic within a
     // filesystem, so a reader (or a crash) either sees the whole previous file
     // or the whole new one, never a truncated inbox. The pid+timestamp in the
     // temp name keeps two writers from colliding on it even though there
     // should only ever be one.
-    const tmpPath = path.join(dataDir, `.${FILE_NAME}.tmp-${pid}-${now()}`);
-    fs.writeFileSync(tmpPath, `${JSON.stringify({ version: 1, approvals }, null, 2)}\n`, 'utf8');
-    fs.renameSync(tmpPath, filePath);
+    const tmpPath = path.join(dataDir, `${TMP_PREFIX}${pid}-${now()}`);
+    try {
+      fsImpl.writeFileSync(tmpPath, `${JSON.stringify({ version: 1, approvals }, null, 2)}\n`, 'utf8');
+      fsImpl.renameSync(tmpPath, filePath);
+    } catch (err) {
+      // A half-written temp file is exactly what the rename was there to keep
+      // out of approvals.json; leaving it on disk would only accumulate
+      // (panel Fix-Runde 1, M4). Removing it is best-effort — if even the
+      // unlink fails there is nothing left to try, and the caller's own error
+      // is the one worth reporting.
+      try {
+        fsImpl.unlinkSync(tmpPath);
+      } catch {
+        // best-effort
+      }
+      throw err;
+    }
   }
 
-  if (loadFromDisk()) persist();
+  /** Sweeps temp files a previous run left behind (a crash between write and rename). Best-effort and silent: they are junk, not evidence. */
+  function cleanupStaleTempFiles() {
+    let names;
+    try {
+      names = fsImpl.readdirSync(dataDir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (!name.startsWith(TMP_PREFIX)) continue;
+      try {
+        fsImpl.unlinkSync(path.join(dataDir, name));
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
+  cleanupStaleTempFiles();
+  if (loadFromDisk()) {
+    try {
+      persist();
+    } catch (err) {
+      // The write-back is bookkeeping: it makes the 'process gone' marking
+      // durable. Failing it costs an accurate file, not correctness — the
+      // ownership gate refuses those entries either way — so it must not cost
+      // the boot (panel Fix-Runde 1, C1).
+      log(`approvals: could not record expired entries in ${filePath} (${err.message}); they are refused in memory regardless`);
+    }
+  }
 
   /**
    * Records one newly raised approval question. `entry.id` is the caller's own
@@ -229,6 +322,16 @@ export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid
    * A FINISHED entry with the same id is replaced instead — a CLI numbers its
    * requests from 1 again on every turn, so id reuse across turns of one chat
    * is normal, not a collision.
+   *
+   * A failed write is ROLLED BACK and rethrown, and that is the one place in
+   * this file where a write failure is not survivable (panel Fix-Runde 1, I1).
+   * Keeping the entry in memory after a failed persist() would leave an id
+   * that is pending and owned but unreachable: the inbox would list a question
+   * whose buttons can only 404, and — worse — the key stays occupied for the
+   * rest of the process's life, so `chatId:1` (a CLI numbers from 1 every
+   * turn) would make the FIRST approval of every later turn in that chat throw
+   * 'already pending' and auto-deny. The caller (server.mjs's approval
+   * handler) turns the rethrow into a fail-closed deny for this ONE question.
    */
   async function put(entry) {
     const id = entry?.id;
@@ -257,9 +360,20 @@ export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid
       decidedAt: null,
       expired: null,
     };
+    const hadOwnership = ownedIds.has(id);
     entries.set(id, record);
     ownedIds.add(id);
-    persist();
+    try {
+      persist();
+    } catch (err) {
+      // Exactly back to the state before this call: the replaced entry
+      // restored (or none), and the ownership marker as it was.
+      if (existing) entries.set(id, existing);
+      else entries.delete(id);
+      if (!hadOwnership) ownedIds.delete(id);
+      log(`approvals: could not record ${id} (${err.message}); refusing the question rather than holding it unanswerable`);
+      throw err;
+    }
     return record;
   }
 
@@ -306,7 +420,19 @@ export function createApprovalStore({ dataDir, now = Date.now, pid = process.pid
     // wrong reason (see the order note above); it is pruned in persist()
     // instead, along with the entry itself.
     entries.set(id, decided);
-    persist();
+    try {
+      persist();
+    } catch (err) {
+      // Deliberately NOT rolled back and NOT rethrown, the opposite of put()
+      // above (panel Fix-Runde 1, M1). By the time a decision reaches this
+      // point it is real: the caller resolves the CLI's pending control
+      // request with it, the tool either runs or does not, and no file can
+      // undo that. Rolling back would only make the store disagree with what
+      // happened. What is lost is the RECORD — on the next start this entry
+      // reads as pending and is reported as 'process gone', which is a lie
+      // about a question that was answered. That is worth a loud line.
+      log(`approvals: ${id} was decided (${behavior}) but the record could not be written (${err.message}); the decision stands, the file is now out of date`);
+    }
     return decided;
   }
 

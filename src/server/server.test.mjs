@@ -2511,3 +2511,148 @@ test('triggers: a fire refused by the global cap streams the reason instead of s
   expect(complete.fired).toBe(false);
   expect(complete.reason).toMatch(/global trigger cap/);
 });
+
+// -------------------------------------------------- approval inbox, Fix-Runde 1
+//
+// Four mechanisms the first round shipped without a test, each of them found by
+// a mutant that survived the whole suite (panel findings I2, I4, M6/M7, M10).
+
+/** Reads the durable inbox straight off disk — the record is what these tests are about, not the in-memory map. */
+function readApprovalsFile() {
+  const raw = fs.readFileSync(path.join(dataDir, 'approvals.json'), 'utf8');
+  return JSON.parse(raw).approvals;
+}
+
+/** A harness that raises one approval and parks on it until the test lets go. */
+function parkingApprovalHarness(request = { id: 'park-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } }) {
+  let markAsked;
+  const asked = new Promise((resolve) => {
+    markAsked = resolve;
+  });
+  return {
+    asked,
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      const pending = onApprovalRequest(request);
+      markAsked();
+      const decision = await pending;
+      onEvent?.({ type: 'text', text: `decision was ${decision.behavior}` });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+test('approvals: a chat turn is refused 409 while a trigger turn is parked on an approval in that same chat', async () => {
+  // I2: the trigger turn holds no entry in chatAbortControllers (it never came
+  // through the chat route), so the existing busy gate did not see it. A chat
+  // turn posted into that chat would run a second CLI against one transcript,
+  // and its finally block's cleanupApprovalsForChat(chatId) would deny the
+  // parked question on the way out — an overnight approval destroyed by an
+  // unrelated message.
+  const harness = parkingApprovalHarness();
+  const { url, runner } = await boot({ harness, harnessName: 'fake', unattendedApprovalTimeoutMs: 60_000 });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const firing = runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  await harness.asked;
+
+  const inbox = await (await fetch(`${url}/api/approvals`)).json();
+  expect(inbox.approvals).toHaveLength(1);
+  const parked = inbox.approvals[0];
+
+  const res = await postJson(`${url}/api/chat/turn`, { chatId: parked.chatId, text: 'unrelated message' });
+  expect(res.status).toBe(409);
+  expect((await res.json()).error).toMatch(/trigger turn/);
+
+  // The question is untouched: still listed, still answerable.
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
+  const decided = await postJson(`${url}/api/approvals/${parked.id}`, { chatId: parked.chatId, behavior: 'allow' });
+  expect(decided.status).toBe(200);
+  expect((await firing).fired).toBe(true);
+
+  // Once the trigger turn is over, the chat takes turns again — the gate is a
+  // gate, not a permanent lock on a chat a trigger ever touched.
+  const after = await postJson(`${url}/api/chat/turn`, { chatId: parked.chatId, text: 'now it is free' });
+  expect(after.status).toBe(200);
+  // This harness parks on every turn, so answer the second question too rather
+  // than leaving the stream open until the test times out.
+  await readSse(after, async (frame) => {
+    if (frame.type === 'approval') {
+      await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'deny' });
+    }
+  });
+});
+
+test('approvals: the auto-deny timer records the denial on disk, so the post-mortem does not report it as still pending', async () => {
+  // I4: removing recordDecision() from the timer left the whole suite green.
+  // The consequence in the field is a file that says 'pending' for a question
+  // the server denied hours ago — and on the next start that reads as
+  // 'process gone', which blames a restart for a decision the server made.
+  const harness = parkingApprovalHarness({ id: 'lapse-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+  const { url, runner } = await boot({ harness, harnessName: 'fake', unattendedApprovalTimeoutMs: 40 });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(true);
+
+  const entry = readApprovalsFile().find((e) => e.requestId === 'lapse-1');
+  expect(entry).toMatchObject({ status: 'decided', decision: { behavior: 'deny', message: 'approval timed out' } });
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+});
+
+test('approvals: a trigger turn that ends with its question still open releases it, and the stale id can no longer be answered', async () => {
+  // M6/M7: only chat turns had an end-of-turn cleanup. A trigger turn that
+  // ended some other way (CLI died, turn errored) left the entry pending with
+  // an armed timer — hours of one, at the unattended deadline — and answering
+  // it returned 200 as if someone were still listening.
+  const abandoningHarness = {
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      // Raised and deliberately NOT awaited: the turn walks away from it.
+      onApprovalRequest({ id: 'abandoned-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      await Promise.resolve();
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+  const { url, runner } = await boot({ harness: abandoningHarness, harnessName: 'fake', unattendedApprovalTimeoutMs: 60_000 });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+
+  const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(result.fired).toBe(true);
+
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+  const late = await postJson(`${url}/api/approvals/abandoned-1`, { chatId: result.chatId, behavior: 'allow' });
+  expect(late.status).not.toBe(200);
+  expect(readApprovalsFile().find((e) => e.requestId === 'abandoned-1')).toMatchObject({
+    status: 'decided',
+    decision: { behavior: 'deny', message: 'turn ended' },
+  });
+});
+
+test('approvals: the SSE frame carries the server\'s own deadlineAt, so the client never has to guess which of the two deadlines applies', async () => {
+  // M10: the web half of this was tested against synthetic frames, so dropping
+  // deadlineAt from the server left both suites green. The client would then
+  // fall back to its 10-minute constant and sweep an 8-hour trigger question
+  // out of the live dialog after ten minutes, buttons and all.
+  const { url } = await boot({
+    harness: approvalHarness({ request: { id: 'deadline-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } } }),
+    harnessName: 'fake',
+    approvalTimeoutMs: 60_000,
+  });
+
+  const before = Date.now();
+  const res = await postJson(`${url}/api/chat/turn`, { text: 'when do you give up?' });
+  let approvalFrame = null;
+  await readSse(res, async (frame) => {
+    if (frame.type === 'approval' && approvalFrame === null) {
+      approvalFrame = frame;
+      await postJson(`${url}/api/approvals/${frame.id}`, { chatId: frame.chatId, behavior: 'allow' });
+    }
+  });
+  const after = Date.now();
+
+  expect(approvalFrame.deadlineAt).toBeGreaterThanOrEqual(before + 60_000);
+  expect(approvalFrame.deadlineAt).toBeLessThanOrEqual(after + 60_000);
+});
