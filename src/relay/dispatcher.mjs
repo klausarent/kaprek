@@ -22,6 +22,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { appendRun } from '../orchestrator/runs.mjs';
 
 /** Full rounds (every peer on the route once) before the run must ask a human. Conservative on purpose: two rounds is enough to see whether the pair is converging, and short enough that a bad run costs little. */
 export const RELAY_ROUNDS_PER_GATE = 2;
@@ -243,6 +244,26 @@ export function createRelayDispatcher({
               });
             })();
 
+      // Book the PEER turn in runs.jsonl — claude relay turns are booked by
+      // runTurn() itself, so booking them here too would double every claude
+      // line; the peers have no other path into the ledger. Best-effort like
+      // run.mjs's own appendRun: a ledger write must never fail the turn.
+      if (peerId !== 'claude') {
+        try {
+          appendRun(dataDir, {
+            chatId,
+            harness: peerId,
+            costUsd: answer.costUsd ?? null,
+            usage: answer.usage ?? null,
+            durationMs: answer.durationMs ?? null,
+            stopReason: 'result',
+            origin: 'relay',
+          });
+        } catch {
+          // the message event below still records the answer itself
+        }
+      }
+
       const body = writeBody({ dataDir, runId: relay.runId, turn: relay.turns + 1, from: peerId, text: answer.message });
       appendRelayEvent(chatId, {
         eventType: 'message',
@@ -264,6 +285,19 @@ export function createRelayDispatcher({
       });
       return { ...answer, ...body, dispatchId };
     } catch (err) {
+      if (peerId !== 'claude') {
+        try {
+          appendRun(dataDir, {
+            chatId,
+            harness: peerId,
+            stopReason: 'error',
+            error: { message: err?.message ?? String(err) },
+            origin: 'relay',
+          });
+        } catch {
+          // the dispatch.failed event below still records the failure
+        }
+      }
       appendRelayEvent(chatId, {
         eventType: 'dispatch.failed',
         runId: relay.runId,

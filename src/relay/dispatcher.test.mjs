@@ -98,6 +98,48 @@ test('the route is followed in order, and two full rounds produce exactly one ga
   expect(pending[0]).toMatchObject({ kind: RELAY_GATE_KIND, mode: 'deferred' });
 });
 
+test('every peer turn is booked in runs.jsonl — the cost ledger covers the whole run, not just the claude half', async () => {
+  const grok = scriptedPeer('grok', [
+    { message: 'draft 1', costUsd: 0.03, usage: { total_tokens: 100 } },
+    { message: 'draft 2', costUsd: 0.04, usage: { total_tokens: 120 } },
+  ]);
+  const claude = scriptedPeer('claude', [{ message: 'review 1' }, { message: 'review 2' }]);
+  const { chatId, dispatcher } = setup({ grok, claude });
+
+  await dispatcher.startRun({ chatId, goal: 'write the batch' });
+  await settle(dispatcher, chatId);
+
+  const runs = fs
+    .readFileSync(path.join(dataDir, 'runs.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const grokRuns = runs.filter((run) => run.harness === 'grok');
+  expect(grokRuns).toHaveLength(2);
+  expect(grokRuns[0]).toMatchObject({ origin: 'relay', chatId, costUsd: 0.03, stopReason: 'result' });
+  // Claude relay turns are booked by runTurn() itself in production — the
+  // dispatcher booking them AGAIN would double every claude line.
+  expect(runs.filter((run) => run.harness === 'claude')).toHaveLength(0);
+});
+
+test('a failed peer dispatch is booked too, as an error line', async () => {
+  const grok = scriptedPeer('grok', [() => Promise.reject(new Error('grok did not answer within 5ms'))]);
+  const { chatId, dispatcher } = setup({ grok });
+
+  await dispatcher.startRun({ chatId, goal: 'write the batch' });
+  await settle(dispatcher, chatId);
+
+  const runs = fs
+    .readFileSync(path.join(dataDir, 'runs.jsonl'), 'utf8')
+    .trim()
+    .split('\n')
+    .map((line) => JSON.parse(line));
+  const grokRuns = runs.filter((run) => run.harness === 'grok');
+  expect(grokRuns).toHaveLength(1);
+  expect(grokRuns[0]).toMatchObject({ origin: 'relay', stopReason: 'error' });
+  expect(grokRuns[0].error.message).toContain('did not answer');
+});
+
 test('a voucher buys exactly one more round, and a changed route makes it unspendable', async () => {
   const grok = scriptedPeer('grok', [{ message: 'a' }, { message: 'b' }, { message: 'c' }]);
   const claude = scriptedPeer('claude', [{ message: 'x' }, { message: 'y' }, { message: 'z' }]);
