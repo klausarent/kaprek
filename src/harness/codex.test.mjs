@@ -439,3 +439,94 @@ test('two approvals in flight at once are answered independently, in whatever or
   // The decline (request 1) arrived before the accept (request 0).
   expect(child.approvalAnswers.map((a) => a.id)).toEqual([1, 0]);
 });
+
+// --- robustness: clocks, abort, error normalization (M1 Task 3) ---
+
+/** A server that answers the handshake but then goes silent forever — the turn only ends by abort, clock, or child death. */
+function silentServer({ threadId = 'th-1' } = {}) {
+  return makeFakeCodexServer((c, msg) => {
+    if (msg.method === 'initialize') c.send({ id: msg.id, result: { userAgent: 'fake/0' } });
+    else if (msg.method === 'thread/start') c.send({ id: msg.id, result: { thread: { id: threadId } } });
+    else if (msg.method === 'turn/start') c.send({ id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+  });
+}
+
+test('an abort sends turn/interrupt before the kill and resolves stopReason aborted', async () => {
+  const child = silentServer();
+  const controller = new AbortController();
+  const turn = startTurn({ cwd: '.', prompt: 'hi', signal: controller.signal, spawnFn: () => child });
+
+  // Let the handshake complete before aborting, so a threadId exists.
+  await new Promise((r) => setTimeout(r, 50));
+  controller.abort();
+  const result = await turn;
+
+  expect(result.stopReason).toBe('aborted');
+  expect(result.error).toBeNull();
+  const interrupt = child.received.find((m) => m.method === 'turn/interrupt');
+  expect(interrupt?.params?.threadId).toBe('th-1');
+  expect(child.kill).toHaveBeenCalled();
+});
+
+test('a silent model trips the idle clock: stopReason timeout, timeoutClock idle', async () => {
+  const child = silentServer();
+  const result = await startTurn({ cwd: '.', prompt: 'hi', spawnFn: () => child, idleMs: 40, clockIntervalMs: 10 });
+  expect(result.stopReason).toBe('timeout');
+  expect(result.timeoutClock).toBe('idle');
+  expect(result.error).toBeNull();
+}, 10000);
+
+test('a child that dies before the turn completes is an error carrying the exit code and stderr', async () => {
+  const child = silentServer();
+  const turn = startTurn({ cwd: '.', prompt: 'hi', spawnFn: () => child });
+  await new Promise((r) => setTimeout(r, 30));
+  child.stderr.write('ERROR model backend unreachable\n');
+  child.killed = true;
+  child.emit('close', 1);
+  const result = await turn;
+  expect(result.stopReason).toBe('error');
+  expect(result.error.message).toContain('code 1');
+  expect(result.error.message).toContain('backend unreachable');
+});
+
+test('a JSON-RPC error on turn/start ends the turn as an error, not a hang', async () => {
+  const child = makeFakeCodexServer((c, msg) => {
+    if (msg.method === 'initialize') c.send({ id: msg.id, result: {} });
+    else if (msg.method === 'thread/start') c.send({ id: msg.id, result: { thread: { id: 'th-1' } } });
+    else if (msg.method === 'turn/start') c.send({ id: msg.id, error: { code: -32000, message: 'model not available' } });
+  });
+  const result = await startTurn({ cwd: '.', prompt: 'hi', spawnFn: () => child });
+  expect(result.stopReason).toBe('error');
+  expect(result.error.message).toContain('model not available');
+});
+
+test('an oversized output line is dropped and counted instead of being parsed or ending the turn', async () => {
+  const child = makeFakeCodexServer((c, msg) => {
+    if (msg.method === 'initialize') c.send({ id: msg.id, result: {} });
+    else if (msg.method === 'thread/start') c.send({ id: msg.id, result: { thread: { id: 'th-1' } } });
+    else if (msg.method === 'turn/start') {
+      c.send({ id: msg.id, result: { turn: { id: 'turn-1' } } });
+      c.stdout.write(`${'x'.repeat(9 * 1024 * 1024)}\n`);
+      c.send({ method: 'turn/completed', params: { threadId: 'th-1', turn: { id: 'turn-1', status: 'completed', error: null } } });
+    }
+  });
+  const result = await startTurn({ cwd: '.', prompt: 'hi', spawnFn: () => child });
+  expect(result.stopReason).toBe('result');
+  expect(result.droppedLines).toBe(1);
+}, 15000);
+
+test('an onEvent consumer that throws is collected as a warning and the turn still completes', async () => {
+  const child = happyServer({
+    turnEvents: [{ method: 'item/agentMessage/delta', params: { threadId: 'th-1', turnId: 'turn-1', itemId: 'm1', delta: 'hi' } }],
+  });
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => child,
+    onEvent: (event) => {
+      if (event.type === 'text') throw new Error('boom in onEvent');
+    },
+  });
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings).toContain('boom in onEvent');
+});

@@ -17,6 +17,7 @@
 // reported through the resolved TurnResult.
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
+import { ABSOLUTE_MS, ACTIVE_TOTAL_MS, IDLE_MS, TOOL_LEASE_MS, createTurnClocks } from './timeout.mjs';
 
 /**
  * kaprek's permissionMode → Codex {approvalPolicy, sandbox}.
@@ -35,6 +36,8 @@ export function mapPermissionMode(mode) {
 
 /** Grace given to the child to exit after we end stdin post-completion. */
 const DEFAULT_KILL_GRACE_MS = 3000;
+/** Same 8 MiB line cap as claude-code.mjs: a single runaway line is dropped and counted, never parsed or buffered. */
+const MAX_LINE_BYTES = 8 * 1024 * 1024;
 
 export async function startTurn({
   cwd,
@@ -46,6 +49,11 @@ export async function startTurn({
   signal,
   spawnFn = spawn,
   killGraceMs = DEFAULT_KILL_GRACE_MS,
+  idleMs = IDLE_MS,
+  toolLeaseMs = TOOL_LEASE_MS,
+  timeoutMs = ACTIVE_TOTAL_MS,
+  absoluteTimeoutMs = ABSOLUTE_MS,
+  clockIntervalMs = 1000,
 } = {}) {
   const warnings = [];
   const safeEmit = (event) => {
@@ -70,6 +78,18 @@ export async function startTurn({
     let lastUsage = null;
     let settled = false;
     let stderrTail = '';
+    let droppedLines = 0;
+
+    // The same four independent clocks claude-code.mjs runs (see
+    // timeout.mjs's own doc comment): the harness feeds progress/approval
+    // events and polls check(); it owns no time math.
+    const clocks = createTurnClocks({ idleMs, toolLeaseMs, activeTotalMs: timeoutMs, absoluteMs: absoluteTimeoutMs });
+    let pendingApprovalCount = 0;
+    const clockTimer = setInterval(() => {
+      const hit = clocks.check();
+      if (hit) interruptAndSettle({ stopReason: 'timeout', timeoutClock: hit.clock });
+    }, clockIntervalMs);
+    clockTimer.unref?.();
 
     // Items currently in flight, by item id. An approval request names only
     // its itemId; the human-readable payload (the command, the diff) arrived
@@ -116,6 +136,7 @@ export async function startTurn({
     const settle = (result) => {
       if (settled) return;
       settled = true;
+      clearInterval(clockTimer);
       for (const entry of pending.values()) entry.reject(new Error('turn ended'));
       pending.clear();
       endChild();
@@ -124,9 +145,20 @@ export async function startTurn({
         costUsd: null,
         usage: lastUsage,
         error: null,
+        ...(droppedLines ? { droppedLines } : {}),
         ...(warnings.length ? { warnings } : {}),
         ...result,
       });
+    };
+
+    // Abort and clock hits share one path: ask the server to interrupt the
+    // turn (a courtesy the real CLI honors by stopping the model), then end
+    // the child. The settle() itself is not delayed on the interrupt — the
+    // child is being killed either way, this is not a negotiation.
+    const interruptAndSettle = (result) => {
+      if (settled) return;
+      if (threadId) write({ jsonrpc: '2.0', id: nextId++, method: 'turn/interrupt', params: { threadId } });
+      settle(result);
     };
 
     const toolInputFor = (item) => {
@@ -139,16 +171,19 @@ export async function startTurn({
     const onNotification = (msg) => {
       const { method, params = {} } = msg;
       if (method === 'item/agentMessage/delta') {
+        clocks.onProgress('assistant-message');
         if (params.delta) safeEmit({ type: 'text', text: params.delta });
         return;
       }
       if (method === 'item/reasoning/summaryTextDelta' || method === 'item/reasoning/textDelta') {
+        clocks.onProgress('assistant-message');
         if (params.delta) safeEmit({ type: 'thinking', text: params.delta });
         return;
       }
       if (method === 'item/started') {
         const item = params.item ?? {};
         if (item.type === 'commandExecution' || item.type === 'fileChange' || item.type === 'mcpToolCall') {
+          clocks.onProgress('tool-start');
           itemCache.set(item.id, item);
           outputBuffers.set(item.id, '');
           safeEmit({ type: 'tool-start', id: item.id, name: item.type, input: toolInputFor(item) });
@@ -164,6 +199,7 @@ export async function startTurn({
       if (method === 'item/completed') {
         const item = params.item ?? {};
         if (itemCache.has(item.id)) {
+          clocks.onProgress('tool-end');
           const output = outputBuffers.get(item.id) ?? '';
           const result = item.type === 'fileChange' ? JSON.stringify(item.changes ?? []) : output;
           safeEmit({ type: 'tool-end', id: item.id, result, isError: item.status !== 'completed' });
@@ -197,6 +233,7 @@ export async function startTurn({
         return;
       }
       if (method === 'turn/completed') {
+        clocks.onProgress('result');
         const turn = params.turn ?? {};
         const isError = turn.status === 'failed' || Boolean(turn.error);
         safeEmit({ type: 'result', sessionId: threadId, costUsd: null, usage: lastUsage, isError });
@@ -251,7 +288,16 @@ export async function startTurn({
         suggestions: null,
       };
       safeEmit({ type: 'approval', phase: 'requested', id: request.id, toolName, request });
+      // Waiting on a human pauses idle/tool-lease/active-total (never
+      // absolute) — same reasoning as claude-code.mjs's approval handling.
+      pendingApprovalCount += 1;
+      if (pendingApprovalCount === 1) clocks.onApprovalStart();
+      let responded = false;
       const respond = (decision, behavior) => {
+        if (responded) return;
+        responded = true;
+        pendingApprovalCount -= 1;
+        if (pendingApprovalCount === 0) clocks.onApprovalEnd();
         write({ jsonrpc: '2.0', id: msg.id, result: { decision } });
         safeEmit({ type: 'approval', phase: 'resolved', id: request.id, toolName, behavior });
       };
@@ -276,6 +322,10 @@ export async function startTurn({
     const rl = createInterface({ input: child.stdout });
     rl.on('line', (line) => {
       if (!line.trim() || settled) return;
+      if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+        droppedLines += 1;
+        return;
+      }
       let msg;
       try {
         msg = JSON.parse(line);
@@ -313,7 +363,7 @@ export async function startTurn({
       });
     });
 
-    const abort = () => settle({ stopReason: 'aborted' });
+    const abort = () => interruptAndSettle({ stopReason: 'aborted' });
     signal?.addEventListener?.('abort', abort, { once: true });
 
     (async () => {
@@ -332,6 +382,7 @@ export async function startTurn({
           thread = await request('thread/start', { cwd, approvalPolicy, sandbox, ephemeral: false });
           threadId = thread?.thread?.id ?? null;
         }
+        clocks.onProgress('init');
         safeEmit({ type: 'init', sessionId: threadId, tools: [], model: null, permissionMode: permissionMode ?? 'default' });
         await request('turn/start', { threadId, input: [{ type: 'text', text: prompt }] });
         // From here the notifications drive the turn to turn/completed.
