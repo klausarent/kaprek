@@ -85,7 +85,31 @@ export const KNOWN_READONLY_TOOLS = [
  */
 export const ASK_TOOLS_TRIGGER = [...ASK_TOOLS_CHAT, ...KNOWN_READONLY_TOOLS];
 
-const PROFILES = { chat: ASK_TOOLS_CHAT, trigger: ASK_TOOLS_TRIGGER };
+/** Edit-shaped tools the 'chat-edits' profile lets run without asking. */
+const EDIT_TOOLS = ['Write', 'Edit', 'NotebookEdit'];
+
+// The approval stances a HUMAN can pick for a chat turn (triggers always run
+// the strict 'trigger' profile — nobody is watching those):
+//   chat        every write/outward tool asks (the fail-closed default)
+//   chat-edits  edits run free, everything else still asks (CLI acceptEdits)
+//   chat-auto   nothing asks at all (CLI bypassPermissions) — the operator
+//               explicitly chose full auto, same as running the CLI with
+//               --dangerously-skip-permissions; kaprek adds no gate the
+//               operator just chose to remove.
+const PROFILES = {
+  chat: ASK_TOOLS_CHAT,
+  'chat-edits': ASK_TOOLS_CHAT.filter((tool) => !EDIT_TOOLS.includes(tool)),
+  'chat-auto': [],
+  trigger: ASK_TOOLS_TRIGGER,
+};
+
+/** CLI permission mode per profile — written into the settings file AND passed as --permission-mode. */
+export const PROFILE_CLI_MODE = {
+  chat: 'default',
+  'chat-edits': 'acceptEdits',
+  'chat-auto': 'bypassPermissions',
+  trigger: 'default',
+};
 
 /**
  * Merges `learnedTools` (see src/harness/knownTools.mjs — names the CLI
@@ -109,7 +133,12 @@ const PROFILES = { chat: ASK_TOOLS_CHAT, trigger: ASK_TOOLS_TRIGGER };
 export function mergeAskList(profile, learnedTools = []) {
   const base = PROFILES[profile];
   if (!base) throw new Error(`mergeAskList requires profile to be one of ${Object.keys(PROFILES).join(', ')} (got ${JSON.stringify(profile)})`);
-  const extra = learnedTools.filter((t) => !base.includes(t) && (profile === 'trigger' || !KNOWN_READONLY_TOOLS.includes(t)));
+  // Full auto asks for NOTHING — a learned tool must not sneak a question
+  // back into a stance the operator explicitly chose to run ungated.
+  if (profile === 'chat-auto') return [];
+  const extra = learnedTools.filter(
+    (t) => !base.includes(t) && (profile === 'trigger' || !KNOWN_READONLY_TOOLS.includes(t)) && (profile !== 'chat-edits' || !EDIT_TOOLS.includes(t)),
+  );
   return [...base, ...extra];
 }
 
@@ -164,7 +193,7 @@ export function writeHarnessSettings({ dataDir, profile, learnedTools = [] }) {
   const settingsPath = path.join(dir, `settings-${profile}.json`);
   const settings = {
     hooks: {},
-    permissions: { defaultMode: 'default', allow: [], deny: [], ask },
+    permissions: { defaultMode: PROFILE_CLI_MODE[profile] ?? 'default', allow: [], deny: [], ask },
   };
   const content = `${JSON.stringify(settings, null, 2)}\n`;
 

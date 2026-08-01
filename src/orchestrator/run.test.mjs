@@ -947,3 +947,45 @@ test('an empty thinking event is streamed as activity but never persisted — th
   expect(thinking).toHaveLength(1);
   expect(thinking[0].text).toBe('real thought');
 });
+
+test('approvalMode auto runs the chat-auto profile and bypassPermissions; a trigger turn ignores it completely', async () => {
+  const script = [
+    { type: 'init', sessionId: 's-am', tools: [], model: 'm', permissionMode: 'bypassPermissions' },
+    { type: 'result', sessionId: 's-am', costUsd: null, usage: {}, isError: false },
+  ];
+  const seenOptions = [];
+  const harness = {
+    startTurn: async (options) => {
+      seenOptions.push(options);
+      for (const e of script) options.onEvent(e);
+      return { sessionId: 's-am', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+
+  await runTurn({ dataDir: tmpDir, text: 'go wild', harness, approvalMode: 'auto' });
+  expect(seenOptions[0].permissionMode).toBe('bypassPermissions');
+  expect(seenOptions[0].settingsPath).toContain('settings-chat-auto');
+  const auto = JSON.parse(fs.readFileSync(seenOptions[0].settingsPath, 'utf8'));
+  expect(auto.permissions.ask).toEqual([]);
+
+  // Nobody watches a trigger turn — approvalMode must not weaken it.
+  await runTurn({ dataDir: tmpDir, text: 'night run', harness, approvalMode: 'auto', origin: 'trigger' });
+  expect(seenOptions[1].settingsPath).toContain('settings-trigger');
+  expect(seenOptions[1].permissionMode).not.toBe('bypassPermissions');
+});
+
+test('approvalMode edits maps to acceptEdits with the edit tools free and everything else still asking', async () => {
+  const seenOptions = [];
+  const harness = {
+    startTurn: async (options) => {
+      seenOptions.push(options);
+      options.onEvent({ type: 'result', sessionId: 's-ed', costUsd: null, usage: {}, isError: false });
+      return { sessionId: 's-ed', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'edit stuff', harness, approvalMode: 'edits' });
+  expect(seenOptions[0].permissionMode).toBe('acceptEdits');
+  const settings = JSON.parse(fs.readFileSync(seenOptions[0].settingsPath, 'utf8'));
+  expect(settings.permissions.ask).not.toContain('Edit');
+  expect(settings.permissions.ask).toContain('Bash');
+});

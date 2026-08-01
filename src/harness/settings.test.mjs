@@ -202,3 +202,21 @@ test('throws when even the turn-unique fallback file cannot be written', () => {
 
   writeSpy.mockRestore();
 });
+
+test('the chat-edits profile drops the edit tools from ask and runs the CLI in acceptEdits mode', () => {
+  const settingsPath = writeHarnessSettings({ dataDir: tmpDir, profile: 'chat-edits' });
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  expect(settings.permissions.defaultMode).toBe('acceptEdits');
+  for (const tool of ['Write', 'Edit', 'NotebookEdit']) expect(settings.permissions.ask).not.toContain(tool);
+  // Everything else that writes or reaches out still asks.
+  for (const tool of ['Bash', 'WebFetch', 'Task']) expect(settings.permissions.ask).toContain(tool);
+});
+
+test('the chat-auto profile asks for NOTHING and runs the CLI in bypassPermissions — the human explicitly chose full auto', () => {
+  const settingsPath = writeHarnessSettings({ dataDir: tmpDir, profile: 'chat-auto' });
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  expect(settings.permissions.defaultMode).toBe('bypassPermissions');
+  expect(settings.permissions.ask).toEqual([]);
+  // Learned tools must not sneak questions back into full auto.
+  expect(mergeAskList('chat-auto', ['BrandNewTool'])).toEqual([]);
+});

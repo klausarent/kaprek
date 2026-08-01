@@ -1818,3 +1818,16 @@ pre,
   font-size: 0.75rem;
   opacity: 0.85;
 }
+
+.chat-approval-select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+}
+.chat-approval-select-auto {
+  border-color: #c0392b;
+  color: #c0392b;
+}

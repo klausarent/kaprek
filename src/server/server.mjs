@@ -1573,6 +1573,15 @@ async function handleChatTurn(
     return;
   }
 
+  // The approval stance for THIS turn — a per-turn choice, like the CLI's
+  // own permission modes ('auto' mirrors --dangerously-skip-permissions:
+  // the human explicitly opted out of the gate for this turn).
+  const approvalMode = body.data?.approvalMode ?? 'ask';
+  if (!['ask', 'edits', 'auto'].includes(approvalMode)) {
+    sendJson(res, 400, { error: 'invalid approvalMode (ask | edits | auto)' });
+    return;
+  }
+
   let chatId = body.data?.chatId;
   let chatEngine;
   if (chatId !== undefined) {
@@ -1729,6 +1738,7 @@ async function handleChatTurn(
       harnessName: turnHarnessName,
       cwd: turnCwd,
       permissionMode,
+      approvalMode,
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so

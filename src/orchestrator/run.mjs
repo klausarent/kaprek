@@ -13,7 +13,7 @@ import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
-import { writeHarnessSettings, mergeAskList } from '../harness/settings.mjs';
+import { writeHarnessSettings, mergeAskList, PROFILE_CLI_MODE } from '../harness/settings.mjs';
 import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
@@ -230,6 +230,11 @@ export async function runTurn({
   harnessName = null,
   cwd,
   permissionMode,
+  // The approval stance a human picked for THIS turn: 'ask' (default,
+  // everything write-shaped asks), 'edits' (edits run free), 'auto'
+  // (nothing asks — CLI bypassPermissions). Only meaningful for a chat
+  // turn; a trigger turn always runs the strict trigger profile below.
+  approvalMode = 'ask',
   allowedTools,
   absoluteTimeoutMs,
   onEvent,
@@ -475,7 +480,16 @@ export async function runTurn({
   // settings.mjs's own doc comment for why `permissions.ask` is what makes
   // this actually work against the CLI's own auto-approval at the 'Mode'
   // stage (task-7a Fix-Runde 2).
-  const settingsProfile = origin === 'trigger' ? 'trigger' : 'chat';
+  const CHAT_PROFILES = { ask: 'chat', edits: 'chat-edits', auto: 'chat-auto' };
+  const settingsProfile = origin === 'trigger' ? 'trigger' : (CHAT_PROFILES[approvalMode] ?? 'chat');
+  // A NON-default stance overrides the caller's permissionMode — the
+  // settings file's defaultMode and the --permission-mode flag must tell
+  // the CLI the same story, or the stricter of the two silently wins and
+  // the picker lies. The 'ask' stance (and every trigger turn) keeps the
+  // caller's permissionMode untouched: that passthrough is an existing
+  // contract (see the run.test.mjs tests named after it).
+  const effectivePermissionMode =
+    origin === 'trigger' || approvalMode === 'ask' ? permissionMode : (PROFILE_CLI_MODE[settingsProfile] ?? permissionMode);
   // Self-learning ask-coverage (task-7a Fix-Runde 3): a hand-maintained
   // ASK_TOOLS_* list goes stale the moment the CLI ships a new built-in
   // tool — readKnownTools() is whatever THIS dataDir has already learned
@@ -529,7 +543,7 @@ export async function runTurn({
       cwd,
       prompt: text,
       sessionId: priorSessionId,
-      permissionMode,
+      permissionMode: effectivePermissionMode,
       allowedTools,
       // Spread, not passed as `absoluteTimeoutMs: undefined`: claude-code.mjs
       // reads it as a defaulted destructuring parameter, so an explicit

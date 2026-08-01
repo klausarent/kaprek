@@ -3497,3 +3497,31 @@ test('engines: an explicitly injected harness wins over the chat engine (the tes
   expect(seen).toEqual(['injected']);
   expect(registry.ran).toEqual([]);
 });
+
+test('approvalMode: auto reaches the harness as bypassPermissions, garbage is a 400 before SSE', async () => {
+  const seen = [];
+  const harness = {
+    startTurn: async (options) => {
+      seen.push(options.permissionMode);
+      for (const event of fakeScript()) options.onEvent(event);
+      return { sessionId: 'sess-1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness, harnessName: 'fake' });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'go', approvalMode: 'auto' }),
+  });
+  expect(res.status).toBe(200);
+  await readSse(res);
+  expect(seen).toEqual(['bypassPermissions']);
+
+  const bad = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'go', approvalMode: 'yolo-extreme' }),
+  });
+  expect(bad.status).toBe(400);
+});

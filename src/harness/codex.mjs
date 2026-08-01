@@ -31,6 +31,9 @@ import { ABSOLUTE_MS, ACTIVE_TOTAL_MS, IDLE_MS, TOOL_LEASE_MS, createTurnClocks 
  */
 export function mapPermissionMode(mode) {
   if (mode === 'acceptEdits') return { approvalPolicy: 'on-request', sandbox: 'workspace-write' };
+  // Full auto: the operator explicitly chose to run ungated (kaprek's
+  // 'auto' approval stance) — mirrors claude's bypassPermissions.
+  if (mode === 'bypassPermissions') return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
   return { approvalPolicy: 'untrusted', sandbox: 'read-only' };
 }
 

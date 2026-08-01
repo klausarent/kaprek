@@ -222,6 +222,9 @@ test('the permission-mode table: default asks for every write, acceptEdits lets 
   expect(mapPermissionMode('default')).toEqual({ approvalPolicy: 'untrusted', sandbox: 'read-only' });
   expect(mapPermissionMode(undefined)).toEqual({ approvalPolicy: 'untrusted', sandbox: 'read-only' });
   expect(mapPermissionMode('acceptEdits')).toEqual({ approvalPolicy: 'on-request', sandbox: 'workspace-write' });
+  // Full auto — the operator explicitly chose it, mirror of the claude
+  // harness's bypassPermissions stance.
+  expect(mapPermissionMode('bypassPermissions')).toEqual({ approvalPolicy: 'never', sandbox: 'danger-full-access' });
   // Unknown modes fall back to the strictest row rather than guessing open.
   expect(mapPermissionMode('somethingNew')).toEqual({ approvalPolicy: 'untrusted', sandbox: 'read-only' });
 });

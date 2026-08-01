@@ -11,6 +11,7 @@ import {
   fetchEngines,
   streamChatTurn,
   toDigestEvent,
+  type ApprovalMode,
   type ChatStreamEvent,
   type DigestEvent,
   type Engine,
@@ -92,6 +93,20 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // an existing chat only displays what it already is.
   const [engine, setEngine] = useState("claude-code");
   const [engines, setEngines] = useState<Engine[]>([]);
+  // Per-turn approval stance, remembered across sessions — the person who
+  // works in full auto works in full auto tomorrow too.
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>(() => {
+    const stored = window.localStorage.getItem("kaprek-approval-mode");
+    return stored === "edits" || stored === "auto" ? stored : "ask";
+  });
+  const pickApprovalMode = (mode: ApprovalMode) => {
+    setApprovalMode(mode);
+    try {
+      window.localStorage.setItem("kaprek-approval-mode", mode);
+    } catch {
+      // storage full/blocked — the select still works for this session
+    }
+  };
 
   const abortRef = useRef<AbortController | null>(null);
   // id -> index into `events`, for the tool-start/tool-end event this turn
@@ -198,6 +213,7 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         // server-side.
         missionId: chatId ? undefined : missionId,
         engine: chatId ? undefined : engine,
+        approvalMode,
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),
@@ -423,6 +439,19 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
           rows={3}
         />
         <div className="chat-composer-actions">
+          {/* Per-turn approval stance — 'auto' is the CLI's yolo, and gets a
+              warning tint so nobody is surprised what they picked. */}
+          <select
+            className={`chat-approval-select${approvalMode === "auto" ? " chat-approval-select-auto" : ""}`}
+            value={approvalMode}
+            onChange={(e) => pickApprovalMode(e.target.value as ApprovalMode)}
+            disabled={streaming}
+            aria-label="Approvals"
+          >
+            <option value="ask">Ask first</option>
+            <option value="edits">Edits free</option>
+            <option value="auto">Full auto</option>
+          </select>
           {/* A NEW chat picks its engine here; once the chat exists the choice
               is settled and only shows as a badge (default shows nothing). */}
           {!chatId && engines.length > 1 && (

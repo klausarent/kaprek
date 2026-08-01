@@ -743,10 +743,14 @@ async function readSseBody<T>(res: Response, onFrame: (frame: T) => void): Promi
   }
 }
 
+/** The approval stance for one turn — mirrors the CLI's permission modes. */
+export type ApprovalMode = "ask" | "edits" | "auto";
+
 export async function streamChatTurn({
   chatId,
   missionId,
   engine,
+  approvalMode,
   text,
   onEvent,
   signal,
@@ -758,6 +762,8 @@ export async function streamChatTurn({
   /** Which engine runs the new chat (ignored when chatId is given — the
    * engine is fixed at chat creation, server-side). */
   engine?: string;
+  /** Per-turn approval stance; omitted means 'ask'. */
+  approvalMode?: ApprovalMode;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -765,9 +771,11 @@ export async function streamChatTurn({
   const res = await apiFetch("/api/chat/turn", {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
-    body: JSON.stringify(
-      chatId ? { chatId, text } : { text, ...(missionId ? { missionId } : {}), ...(engine ? { engine } : {}) },
-    ),
+    body: JSON.stringify({
+      ...(chatId ? { chatId } : { ...(missionId ? { missionId } : {}), ...(engine ? { engine } : {}) }),
+      ...(approvalMode ? { approvalMode } : {}),
+      text,
+    }),
     signal,
   });
   if (!res.ok || !res.body) {
