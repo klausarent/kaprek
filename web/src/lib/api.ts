@@ -510,6 +510,18 @@ export type Engine = {
   supportsSettingsPath: boolean;
 };
 
+/** A request someone has typed often enough that a trigger would serve them better. */
+export type RepeatSuggestion = {
+  key: string;
+  count: number;
+  sample: string;
+  lastTs: string | null;
+};
+
+export function fetchRepeats(): Promise<RepeatSuggestion[]> {
+  return getJson<{ repeats: RepeatSuggestion[] }>("/api/repeats").then((r) => r.repeats);
+}
+
 export function fetchEngines(): Promise<Engine[]> {
   return getJson<{ engines: Engine[] }>("/api/engines").then((r) => r.engines);
 }
@@ -746,11 +758,16 @@ async function readSseBody<T>(res: Response, onFrame: (frame: T) => void): Promi
 /** The approval stance for one turn — mirrors the CLI's permission modes. */
 export type ApprovalMode = "ask" | "edits" | "auto";
 
+/** Reasoning effort both CLIs accept. */
+export type Effort = "low" | "medium" | "high" | "xhigh" | "max";
+export const EFFORT_LEVELS: Effort[] = ["low", "medium", "high", "xhigh", "max"];
+
 export async function streamChatTurn({
   chatId,
   missionId,
   engine,
   approvalMode,
+  effort,
   text,
   onEvent,
   signal,
@@ -764,6 +781,8 @@ export async function streamChatTurn({
   engine?: string;
   /** Per-turn approval stance; omitted means 'ask'. */
   approvalMode?: ApprovalMode;
+  /** Per-turn reasoning effort; omitted leaves the CLI's own default. */
+  effort?: Effort;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -774,6 +793,7 @@ export async function streamChatTurn({
     body: JSON.stringify({
       ...(chatId ? { chatId } : { ...(missionId ? { missionId } : {}), ...(engine ? { engine } : {}) }),
       ...(approvalMode ? { approvalMode } : {}),
+      ...(effort ? { effort } : {}),
       text,
     }),
     signal,

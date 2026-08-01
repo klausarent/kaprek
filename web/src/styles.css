@@ -1860,3 +1860,30 @@ pre,
   padding-left: 10px;
   border-left: 2px solid var(--border, #ccc);
 }
+
+.chat-effort-select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+}
+
+.repeat-hint {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  justify-content: space-between;
+  margin: 10px 0;
+  padding: 8px 12px;
+  border: 1px dashed var(--border, #ccc);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+.repeat-hint-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+}

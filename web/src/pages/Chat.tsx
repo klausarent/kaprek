@@ -12,6 +12,7 @@ import {
   streamChatTurn,
   toDigestEvent,
   type ApprovalMode,
+  type Effort,
   type ChatStreamEvent,
   type DigestEvent,
   type Engine,
@@ -33,7 +34,9 @@ import { setStatus } from "../lib/status";
 import { navigateToChats } from "../App";
 import EventBlock from "../components/EventBlock";
 import WorkFold from "../components/WorkFold";
+import RepeatHint from "../components/RepeatHint";
 import { toSimpleItems } from "../lib/simple";
+import { EFFORT_LEVELS } from "../lib/api";
 import ApprovalDialog from "../components/ApprovalDialog";
 import AgentPanel from "../components/AgentPanel";
 
@@ -75,6 +78,8 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // a gate), and those are the moments this component already re-renders.
   const [relay, setRelay] = useState<RelayRun | null>(null);
   const [relayReloads, setRelayReloads] = useState(0);
+  // Bumped after every finished turn so the repeat nudge re-checks.
+  const [turnsDone, setTurnsDone] = useState(0);
   const [events, setEvents] = useState<DigestEvent[]>([]);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -115,6 +120,20 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
       }
       return next;
     });
+  };
+  // Reasoning effort, remembered like the stance. "default" means: say
+  // nothing and let the CLI use whatever it is configured for.
+  const [effort, setEffort] = useState<Effort | "default">(() => {
+    const stored = window.localStorage.getItem("kaprek-effort");
+    return (EFFORT_LEVELS as string[]).includes(stored ?? "") ? (stored as Effort) : "default";
+  });
+  const pickEffort = (value: Effort | "default") => {
+    setEffort(value);
+    try {
+      window.localStorage.setItem("kaprek-effort", value);
+    } catch {
+      // storage blocked — the select still works for this session
+    }
   };
   const pickApprovalMode = (mode: ApprovalMode) => {
     setApprovalMode(mode);
@@ -231,6 +250,7 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         missionId: chatId ? undefined : missionId,
         engine: chatId ? undefined : engine,
         approvalMode,
+        effort: effort === "default" ? undefined : effort,
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),
@@ -250,6 +270,7 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
     } finally {
       setStreaming(false);
       abortRef.current = null;
+      setTurnsDone((n) => n + 1);
     }
   };
 
@@ -456,6 +477,8 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         onToggle={() => setPanelExpanded((prev) => !prev)}
       />
 
+      <RepeatHint reloadKey={turnsDone} />
+
       {streamError && <div className="error-box">{streamError}</div>}
       {lastTurn?.errorMessage && <div className="error-box">{lastTurn.errorMessage}</div>}
       {rateLimitHint && <div className="chat-rate-limit-hint">{rateLimitHint}</div>}
@@ -474,6 +497,20 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         <div className="chat-composer-actions">
           {/* Per-turn approval stance — 'auto' is the CLI's yolo, and gets a
               warning tint so nobody is surprised what they picked. */}
+          <select
+            className="chat-effort-select"
+            value={effort}
+            onChange={(e) => pickEffort(e.target.value as Effort | "default")}
+            disabled={streaming}
+            aria-label="Effort"
+          >
+            <option value="default">Effort: default</option>
+            {EFFORT_LEVELS.map((level) => (
+              <option key={level} value={level}>
+                Effort: {level}
+              </option>
+            ))}
+          </select>
           <select
             className={`chat-approval-select${approvalMode === "auto" ? " chat-approval-select-auto" : ""}`}
             value={approvalMode}

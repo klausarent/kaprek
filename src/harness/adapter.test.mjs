@@ -14,7 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { isNormalizedEvent, EVENT_TYPES } from './adapter.mjs';
-import { startTurn } from './claude-code.mjs';
+import { startTurn, buildArgs } from './claude-code.mjs';
 import { createFakeHarness } from './fake.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -346,4 +346,16 @@ test('adapter.mjs exports every event type isNormalizedEvent actually recognizes
     expect(isNormalizedEvent({ type: 'bogus-not-a-real-type' })).toBe(false);
     expect(typeof type).toBe('string');
   }
+});
+
+test('effort reaches the CLI as --effort, and an unknown level is dropped rather than passed on', () => {
+  expect(buildArgs({ effort: 'high' })).toContain('--effort');
+  expect(buildArgs({ effort: 'high' })[buildArgs({ effort: 'high' }).indexOf('--effort') + 1]).toBe('high');
+  for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) {
+    expect(buildArgs({ effort: level })).toContain(level);
+  }
+  // The CLI only warns about a bad value and silently uses its default —
+  // kaprek must not be the thing that sends it one.
+  expect(buildArgs({ effort: 'bogus' })).not.toContain('--effort');
+  expect(buildArgs({})).not.toContain('--effort');
 });

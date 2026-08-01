@@ -331,11 +331,18 @@ function normalizeApprovalRequest(requestId, request) {
  * src/triggers/runner.mjs) — exported so that guarantee can be asserted
  * against the real argv builder rather than restated in a test.
  */
-export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler }) {
+/** Reasoning-effort levels both CLIs accept (claude --help, CLI 2.1.x). */
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler, effort }) {
   const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose'];
   if (sessionId) args.push('--resume', sessionId);
   if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);
   if (permissionMode) args.push('--permission-mode', permissionMode);
+  // Verified against CLI 2.1.x: an unknown level only produces a warning and
+  // is then ignored, so a bad value would silently mean "default effort".
+  // Drop it here instead of letting that happen unnoticed.
+  if (EFFORT_LEVELS.includes(effort)) args.push('--effort', effort);
   if (allowedTools && allowedTools.length > 0) args.push('--allowedTools', allowedTools.join(','));
   if (settingsPath) args.push('--settings', settingsPath);
   if (hasApprovalHandler) args.push('--permission-prompt-tool', 'stdio');
@@ -394,6 +401,7 @@ export async function startTurn({
   permissionMode,
   allowedTools,
   settingsPath,
+  effort,
   onEvent,
   onApprovalRequest,
   signal,
@@ -411,7 +419,7 @@ export async function startTurn({
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
   }
 
-  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler: typeof onApprovalRequest === 'function' });
+  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, effort, hasApprovalHandler: typeof onApprovalRequest === 'function' });
 
   const { command, useShell } = resolveCli();
 

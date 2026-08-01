@@ -235,6 +235,9 @@ export async function runTurn({
   // (nothing asks — CLI bypassPermissions). Only meaningful for a chat
   // turn; a trigger turn always runs the strict trigger profile below.
   approvalMode = 'ask',
+  // Reasoning effort for this turn ('low'..'max'); undefined leaves the
+  // CLI's own default alone.
+  effort,
   allowedTools,
   absoluteTimeoutMs,
   onEvent,
@@ -544,6 +547,7 @@ export async function runTurn({
       prompt: text,
       sessionId: priorSessionId,
       permissionMode: effectivePermissionMode,
+      effort,
       allowedTools,
       // Spread, not passed as `absoluteTimeoutMs: undefined`: claude-code.mjs
       // reads it as a defaulted destructuring parameter, so an explicit

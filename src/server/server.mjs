@@ -41,6 +41,8 @@ import {
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
+import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
+import { findRepeats } from '../triggers/repeats.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
@@ -1582,6 +1584,15 @@ async function handleChatTurn(
     return;
   }
 
+  // Reasoning effort for this turn. Omitted leaves the CLI's own default
+  // alone; a bad value is refused here rather than silently ignored by the
+  // CLI (which only warns and falls back to its default).
+  const effort = body.data?.effort;
+  if (effort !== undefined && effort !== null && !EFFORT_LEVELS.includes(effort)) {
+    sendJson(res, 400, { error: `invalid effort (${EFFORT_LEVELS.join(' | ')})` });
+    return;
+  }
+
   let chatId = body.data?.chatId;
   let chatEngine;
   if (chatId !== undefined) {
@@ -1739,6 +1750,7 @@ async function handleChatTurn(
       cwd: turnCwd,
       permissionMode,
       approvalMode,
+      ...(effort ? { effort } : {}),
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so
@@ -2342,6 +2354,25 @@ async function handleRequest(
         return;
       }
       sendJson(res, 200, { presets: loadPresets(dataDir) });
+      return;
+    }
+    if (segments.length === 2 && segments[1] === 'repeats') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      // Work you keep typing by hand is work that wants a trigger. Read from
+      // the chats that already exist — no tracking, no extra store.
+      const chats = getChats();
+      const events = [];
+      for (const chat of chats.list()) {
+        try {
+          for (const event of chats.events(chat.id)) if (event.kind === 'user') events.push(event);
+        } catch {
+          // a chat whose log is unreadable simply contributes nothing
+        }
+      }
+      sendJson(res, 200, { repeats: findRepeats(events) });
       return;
     }
     if (segments.length === 2 && segments[1] === 'engines') {

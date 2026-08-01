@@ -3525,3 +3525,20 @@ test('approvalMode: auto reaches the harness as bypassPermissions, garbage is a 
   });
   expect(bad.status).toBe(400);
 });
+
+test('repeats: a request typed three times is offered as an automation, twice is not', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  const say = async (text) => {
+    const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text }) });
+    await readSse(res);
+  };
+  await say('Check the deployment logs for errors');
+  await say('check the deployment logs for errors');
+  expect((await (await fetch(`${url}/api/repeats`)).json()).repeats).toHaveLength(0);
+
+  await say('Check the deployment logs for errors please');
+  const { repeats } = await (await fetch(`${url}/api/repeats`)).json();
+  expect(repeats).toHaveLength(1);
+  expect(repeats[0].count).toBe(3);
+  expect(repeats[0].sample).toContain('deployment logs');
+}, 30_000);

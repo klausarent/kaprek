@@ -18,6 +18,7 @@
 import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { ABSOLUTE_MS, ACTIVE_TOTAL_MS, IDLE_MS, TOOL_LEASE_MS, createTurnClocks } from './timeout.mjs';
+import { EFFORT_LEVELS } from './claude-code.mjs';
 
 /**
  * kaprek's permissionMode → Codex {approvalPolicy, sandbox}.
@@ -47,6 +48,7 @@ export async function startTurn({
   prompt,
   sessionId,
   permissionMode,
+  effort,
   onEvent = () => {},
   onApprovalRequest,
   signal,
@@ -392,7 +394,13 @@ export async function startTurn({
         }
         clocks.onProgress('init');
         safeEmit({ type: 'init', sessionId: threadId, tools: [], model: null, permissionMode: permissionMode ?? 'default' });
-        await request('turn/start', { threadId, input: [{ type: 'text', text: prompt }] });
+        await request('turn/start', {
+          threadId,
+          input: [{ type: 'text', text: prompt }],
+          // Same five levels the claude CLI accepts; codex takes the string
+          // straight through (schema: ReasoningEffort, non-empty string).
+          ...(EFFORT_LEVELS.includes(effort) ? { effort } : {}),
+        });
         // From here the notifications drive the turn to turn/completed.
       } catch (err) {
         if (!settled) settle({ stopReason: 'error', error: { message: err.message } });
