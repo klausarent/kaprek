@@ -3236,3 +3236,122 @@ test('relay: a turn that a reviewer cannot answer in the agreed shape parks the 
   // A schema-shaped answer with a bogus status is not an answer either.
   expect(parseRelayAnswer('{"status":"whatever","message":"x"}')).toMatchObject({ status: 'needs_human' });
 });
+
+// --- missions: the mission routes and mission-bound chat turns (Zielbild M0) ---
+
+test('missions: create, list, detail roundtrip over HTTP', async () => {
+  const { url } = await boot();
+  const created = await fetch(`${url}/api/missions`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ title: 'Ship it', goal: 'ship the widget' }),
+  });
+  expect(created.status).toBe(201);
+  const { mission } = await created.json();
+  expect(mission.status).toBe('active');
+
+  const list = await fetch(`${url}/api/missions`);
+  const listBody = await list.json();
+  expect(listBody.missions).toHaveLength(1);
+  expect(listBody.missions[0].pendingApprovals).toBe(0);
+
+  const detail = await fetch(`${url}/api/missions/${mission.id}`);
+  expect(detail.status).toBe(200);
+  const detailBody = await detail.json();
+  expect(detailBody.mission.title).toBe('Ship it');
+  expect(detailBody.chats).toEqual([]);
+  expect(detailBody.tasks).toEqual([]);
+  expect(detailBody.pendingApprovals).toEqual([]);
+});
+
+test('missions: creating with a non-existent or relative cwd is a 400, never a silent fallback', async () => {
+  const { url } = await boot();
+  const missing = await fetch(`${url}/api/missions`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ title: 'x', cwd: path.join(os.tmpdir(), 'kaprek-definitely-missing-dir') }),
+  });
+  expect(missing.status).toBe(400);
+  const relative = await fetch(`${url}/api/missions`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ title: 'x', cwd: 'relative/dir' }),
+  });
+  expect(relative.status).toBe(400);
+});
+
+test('missions: unknown mission id is a 404 on detail, status, and link', async () => {
+  const { url } = await boot();
+  expect((await fetch(`${url}/api/missions/nope`)).status).toBe(404);
+  expect((await fetch(`${url}/api/missions/nope/status`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ status: 'done' }) })).status).toBe(404);
+  expect((await fetch(`${url}/api/missions/nope/link`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ chatId: 'c1' }) })).status).toBe(404);
+});
+
+test('missions: status transitions are validated, link takes exactly one of chatId/taskId', async () => {
+  const { url } = await boot();
+  const { mission } = await (await fetch(`${url}/api/missions`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ title: 'x' }) })).json();
+
+  const ok = await fetch(`${url}/api/missions/${mission.id}/status`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ status: 'waiting' }) });
+  expect((await ok.json()).mission.status).toBe('waiting');
+  const bad = await fetch(`${url}/api/missions/${mission.id}/status`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ status: 'paused' }) });
+  expect(bad.status).toBe(400);
+
+  const both = await fetch(`${url}/api/missions/${mission.id}/link`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ chatId: 'c1', taskId: 't1' }) });
+  expect(both.status).toBe(400);
+  const neither = await fetch(`${url}/api/missions/${mission.id}/link`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({}) });
+  expect(neither.status).toBe(400);
+  const task = await fetch(`${url}/api/missions/${mission.id}/link`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ taskId: 't1' }) });
+  expect((await task.json()).mission.tasks).toEqual(['t1']);
+});
+
+test('presets: GET /api/presets lists the builtin catalog', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/presets`);
+  expect(res.status).toBe(200);
+  const { presets } = await res.json();
+  expect(presets.map((p) => p.id)).toContain('blank');
+  expect(presets.map((p) => p.id)).toContain('guided-feature');
+});
+
+test('chat: a turn with missionId links the new chat and runs in the mission cwd — and a follow-up turn keeps it', async () => {
+  const missionCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mission-cwd-'));
+  const harness = createFakeHarness({ script: fakeScript() });
+  const { url } = await boot({ harness, harnessName: 'fake' });
+
+  const { mission } = await (await fetch(`${url}/api/missions`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ title: 'm', cwd: missionCwd }) })).json();
+
+  const first = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'hi', missionId: mission.id }) });
+  expect(first.status).toBe(200);
+  const frames = await readSse(first);
+  const chatId = frames[0].chatId;
+  expect(harness.startedTurns[0].cwd).toBe(missionCwd);
+
+  // The chat is linked on the mission and carries the missionId itself.
+  const detail = await (await fetch(`${url}/api/missions/${mission.id}`)).json();
+  expect(detail.chats.map((c) => c.id)).toEqual([chatId]);
+  expect(detail.chats[0].missionId).toBe(mission.id);
+
+  // A follow-up turn addressed by chatId alone still runs in the mission cwd.
+  const second = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'again', chatId }) });
+  expect(second.status).toBe(200);
+  await readSse(second);
+  expect(harness.startedTurns[1].cwd).toBe(missionCwd);
+
+  fs.rmSync(missionCwd, { recursive: true, force: true });
+});
+
+test('chat: a turn with an unknown missionId is a 404 JSON response, no SSE', async () => {
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'hi', missionId: 'nope' }) });
+  expect(res.status).toBe(404);
+  expect(res.headers.get('content-type')).toContain('application/json');
+});
+
+test('chat: a mission whose cwd vanished fails the turn with a 400, no silent workspace fallback', async () => {
+  const missionCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-mission-gone-'));
+  const { url } = await boot({ harness: createFakeHarness({ script: fakeScript() }), harnessName: 'fake' });
+  const { mission } = await (await fetch(`${url}/api/missions`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ title: 'm', cwd: missionCwd }) })).json();
+  fs.rmSync(missionCwd, { recursive: true, force: true });
+  const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'hi', missionId: mission.id }) });
+  expect(res.status).toBe(400);
+});

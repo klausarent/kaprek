@@ -29,6 +29,17 @@ import {
 } from '../board/store.mjs';
 import { signReceipt, verifyReceipt, InvalidAgentNameError } from '../receipt/receipt.mjs';
 import { openChats, ChatNotFoundError } from '../chats/store.mjs';
+import {
+  openMissions,
+  MISSION_STATUSES,
+  MissionNotFoundError,
+  InvalidTitleError as MissionInvalidTitleError,
+  InvalidStatusError as MissionInvalidStatusError,
+  InvalidCwdError,
+  InvalidGoalError,
+  InvalidLinkError,
+} from '../missions/store.mjs';
+import { loadPresets } from '../missions/presets.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
@@ -1328,11 +1339,156 @@ async function handleApprovalsList(res, approvalStore) {
  * them (chats.get()/createChat()/mkdirSync() are all synchronous), so two
  * concurrent requests for the same chatId can never both pass the check.
  */
+/** Maps a mission-store error to an HTTP status, or null for a non-mission error. */
+function missionErrorStatus(err) {
+  if (err instanceof MissionNotFoundError) return 404;
+  if (
+    err instanceof MissionInvalidTitleError ||
+    err instanceof MissionInvalidStatusError ||
+    err instanceof InvalidCwdError ||
+    err instanceof InvalidGoalError ||
+    err instanceof InvalidLinkError
+  ) {
+    return 400;
+  }
+  return null;
+}
+
+/**
+ * Mission routes, mounted at /api/missions/*. A mission is the central
+ * object of Zielbild M0: a goal plus an optional working directory and
+ * links to the chats and board tasks carrying the work. `getMissions()` is
+ * a lazy singleton like `getBoard()` — the mission store is only ever
+ * written through these routes, so one cached projection stays truthful.
+ */
+async function handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore }) {
+  const missions = getMissions();
+
+  // /api/missions
+  if (segments.length === 2) {
+    if (req.method === 'GET') {
+      const pending = await getApprovalStore().listPending();
+      const list = missions.list().map((mission) => ({
+        ...mission,
+        pendingApprovals: pending.filter((entry) => entry.chatId && mission.chats.includes(entry.chatId)).length,
+      }));
+      sendJson(res, 200, { missions: list });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (!body.ok) {
+        sendJson(res, body.status, { error: body.error });
+        return;
+      }
+      const { title, goal = null, cwd = null, preset = null } = body.data ?? {};
+      // Existence is a route concern, shape is a store concern: the store
+      // validates "absolute path", but only this process can ask the disk.
+      // Checked BEFORE create() so a mission with a dead cwd never enters
+      // the log (fail-closed).
+      if (cwd !== null) {
+        if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) {
+          sendJson(res, 400, { error: 'cwd must be an absolute path' });
+          return;
+        }
+        let stat = null;
+        try {
+          stat = fs.statSync(cwd);
+        } catch {
+          stat = null;
+        }
+        if (!stat || !stat.isDirectory()) {
+          sendJson(res, 400, { error: 'cwd does not exist or is not a directory' });
+          return;
+        }
+      }
+      try {
+        const mission = missions.create({ title, goal, cwd, preset });
+        sendJson(res, 201, { mission });
+      } catch (err) {
+        const status = missionErrorStatus(err);
+        if (status === null) throw err;
+        sendJson(res, status, { error: err.message });
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  // /api/missions/<id>
+  if (segments.length === 3) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    let mission;
+    try {
+      mission = missions.get(segments[2]);
+    } catch (err) {
+      const status = missionErrorStatus(err);
+      if (status === null) throw err;
+      sendJson(res, status, { error: err.message });
+      return;
+    }
+    // A chat belongs to the detail view if the chat itself claims the
+    // mission (createChat missionId) OR the mission links it (link route) —
+    // the union, so neither path leaves an orphan invisible.
+    const chats = getChats()
+      .list()
+      .filter((chat) => chat.missionId === mission.id || mission.chats.includes(chat.id));
+    const tasks = getBoard()
+      .list()
+      .filter((task) => mission.tasks.includes(task.id));
+    const pendingApprovals = (await getApprovalStore().listPending())
+      .filter((entry) => entry.chatId && chats.some((chat) => chat.id === entry.chatId));
+    sendJson(res, 200, { mission, chats, tasks, pendingApprovals });
+    return;
+  }
+
+  // /api/missions/<id>/status | /api/missions/<id>/link
+  if (segments.length === 4 && (segments[3] === 'status' || segments[3] === 'link')) {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    try {
+      if (segments[3] === 'status') {
+        sendJson(res, 200, { mission: missions.setStatus(segments[2], body.data?.status) });
+        return;
+      }
+      const { chatId, taskId } = body.data ?? {};
+      const givenBoth = chatId !== undefined && taskId !== undefined;
+      if (givenBoth || (chatId === undefined && taskId === undefined)) {
+        sendJson(res, 400, { error: 'link takes exactly one of chatId or taskId' });
+        return;
+      }
+      const mission = chatId !== undefined
+        ? missions.linkChat(segments[2], chatId)
+        : missions.linkTask(segments[2], taskId);
+      sendJson(res, 200, { mission });
+    } catch (err) {
+      const status = missionErrorStatus(err);
+      if (status === null) throw err;
+      sendJson(res, status, { error: err.message });
+    }
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
 async function handleChatTurn(
   req,
   res,
   {
     getChats,
+    getMissions,
     harness,
     harnessName,
     dataDir,
@@ -1362,14 +1518,38 @@ async function handleChatTurn(
   }
 
   const chats = getChats();
+
+  // Mission resolution — BEFORE any SSE bytes, so a bad mission is a plain
+  // JSON error. A turn's mission comes either from the request (creating a
+  // new chat inside a mission) or from the chat's own stored missionId (a
+  // follow-up turn keeps running where the mission lives).
+  const requestMissionId = body.data?.missionId;
+  if (requestMissionId !== undefined && requestMissionId !== null && typeof requestMissionId !== 'string') {
+    sendJson(res, 400, { error: 'invalid missionId' });
+    return;
+  }
+  let mission = null;
+  if (typeof requestMissionId === 'string') {
+    try {
+      mission = getMissions().get(requestMissionId);
+    } catch (err) {
+      if (err instanceof MissionNotFoundError) {
+        sendJson(res, 404, { error: err.message });
+        return;
+      }
+      throw err;
+    }
+  }
+
   let chatId = body.data?.chatId;
   if (chatId !== undefined) {
     if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
       sendJson(res, 400, { error: 'invalid chatId' });
       return;
     }
+    let existing;
     try {
-      chats.get(chatId);
+      existing = chats.get(chatId);
     } catch (err) {
       if (err instanceof ChatNotFoundError) {
         sendJson(res, 404, { error: err.message });
@@ -1377,9 +1557,27 @@ async function handleChatTurn(
       }
       throw err;
     }
+    if (mission && existing.missionId && existing.missionId !== mission.id) {
+      sendJson(res, 400, { error: 'chat already belongs to a different mission' });
+      return;
+    }
+    if (!mission && existing.missionId) {
+      try {
+        mission = getMissions().get(existing.missionId);
+      } catch {
+        // Fail-closed: a chat that claims a mission this store cannot
+        // resolve must not silently fall back to the workspace cwd.
+        sendJson(res, 400, { error: 'mission not found for this chat' });
+        return;
+      }
+    }
   } else {
     const title = text.slice(0, 80).trim();
-    chatId = chats.createChat(title.length > 0 ? { title } : undefined).id;
+    chatId = chats.createChat({
+      ...(title.length > 0 ? { title } : {}),
+      missionId: mission ? mission.id : null,
+    }).id;
+    if (mission) getMissions().linkChat(mission.id, chatId);
   }
 
   if (chatAbortControllers.has(chatId)) {
@@ -1406,6 +1604,25 @@ async function handleChatTurn(
 
   const workspaceDir = path.join(dataDir, 'workspace');
   fs.mkdirSync(workspaceDir, { recursive: true });
+
+  // A mission with a cwd is the ONE deliberate door out of the workspace
+  // jail: chosen by a human once at mission creation, re-checked here every
+  // turn. If the directory is gone the turn fails — never a silent fallback
+  // into the workspace, where the agent would edit the wrong tree.
+  let turnCwd = workspaceDir;
+  if (mission && mission.cwd) {
+    let stat = null;
+    try {
+      stat = fs.statSync(mission.cwd);
+    } catch {
+      stat = null;
+    }
+    if (!stat || !stat.isDirectory()) {
+      sendJson(res, 400, { error: `mission cwd does not exist: ${mission.cwd}` });
+      return;
+    }
+    turnCwd = mission.cwd;
+  }
 
   // Read before runTurn() rather than inside it, so the approval handler and
   // the harness are talking about the same turn start.
@@ -1454,7 +1671,7 @@ async function handleChatTurn(
       text,
       harness,
       harnessName,
-      cwd: workspaceDir,
+      cwd: turnCwd,
       permissionMode,
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
@@ -1951,6 +2168,7 @@ async function handleRequest(
     dataDir,
     importSqlite,
     getBoard,
+    getMissions,
     tmpRoot,
     getChats,
     harness,
@@ -2047,6 +2265,18 @@ async function handleRequest(
       await handleBoardRoutes(req, res, getBoard, segments, url, dataDir);
       return;
     }
+    if (segments[1] === 'missions') {
+      await handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore });
+      return;
+    }
+    if (segments.length === 2 && segments[1] === 'presets') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendJson(res, 200, { presets: loadPresets(dataDir) });
+      return;
+    }
     if (segments.length === 4 && segments[1] === 'chat' && segments[3] === 'relay') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { error: 'method not allowed' });
@@ -2069,6 +2299,7 @@ async function handleRequest(
     if (segments[1] === 'chat') {
       await handleChatRoutes(req, res, segments, url, {
         getChats,
+        getMissions,
         harness,
         harnessName,
         dataDir,
@@ -2220,6 +2451,14 @@ export function startServer({
   function getBoard() {
     if (!board) board = openBoard(dataDir);
     return board;
+  }
+
+  // Missions, same lazy pattern as the board: only ever written through this
+  // server's own routes, so one cached projection stays truthful.
+  let missionStore = null;
+  function getMissions() {
+    if (!missionStore) missionStore = openMissions(dataDir);
+    return missionStore;
   }
 
   // Unlike getBoard() above, this deliberately does NOT cache one openChats()
@@ -2495,6 +2734,7 @@ export function startServer({
       dataDir,
       importSqlite,
       getBoard,
+      getMissions,
       tmpRoot,
       getChats,
       harness,

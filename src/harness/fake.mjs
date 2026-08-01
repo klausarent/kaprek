@@ -24,8 +24,13 @@ export function createFakeHarness({ script = [] } = {}) {
   // and what onApprovalRequest answered, without a real CLI/control-channel.
   const approvalLog = [];
   let approvalCounter = 0;
+  // Every startTurn() call's non-callback options, in order — lets a test
+  // assert what the orchestrator actually asked for (cwd, resumed session,
+  // prompt) without a real CLI process.
+  const startedTurns = [];
 
-  async function startTurn({ sessionId: requestedSessionId, onEvent, onApprovalRequest, signal } = {}) {
+  async function startTurn({ sessionId: requestedSessionId, onEvent, onApprovalRequest, signal, ...rest } = {}) {
+    startedTurns.push({ sessionId: requestedSessionId ?? null, ...rest });
     let sessionId = requestedSessionId ?? null;
     let costUsd = null;
     let usage = null;
@@ -93,5 +98,5 @@ export function createFakeHarness({ script = [] } = {}) {
     };
   }
 
-  return { startTurn, approvalLog };
+  return { startTurn, approvalLog, startedTurns };
 }
