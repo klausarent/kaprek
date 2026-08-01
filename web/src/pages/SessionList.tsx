@@ -102,7 +102,7 @@ function ProjectGrid() {
     if (!projects) return [];
     const q = search.trim().toLowerCase();
     if (!q) return projects;
-    return projects.filter((p) => p.projectSlug.toLowerCase().includes(q));
+    return projects.filter((p) => p.projectSlug.toLowerCase().includes(q) || (p.displayName ?? "").toLowerCase().includes(q));
   }, [projects, search]);
 
   return (
@@ -143,7 +143,7 @@ function ProjectGrid() {
                 navigateToSessions(p.projectSlug);
               }}
             >
-              <div className="card-title">{p.projectSlug}</div>
+              <div className="card-title">{p.displayName ?? p.projectSlug}</div>
               <div className="card-meta">
                 {p.sessionCount} session{p.sessionCount === 1 ? "" : "s"}
               </div>

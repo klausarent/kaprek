@@ -269,7 +269,9 @@ function latestSessionMtime(project) {
   return latest;
 }
 
-/** GET /api/projects — lightweight project list, no filesystem paths exposed. */
+/** GET /api/projects — lightweight project list. displayName is the cwd the
+ * sessions themselves recorded (the slug encodes the same path illegibly);
+ * the server's own filesystem layout stays unexposed. */
 function handleProjects(res, rootDir) {
   const projects = scanProjects(rootDir)
     .slice()
@@ -277,6 +279,7 @@ function handleProjects(res, rootDir) {
     .map((p) => ({
       projectSlug: p.projectSlug,
       sessionCount: p.sessions.length,
+      displayName: p.displayName ?? null,
     }));
   sendJson(res, 200, projects);
 }

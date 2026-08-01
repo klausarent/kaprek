@@ -235,9 +235,45 @@ export function readSessionMeta(jsonlPath, opts = {}) {
   return scanSessionFile(jsonlPath, opts).meta;
 }
 
+// displayName cache: slug -> { mtime of the newest session it was read from,
+// name }. A project's readable name only changes when a newer session file
+// appears, so re-reading heads on every scanProjects() call would be waste.
+const displayNameCache = new Map();
+const DISPLAY_NAME_HEAD_BYTES = 64 * 1024;
+
+/**
+ * Best-effort readable project name: the `cwd` recorded in the newest
+ * session's head. The slug already encodes the same path (dashes for
+ * separators) — this is the SAME information, just legible; a project whose
+ * sessions carry no cwd stays null and the UI falls back to the slug.
+ */
+function readProjectDisplayName(slug, sessions) {
+  if (sessions.length === 0) return null;
+  const newest = sessions.reduce((a, b) => (a.mtime > b.mtime ? a : b));
+  const cached = displayNameCache.get(slug);
+  if (cached && cached.mtime === newest.mtime) return cached.name;
+  let name = null;
+  try {
+    const fd = fs.openSync(newest.file, 'r');
+    try {
+      const buf = Buffer.alloc(Math.min(DISPLAY_NAME_HEAD_BYTES, sessions.length ? fs.fstatSync(fd).size : 0));
+      fs.readSync(fd, buf, 0, buf.length, 0);
+      const match = /"cwd"\s*:\s*"((?:[^"\\]|\\.)*)"/.exec(buf.toString('utf8'));
+      if (match) name = JSON.parse(`"${match[1]}"`);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    name = null;
+  }
+  displayNameCache.set(slug, { mtime: newest.mtime, name });
+  return name;
+}
+
 /**
  * Walks `rootDir` (one directory per Claude Code project) and lists its
- * session files without reading any of them.
+ * session files without reading any of them (only the newest session's head
+ * is peeked for a readable displayName, cached by mtime).
  */
 export function scanProjects(rootDir) {
   evictStaleCache();
@@ -264,6 +300,6 @@ export function scanProjects(rootDir) {
       };
     });
 
-    return { projectSlug: entry.name, dir, sessions };
+    return { projectSlug: entry.name, dir, sessions, displayName: readProjectDisplayName(entry.name, sessions) };
   });
 }

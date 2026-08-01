@@ -314,3 +314,24 @@ test('sanity: the ported parser fixture still parses fine as input for the meta-
   const meta = readSessionMeta(fixture, { cache: false });
   expect(meta.title).toBe('Final title: Digest Parser Fixture');
 });
+
+test('scanProjects derives a readable displayName from the newest session cwd, and copes with sessions that have none', () => {
+  const projDir = path.join(tmpDir, 'C--Users-u-Documents-my-tool');
+  fs.mkdirSync(projDir);
+  fs.writeFileSync(
+    path.join(projDir, 'old.jsonl'),
+    JSON.stringify(envelope({ cwd: 'C:\\Users\\u\\Documents\\old-path' })) + '\n',
+    'utf8',
+  );
+  const newer = path.join(projDir, 'new.jsonl');
+  fs.writeFileSync(newer, JSON.stringify(envelope({ cwd: 'C:\\Users\\u\\Documents\\my-tool' })) + '\n', 'utf8');
+  fs.utimesSync(newer, new Date(), new Date(Date.now() + 5000));
+
+  const bare = path.join(tmpDir, 'C--no-cwd-project');
+  fs.mkdirSync(bare);
+  fs.writeFileSync(path.join(bare, 's.jsonl'), '{"type":"assistant"}\n', 'utf8');
+
+  const bySlug = Object.fromEntries(scanProjects(tmpDir).map((p) => [p.projectSlug, p]));
+  expect(bySlug['C--Users-u-Documents-my-tool'].displayName).toBe('C:\\Users\\u\\Documents\\my-tool');
+  expect(bySlug['C--no-cwd-project'].displayName).toBeNull();
+});

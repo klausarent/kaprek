@@ -6,6 +6,8 @@ import { setStatus } from "./status";
 export type ProjectSummary = {
   projectSlug: string;
   sessionCount: number;
+  /** The cwd the project's sessions recorded — the readable form of the slug; null when no session carries one. */
+  displayName?: string | null;
 };
 
 export type SessionMeta = {
