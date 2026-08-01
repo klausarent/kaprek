@@ -239,7 +239,12 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         setEvents((prev) => [...prev, nowEvent("assistant", event.text)]);
         break;
       case "thinking":
-        setEvents((prev) => [...prev, nowEvent("thinking", event.text)]);
+        // Empty thinking (the CLI redacts the text, signature-only) still
+        // feeds the agent panel above as activity, but must not stack empty
+        // blocks in the transcript.
+        if (event.text.trim() !== "") {
+          setEvents((prev) => [...prev, nowEvent("thinking", event.text)]);
+        }
         break;
       case "tool-start":
         setEvents((prev) => {

@@ -926,3 +926,24 @@ test('onChatResolved is never called for a caller-supplied chatId that does not 
   ).rejects.toThrow();
   expect(seen).toEqual([]);
 });
+
+test('an empty thinking event is streamed as activity but never persisted — the model redacts its thinking, the store must not fill with husks', async () => {
+  const script = [
+    { type: 'init', sessionId: 's-th', tools: [], model: 'm', permissionMode: 'default' },
+    { type: 'thinking', text: '' },
+    { type: 'thinking', text: '   ' },
+    { type: 'thinking', text: 'real thought' },
+    { type: 'text', text: 'answer' },
+    { type: 'result', sessionId: 's-th', costUsd: null, usage: {}, isError: false },
+  ];
+  const seen = [];
+  const { chatId } = await runTurn({ dataDir: tmpDir, text: 'think', harness: createFakeHarness({ script }), onEvent: (e) => seen.push(e) });
+
+  // The stream still carries all three (the agent panel needs the activity signal)…
+  expect(seen.filter((e) => e.type === 'thinking')).toHaveLength(3);
+  // …but only the one with content reaches the store.
+  const chats = openChats(tmpDir);
+  const thinking = chats.events(chatId).filter((e) => e.kind === 'thinking');
+  expect(thinking).toHaveLength(1);
+  expect(thinking[0].text).toBe('real thought');
+});

@@ -297,7 +297,15 @@ export async function runTurn({
       }
       case 'thinking': {
         const sanitized = sanitizeText(event.text, maxTextLen, redact);
-        chats.appendEvent(effectiveChatId, { kind: 'thinking', text: sanitized });
+        // Current CLIs redact thinking to an empty string plus a signature
+        // (verified live against claude-fable-5 AND opus, including
+        // --include-partial-messages deltas). The stream still forwards the
+        // event — the agent panel uses it as an activity signal — but an
+        // empty husk is never persisted: Klaus' first recorded run stored 50
+        // thinking events with no text, rendered as 50 empty blocks.
+        if (sanitized.trim() !== '') {
+          chats.appendEvent(effectiveChatId, { kind: 'thinking', text: sanitized });
+        }
         onEvent?.({ ...event, text: sanitized });
         break;
       }
