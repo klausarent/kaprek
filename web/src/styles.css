@@ -1800,3 +1800,21 @@ pre,
     width: 100%;
   }
 }
+
+/* --- engine picker + badge (M1) --- */
+.chat-engine-select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  font-size: 0.85rem;
+}
+.engine-badge {
+  display: inline-block;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  border: 1px solid var(--border, #ccc);
+  font-size: 0.75rem;
+  opacity: 0.85;
+}

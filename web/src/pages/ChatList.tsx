@@ -5,6 +5,7 @@
 import { useEffect, useState } from "react";
 import { fetchChatList, type ChatSummary } from "../lib/api";
 import { navigateToChat } from "../App";
+import EngineBadge from "../components/EngineBadge";
 
 function fmtWhen(ts: string | null): string {
   if (!ts) return "–";
@@ -57,6 +58,7 @@ export default function ChatList({ triggerId, includeSilent }: { triggerId?: str
               <div className="session-row-top">
                 <span className="session-row-title">{chat.title ?? "(untitled chat)"}</span>
                 <span className="session-row-badges">
+                  <EngineBadge engine={chat.engine} />
                   {chat.origin === "trigger" && <span className="badge">trigger</span>}
                   {chat.silent && <span className="badge badge-muted">silent</span>}
                 </span>

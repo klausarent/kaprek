@@ -8,12 +8,15 @@ import {
   answerApproval,
   cancelChatTurn,
   fetchChat,
+  fetchEngines,
   streamChatTurn,
   toDigestEvent,
   type ChatStreamEvent,
   type DigestEvent,
+  type Engine,
   type RelayRun,
 } from "../lib/api";
+import EngineBadge from "../components/EngineBadge";
 import { upsertQuestion } from "../lib/questions";
 import RelayPanel from "../components/RelayPanel";
 import {
@@ -85,6 +88,10 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // One shared clock for the approval countdown and the turn duration, ticked
   // only while something is actually running or waiting (see below).
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // Which engine a NEW chat will run on. Fixed at chat creation server-side;
+  // an existing chat only displays what it already is.
+  const [engine, setEngine] = useState("claude-code");
+  const [engines, setEngines] = useState<Engine[]>([]);
 
   const abortRef = useRef<AbortController | null>(null);
   // id -> index into `events`, for the tool-start/tool-end event this turn
@@ -109,9 +116,19 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         setChatId(initialChatId);
         setEvents(stored.map(toDigestEvent));
         setRelay(chat?.relay ?? null);
+        setEngine(chat?.engine ?? "claude-code");
       })
       .catch((e) => setLoadError((e as Error).message));
   }, [initialChatId, relayReloads]);
+
+  // The picker's options — only a brand-new chat needs them; an existing
+  // chat's engine is already settled.
+  useEffect(() => {
+    if (initialChatId) return;
+    fetchEngines()
+      .then(setEngines)
+      .catch(() => setEngines([]));
+  }, [initialChatId]);
 
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -176,9 +193,11 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
     try {
       await streamChatTurn({
         chatId,
-        // Only the turn that CREATES the chat carries the mission — a
-        // follow-up turn takes its mission from the chat itself, server-side.
+        // Only the turn that CREATES the chat carries the mission and the
+        // engine — a follow-up turn takes both from the chat itself,
+        // server-side.
         missionId: chatId ? undefined : missionId,
+        engine: chatId ? undefined : engine,
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),
@@ -399,6 +418,24 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
           rows={3}
         />
         <div className="chat-composer-actions">
+          {/* A NEW chat picks its engine here; once the chat exists the choice
+              is settled and only shows as a badge (default shows nothing). */}
+          {!chatId && engines.length > 1 && (
+            <select
+              className="chat-engine-select"
+              value={engine}
+              onChange={(e) => setEngine(e.target.value)}
+              disabled={streaming}
+              aria-label="Engine"
+            >
+              {engines.map((entry) => (
+                <option key={entry.id} value={entry.id}>
+                  {entry.displayName}
+                </option>
+              ))}
+            </select>
+          )}
+          {chatId && <EngineBadge engine={engine} engines={engines} />}
           {streaming ? (
             <button type="button" className="btn btn-danger" onClick={handleStop}>
               Stop

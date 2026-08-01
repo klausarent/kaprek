@@ -497,6 +497,21 @@ export function fetchPresets(): Promise<Preset[]> {
   return getJson<{ presets: Preset[] }>("/api/presets").then((r) => r.presets);
 }
 
+/** One engine's capability declaration (see src/harness/registry.mjs). */
+export type Engine = {
+  id: string;
+  displayName: string;
+  supportsCostUsd: boolean;
+  supportsUpdatedInput: boolean;
+  supportsAllowedTools: boolean;
+  supportsMcpConfig: boolean;
+  supportsSettingsPath: boolean;
+};
+
+export function fetchEngines(): Promise<Engine[]> {
+  return getJson<{ engines: Engine[] }>("/api/engines").then((r) => r.engines);
+}
+
 // Chat (src/orchestrator/run.mjs via /api/chat/*)
 
 // Mirrors src/harness/adapter.mjs's NormalizedEvent union — what a chat turn
@@ -598,6 +613,8 @@ export type ChatSummary = {
   silent?: boolean;
   /** The mission this chat belongs to, if any (see src/missions/store.mjs). */
   missionId?: string | null;
+  /** Which harness runs this chat's turns (a registry id, e.g. 'claude-code', 'codex'). */
+  engine?: string;
   /** The relay run this chat hosts, if any (see src/relay/dispatcher.mjs). */
   relay?: RelayRun | null;
   createdAt: string | null;
@@ -727,6 +744,7 @@ async function readSseBody<T>(res: Response, onFrame: (frame: T) => void): Promi
 export async function streamChatTurn({
   chatId,
   missionId,
+  engine,
   text,
   onEvent,
   signal,
@@ -735,6 +753,9 @@ export async function streamChatTurn({
   /** Creates the new chat inside this mission (ignored when chatId is given —
    * a follow-up turn takes its mission from the chat itself, server-side). */
   missionId?: string;
+  /** Which engine runs the new chat (ignored when chatId is given — the
+   * engine is fixed at chat creation, server-side). */
+  engine?: string;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -742,7 +763,9 @@ export async function streamChatTurn({
   const res = await apiFetch("/api/chat/turn", {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
-    body: JSON.stringify(chatId ? { chatId, text } : missionId ? { missionId, text } : { text }),
+    body: JSON.stringify(
+      chatId ? { chatId, text } : { text, ...(missionId ? { missionId } : {}), ...(engine ? { engine } : {}) },
+    ),
     signal,
   });
   if (!res.ok || !res.body) {
