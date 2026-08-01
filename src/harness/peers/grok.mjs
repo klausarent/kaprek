@@ -39,28 +39,86 @@ import {
 } from './driver.mjs';
 
 /**
- * Finds the grok binary the same way claude-code.mjs finds claude: an
- * explicit override wins, then a PATH walk on Windows (where a .cmd shim
- * needs `shell: true` and a native .exe does not), then a plain name and let
- * spawn report ENOENT.
+ * Resolves an npm .cmd shim to the node script it wraps, so the driver can
+ * spawn `node <entry> <args>` directly and never needs `shell: true`.
+ *
+ * Why this exists (tag-5 live acceptance, both bugs reproduced against the
+ * real CLI): with shell:true node JOINS argv into one raw cmd.exe line, so
+ * the empty-string argument of `--tools ''` vanishes entirely (clap: "a
+ * value is required for '--tools <TOOLS>'"), and cmd.exe eats the quotes
+ * inside the --json-schema JSON ("invalid JSON: key must be a string").
+ * Quoting argv for cmd.exe is a dead end; not needing cmd.exe is the fix.
+ *
+ * npm's cmd-shim ends in `... "%_prog%"  "%dp0%\<relative entry>" %*`, where
+ * %dp0% is the shim's own directory. That line is what this parses. Returns
+ * null when the file is unreadable, not shim-shaped, or the entry it names
+ * does not exist — the caller then falls back honestly instead of spawning a
+ * node command that cannot work.
  */
-export function resolveGrokCli(env = process.env) {
+export function resolveCmdShim(shimPath, { execPath = process.execPath } = {}) {
+  let text;
+  try {
+    text = fs.readFileSync(shimPath, 'utf8');
+  } catch {
+    return null;
+  }
+  const match = text.match(/"%dp0%\\([^"]+)"\s+%\*/);
+  if (!match) return null;
+  const entry = path.join(path.dirname(shimPath), match[1]);
+  try {
+    if (!fs.existsSync(entry)) return null;
+  } catch {
+    return null;
+  }
+  return { command: execPath, argsPrefix: [entry], useShell: false };
+}
+
+/**
+ * Finds the grok binary the same way claude-code.mjs finds claude: an
+ * explicit override wins, then a PATH walk on Windows, then a plain name and
+ * let spawn report ENOENT.
+ *
+ * The Windows walk runs in two passes: a native .exe ANYWHERE on PATH beats
+ * a .cmd shim that happens to come earlier (both installs coexist on this
+ * machine: ~/.grok/bin/grok.exe and the npm shim in AppData/Roaming/npm),
+ * because the exe needs no shell and has none of the quoting problems above.
+ * A shim that is found is resolved to its node entry via resolveCmdShim();
+ * only when that fails does shell:true survive as the last resort.
+ *
+ * `argsPrefix` is prepended to the turn's argv by runGrokTurn() — empty for
+ * a direct binary, the entry-script path when the command is node itself.
+ */
+export function resolveGrokCli(env = process.env, { platform = process.platform } = {}) {
   const override = env.KAPREK_GROK_PATH;
-  if (override) return { command: override, useShell: /\.(cmd|bat)$/i.test(override) };
-  if (process.platform !== 'win32') return { command: 'grok', useShell: false };
+  if (override) {
+    if (/\.(cmd|bat)$/i.test(override)) {
+      return resolveCmdShim(override) ?? { command: override, argsPrefix: [], useShell: true };
+    }
+    return { command: override, argsPrefix: [], useShell: false };
+  }
+  if (platform !== 'win32') return { command: 'grok', argsPrefix: [], useShell: false };
 
   const dirs = (env.PATH ?? '').split(path.delimiter).filter(Boolean);
   for (const dir of dirs) {
-    for (const name of ['grok.exe', 'grok.cmd', 'grok.bat']) {
-      const full = path.join(dir, name);
-      try {
-        if (fs.existsSync(full)) return { command: full, useShell: /\.(cmd|bat)$/i.test(name) };
-      } catch {
-        // unreadable PATH entry — keep looking
-      }
+    const full = path.join(dir, 'grok.exe');
+    try {
+      if (fs.existsSync(full)) return { command: full, argsPrefix: [], useShell: false };
+    } catch {
+      // unreadable PATH entry — keep looking
     }
   }
-  return { command: 'grok', useShell: false };
+  for (const dir of dirs) {
+    for (const name of ['grok.cmd', 'grok.bat']) {
+      const full = path.join(dir, name);
+      try {
+        if (!fs.existsSync(full)) continue;
+      } catch {
+        continue;
+      }
+      return resolveCmdShim(full) ?? { command: full, argsPrefix: [], useShell: true };
+    }
+  }
+  return { command: 'grok', argsPrefix: [], useShell: false };
 }
 
 /** The argv for one turn, minus the binary. Exported so a test can assert the contract rather than trusting a comment. */
@@ -160,8 +218,8 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
   const rawLogPath = path.join(scratchDir, `grok-raw-${stamp}.log`);
   fs.writeFileSync(promptPath, prompt, 'utf8');
 
-  const { command, useShell } = resolveGrokCli(env);
-  const args = buildGrokArgs({ promptPath, cwd });
+  const { command, argsPrefix = [], useShell } = resolveGrokCli(env);
+  const args = [...argsPrefix, ...buildGrokArgs({ promptPath, cwd })];
 
   const result = await new Promise((resolve) => {
     const child = spawnFn(command, args, {

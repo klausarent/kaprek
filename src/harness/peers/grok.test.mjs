@@ -182,6 +182,76 @@ test('the prompt file is cleaned up, so a draft does not linger in temp', async 
 });
 
 test('an explicit path override wins over the PATH walk', () => {
-  expect(resolveGrokCli({ KAPREK_GROK_PATH: 'C:/tools/grok.cmd' })).toEqual({ command: 'C:/tools/grok.cmd', useShell: true });
-  expect(resolveGrokCli({ KAPREK_GROK_PATH: '/usr/local/bin/grok' })).toEqual({ command: '/usr/local/bin/grok', useShell: false });
+  // A .cmd override that cannot be resolved to a node entry keeps the old
+  // shell:true behavior — last resort, not the happy path (see below).
+  expect(resolveGrokCli({ KAPREK_GROK_PATH: 'C:/tools/grok.cmd' })).toEqual({ command: 'C:/tools/grok.cmd', argsPrefix: [], useShell: true });
+  expect(resolveGrokCli({ KAPREK_GROK_PATH: '/usr/local/bin/grok' })).toEqual({ command: '/usr/local/bin/grok', argsPrefix: [], useShell: false });
+});
+
+// The two Windows spawn bugs from the tag-5 live acceptance (ledger,
+// 01.08.): with shell:true node JOINS argv raw, so `--tools ''` (an empty
+// string argument) vanishes entirely, and cmd.exe eats the quotes inside the
+// --json-schema JSON. The fix is to never need shell:true: prefer a native
+// .exe anywhere on PATH, and resolve an npm .cmd shim to the node script it
+// wraps so argv arrives byte-exact.
+
+/** Writes a real npm cmd-shim (the exact text `npm i -g` generates) plus the node entry it points at. */
+function writeShim(dir, { withEntry = true } = {}) {
+  const shimPath = path.join(dir, 'grok.cmd');
+  fs.writeFileSync(
+    shimPath,
+    '@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\n' +
+      'IF EXIST "%dp0%\\node.exe" (\r\n  SET "_prog=%dp0%\\node.exe"\r\n) ELSE (\r\n  SET "_prog=node"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\n' +
+      'endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\@xai-official\\grok\\bin\\grok" %*\r\n',
+    'utf8',
+  );
+  const entry = path.join(dir, 'node_modules', '@xai-official', 'grok', 'bin', 'grok');
+  if (withEntry) {
+    fs.mkdirSync(path.dirname(entry), { recursive: true });
+    fs.writeFileSync(entry, '// grok cli entry\n', 'utf8');
+  }
+  return { shimPath, entry };
+}
+
+test('a native exe anywhere on PATH beats a cmd shim that comes earlier', () => {
+  const shimDir = tmpDir();
+  const exeDir = tmpDir();
+  writeShim(shimDir);
+  const exePath = path.join(exeDir, 'grok.exe');
+  fs.writeFileSync(exePath, 'MZ', 'utf8');
+  const env = { PATH: [shimDir, exeDir].join(path.delimiter) };
+  expect(resolveGrokCli(env, { platform: 'win32' })).toEqual({ command: exePath, argsPrefix: [], useShell: false });
+});
+
+test('a cmd shim resolves to its node entry and spawns without a shell', () => {
+  const shimDir = tmpDir();
+  const { entry } = writeShim(shimDir);
+  const env = { PATH: shimDir };
+  expect(resolveGrokCli(env, { platform: 'win32' })).toEqual({ command: process.execPath, argsPrefix: [entry], useShell: false });
+});
+
+test('a shim without a resolvable entry falls back to shell:true rather than failing', () => {
+  const shimDir = tmpDir();
+  const { shimPath } = writeShim(shimDir, { withEntry: false });
+  const env = { PATH: shimDir };
+  expect(resolveGrokCli(env, { platform: 'win32' })).toEqual({ command: shimPath, argsPrefix: [], useShell: true });
+});
+
+// Needs the real platform: runGrokTurn resolves with process.platform, and on
+// POSIX the PATH walk never looks at .cmd shims in the first place.
+test.skipIf(process.platform !== 'win32')('a resolved shim really spawns node with the entry prepended to the argv', async () => {
+  const dir = tmpDir();
+  const shimDir = tmpDir();
+  const { entry } = writeShim(shimDir);
+  const seen = [];
+  const spawnFn = (command, args, options) => {
+    seen.push({ command, args, shell: options.shell });
+    return spawn(process.execPath, ['-e', `process.stdout.write(${JSON.stringify(answer('done', 'ok'))})`], { stdio: ['ignore', 'pipe', 'pipe'] });
+  };
+  await runGrokTurn({ cwd: dir, prompt: 'hi', logDir: dir, spawnFn, env: { PATH: shimDir } });
+  expect(seen).toHaveLength(1);
+  expect(seen[0].shell).toBe(false);
+  expect(seen[0].command).toBe(process.execPath);
+  expect(seen[0].args[0]).toBe(entry);
+  expect(seen[0].args).toContain('--tools');
 });
