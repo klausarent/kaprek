@@ -207,12 +207,70 @@ export async function startTurn({
       // never break a turn (adapter contract).
     };
 
-    // A server->client REQUEST blocks the turn until answered. Task 2 wires
-    // the approval bridge; the standing rule is fail-closed: anything not
-    // explicitly handled is declined immediately rather than left hanging.
+    // A server->client REQUEST blocks the turn until answered. The two
+    // approval kinds kaprek can phrase to a human are bridged to
+    // onApprovalRequest; everything else (tool user-input, MCP elicitation,
+    // auth refresh, ...) is declined immediately rather than left hanging —
+    // fail-closed, and a warning so the transcript says what was refused.
+    // The v1 method names are kept defensively: a codex answering without
+    // the experimental API uses them for the same two questions.
+    const APPROVAL_METHODS = new Map([
+      ['item/fileChange/requestApproval', 'fileChange'],
+      ['item/commandExecution/requestApproval', 'commandExecution'],
+      ['applyPatchApproval', 'fileChange'],
+      ['execCommandApproval', 'commandExecution'],
+    ]);
+
     const onServerRequest = (msg) => {
-      warnings.push(`unhandled codex server request declined: ${msg.method}`);
-      write({ jsonrpc: '2.0', id: msg.id, result: { decision: 'decline' } });
+      const toolName = APPROVAL_METHODS.get(msg.method);
+      if (!toolName) {
+        warnings.push(`unhandled codex server request declined: ${msg.method}`);
+        write({ jsonrpc: '2.0', id: msg.id, result: { decision: 'decline' } });
+        return;
+      }
+      const params = msg.params ?? {};
+      // The approval params are deliberately thin (itemId + reason); the
+      // human-readable payload arrived on item/started and sits in the item
+      // cache. Params still win where both carry a value — they describe
+      // THIS approval, the cache describes the item as it started.
+      const cached = itemCache.get(params.itemId) ?? {};
+      const input =
+        toolName === 'fileChange'
+          ? { changes: params.changes ?? cached.changes ?? [] }
+          : { command: params.command ?? cached.command ?? null, cwd: params.cwd ?? cached.cwd ?? null };
+      const request = {
+        id: String(msg.id),
+        toolName,
+        displayName: toolName,
+        input,
+        description: null,
+        reason: params.reason ?? null,
+        reasonType: null,
+        agentId: null,
+        toolUseId: params.itemId ?? null,
+        suggestions: null,
+      };
+      safeEmit({ type: 'approval', phase: 'requested', id: request.id, toolName, request });
+      const respond = (decision, behavior) => {
+        write({ jsonrpc: '2.0', id: msg.id, result: { decision } });
+        safeEmit({ type: 'approval', phase: 'resolved', id: request.id, toolName, behavior });
+      };
+      if (typeof onApprovalRequest !== 'function') {
+        respond('decline', 'deny');
+        return;
+      }
+      // Not awaited: multiple approvals may be in flight at once, and the
+      // adapter contract forbids serializing them.
+      Promise.resolve()
+        .then(() => onApprovalRequest(request))
+        .then((decision) => {
+          if (decision?.behavior === 'allow') respond('accept', 'allow');
+          else respond('decline', 'deny');
+        })
+        .catch((err) => {
+          warnings.push(`approval handler failed: ${err?.message ?? String(err)}`);
+          respond('decline', 'deny');
+        });
     };
 
     const rl = createInterface({ input: child.stdout });

@@ -9,7 +9,7 @@ import { test, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { PassThrough, Writable } from 'node:stream';
 import { startTurn, mapPermissionMode } from './codex.mjs';
-import { isNormalizedEvent } from './adapter.mjs';
+import { isApprovalRequest, isNormalizedEvent } from './adapter.mjs';
 
 /**
  * An in-memory stand-in for the `codex app-server` process. Parses each
@@ -231,4 +231,211 @@ test('after turn/completed the child is ended, and the turn result names the thr
   const result = await startTurn({ cwd: '.', prompt: 'hi', spawnFn: () => child });
   expect(result.sessionId).toBe('th-9');
   expect(child.kill).toHaveBeenCalled();
+});
+
+// --- approvals: the server-request bridge (M1 Task 2) ---
+
+/**
+ * A server that, on turn/start, walks an approval scenario: emits the
+ * item/started for the pending item, sends the approval REQUEST (id-bearing),
+ * and completes the turn only after the client answered. Records every
+ * client response to a server request in `child.approvalAnswers`.
+ */
+function approvalServer({ requests, threadId = 'th-1' }) {
+  const child = makeFakeCodexServer((c, msg) => {
+    if (msg.method === 'initialize') {
+      c.send({ id: msg.id, result: { userAgent: 'fake/0' } });
+    } else if (msg.method === 'thread/start' || msg.method === 'thread/resume') {
+      c.send({ id: msg.id, result: { thread: { id: msg.params.threadId ?? threadId } } });
+    } else if (msg.method === 'turn/start') {
+      c.send({ id: msg.id, result: { turn: { id: 'turn-1', status: 'inProgress' } } });
+      for (const req of requests) {
+        if (req.item) c.send({ method: 'item/started', params: { threadId, turnId: 'turn-1', item: req.item } });
+        c.send({ id: req.serverRequestId, method: req.method, params: { threadId, turnId: 'turn-1', ...req.params } });
+      }
+    } else if (msg.id !== undefined && msg.method === undefined) {
+      // A response to one of OUR requests: record it; when all are in,
+      // complete the turn.
+      child.approvalAnswers.push(msg);
+      if (child.approvalAnswers.length === requests.length) {
+        c.send({ method: 'turn/completed', params: { threadId, turn: { id: 'turn-1', status: 'completed', error: null } } });
+      }
+    }
+  });
+  child.approvalAnswers = [];
+  return child;
+}
+
+test('a fileChange approval reaches onApprovalRequest with the diff from the item cache, and allow answers accept', async () => {
+  const changes = [{ path: 'C:/work/NOTES.md', kind: { type: 'add' }, diff: 'hello\n' }];
+  const child = approvalServer({
+    requests: [
+      {
+        method: 'item/fileChange/requestApproval',
+        serverRequestId: 0,
+        item: { type: 'fileChange', id: 'fc-1', changes, status: 'inProgress' },
+        params: { itemId: 'fc-1', startedAtMs: 1, reason: 'writing outside the sandbox', grantRoot: null },
+      },
+    ],
+  });
+
+  const seen = [];
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'write it',
+    spawnFn: () => child,
+    onApprovalRequest: async (request) => {
+      seen.push(request);
+      return { behavior: 'allow' };
+    },
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(seen).toHaveLength(1);
+  expect(isApprovalRequest(seen[0])).toBe(true);
+  expect(seen[0].toolName).toBe('fileChange');
+  expect(seen[0].input).toEqual({ changes });
+  expect(seen[0].reason).toBe('writing outside the sandbox');
+  expect(child.approvalAnswers).toEqual([{ jsonrpc: '2.0', id: 0, result: { decision: 'accept' } }]);
+});
+
+test('deny answers decline, with the command payload taken from params over the cache', async () => {
+  const child = approvalServer({
+    requests: [
+      {
+        method: 'item/commandExecution/requestApproval',
+        serverRequestId: 7,
+        item: { type: 'commandExecution', id: 'x-1', command: 'stale-from-cache', cwd: 'C:/cache', status: 'inProgress' },
+        params: { itemId: 'x-1', startedAtMs: 1, command: 'rm -rf /', cwd: 'C:/work', reason: null },
+      },
+    ],
+  });
+
+  const seen = [];
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'run it',
+    spawnFn: () => child,
+    onApprovalRequest: async (request) => {
+      seen.push(request);
+      return { behavior: 'deny', message: 'no' };
+    },
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(seen[0].toolName).toBe('commandExecution');
+  // Params carry the authoritative command; the cache only fills gaps.
+  expect(seen[0].input).toEqual({ command: 'rm -rf /', cwd: 'C:/work' });
+  expect(child.approvalAnswers).toEqual([{ jsonrpc: '2.0', id: 7, result: { decision: 'decline' } }]);
+});
+
+test('no approval handler means auto-decline — fail-closed, never fail-open', async () => {
+  const child = approvalServer({
+    requests: [
+      {
+        method: 'item/fileChange/requestApproval',
+        serverRequestId: 0,
+        item: { type: 'fileChange', id: 'fc-1', changes: [], status: 'inProgress' },
+        params: { itemId: 'fc-1', startedAtMs: 1 },
+      },
+    ],
+  });
+
+  const result = await startTurn({ cwd: '.', prompt: 'write it', spawnFn: () => child });
+  expect(result.stopReason).toBe('result');
+  expect(child.approvalAnswers).toEqual([{ jsonrpc: '2.0', id: 0, result: { decision: 'decline' } }]);
+});
+
+test('an unknown server request is declined immediately and collected as a warning, and the turn survives', async () => {
+  const child = approvalServer({
+    requests: [
+      { method: 'item/tool/requestUserInput', serverRequestId: 3, params: { itemId: 'q-1', questions: [] } },
+    ],
+  });
+
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'hi',
+    spawnFn: () => child,
+    onApprovalRequest: async () => {
+      throw new Error('must not be called for a request kaprek cannot phrase');
+    },
+  });
+
+  expect(result.stopReason).toBe('result');
+  expect(result.warnings?.some((w) => w.includes('item/tool/requestUserInput'))).toBe(true);
+  expect(child.approvalAnswers).toEqual([{ jsonrpc: '2.0', id: 3, result: { decision: 'decline' } }]);
+});
+
+test('the approval lifecycle is visible as events: requested, then resolved with the behavior', async () => {
+  const child = approvalServer({
+    requests: [
+      {
+        method: 'item/fileChange/requestApproval',
+        serverRequestId: 0,
+        item: { type: 'fileChange', id: 'fc-1', changes: [], status: 'inProgress' },
+        params: { itemId: 'fc-1', startedAtMs: 1 },
+      },
+    ],
+  });
+
+  const events = [];
+  await startTurn({
+    cwd: '.',
+    prompt: 'write it',
+    spawnFn: () => child,
+    onEvent: (e) => events.push(e),
+    onApprovalRequest: async () => ({ behavior: 'allow' }),
+  });
+
+  const approvals = events.filter((e) => e.type === 'approval');
+  expect(approvals).toHaveLength(2);
+  expect(approvals[0]).toMatchObject({ phase: 'requested', toolName: 'fileChange' });
+  expect(approvals[1]).toMatchObject({ phase: 'resolved', toolName: 'fileChange', behavior: 'allow' });
+  for (const event of approvals) expect(isNormalizedEvent(event)).toBe(true);
+});
+
+test('two approvals in flight at once are answered independently, in whatever order the human decides', async () => {
+  const child = approvalServer({
+    requests: [
+      {
+        method: 'item/fileChange/requestApproval',
+        serverRequestId: 0,
+        item: { type: 'fileChange', id: 'fc-1', changes: [{ path: 'a', kind: { type: 'add' }, diff: 'a' }], status: 'inProgress' },
+        params: { itemId: 'fc-1', startedAtMs: 1 },
+      },
+      {
+        method: 'item/commandExecution/requestApproval',
+        serverRequestId: 1,
+        item: { type: 'commandExecution', id: 'x-1', command: 'run', cwd: '.', status: 'inProgress' },
+        params: { itemId: 'x-1', startedAtMs: 2, command: 'run', cwd: '.' },
+      },
+    ],
+  });
+
+  // The FIRST request resolves only after the second one already answered —
+  // the harness must not serialize them.
+  let releaseFirst;
+  const firstGate = new Promise((r) => {
+    releaseFirst = r;
+  });
+  const result = await startTurn({
+    cwd: '.',
+    prompt: 'both',
+    spawnFn: () => child,
+    onApprovalRequest: async (request) => {
+      if (request.toolName === 'fileChange') {
+        await firstGate;
+        return { behavior: 'allow' };
+      }
+      queueMicrotask(() => releaseFirst());
+      return { behavior: 'deny', message: 'no' };
+    },
+  });
+
+  expect(result.stopReason).toBe('result');
+  const byId = Object.fromEntries(child.approvalAnswers.map((a) => [a.id, a.result.decision]));
+  expect(byId).toEqual({ 0: 'accept', 1: 'decline' });
+  // The decline (request 1) arrived before the accept (request 0).
+  expect(child.approvalAnswers.map((a) => a.id)).toEqual([1, 0]);
 });
