@@ -62,7 +62,7 @@ type TurnSummary = {
   errorMessage: string | null;
 };
 
-export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
+export default function Chat({ chatId: initialChatId, missionId }: { chatId?: string; missionId?: string }) {
   const [chatId, setChatId] = useState<string | undefined>(initialChatId);
   // The relay run this chat hosts, if any. Reloaded on demand rather than
   // polled: it changes when the operator does something (start, stop, answer
@@ -176,6 +176,9 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
     try {
       await streamChatTurn({
         chatId,
+        // Only the turn that CREATES the chat carries the mission — a
+        // follow-up turn takes its mission from the chat itself, server-side.
+        missionId: chatId ? undefined : missionId,
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),

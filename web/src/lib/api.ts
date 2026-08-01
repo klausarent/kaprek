@@ -437,6 +437,66 @@ export function verifyTaskReceipt(id: string): Promise<VerifyReceiptResult> {
   return getJson<VerifyReceiptResult>(`/api/board/tasks/${encodeURIComponent(id)}/receipt/verify`);
 }
 
+// Missions (src/missions/store.mjs via /api/missions/*)
+
+export type MissionStatus = "active" | "waiting" | "done" | "archived";
+
+export type Mission = {
+  id: string;
+  title: string;
+  goal: string | null;
+  /** Absolute project directory this mission's turns run in; null means the workspace default. */
+  cwd: string | null;
+  preset: string | null;
+  status: MissionStatus;
+  createdAt: string;
+  updatedAt: string;
+  chats: string[];
+  tasks: string[];
+  /** Only present on the list route: how many inbox questions wait on this mission's chats. */
+  pendingApprovals?: number;
+};
+
+export type Preset = {
+  id: string;
+  title: string;
+  description: string;
+  goalTemplate: string;
+  firstPrompt: string;
+  builtin: boolean;
+};
+
+export type MissionDetail = {
+  mission: Mission;
+  chats: ChatSummary[];
+  tasks: Task[];
+  pendingApprovals: InboxApproval[];
+};
+
+export function fetchMissions(): Promise<Mission[]> {
+  return getJson<{ missions: Mission[] }>("/api/missions").then((r) => r.missions);
+}
+
+export function createMission(input: { title: string; goal?: string; cwd?: string; preset?: string }): Promise<Mission> {
+  return postJson<{ mission: Mission }>("/api/missions", input).then((r) => r.mission);
+}
+
+export function fetchMission(id: string): Promise<MissionDetail> {
+  return getJson<MissionDetail>(`/api/missions/${encodeURIComponent(id)}`);
+}
+
+export function setMissionStatus(id: string, status: MissionStatus): Promise<Mission> {
+  return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/status`, { status }).then((r) => r.mission);
+}
+
+export function linkMissionTask(id: string, taskId: string): Promise<Mission> {
+  return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/link`, { taskId }).then((r) => r.mission);
+}
+
+export function fetchPresets(): Promise<Preset[]> {
+  return getJson<{ presets: Preset[] }>("/api/presets").then((r) => r.presets);
+}
+
 // Chat (src/orchestrator/run.mjs via /api/chat/*)
 
 // Mirrors src/harness/adapter.mjs's NormalizedEvent union — what a chat turn
@@ -536,6 +596,8 @@ export type ChatSummary = {
   origin?: "user" | "trigger" | "relay";
   triggerId?: string | null;
   silent?: boolean;
+  /** The mission this chat belongs to, if any (see src/missions/store.mjs). */
+  missionId?: string | null;
   /** The relay run this chat hosts, if any (see src/relay/dispatcher.mjs). */
   relay?: RelayRun | null;
   createdAt: string | null;
@@ -664,11 +726,15 @@ async function readSseBody<T>(res: Response, onFrame: (frame: T) => void): Promi
 
 export async function streamChatTurn({
   chatId,
+  missionId,
   text,
   onEvent,
   signal,
 }: {
   chatId?: string;
+  /** Creates the new chat inside this mission (ignored when chatId is given —
+   * a follow-up turn takes its mission from the chat itself, server-side). */
+  missionId?: string;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -676,7 +742,7 @@ export async function streamChatTurn({
   const res = await apiFetch("/api/chat/turn", {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
-    body: JSON.stringify(chatId ? { chatId, text } : { text }),
+    body: JSON.stringify(chatId ? { chatId, text } : missionId ? { missionId, text } : { text }),
     signal,
   });
   if (!res.ok || !res.body) {

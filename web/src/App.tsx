@@ -18,6 +18,8 @@ import Search from "./pages/Search";
 import Board from "./pages/Board";
 import Chat from "./pages/Chat";
 import ChatList from "./pages/ChatList";
+import Missions from "./pages/Missions";
+import MissionDetail from "./pages/MissionDetail";
 import Triggers from "./pages/Triggers";
 import Approvals from "./pages/Approvals";
 import QuestionBox from "./components/QuestionBox";
@@ -30,8 +32,10 @@ export type Route =
   | { name: "thread"; project: string; sessionId: string }
   | { name: "search"; query: string }
   | { name: "board" }
-  | { name: "chat"; chatId: string | undefined }
+  | { name: "chat"; chatId: string | undefined; missionId?: string }
   | { name: "chats"; triggerId: string | undefined; includeSilent: boolean }
+  | { name: "missions" }
+  | { name: "mission"; missionId: string }
   | { name: "triggers" }
   | { name: "approvals" }
   | { name: "apps" };
@@ -49,7 +53,7 @@ function parseHash(hash: string): Route {
     // Malformed percent-encoding (raw '%', hand-edited/bookmarked URL) makes
     // decodeURIComponent throw a URIError — fall back to the chat route
     // instead of a white screen with no error boundary to catch it.
-    return { name: "chat", chatId: undefined };
+    return { name: "chat", chatId: undefined, missionId: undefined };
   }
   if (parts[0] === "search") {
     const params = new URLSearchParams(queryPart ?? "");
@@ -72,7 +76,14 @@ function parseHash(hash: string): Route {
     return { name: "chats", triggerId: params.get("triggerId") ?? undefined, includeSilent: params.get("includeSilent") === "1" };
   }
   if (parts[0] === "chat") {
-    return { name: "chat", chatId: parts[1] };
+    const params = new URLSearchParams(queryPart ?? "");
+    return { name: "chat", chatId: parts[1], missionId: params.get("missionId") ?? undefined };
+  }
+  if (parts[0] === "missions") {
+    return { name: "missions" };
+  }
+  if (parts[0] === "mission" && parts[1]) {
+    return { name: "mission", missionId: parts[1] };
   }
   if (parts[0] === "session" && parts[1] && parts[2]) {
     return { name: "thread", project: parts[1], sessionId: parts[2] };
@@ -84,7 +95,7 @@ function parseHash(hash: string): Route {
     return { name: "list", project: null };
   }
   // Empty hash (and anything unrecognized) is the chat.
-  return { name: "chat", chatId: undefined };
+  return { name: "chat", chatId: undefined, missionId: undefined };
 }
 
 export function navigateToProjects() {
@@ -117,6 +128,19 @@ export function navigateToChats({ triggerId, includeSilent }: { triggerId?: stri
   if (includeSilent) params.set("includeSilent", "1");
   const qs = params.toString();
   window.location.hash = `#/chats${qs ? `?${qs}` : ""}`;
+}
+
+export function navigateToMissions() {
+  window.location.hash = "#/missions";
+}
+
+export function navigateToMission(missionId: string) {
+  window.location.hash = `#/mission/${encodeURIComponent(missionId)}`;
+}
+
+/** Opens a fresh chat whose first turn will run inside the given mission. */
+export function navigateToMissionChat(missionId: string) {
+  window.location.hash = `#/chat?missionId=${encodeURIComponent(missionId)}`;
 }
 
 export function navigateToTriggers() {
@@ -257,6 +281,16 @@ export default function App() {
             Chat
           </a>
           <a
+            href="#/missions"
+            className={route.name === "missions" || route.name === "mission" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToMissions();
+            }}
+          >
+            Missions
+          </a>
+          <a
             href="#/triggers"
             className={route.name === "triggers" ? "active" : ""}
             onClick={(e) => {
@@ -327,10 +361,14 @@ export default function App() {
           <Apps />
         ) : route.name === "chats" ? (
           <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
+        ) : route.name === "missions" ? (
+          <Missions />
+        ) : route.name === "mission" ? (
+          <MissionDetail missionId={route.missionId} />
         ) : route.name === "list" ? (
           <SessionList project={route.project} />
         ) : (
-          <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} />
+          <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} missionId={route.missionId} />
         )}
       </main>
       {/* Global on purpose: a question an unattended agent filed at 3am has to
