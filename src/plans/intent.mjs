@@ -26,10 +26,19 @@ const DIRECT_WORDS = [
   'konzipier',
   'planen',
   'planung',
-  'spec',
+  'planning',
   'entwurf',
   'entwerfen',
 ];
+
+/**
+ * A signal directly preceded by one of these is the opposite of a signal.
+ * Both peer reviews caught "Bitte keine Planung starten" opening the
+ * planning popup. Only the two words in front count: "lass uns planen, aber
+ * nicht das Frontend" is still planning.
+ */
+const NEGATORS = ['kein', 'keine', 'keinen', 'nicht', 'ohne', 'no', 'not', 'dont', 'without'];
+const NEGATION_WINDOW = 2;
 
 /** Multi-word signals, matched against the normalized word stream. */
 const DIRECT_PHRASES = ['lets plan', 'plan out', 'wie sollten wir', 'how should we', 'wie gehen wir vor', 'was waere der beste weg'];
@@ -66,6 +75,22 @@ function normalize(text) {
 const hasPhrase = (stream, phrase) => stream.includes(` ${phrase} `);
 
 /**
+ * Whether `phrase` appears at least once WITHOUT a negator in the two words
+ * before it. A phrase that only ever appears negated does not count as a
+ * signal at all.
+ */
+function hasUnnegatedPhrase(stream, phrase) {
+  const words = stream.trim().split(' ');
+  const parts = phrase.split(' ');
+  for (let i = 0; i + parts.length <= words.length; i += 1) {
+    if (parts.some((part, offset) => words[i + offset] !== part)) continue;
+    const before = words.slice(Math.max(0, i - NEGATION_WINDOW), i);
+    if (!before.some((word) => NEGATORS.includes(word))) return true;
+  }
+  return false;
+}
+
+/**
  * Whether `text` reads like someone starting to plan or brainstorm.
  *
  * @param {unknown} text - a user's prompt; anything non-string is false
@@ -80,7 +105,7 @@ export function looksLikePlanning(text) {
   const hasOpener = OPENERS.some((opener) => hasPhrase(stream, opener));
   if (!hasOpener && LOOKUP_PHRASES.some((phrase) => hasPhrase(stream, phrase))) return false;
 
-  if (DIRECT_WORDS.some((word) => hasPhrase(stream, word))) return true;
-  if (DIRECT_PHRASES.some((phrase) => hasPhrase(stream, phrase))) return true;
-  return hasOpener && BUILD_VERBS.some((verb) => hasPhrase(stream, verb));
+  if (DIRECT_WORDS.some((word) => hasUnnegatedPhrase(stream, word))) return true;
+  if (DIRECT_PHRASES.some((phrase) => hasUnnegatedPhrase(stream, phrase))) return true;
+  return hasOpener && BUILD_VERBS.some((verb) => hasUnnegatedPhrase(stream, verb));
 }

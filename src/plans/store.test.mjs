@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { openPlans, PLAN_STATUSES, PlanNotFoundError, PlanFileMissingError, InvalidPlanPathError, InvalidStatusError } from './store.mjs';
+import { openPlans, PLAN_STATUSES, PlanNotFoundError, PlanFileMissingError, InvalidPlanPathError, InvalidStatusError, PlanOutsideRootError } from './store.mjs';
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-plans-'));
@@ -118,13 +118,81 @@ test('a plan whose file was deleted says so instead of pretending', () => {
   expect(() => store.read(plan.id)).toThrow(PlanFileMissingError);
 });
 
-test('an oversized plan is capped rather than loaded whole', () => {
+test('an oversized plan is capped rather than loaded whole, but its steps stay complete', () => {
   const dataDir = tmpDataDir();
-  const file = writePlanFile(dataDir, 'big.md', `# Big\n\n${'x'.repeat(2 * 1024 * 1024)}`);
+  const tail = `${'x'.repeat(1024 * 1024)}\n- [ ] A step past the cap`;
+  const file = writePlanFile(dataDir, 'big.md', `# Big\n\n- [ ] An early step\n${tail}`);
   const store = openPlans(dataDir);
   const plan = store.register({ path: file });
 
   const read = store.read(plan.id);
   expect(read.truncated).toBe(true);
   expect(read.content.length).toBeLessThan(2 * 1024 * 1024);
+  // Grok's review: parsing steps out of the TRUNCATED text hides every step
+  // past the cap, while setStep still writes against the full file — so the
+  // indices would silently disagree. Steps come from the whole document.
+  expect(read.steps.map((s) => s.text)).toEqual(['An early step', 'A step past the cap']);
+});
+
+test('a plan outside every allowed root is refused, at registration and afterwards', () => {
+  const dataDir = tmpDataDir();
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-elsewhere-'));
+  const stranger = writePlanFile(outside, 'someone-elses.md');
+  const store = openPlans(dataDir);
+
+  expect(() => store.register({ path: stranger })).toThrow(PlanOutsideRootError);
+
+  // And a log that already names an outside file (hand-edited, or written by
+  // an older build) must not become a write permit either.
+  const inside = writePlanFile(dataDir);
+  const plan = store.register({ path: inside });
+  const events = path.join(dataDir, 'plans', 'events.jsonl');
+  fs.appendFileSync(events, `${JSON.stringify({ id: 'x', ts: new Date().toISOString(), type: 'plan.created', planId: 'forged', data: { path: stranger, title: 'Forged', kind: 'plan' } })}\n`, 'utf8');
+
+  const reopened = openPlans(dataDir);
+  expect(() => reopened.read('forged')).toThrow(PlanOutsideRootError);
+  expect(() => reopened.setStep('forged', 0, true)).toThrow(PlanOutsideRootError);
+  expect(reopened.get(plan.id).id).toBe(plan.id);
+});
+
+test('a second root can be opened deliberately — that is what a mission cwd is', () => {
+  const dataDir = tmpDataDir();
+  const project = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-project-'));
+  const file = writePlanFile(project, 'plan.md');
+  const store = openPlans(dataDir, { allowedRoots: () => [dataDir, project] });
+  expect(store.register({ path: file }).path).toBe(path.resolve(file));
+});
+
+test('a directory is not a plan, even though it exists', () => {
+  const dataDir = tmpDataDir();
+  const dir = path.join(dataDir, 'docs');
+  fs.mkdirSync(dir, { recursive: true });
+  const store = openPlans(dataDir);
+  expect(() => store.register({ path: dir })).toThrow(PlanFileMissingError);
+});
+
+test('registering again fills in what the first registration did not know', () => {
+  const dataDir = tmpDataDir();
+  const file = writePlanFile(dataDir);
+  const store = openPlans(dataDir);
+  store.register({ path: file, chatId: 'chat-1' });
+  const second = store.register({ path: file, missionId: 'm-2' });
+  expect(second.chatId).toBe('chat-1');
+  expect(second.missionId).toBe('m-2');
+});
+
+test('two instances that both registered the same file collapse to one plan on reopen', () => {
+  // Grok's review: two kaprek processes on one dataDir each append their own
+  // plan.created for the same path. Two entries pointing at one file means
+  // two step-writers racing on it.
+  const dataDir = tmpDataDir();
+  const file = path.resolve(writePlanFile(dataDir));
+  const events = path.join(dataDir, 'plans', 'events.jsonl');
+  fs.mkdirSync(path.dirname(events), { recursive: true });
+  for (const planId of ['from-instance-a', 'from-instance-b']) {
+    fs.appendFileSync(events, `${JSON.stringify({ id: planId, ts: new Date().toISOString(), type: 'plan.created', planId, data: { path: file, title: 'Same file', kind: 'plan' } })}\n`, 'utf8');
+  }
+  const store = openPlans(dataDir);
+  expect(store.list()).toHaveLength(1);
+  expect(store.list()[0].id).toBe('from-instance-a');
 });

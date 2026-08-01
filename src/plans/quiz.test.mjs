@@ -66,6 +66,28 @@ test('a question with no options but free text allowed still counts', () => {
   expect(quiz.questions[0].options).toEqual([]);
 });
 
+test('a broken last block never falls back to an older one', () => {
+  // Codex' review: with "the last block wins" implemented as "keep the last
+  // one that parsed", an example block followed by a real block that got cut
+  // off mid-stream would re-ask the EXAMPLE question. Showing a stale
+  // question as if it were live is worse than showing none.
+  const example = { questions: [{ question: 'Example question', options: [{ label: 'A' }, { label: 'B' }] }] };
+  const cutOff = `${'```'}${QUIZ_FENCE}\n{"questions": [{"question": "The real one"`;
+  expect(parseQuiz(`${fence(JSON.stringify(example))}\n${cutOff}`)).toBeNull();
+});
+
+test('a quiz nested inside a longer outer fence is an example, not a question', () => {
+  const inner = fence(JSON.stringify(ONE_QUESTION));
+  expect(parseQuiz(`Here is how it looks:\n\n${'````'}markdown\n${inner}\n${'````'}\n`)).toBeNull();
+});
+
+test('duplicate ids are made distinct, so two cards never share one answer', () => {
+  const quiz = parseQuiz(
+    fence(JSON.stringify({ questions: [{ id: 'same', question: 'First?', allowOther: true }, { id: 'same', question: 'Second?', allowOther: true }] })),
+  );
+  expect(new Set(quiz.questions.map((q) => q.id)).size).toBe(2);
+});
+
 test('done ends the quiz and needs no questions', () => {
   const quiz = parseQuiz(fence('{"done": true}'));
   expect(quiz).not.toBeNull();

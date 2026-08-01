@@ -31,6 +31,28 @@ test('a document with no checkboxes has no steps', () => {
   expect(parseSteps(null)).toEqual([]);
 });
 
+test('a checkbox inside a code fence is an example, not a step', () => {
+  // Found by Codex' adversarial review: kaprek's own guided-plan prompt shows
+  // the format inside a fence, so any plan quoting it would grow phantom
+  // steps — and ticking one would rewrite the example.
+  const doc = ['# Plan', '', 'Format steps like this:', '', '```markdown', '- [ ] Not a real step', '```', '', '- [ ] A real step', ''].join('\n');
+  const steps = parseSteps(doc);
+  expect(steps.map((s) => s.text)).toEqual(['A real step']);
+  // And the index the UI ticks must address the real one.
+  expect(setStep(doc, 0, true)).toContain('- [x] A real step');
+  expect(setStep(doc, 0, true)).toContain('- [ ] Not a real step');
+});
+
+test('fences of any length and tildes both close correctly', () => {
+  const doc = ['~~~', '- [ ] tilde example', '~~~', '````', '- [ ] four backticks', '```', '- [ ] still inside', '````', '- [ ] real'].join('\n');
+  expect(parseSteps(doc).map((s) => s.text)).toEqual(['real']);
+});
+
+test('an unclosed fence swallows the rest, rather than guessing', () => {
+  const doc = ['- [ ] before', '```', '- [ ] after an unclosed fence'].join('\n');
+  expect(parseSteps(doc).map((s) => s.text)).toEqual(['before']);
+});
+
 test('ticking a step changes that line and nothing else', () => {
   const next = setStep(PLAN, 0, true);
   expect(next.split('\n')[4]).toBe('- [ ] **Step 1: Write the failing test**'.replace('[ ]', '[x]'));

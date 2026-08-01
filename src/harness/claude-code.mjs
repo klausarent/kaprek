@@ -334,11 +334,16 @@ function normalizeApprovalRequest(requestId, request) {
 /** Reasoning-effort levels both CLIs accept (claude --help, CLI 2.1.x). */
 export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
-export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler, effort }) {
+export function buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, hasApprovalHandler, effort, appendSystemPrompt }) {
   const args = ['-p', '--output-format', 'stream-json', '--input-format', 'stream-json', '--verbose'];
   if (sessionId) args.push('--resume', sessionId);
   if (mcpConfigPath) args.push('--mcp-config', mcpConfigPath);
   if (permissionMode) args.push('--permission-mode', permissionMode);
+  // A guided mode (see src/plans/prompt.mjs) rides here rather than in the
+  // user's own message: their prompt stays their words. Blank is dropped —
+  // an empty appendix would look like a guided turn in the argv while
+  // changing nothing about it.
+  if (typeof appendSystemPrompt === 'string' && appendSystemPrompt.trim() !== '') args.push('--append-system-prompt', appendSystemPrompt);
   // Verified against CLI 2.1.x: an unknown level only produces a warning and
   // is then ignored, so a bad value would silently mean "default effort".
   // Drop it here instead of letting that happen unnoticed.
@@ -402,6 +407,7 @@ export async function startTurn({
   allowedTools,
   settingsPath,
   effort,
+  appendSystemPrompt,
   onEvent,
   onApprovalRequest,
   signal,
@@ -419,7 +425,7 @@ export async function startTurn({
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
   }
 
-  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, effort, hasApprovalHandler: typeof onApprovalRequest === 'function' });
+  const args = buildArgs({ sessionId, mcpConfigPath, permissionMode, allowedTools, settingsPath, effort, appendSystemPrompt, hasApprovalHandler: typeof onApprovalRequest === 'function' });
 
   const { command, useShell } = resolveCli();
 

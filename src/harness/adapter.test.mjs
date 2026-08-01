@@ -359,3 +359,13 @@ test('effort reaches the CLI as --effort, and an unknown level is dropped rather
   expect(buildArgs({ effort: 'bogus' })).not.toContain('--effort');
   expect(buildArgs({})).not.toContain('--effort');
 });
+
+test('a guided mode reaches the CLI as --append-system-prompt, and nothing empty ever does', () => {
+  const args = buildArgs({ appendSystemPrompt: 'Ask through the quiz block.' });
+  expect(args).toContain('--append-system-prompt');
+  expect(args[args.indexOf('--append-system-prompt') + 1]).toBe('Ask through the quiz block.');
+  // Appending nothing would still count as "guided" to a reader of the argv
+  // while changing the turn not at all.
+  expect(buildArgs({ appendSystemPrompt: '   ' })).not.toContain('--append-system-prompt');
+  expect(buildArgs({})).not.toContain('--append-system-prompt');
+});

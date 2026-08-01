@@ -22,6 +22,8 @@
 // in kaprek where it is: an unanswerable question is worse than an ugly one.
 // Everything INSIDE a block, by contrast, is validated fail-closed.
 
+import { scanFences } from './markdown.mjs';
+
 /** The info string of the fenced block: ```kaprek-quiz */
 export const QUIZ_FENCE = 'kaprek-quiz';
 
@@ -31,8 +33,18 @@ const MAX_OPTIONS = 8;
 const MAX_LABEL_LEN = 120;
 const MAX_QUESTION_LEN = 400;
 
-/** Matches every ```kaprek-quiz block; `g` because the LAST one wins (see below). */
-const BLOCK_RE = /```kaprek-quiz\s*\r?\n([\s\S]*?)```/g;
+/**
+ * Every top-level fence whose info string is `kaprek-quiz`.
+ *
+ * Uses markdown.mjs's fence scanner rather than a regex over the raw text:
+ * a regex cannot tell a real block from one shown INSIDE a longer ````
+ * fence, which is exactly how the protocol gets explained (in this file's
+ * own doc comment, in the mode prompt, in the README). Codex' review turned
+ * that from a theoretical concern into a reproducible false positive.
+ */
+function quizBlocks(text) {
+  return scanFences(text.split('\n')).filter((block) => block.info.toLowerCase() === QUIZ_FENCE);
+}
 
 function trimmedString(value, maxLen) {
   if (typeof value !== 'string') return '';
@@ -89,15 +101,21 @@ function normalizeQuestion(raw, index) {
 export function parseQuiz(text) {
   if (typeof text !== 'string') return null;
 
+  // Only the LAST block is considered, and if it is unclosed or does not
+  // parse, the answer is null — never an earlier block. Codex' review caught
+  // the difference: "keep the last one that parsed" means an example block
+  // followed by a real block cut off mid-stream re-asks the EXAMPLE. A stale
+  // question presented as live is worse than no question at all.
+  const blocks = quizBlocks(text);
+  const last = blocks[blocks.length - 1];
+  if (!last || last.end === null) return null;
+
   let payload = null;
-  for (const match of text.matchAll(BLOCK_RE)) {
-    try {
-      const parsed = JSON.parse(match[1]);
-      if (parsed && typeof parsed === 'object') payload = parsed;
-    } catch {
-      // A block that does not parse is skipped, not fatal: an earlier valid
-      // block (or a later one) can still carry the real question.
-    }
+  try {
+    const parsed = JSON.parse(last.body);
+    if (parsed && typeof parsed === 'object') payload = parsed;
+  } catch {
+    return null;
   }
   if (!payload) return null;
 
@@ -106,6 +124,16 @@ export function parseQuiz(text) {
     .slice(0, MAX_QUESTIONS)
     .map(normalizeQuestion)
     .filter(Boolean);
+
+  // Answers are keyed by id, so two questions sharing one id would share one
+  // answer — the second card would silently overwrite the first.
+  const seen = new Set();
+  for (const question of questions) {
+    let id = question.id;
+    for (let n = 2; seen.has(id); n += 1) id = `${question.id}-${n}`;
+    question.id = id;
+    seen.add(id);
+  }
 
   // "done" is a valid quiz with nothing to ask; anything else needs at least
   // one answerable question or there is no reason to show a dialog.

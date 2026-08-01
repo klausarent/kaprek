@@ -29,6 +29,19 @@ test('a word that merely contains a signal never triggers it', () => {
   expect(looksLikePlanning('Der Bauplan liegt im Ordner, lies ihn')).toBe(false);
 });
 
+test('a negated signal is the opposite of a signal', () => {
+  // Both reviews flagged these: "Bitte keine Planung starten" fired the
+  // popup for planning, and "spec" fired on any mention of a spec file.
+  expect(looksLikePlanning('Bitte keine Planung starten, einfach umsetzen')).toBe(false);
+  expect(looksLikePlanning('Nicht brainstormen bitte, direkt bauen')).toBe(false);
+  expect(looksLikePlanning("Don't plan this, just do it")).toBe(false);
+  expect(looksLikePlanning('Review the spec please')).toBe(false);
+});
+
+test('planning is recognized in English too', () => {
+  expect(looksLikePlanning('We are planning the release, help me structure it')).toBe(true);
+});
+
 test('steering turns and junk are never planning', () => {
   for (const text of ['ja', 'weiter', 'ok mach', '', null, undefined, 42]) {
     expect(looksLikePlanning(text)).toBe(false);

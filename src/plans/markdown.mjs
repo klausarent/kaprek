@@ -14,6 +14,63 @@
 const STEP_RE = /^(\s*)([-*])\s\[([ xX])\]\s(.*)$/;
 
 /**
+ * A fence line: three or more backticks or tildes. CommonMark closes a fence
+ * only with the same character and at least as many of them, which is what
+ * lets a ```` block contain a ``` one.
+ */
+const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})\s*(.*)$/;
+
+/**
+ * Every top-level fenced block in `lines`.
+ *
+ * Shared with quiz.mjs, which needs the same answer for a different reason:
+ * a ```kaprek-quiz block shown INSIDE a longer ```` fence is someone
+ * explaining the protocol, not using it. Nesting is resolved the CommonMark
+ * way — a fence closes only on the same character, at least as long, with
+ * nothing after it — which is exactly what makes ```` able to contain ```.
+ *
+ * @returns {Array<{info: string, start: number, end: number|null, body: string}>}
+ *   `end` is null for a fence that is never closed (a stream cut off
+ *   mid-block); `body` is what sits between the fence lines.
+ */
+export function scanFences(lines) {
+  const blocks = [];
+  let open = null;
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = FENCE_RE.exec(lines[i]);
+    if (!match) continue;
+    if (open === null) {
+      open = { marker: match[1], info: match[2].trim(), start: i };
+      continue;
+    }
+    if (match[1][0] === open.marker[0] && match[1].length >= open.marker.length && match[2].trim() === '') {
+      blocks.push({ info: open.info, start: open.start, end: i, body: lines.slice(open.start + 1, i).join('\n') });
+      open = null;
+    }
+  }
+  if (open !== null) blocks.push({ info: open.info, start: open.start, end: null, body: lines.slice(open.start + 1).join('\n') });
+  return blocks;
+}
+
+/**
+ * Whether each line sits inside a fenced code block.
+ *
+ * Codex' adversarial review found this: kaprek's own guided-plan prompt shows
+ * the checkbox format inside a fence, so a plan quoting it would grow phantom
+ * steps — and ticking one would rewrite the example instead of the step. An
+ * unclosed fence swallows everything after it, matching CommonMark and
+ * erring towards "not a step" rather than guessing where the author meant to
+ * close it.
+ */
+function fencedLines(lines) {
+  const inFence = new Array(lines.length).fill(false);
+  for (const block of scanFences(lines)) {
+    for (let i = block.start; i <= (block.end ?? lines.length - 1); i += 1) inFence[i] = true;
+  }
+  return inFence;
+}
+
+/**
  * Every checkbox in the document, in order.
  *
  * @param {unknown} markdown
@@ -26,7 +83,9 @@ export function parseSteps(markdown) {
   if (typeof markdown !== 'string') return [];
   const steps = [];
   const lines = markdown.split('\n');
+  const fenced = fencedLines(lines);
   for (let line = 0; line < lines.length; line += 1) {
+    if (fenced[line]) continue;
     const match = STEP_RE.exec(lines[line]);
     if (!match) continue;
     steps.push({ index: steps.length, line, text: match[4].trim(), done: match[3].toLowerCase() === 'x' });
