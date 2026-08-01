@@ -42,6 +42,7 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Zero runtime dependencies. The web UI ships as a prebuilt static bundle.
 - Preserves a session's scratchpad work products (scripts, data, images) before OS temp cleanup deletes them — see [Artifact preservation](#artifact-preservation).
 - Missions: name a goal once, point it at a real project directory, and every chat, task, and pending question of that work hangs together — see [Missions](#missions).
+- Two engines: chats run on your Claude Code CLI by default, or on your Codex CLI — picked per chat, same approval flow, same inbox — see [Engines](#engines).
 
 ## Missions
 
@@ -68,6 +69,26 @@ Presets pre-fill a new mission: two generic ones ship built in (`blank` and
 `<dataDir>/presets/` — `{id, title, description, goalTemplate, firstPrompt}`.
 A user preset with a builtin's id replaces it; an invalid file is skipped with
 a warning, never a crash.
+
+## Engines
+
+A new chat picks which already-installed, already-authenticated CLI runs its
+turns: `claude` (the default) or `codex`. The choice is fixed at chat
+creation — one conversation is one CLI session, and handing a resume id from
+one CLI to another is not a thing — and shows as a badge afterwards; the
+default engine deliberately shows nothing.
+
+The Codex engine speaks JSON-RPC to `codex app-server`, spawned per turn the
+same way `claude -p` is. Approvals work identically from your side: with the
+default permission mode, Codex runs in a read-only sandbox, so every write it
+wants becomes a question — in the live approval dialog or the durable inbox,
+wherever the turn is running. Honest differences, declared by the registry
+(`GET /api/engines`) rather than discovered mid-turn: Codex reports token
+usage but **no dollar figure** (cost shows as unknown, never as a made-up
+number), an approval cannot rewrite the proposed input on allow, and
+Claude-specific options (allowed tools, MCP config, settings files) do not
+apply. Trigger and relay turns stay on the default engine for now —
+multi-engine orchestration is the next milestone, not a checkbox.
 
 ## Search
 
