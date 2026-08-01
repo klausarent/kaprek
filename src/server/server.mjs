@@ -1184,7 +1184,20 @@ export function parseRelayAnswer(text, result = {}) {
       return { status: parsed.status, message: parsed.message, usage: result.usage ?? null, costUsd: result.costUsd ?? null, durationMs: 0, rawLogPath: null };
     }
   } catch {
-    // falls through to the honest answer below
+    // The German-quote trap (tag-5 live acceptance): a reviewer writing
+    // „Zitat" closes the German quotation with an unescaped ASCII quote
+    // INSIDE a JSON string, and the whole document stops parsing — while the
+    // status field itself is sitting there, perfectly readable. The run's
+    // steering wheel is `status`, not the prose around it, so when the
+    // broken document carries exactly ONE distinct status value, that value
+    // is taken and the WHOLE text becomes the message (the next peer reads
+    // it as prose anyway). Two contradicting status fields stay ambiguous
+    // and fall through to needs_human — a human call, not a coin flip.
+    const statuses = [...candidate.matchAll(/"status"\s*:\s*"(handoff|done|needs_human)"/g)].map((m) => m[1]);
+    const unique = [...new Set(statuses)];
+    if (unique.length === 1) {
+      return { status: unique[0], message: text, usage: result.usage ?? null, costUsd: result.costUsd ?? null, durationMs: 0, rawLogPath: null };
+    }
   }
   return {
     status: 'needs_human',

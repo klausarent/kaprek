@@ -3237,6 +3237,25 @@ test('relay: a turn that a reviewer cannot answer in the agreed shape parks the 
   expect(parseRelayAnswer('{"status":"whatever","message":"x"}')).toMatchObject({ status: 'needs_human' });
 });
 
+test('relay: the German-quote trap — broken JSON with an unambiguous status field still reads as that status', async () => {
+  // Straight from the tag-5 live acceptance: the reviewer wrote „Zitat" with
+  // an unescaped ASCII quote closing a German quotation INSIDE a JSON string,
+  // which kills JSON.parse — but the status FIELD is sitting right there,
+  // unambiguous. Parking that at a gate made a working relay look broken.
+  const broken = '```json\n{\n  "status": "handoff",\n  "message": "Befund 1: „tickt ein stummes Licht" — Licht tickt nicht. Bitte revidieren."\n}\n```';
+  const parsed = parseRelayAnswer(broken);
+  expect(parsed.status).toBe('handoff');
+  // The whole text becomes the message — the next peer reads it as prose.
+  expect(parsed.message).toContain('Licht tickt nicht');
+
+  // Two CONTRADICTING status fields are ambiguous — that stays a human call.
+  const ambiguous = '{"status": "handoff", "inner": {"status": "done", "message": "x"';
+  expect(parseRelayAnswer(ambiguous)).toMatchObject({ status: 'needs_human' });
+
+  // Broken JSON without any status field keeps the old honest answer.
+  expect(parseRelayAnswer('{"message": "no status here"')).toMatchObject({ status: 'needs_human' });
+});
+
 // --- missions: the mission routes and mission-bound chat turns (Zielbild M0) ---
 
 test('missions: create, list, detail roundtrip over HTTP', async () => {
