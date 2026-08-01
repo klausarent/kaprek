@@ -41,6 +41,33 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Secret redaction on by default, applied before any truncation.
 - Zero runtime dependencies. The web UI ships as a prebuilt static bundle.
 - Preserves a session's scratchpad work products (scripts, data, images) before OS temp cleanup deletes them — see [Artifact preservation](#artifact-preservation).
+- Missions: name a goal once, point it at a real project directory, and every chat, task, and pending question of that work hangs together — see [Missions](#missions).
+
+## Missions
+
+A mission (`#/missions`) is what you're trying to get done: a title, a goal,
+and optionally the project directory the work lives in. Chats started inside a
+mission are linked to it, board tasks can be linked to it, and the mission's
+detail page shows what is waiting on you — the same durable inbox questions,
+grouped by the work they belong to. There is only one interface: the same
+missions page serves a weekend project and a client codebase alike.
+
+**The working-directory rule, stated plainly:** by default every chat turn
+runs in a jailed `<dataDir>/workspace` directory, so an agent never edits
+whatever directory kaprek happened to be started from. A mission may point at
+a real project directory instead. That is the one deliberate door out of the
+jail, and it is bound to an explicit human act: you type the absolute path
+once when creating the mission, it is checked to exist right there, and it is
+re-checked on every turn — if the directory is gone the turn fails with an
+error rather than silently falling back to the workspace. Every turn of that
+mission (including follow-ups addressed by chat id alone) runs in the
+mission's directory, with the same permission flow as any other turn.
+
+Presets pre-fill a new mission: two generic ones ship built in (`blank` and
+`guided-feature`), and you can add your own as JSON files under
+`<dataDir>/presets/` — `{id, title, description, goalTemplate, firstPrompt}`.
+A user preset with a builtin's id replaces it; an invalid file is skipped with
+a warning, never a crash.
 
 ## Search
 
