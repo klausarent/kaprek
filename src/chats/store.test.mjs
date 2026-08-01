@@ -290,3 +290,32 @@ test('a stored tool event has the same keys as a digestSession tool event', asyn
 
   expect(Object.keys(storedToolEvent).sort()).toEqual(Object.keys(parserToolEvent).sort());
 });
+
+// --- missionId meta (a chat can belong to a mission) ---
+
+test('createChat stores a missionId and lists it in the summary', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T', missionId: 'mission-1' });
+  expect(chat.missionId).toBe('mission-1');
+  expect(chats.get(chat.id).missionId).toBe('mission-1');
+  expect(chats.list().find((c) => c.id === chat.id).missionId).toBe('mission-1');
+});
+
+test('missionId defaults to null and rejects non-string values', () => {
+  const chats = openChats(tmpDir);
+  expect(chats.createChat({ title: 'T' }).missionId).toBeNull();
+  expect(() => chats.createChat({ title: 'T', missionId: 42 })).toThrow(InvalidChatMetaError);
+});
+
+test('a chat.created line written before missionId existed loads as null', () => {
+  const chatId = 'aaaaaaaa-0000-0000-0000-000000000001';
+  const dir = path.join(tmpDir, 'chats', chatId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'events.jsonl'),
+    `${JSON.stringify({ id: 'e1', ts: new Date().toISOString(), type: 'chat.created', data: { title: 'Old', origin: 'user', triggerId: null, silent: false } })}\n`,
+    'utf8',
+  );
+  const chats = openChats(tmpDir);
+  expect(chats.get(chatId).missionId).toBeNull();
+});

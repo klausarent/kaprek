@@ -160,6 +160,7 @@ function applyEvent(chat, wrapper) {
       chat.origin = data.origin ?? 'user';
       chat.triggerId = data.triggerId ?? null;
       chat.silent = data.silent ?? false;
+      chat.missionId = data.missionId ?? null;
       chat.createdAt = ts;
       chat.updatedAt = ts;
       break;
@@ -222,6 +223,7 @@ function summarize(chat) {
     origin: chat.origin ?? 'user',
     triggerId: chat.triggerId ?? null,
     silent: chat.silent ?? false,
+    missionId: chat.missionId ?? null,
     relay: chat.relay ?? null,
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
@@ -244,7 +246,7 @@ export function openChats(dataDir) {
     for (const entry of fs.readdirSync(chatsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const chatId = entry.name;
-      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, missionId: null, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
       for (const wrapper of loadEvents(eventsPathFor(dataDir, chatId))) {
         applyEvent(chat, wrapper);
       }
@@ -280,8 +282,11 @@ export function openChats(dataDir) {
      * @param {boolean} [silent] - true hides the chat from GET /api/chat/list
      *   by default (see src/server/server.mjs's ?includeSilent=1 handling) —
      *   used for a heartbeat run whose whole point was "nothing to report"
+     * @param {string|null} [missionId] - the mission this chat belongs to
+     *   (see src/missions/store.mjs); the server links the chat onto the
+     *   mission via linkChat() in the same request that creates it
      */
-    createChat({ title, origin = 'user', triggerId = null, silent = false } = {}) {
+    createChat({ title, origin = 'user', triggerId = null, silent = false, missionId = null } = {}) {
       if (title !== undefined && (typeof title !== 'string' || title.trim().length === 0)) {
         throw new InvalidTitleError();
       }
@@ -294,9 +299,12 @@ export function openChats(dataDir) {
       if (typeof silent !== 'boolean') {
         throw new InvalidChatMetaError('silent', 'must be a boolean');
       }
+      if (missionId !== null && typeof missionId !== 'string') {
+        throw new InvalidChatMetaError('missionId', 'must be a string or null');
+      }
       const chatId = crypto.randomUUID();
-      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
-      commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent });
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, missionId: null, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent, missionId });
       chats.set(chatId, chat);
       return summarize(chat);
     },
