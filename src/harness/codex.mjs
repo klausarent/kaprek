@@ -276,7 +276,12 @@ export async function startTurn({
           ? { changes: params.changes ?? cached.changes ?? [] }
           : { command: params.command ?? cached.command ?? null, cwd: params.cwd ?? cached.cwd ?? null };
       const request = {
-        id: String(msg.id),
+        // NOT the bare JSON-RPC id: codex numbers those per process starting
+        // at 0, and the server's inbox keys approvals by chatId + this id —
+        // turn 2's first approval would collide with turn 1's and be treated
+        // as already answered (found live, M1 acceptance). The turn id is
+        // unique per turn, and each turn is its own codex process.
+        id: `${params.turnId ?? 'turn'}:${msg.id}`,
         toolName,
         displayName: toolName,
         input,

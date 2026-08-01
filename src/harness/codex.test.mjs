@@ -297,6 +297,13 @@ test('a fileChange approval reaches onApprovalRequest with the diff from the ite
   expect(seen[0].input).toEqual({ changes });
   expect(seen[0].reason).toBe('writing outside the sandbox');
   expect(child.approvalAnswers).toEqual([{ jsonrpc: '2.0', id: 0, result: { decision: 'accept' } }]);
+  // The request id must be unique ACROSS turns, not only within one: codex
+  // numbers its JSON-RPC ids per process starting at 0, so a bare "0" would
+  // collide with the previous turn's first approval in the server's
+  // chatId-scoped inbox (found live in the M1 acceptance: turn 2's approval
+  // was skipped as already-answered and the turn hung). The turn id makes it
+  // unique — every turn is its own codex process with its own turn id.
+  expect(seen[0].id).toBe('turn-1:0');
 });
 
 test('deny answers decline, with the command payload taken from params over the cache', async () => {
