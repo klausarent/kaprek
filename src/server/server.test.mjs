@@ -10,7 +10,7 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
-import { startServer, createSseQueue, effectiveApprovalDeadline, DEFERRAL_MESSAGE } from './server.mjs';
+import { startServer, createSseQueue, effectiveApprovalDeadline, DEFERRAL_MESSAGE, parseRelayAnswer } from './server.mjs';
 import { TOKEN_HEADER } from './token.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
@@ -3075,4 +3075,164 @@ test('replay: when both attempts die before the action, the approval is handed b
   // And approving it again is accepted, rather than 409 'already decided'.
   const second = await postJson(`${url}/api/approvals/q-1`, { chatId: filed.chatId, behavior: 'allow' });
   expect(second.status).toBe(200);
+});
+
+/**
+ * A harness whose turns answer in the relay's shape, plus a stub grok peer.
+ * Neither ever reaches a real CLI: `boot` is handed the stub through
+ * startServer's getPeerDriver option.
+ */
+function relayReviewHarness(statuses) {
+  let call = 0;
+  return {
+    async startTurn({ onEvent } = {}) {
+      const status = statuses[Math.min(call, statuses.length - 1)];
+      call += 1;
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      onEvent?.({ type: 'text', text: JSON.stringify({ status, message: `review ${call}` }) });
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+/**
+ * Boots a server with ONE stub peer for the whole run. Creating a stub per
+ * lookup would restart its counter, every draft would come out identical, and
+ * the run would stop on "same output twice" - which is the no-progress guard
+ * doing its job on a bug in the test.
+ */
+async function bootRelay(opts) {
+  const grok = stubGrokDriver();
+  return boot({ ...opts, getPeerDriver: (id) => (id === 'grok' ? grok : null) });
+}
+
+/** The grok side of a relay test: answers in shape, spawns nothing. */
+function stubGrokDriver() {
+  let call = 0;
+  return {
+    id: 'grok',
+    available: () => true,
+    async runTurn() {
+      call += 1;
+      return { status: 'handoff', message: `draft ${call}`, usage: null, costUsd: null, durationMs: 1, rawLogPath: null };
+    },
+  };
+}
+
+// ------------------------------------------------------- the relay, end to end
+//
+// Driven through the routes a person actually uses, for the reason the last
+// two live runs taught: the wiring between a route and the thing it starts is
+// exactly where the tests below the route cannot see.
+
+/** A relay gate answered through the ordinary approvals route, which is the only route there is for it. */
+async function answerGate(url, entry, behavior) {
+  return postJson(`${url}/api/approvals/${entry.id}`, { chatId: entry.chatId, behavior });
+}
+
+test('relay: a run started from a chat hands off along its route and files one gate', async () => {
+  // The whole point in one test: start once, watch two handoffs happen on
+  // their own, get exactly one decision to make.
+  const { url } = await bootRelay({ harness: relayReviewHarness(['handoff', 'handoff']), harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'set up the batch' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+
+  const started = await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'write the batch' });
+  expect(started.status).toBe(200);
+  const { runId } = await started.json();
+  expect(typeof runId).toBe('string');
+
+  const gate = await vi.waitFor(
+    async () => {
+      const list = (await (await fetch(`${url}/api/approvals`)).json()).approvals;
+      const found = list.find((entry) => entry.kind === 'relay.gate');
+      if (!found) {
+        const { chat, events } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+        throw new Error(`no gate yet; relay=${JSON.stringify(chat?.relay)} events=${JSON.stringify((events ?? []).filter((e) => e.kind === 'relay').map((e) => [e.eventType, e.reason]))}`);
+      }
+      return found;
+    },
+    { timeout: 8_000 },
+  );
+
+  // The gate reads as a decision about a run, not as a tool-use question.
+  expect(gate.displayName).toContain('write the batch');
+  expect(gate.description).toMatch(/rounds done/);
+
+  const events = (await (await fetch(`${url}/api/chat/${chatId}`)).json()).events.filter((event) => event.kind === 'relay');
+  expect(events.filter((event) => event.eventType === 'message').map((event) => event.from)).toEqual(['grok', 'claude', 'grok', 'claude']);
+  expect(events.filter((event) => event.eventType === 'gate.requested')).toHaveLength(1);
+}, 25_000);
+
+test('relay: approving the gate buys one more round; denying stops the run', async () => {
+  const { url } = await bootRelay({ harness: relayReviewHarness(['handoff', 'handoff', 'handoff']), harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+  await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'write the batch' });
+
+  const gate = await vi.waitFor(
+    async () => {
+      const found = (await (await fetch(`${url}/api/approvals`)).json()).approvals.find((entry) => entry.kind === 'relay.gate');
+      expect(found).toBeTruthy();
+      return found;
+    },
+    { timeout: 5_000 },
+  );
+
+  const allowed = await answerGate(url, gate, 'allow');
+  expect(allowed.status).toBe(200);
+  expect(await allowed.json()).toMatchObject({ relay: 'resumed' });
+
+  // One round later it is asking again rather than carrying on by itself.
+  const second = await vi.waitFor(
+    async () => {
+      const found = (await (await fetch(`${url}/api/approvals`)).json()).approvals.find((entry) => entry.kind === 'relay.gate');
+      expect(found).toBeTruthy();
+      return found;
+    },
+    { timeout: 5_000 },
+  );
+
+  const denied = await answerGate(url, second, 'deny');
+  expect(denied.status).toBe(200);
+  expect(await denied.json()).toMatchObject({ relay: 'stopped' });
+  const { chat } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+  expect(chat.relay.status).toBe('stopped');
+}, 25_000);
+
+test('relay: a chat that is handing off refuses a typed turn, and an unknown run cannot be stopped', async () => {
+  const { url } = await bootRelay({ harness: relayReviewHarness(['handoff', 'handoff']), harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+  await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'g' });
+
+  // A second run on the same chat is refused: one conversation, one thing
+  // writing into it.
+  const second = await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'another' });
+  expect(second.status).toBe(409);
+
+  const stopUnknown = await postJson(`${url}/api/relay/does-not-exist/stop`, {});
+  expect(stopUnknown.status).toBe(404);
+}, 25_000);
+
+test('relay: a run without a goal is refused, and the routes need the instance token like everything else', async () => {
+  const { url } = await bootRelay({ harness: relayReviewHarness(['handoff']), harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+
+  expect((await postJson(`${url}/api/chat/${chatId}/relay`, {})).status).toBe(400);
+  // rawFetch sends no token; every /api route answers 401 to that.
+  expect((await rawFetch(`${url}/api/chat/${chatId}/relay`, { method: 'POST', headers: APP_JSON_HEADERS, body: '{}' })).status).toBe(401);
+}, 25_000);
+
+test('relay: a turn that a reviewer cannot answer in the agreed shape parks the run instead of guessing', async () => {
+  // The local Claude harness is not schema-constrained, so its answer is
+  // parsed. An unreadable one must not be turned into a "handoff" by a lenient
+  // parser: the run stops and asks, with the text attached.
+  expect(parseRelayAnswer('I think this is fine, ship it')).toMatchObject({ status: 'needs_human' });
+  expect(parseRelayAnswer('```json\n{"status":"done","message":"ok"}\n```')).toMatchObject({ status: 'done', message: 'ok' });
+  expect(parseRelayAnswer('{"status":"handoff","message":"revised"}')).toMatchObject({ status: 'handoff' });
+  // A schema-shaped answer with a bogus status is not an answer either.
+  expect(parseRelayAnswer('{"status":"whatever","message":"x"}')).toMatchObject({ status: 'needs_human' });
 });

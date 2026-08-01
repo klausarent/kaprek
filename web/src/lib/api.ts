@@ -53,7 +53,57 @@ export type CompactEvent = {
   postTokens: number | null;
 };
 
-export type DigestEvent = ToolEvent | TextEvent | SubagentEvent | CompactEvent | ApprovalEvent;
+/**
+ * One step of an agent-to-agent handoff (see src/relay/dispatcher.mjs). The
+ * body of a message lives in a file under the run's artifact directory, so
+ * this carries a preview and a reference rather than the text itself: a relay
+ * payload can be dozens of drafts.
+ */
+export type RelayEvent = {
+  kind: "relay";
+  ts: string;
+  eventType:
+    | "run.created"
+    | "dispatch.started"
+    | "message"
+    | "dispatch.failed"
+    | "gate.requested"
+    | "gate.resolved"
+    | "run.completed"
+    | "run.stopped"
+    | "run.interrupted";
+  runId: string;
+  from?: string | null;
+  to?: string | null;
+  round?: number | null;
+  turn?: number | null;
+  textPreview?: string | null;
+  bodyRef?: string | null;
+  bodySha256?: string | null;
+  driver?: string | null;
+  costUsd?: number | null;
+  /** Always true for a peer turn: a subscription CLI's per-turn figure is derived from list prices nobody pays. */
+  costEstimated?: boolean | null;
+  status?: string | null;
+  reason?: string | null;
+  goal?: string | null;
+  route?: string[] | null;
+};
+
+/** The relay run a chat is hosting, if any. */
+export type RelayRun = {
+  runId: string;
+  status: "active" | "waiting_gate" | "interrupted" | "completed" | "stopped";
+  route: string[];
+  goal: string;
+  maxRounds: number;
+  hardMaxTurns: number;
+  rounds: number;
+  turns: number;
+  artifactDir?: string;
+};
+
+export type DigestEvent = ToolEvent | TextEvent | SubagentEvent | CompactEvent | ApprovalEvent | RelayEvent;
 
 // One persisted approval, either lifecycle half (see src/chats/store.mjs's
 // EVENT_SHAPES 'approval' entry — 'requested' carries the proposed call,
@@ -483,9 +533,11 @@ export type ChatStoredEvent =
 export type ChatSummary = {
   id: string;
   title: string | null;
-  origin?: "user" | "trigger";
+  origin?: "user" | "trigger" | "relay";
   triggerId?: string | null;
   silent?: boolean;
+  /** The relay run this chat hosts, if any (see src/relay/dispatcher.mjs). */
+  relay?: RelayRun | null;
   createdAt: string | null;
   updatedAt: string | null;
   eventCount: number;
@@ -688,11 +740,26 @@ export type InboxApproval = ApprovalFrame & {
   mode?: "interactive" | "deferred";
   /** How often the trigger has asked this same question (see the store's dedupe). */
   askedCount?: number;
+  /** 'relay.gate' for a relay's "one more round?" question; absent for an ordinary tool-use approval. */
+  kind?: string | null;
   triggerId?: string | null;
 };
 
 export function fetchApprovalInbox(): Promise<{ approvals: InboxApproval[] }> {
   return getJson<{ approvals: InboxApproval[] }>("/api/approvals");
+}
+
+// ---------------------------------------------------------------------------
+// Relay (src/relay/dispatcher.mjs via /api/chat/<id>/relay and /api/relay/*)
+// ---------------------------------------------------------------------------
+
+/** Starts a handoff run on a chat. The route is fixed in v1; the goal is the operator's one input. */
+export function startRelayRun(chatId: string, goal: string, maxRounds?: number): Promise<{ runId: string; status: string; route: string[] }> {
+  return postJson(`/api/chat/${encodeURIComponent(chatId)}/relay`, maxRounds === undefined ? { goal } : { goal, maxRounds });
+}
+
+export function stopRelayRun(runId: string): Promise<{ ok: true }> {
+  return postJson(`/api/relay/${encodeURIComponent(runId)}/stop`);
 }
 
 // ---------------------------------------------------------------------------

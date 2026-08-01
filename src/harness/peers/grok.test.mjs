@@ -21,7 +21,16 @@ function tmpDir() {
 }
 
 afterEach(() => {
-  for (const dir of dirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+  for (const dir of dirs.splice(0)) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // Windows releases a killed process's handles a moment after the kill,
+      // so a directory that held one can still be EBUSY here. It is a temp
+      // directory: the OS will get it. Failing the test over it would report
+      // a platform quirk as a defect in the code under test.
+    }
+  }
 });
 
 /** Stands in for the grok binary: a node script that gets the same argv the real one would. */
@@ -101,20 +110,23 @@ test('an answer that ignores the schema fails the turn rather than being guessed
 
 test('stdout past the cap ends the turn cleanly instead of buffering a runaway CLI', async () => {
   const dir = tmpDir();
-  const script = `const chunk = 'x'.repeat(64 * 1024); for (let i = 0; i < 40; i += 1) process.stdout.write(chunk); setTimeout(() => {}, 5000);`;
+  // Written in one go and then held open: the cap has to bite on the data,
+  // not on the process happening to exit first.
+  const script = `process.stdout.write('x'.repeat(2 * 1024 * 1024)); setInterval(() => {}, 1000);`;
   await expect(runGrokTurn({ cwd: dir, prompt: 'go', logDir: dir, spawnFn: fakeCli(script) })).rejects.toThrow(
     new RegExp(`more than ${PEER_MAX_STDOUT_BYTES} bytes`),
   );
 });
 
 test('a peer that never answers is killed at the timeout rather than held forever', async () => {
+  // The child here never exits on its own (an open interval keeps it alive),
+  // so the only way this test can finish at all is the timeout firing and
+  // killing it. That is the assertion; a wall-clock bound on top of it would
+  // only measure how loaded the machine running the suite happens to be.
   const dir = tmpDir();
-  const startedAt = Date.now();
   await expect(
-    runGrokTurn({ cwd: dir, prompt: 'go', timeoutMs: 150, logDir: dir, spawnFn: fakeCli('setTimeout(() => {}, 30000)') }),
-  ).rejects.toThrow(/did not answer within 150ms/);
-  // It really returned at the timeout, not at the child's own end.
-  expect(Date.now() - startedAt).toBeLessThan(5_000);
+    runGrokTurn({ cwd: dir, prompt: 'go', timeoutMs: 1_000, logDir: dir, spawnFn: fakeCli('setInterval(() => {}, 1000)') }),
+  ).rejects.toThrow(/did not answer within 1000ms/);
 });
 
 test('an abort signal ends the turn at once', async () => {

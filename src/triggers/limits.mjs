@@ -44,9 +44,15 @@ export const MAX_TRIGGER_TURNS_PER_DAY = 100;
  * for a person, and queueing the rest behind it is the honest response to
  * "nobody has answered the first three yet".
  */
-export const MAX_CONCURRENT_TRIGGER_TURNS = 3;
+export const MAX_CONCURRENT_UNATTENDED_TURNS = 3;
+
+/** @deprecated The old name, from when triggers were the only unattended turns. A relay run's turns share the same ceiling, so the name no longer described what it counts. */
+export const MAX_CONCURRENT_TRIGGER_TURNS = MAX_CONCURRENT_UNATTENDED_TURNS;
 
 const HOUR_MS = 60 * 60 * 1000;
+
+/** Turn origins that count against the global ceilings: everything nobody typed. */
+const UNATTENDED_ORIGINS = new Set(['trigger', 'relay']);
 
 /** Midnight (local time) of the calendar day containing `now`, as epoch ms. */
 function startOfLocalDay(now) {
@@ -136,9 +142,9 @@ export function checkLimits({ dataDir, trigger, now = Date.now(), inFlightRuns =
  * MAX_TRIGGER_TURNS_PER_HOUR/_PER_DAY above for why it exists).
  *
  * Counted from the same runs.jsonl every other limit is derived from, over
- * `origin === 'trigger'` lines only: a user's own chat turns are never
- * throttled by this. A line without `origin` predates the field and is a user
- * turn by definition (see runs.mjs), so it does not count either.
+ * UNATTENDED lines only ('trigger' and 'relay'): a user's own chat turns are
+ * never throttled by this. A line without `origin` predates the field and is
+ * a user turn by definition (see runs.mjs), so it does not count either.
  */
 export function checkGlobalTriggerLimits({ dataDir, now = Date.now(), inFlightRuns = 0 }) {
   const dayStart = startOfLocalDay(now);
@@ -151,7 +157,11 @@ export function checkGlobalTriggerLimits({ dataDir, now = Date.now(), inFlightRu
   let turnsLastHour = inFlightRuns;
   let turnsToday = inFlightRuns;
   for (const run of readRuns(dataDir)) {
-    if (run.origin !== 'trigger') continue;
+    // 'relay' counts here too: a relay turn is an unattended turn that spends
+    // the same money on the same account, and a ceiling one kind of turn can
+    // walk around is not a ceiling. A user's own chat turns are still never
+    // throttled by this.
+    if (!UNATTENDED_ORIGINS.has(run.origin)) continue;
     const ts = Date.parse(run.ts);
     if (!Number.isFinite(ts)) continue;
     if (ts >= hourStart) turnsLastHour += 1;

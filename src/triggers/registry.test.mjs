@@ -474,3 +474,21 @@ test('load: a stored entry is normalized, so a missing optional field comes back
   writeRawTriggersFile([stored]);
   expect(openTriggers(tmpDir, { log: () => {} }).get('daily-checkin').config.checklistPath).toBe('CHECKLIST.md');
 });
+
+test('file-watch config: the relay directory is not a valid source', () => {
+  // A relay writes every handoff under <dataDir>/relay/. A watcher pointed
+  // there would fire on the relay's own output and start a turn that produces
+  // more of it: a loop with an extra hop, and one that would not look like a
+  // loop from the inside.
+  //
+  // The workspace guard above already makes this unreachable today, since
+  // relay/ is a sibling of workspace/ rather than a child. This check exists
+  // because that is a fact about the current directory layout rather than a
+  // decision anyone wrote down.
+  for (const badPath of ['relay', 'relay/run-1', 'RELAY/x']) {
+    expect(() => validateTrigger(validFileWatch({ config: { path: badPath } }))).toThrow(/relay directory/);
+  }
+  // A path that merely starts with the same letters is fine: this is about
+  // the directory, not about the word.
+  expect(() => validateTrigger(validFileWatch({ config: { path: 'relayers/notes' } }))).not.toThrow();
+});

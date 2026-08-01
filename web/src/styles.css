@@ -1537,3 +1537,82 @@ pre,
   padding: 0;
   width: fit-content;
 }
+
+/* Relay: the handoff loop between agents. Deliberately understated — it is a
+   record of work, not a dashboard. */
+.relay-panel {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.relay-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.relay-panel-title {
+  font-weight: 650;
+  font-size: 14px;
+}
+
+.relay-panel-status {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.relay-panel-form {
+  display: flex;
+  gap: 8px;
+}
+
+.event-relay {
+  border-left: 3px solid var(--accent);
+  padding: 8px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.event-relay-status {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.event-relay-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.event-relay-arrow {
+  color: var(--muted);
+}
+
+.event-relay-round,
+.event-relay-cost {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.event-relay-preview {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 13px;
+  max-height: 16em;
+  overflow: auto;
+}
+
+.event-relay-ref {
+  color: var(--muted);
+  font-size: 12px;
+}

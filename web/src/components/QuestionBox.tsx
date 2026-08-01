@@ -52,12 +52,18 @@ export function QuestionCard({
   onDismiss: (question: OpenQuestion) => void;
 }) {
   const asked = question.askedCount ?? 1;
+  // A relay gate is a different kind of decision from "may I run this tool":
+  // it asks whether two agents should keep going. Labelling it as such is the
+  // difference between a question a person can answer and one they have to
+  // decode.
+  const isRelayGate = question.kind === "relay.gate";
   const preview = previewLine(question);
   const truncated = (question.input as { _truncated?: boolean } | null)?._truncated === true;
 
   return (
     <div className="question-card">
       <div className="question-card-head">
+        {isRelayGate && <span className="badge">relay</span>}
         <span className="question-card-tool">{question.displayName ?? question.toolName ?? "a tool"}</span>
         {question.triggerId && <span className="badge badge-muted">{question.triggerId}</span>}
         <span className="question-card-age">{relativeTime(question.requestedAt, nowMs)}</span>
@@ -67,6 +73,7 @@ export function QuestionCard({
       </div>
 
       {asked > 1 && <div className="question-card-note">asked {asked} times</div>}
+      {isRelayGate && question.description && <div className="question-card-note">{question.description}</div>}
 
       <pre className={expanded ? "question-card-input question-card-input-open" : "question-card-input"}>{preview}</pre>
       {onToggleExpand && (
@@ -79,7 +86,7 @@ export function QuestionCard({
 
       <div className="question-card-actions">
         <button type="button" className="btn" disabled={busy} onClick={() => onDecide(question, "allow")}>
-          Approve &amp; run now
+          {isRelayGate ? "Run one more round" : "Approve & run now"}
         </button>
         <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onDecide(question, "deny")}>
           Deny

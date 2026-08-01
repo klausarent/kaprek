@@ -5,7 +5,7 @@
 // Note: `tool` events carry `input` already as a (possibly truncated) JSON
 // string, not an object — truncateEvent() in parse.mjs serializes before
 // truncating. `result` is a string or null (interrupted tool call).
-import type { ApprovalEvent, DigestEvent, SubagentThread, TextEvent, ToolEvent, SubagentEvent, CompactEvent } from "../lib/api";
+import type { ApprovalEvent, DigestEvent, RelayEvent, SubagentThread, TextEvent, ToolEvent, SubagentEvent, CompactEvent } from "../lib/api";
 
 function fmtTime(ts: string): string {
   const ms = Date.parse(ts);
@@ -51,9 +51,53 @@ export default function EventBlock({
       return <CompactBlock event={event} />;
     case "approval":
       return <ApprovalBlock event={event} />;
+    case "relay":
+      return <RelayBlock event={event} />;
     default:
       return <UnknownBlock event={event} />;
   }
+}
+
+/** One relay step. Reads as a line in the conversation, because that is what it is. */
+export function RelayBlock({ event }: { event: RelayEvent }) {
+  const round = event.round ? `round ${event.round}` : null;
+
+  if (event.eventType === "message") {
+    return (
+      <div className="event-relay">
+        <div className="event-relay-head">
+          <span className="badge">{event.from}</span>
+          <span className="event-relay-arrow">→</span>
+          <span className="badge badge-muted">{event.status ?? "handoff"}</span>
+          {round && <span className="event-relay-round">{round}</span>}
+          {/* Never a bare dollar figure: a subscription CLI's per-turn number
+              is derived from list prices nobody is actually paying. */}
+          {typeof event.costUsd === "number" && <span className="event-relay-cost">~${event.costUsd.toFixed(4)} (est.)</span>}
+        </div>
+        <pre className="event-relay-preview">{event.textPreview ?? ""}</pre>
+        {event.bodyRef && <div className="event-relay-ref">full text: {event.bodyRef}</div>}
+      </div>
+    );
+  }
+
+  const label = {
+    "run.created": `Relay run started: ${event.goal ?? ""}`,
+    "dispatch.started": `handing off to ${event.to ?? "?"}`,
+    "dispatch.failed": `the handoff to ${event.to ?? "?"} failed: ${event.reason ?? ""}`,
+    "gate.requested": "waiting for you: one more round?",
+    "gate.resolved": "approved — one more round",
+    "run.completed": "Relay run finished",
+    "run.stopped": `Relay run stopped: ${event.reason ?? ""}`,
+    "run.interrupted": `Relay run interrupted: ${event.reason ?? ""}`,
+  }[event.eventType];
+
+  return (
+    <div className="event-relay event-relay-status">
+      <span className="badge badge-muted">relay</span>
+      <span>{label}</span>
+      {round && <span className="event-relay-round">{round}</span>}
+    </div>
+  );
 }
 
 function UnknownBlock({ event }: { event: { kind: string; ts?: string } }) {

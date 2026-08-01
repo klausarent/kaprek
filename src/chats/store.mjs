@@ -76,13 +76,44 @@ const EVENT_SHAPES = {
     required: ['requestId', 'toolName', 'phase'],
     optional: ['displayName', 'input', 'description', 'agentId', 'toolUseId', 'reasonType', 'reason', 'suggestions', 'behavior', 'message'],
   },
+  // One step of an agent-to-agent handoff (see src/relay/dispatcher.mjs).
+  // Deliberately a chat event and not a store of its own: a relay run IS a
+  // conversation, it belongs in the same append-only log as the turns around
+  // it, and it gets the search index and the thread view for free. `eventType`
+  // is the discriminator; the rest is optional because a run.created and a
+  // message carry very different fields.
+  relay: {
+    required: ['eventType', 'runId'],
+    optional: [
+      'from',
+      'to',
+      'round',
+      'turn',
+      'textPreview',
+      // The body lives in a file under the run's artifact directory, never in
+      // this line: a relay payload can be dozens of drafts, and an event log
+      // that has to be replayed on every open is the wrong place for it.
+      'bodyRef',
+      'bodySha256',
+      'driver',
+      'driverVersion',
+      'costUsd',
+      'costEstimated',
+      'status',
+      'reason',
+      'goal',
+      'route',
+      'dispatchId',
+      'approvalKey',
+    ],
+  },
 };
 export const EVENT_KINDS = Object.keys(EVENT_SHAPES);
 
 // A chat's origin: 'user' for a normal chat turn, 'trigger' for one started
 // by src/triggers/runner.mjs without any user input (see createChat()'s
 // origin/triggerId/silent params below).
-const CHAT_ORIGINS = ['user', 'trigger'];
+const CHAT_ORIGINS = ['user', 'trigger', 'relay'];
 
 function eventsPathFor(dataDir, chatId) {
   return path.join(dataDir, 'chats', chatId, 'events.jsonl');
@@ -137,6 +168,13 @@ function applyEvent(chat, wrapper) {
       chat.eventCount = chat.events.length;
       chat.updatedAt = ts;
       break;
+    case 'chat.relay':
+      // The run's own state, kept on the chat so a reader knows what is going
+      // on without replaying every relay event. Written whenever the
+      // dispatcher advances the run.
+      chat.relay = data.relay ?? null;
+      chat.updatedAt = ts;
+      break;
     case 'chat.silent':
       // Flips visibility after the fact — see setSilent()'s doc comment:
       // src/triggers/runner.mjs uses this once a heartbeat turn's own
@@ -184,6 +222,7 @@ function summarize(chat) {
     origin: chat.origin ?? 'user',
     triggerId: chat.triggerId ?? null,
     silent: chat.silent ?? false,
+    relay: chat.relay ?? null,
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
     eventCount: chat.eventCount,
@@ -205,7 +244,7 @@ export function openChats(dataDir) {
     for (const entry of fs.readdirSync(chatsDir, { withFileTypes: true })) {
       if (!entry.isDirectory()) continue;
       const chatId = entry.name;
-      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
       for (const wrapper of loadEvents(eventsPathFor(dataDir, chatId))) {
         applyEvent(chat, wrapper);
       }
@@ -256,7 +295,7 @@ export function openChats(dataDir) {
         throw new InvalidChatMetaError('silent', 'must be a boolean');
       }
       const chatId = crypto.randomUUID();
-      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
+      const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
       commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent });
       chats.set(chatId, chat);
       return summarize(chat);
@@ -296,6 +335,25 @@ export function openChats(dataDir) {
         throw new InvalidChatMetaError('silent', 'must be a boolean');
       }
       commit(chatId, chat, 'chat.silent', { silent });
+      return summarize(chat);
+    },
+
+    /**
+     * Records the state of the relay run this chat is hosting (see
+     * src/relay/dispatcher.mjs). Same append-only treatment as setSilent
+     * above: the run advances after the chat exists, so its state arrives as
+     * further lines rather than as a rewrite.
+     *
+     * Kept as one opaque object rather than a set of columns because the
+     * dispatcher owns its shape, and this store's job here is to persist and
+     * replay it, not to have an opinion about rounds and vouchers.
+     */
+    setRelay(chatId, relay) {
+      const chat = requireChat(chatId);
+      if (relay !== null && (typeof relay !== 'object' || Array.isArray(relay))) {
+        throw new InvalidChatMetaError('relay', 'must be an object or null');
+      }
+      commit(chatId, chat, 'chat.relay', { relay: relay === null ? null : clone(relay) });
       return summarize(chat);
     },
   };

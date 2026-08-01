@@ -137,6 +137,20 @@ function validateFileWatchConfig(config) {
     throw err;
   }
 
+  // A relay writes every handoff to <dataDir>/relay/ (see
+  // src/relay/dispatcher.mjs). A watcher pointed there would fire on the
+  // relay's own output and start a turn that produces more of it: a loop with
+  // an extra hop, and one nobody would recognise as a loop while watching it.
+  //
+  // Today the workspace guard above already makes this unreachable, because
+  // relay/ is a sibling of workspace/ rather than a child. This check exists
+  // anyway, because that is a fact about the current directory layout and not
+  // a decision anyone wrote down - move the artifacts under the workspace one
+  // day and the protection would disappear silently.
+  if (/^relay(\/|\\|$)/i.test(config.path.trim().replace(/^\.\//, ''))) {
+    fail('config.path', 'must not watch the relay directory: a trigger firing on relay output would loop through it');
+  }
+
   let events = FILE_WATCH_EVENTS;
   if (config.events !== undefined) {
     if (!Array.isArray(config.events) || config.events.length === 0 || !config.events.every((e) => FILE_WATCH_EVENTS.includes(e))) {

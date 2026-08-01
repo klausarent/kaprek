@@ -29,7 +29,7 @@ import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 import { isAskCoverageGap } from '../harness/claude-code.mjs';
 import { APPROVAL_INBOX_TTL_MS, canonicalInput } from '../server/approval-store.mjs';
-import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_TRIGGER_TURNS } from './limits.mjs';
+import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_UNATTENDED_TURNS } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -1398,8 +1398,8 @@ export function createTriggerRunner({
       // as long as its window is open. A schedule slot whose window closes
       // while the cap is full is genuinely missed, and the log says so rather
       // than pretending it ran.
-      if (runningIds.size >= MAX_CONCURRENT_TRIGGER_TURNS) {
-        log(`trigger ${trigger.id}: deferred (${runningIds.size} trigger turns already running, cap ${MAX_CONCURRENT_TRIGGER_TURNS})`);
+      if (runningIds.size >= MAX_CONCURRENT_UNATTENDED_TURNS) {
+        log(`trigger ${trigger.id}: deferred (${runningIds.size} trigger turns already running, cap ${MAX_CONCURRENT_UNATTENDED_TURNS})`);
         continue;
       }
       const cause = { origin: trigger.type };
@@ -1484,7 +1484,7 @@ export function createTriggerRunner({
    */
   function canStartFollowUp(chatId) {
     if (isChatRunning(chatId)) return { allowed: false, reason: 'a turn is already running in this chat' };
-    if (runningIds.size >= MAX_CONCURRENT_TRIGGER_TURNS) {
+    if (runningIds.size >= MAX_CONCURRENT_UNATTENDED_TURNS) {
       return { allowed: false, reason: `${runningIds.size} trigger turns are already running` };
     }
     return { allowed: true, reason: null };

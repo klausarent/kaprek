@@ -12,8 +12,10 @@ import {
   toDigestEvent,
   type ChatStreamEvent,
   type DigestEvent,
+  type RelayRun,
 } from "../lib/api";
 import { upsertQuestion } from "../lib/questions";
+import RelayPanel from "../components/RelayPanel";
 import {
   addApproval,
   buildApprovalAnswer,
@@ -62,6 +64,11 @@ type TurnSummary = {
 
 export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
   const [chatId, setChatId] = useState<string | undefined>(initialChatId);
+  // The relay run this chat hosts, if any. Reloaded on demand rather than
+  // polled: it changes when the operator does something (start, stop, answer
+  // a gate), and those are the moments this component already re-renders.
+  const [relay, setRelay] = useState<RelayRun | null>(null);
+  const [relayReloads, setRelayReloads] = useState(0);
   const [events, setEvents] = useState<DigestEvent[]>([]);
   const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
@@ -98,12 +105,13 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
     if (!initialChatId) return;
     setLoadError(null);
     fetchChat(initialChatId)
-      .then(({ events: stored }) => {
+      .then(({ chat, events: stored }) => {
         setChatId(initialChatId);
         setEvents(stored.map(toDigestEvent));
+        setRelay(chat?.relay ?? null);
       })
       .catch((e) => setLoadError((e as Error).message));
-  }, [initialChatId]);
+  }, [initialChatId, relayReloads]);
 
   useEffect(() => {
     eventsEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -341,6 +349,9 @@ export default function Chat({ chatId: initialChatId }: { chatId?: string }) {
           </a>
         </p>
       </header>
+
+      {/* Only on a chat that exists: a relay run needs somewhere to write. */}
+      {chatId && <RelayPanel chatId={chatId} relay={relay} onChanged={() => setRelayReloads((n) => n + 1)} />}
 
       {loadError && <div className="error-box">{loadError}</div>}
 

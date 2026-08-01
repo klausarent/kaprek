@@ -34,6 +34,9 @@ import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
 import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
+import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUNDS_PER_GATE } from '../relay/dispatcher.mjs';
+import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
+import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
 import {
@@ -980,7 +983,7 @@ function cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore = null)
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -1009,6 +1012,10 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
     // later and across a restart. Answering one is not "resolving a promise",
     // it is a decision plus, for an allow, a fresh turn that runs the action.
     const filed = approvalStore ? await approvalStore.get(key) : null;
+    if (filed?.kind === RELAY_GATE_KIND && filed.status === 'pending') {
+      await decideRelayGate(res, { key, entry: filed, behavior, approvalStore, getRelay });
+      return;
+    }
     if (filed?.mode === 'deferred' && filed.status === 'pending') {
       await decideDeferredApproval(res, { key, entry: filed, behavior, message: body.data?.message, approvalStore, getRunner });
       return;
@@ -1097,6 +1104,152 @@ async function decideDeferredApproval(res, { key, entry, behavior, message, appr
 }
 
 /**
+ * Answers a relay gate: one more round, or the run stops.
+ *
+ * The approval carries the hashes the run had when it asked (see
+ * dispatcher.mjs::participantsHashOf). They are handed back rather than
+ * recomputed here, so the dispatcher can check that the run it is about to
+ * continue is still the run the operator saw. An approval is a statement
+ * about a specific run at a specific moment, and this is what keeps it from
+ * being spent on a different one.
+ */
+async function decideRelayGate(res, { key, entry, behavior, approvalStore, getRelay }) {
+  const relay = getRelay ? getRelay() : null;
+  if (!relay) {
+    sendJson(res, 503, { error: 'the relay is not available in this server' });
+    return;
+  }
+
+  if (behavior === 'deny') {
+    try {
+      await approvalStore.decide(key, { behavior: 'deny', message: 'the operator stopped the run' });
+      await relay.denyGate({ chatId: entry.chatId, reason: 'the operator stopped the run at the gate' });
+    } catch (err) {
+      sendJson(res, 409, { error: err.message });
+      return;
+    }
+    sendJson(res, 200, { ok: true, relay: 'stopped' });
+    return;
+  }
+
+  try {
+    await approvalStore.decide(key, { behavior: 'allow' });
+  } catch (err) {
+    sendJson(res, 409, { error: err.message });
+    return;
+  }
+
+  try {
+    await relay.resumeAfterGate({
+      chatId: entry.chatId,
+      voucher: { participantsHash: entry.participantsHash, budgetSnapshotHash: entry.budgetSnapshotHash, approvalKey: key },
+    });
+  } catch (err) {
+    // The voucher was recorded as spent but could not be redeemed - almost
+    // always because the run changed shape in between. Say so rather than
+    // reporting a success the run did not have.
+    sendJson(res, 409, { error: err.message });
+    return;
+  }
+  sendJson(res, 200, { ok: true, relay: 'resumed' });
+}
+
+/**
+ * Reads a relay answer out of what a Claude turn said.
+ *
+ * The peers are constrained by a JSON schema; the local Claude harness is not,
+ * so its answer is parsed here — leniently about wrapping (a fenced block is
+ * still an answer) and strictly about content. An answer that cannot be read
+ * counts as `needs_human`: the run parks at a gate with the text attached
+ * rather than guessing what the reviewer meant, because the alternative is a
+ * loop steered by a misread word.
+ */
+export function parseRelayAnswer(text, result = {}) {
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(text ?? '');
+  const candidate = (fenced ? fenced[1] : text ?? '').trim();
+  try {
+    const parsed = JSON.parse(candidate);
+    if (['handoff', 'done', 'needs_human'].includes(parsed?.status) && typeof parsed?.message === 'string') {
+      return { status: parsed.status, message: parsed.message, usage: result.usage ?? null, costUsd: result.costUsd ?? null, durationMs: 0, rawLogPath: null };
+    }
+  } catch {
+    // falls through to the honest answer below
+  }
+  return {
+    status: 'needs_human',
+    message: text && text.trim().length > 0 ? text : '(the reviewer produced no readable answer)',
+    usage: result.usage ?? null,
+    costUsd: result.costUsd ?? null,
+    durationMs: 0,
+    rawLogPath: null,
+  };
+}
+
+/**
+ * POST /api/chat/<id>/relay — starts a relay run on that chat.
+ *
+ * A human starts a run, always. There is deliberately no way for a trigger to
+ * start one: a scheduled job that can start an agent-to-agent loop is exactly
+ * the shape of thing that runs all night without anyone deciding it should.
+ */
+async function handleRelayStart(req, res, chatId, { getRelay, getRunner }) {
+  if (!CHAT_ID_RE.test(chatId)) {
+    sendJson(res, 400, { error: 'invalid chat id' });
+    return;
+  }
+  const relay = getRelay ? getRelay() : null;
+  if (!relay) {
+    sendJson(res, 503, { error: 'the relay is not available in this server' });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const goal = body.data?.goal;
+  if (typeof goal !== 'string' || goal.trim().length === 0) {
+    sendJson(res, 400, { error: 'goal is required' });
+    return;
+  }
+  const route = Array.isArray(body.data?.route) && body.data.route.length > 0 ? body.data.route : [...RELAY_DEFAULT_ROUTE];
+  const maxRounds = Number.isInteger(body.data?.maxRounds) && body.data.maxRounds > 0 ? body.data.maxRounds : RELAY_ROUNDS_PER_GATE;
+
+  // Same busy rule a chat turn gets: one conversation, one thing writing into
+  // it at a time.
+  if (getRunner && getRunner().isChatRunning(chatId)) {
+    sendJson(res, 409, { error: 'chat busy: a turn is already running in this chat' });
+    return;
+  }
+
+  try {
+    const started = await relay.startRun({ chatId, goal, route, maxRounds });
+    sendJson(res, 200, { runId: started.runId, status: started.status, route: started.route, maxRounds: started.maxRounds });
+  } catch (err) {
+    sendJson(res, 409, { error: err.message });
+  }
+}
+
+/** POST /api/relay/<runId>/stop — ends a run where it stands. */
+async function handleRelayStop(res, runId, { getRelay }) {
+  if (!isSafeId(runId)) {
+    sendJson(res, 400, { error: 'invalid run id' });
+    return;
+  }
+  const relay = getRelay ? getRelay() : null;
+  if (!relay) {
+    sendJson(res, 503, { error: 'the relay is not available in this server' });
+    return;
+  }
+  const result = await relay.stopRun(runId, 'stopped by the operator');
+  if (!result.stopped) {
+    sendJson(res, 404, { error: result.reason ?? 'unknown run' });
+    return;
+  }
+  sendJson(res, 200, { ok: true });
+}
+
+/**
  * GET /api/approvals — the inbox: every question this process is still
  * waiting on, oldest first. This is the half an SSE frame cannot cover: a
  * frame only reaches whoever was connected at the moment it was pushed, so a
@@ -1136,6 +1289,10 @@ async function handleApprovalsList(res, approvalStore) {
     // follow-up turn. 'interactive' ones belong to a live dialog and are
     // already on screen wherever they matter.
     mode: entry.mode ?? 'interactive',
+    // What sort of question this is: a tool-use approval, or a relay gate
+    // (see relay/dispatcher.mjs). The UI needs it to label the card, and a
+    // gate is answered through a different path on the way back in.
+    kind: entry.kind ?? null,
     triggerId: entry.triggerId ?? null,
     // How often the trigger has asked this same question (see the store's
     // dedupe). Worth showing: a question asked five times is a different kind
@@ -1187,6 +1344,7 @@ async function handleChatTurn(
     chatAbsoluteTimeoutMs = CHAT_ABSOLUTE_TIMEOUT_MS,
     approvalStore,
     getRunner,
+    isRelayChatRunning,
     chatSseQueues,
     approvalStreams,
     describeSource,
@@ -1239,6 +1397,10 @@ async function handleChatTurn(
   // inbox made possible, so this stopped being a theoretical race.
   if (getRunner && getRunner().isChatRunning(chatId)) {
     sendJson(res, 409, { error: 'chat busy: a trigger turn is running in this chat' });
+    return;
+  }
+  if (isRelayChatRunning && isRelayChatRunning(chatId)) {
+    sendJson(res, 409, { error: 'chat busy: a relay run is handing off in this chat' });
     return;
   }
 
@@ -1800,6 +1962,8 @@ async function handleRequest(
     approvalTimeoutMs,
     chatAbsoluteTimeoutMs,
     getApprovalStore,
+    getRelay,
+    isRelayChatRunning,
     getTriggers,
     getRunner,
     chatSseQueues,
@@ -1883,6 +2047,25 @@ async function handleRequest(
       await handleBoardRoutes(req, res, getBoard, segments, url, dataDir);
       return;
     }
+    if (segments.length === 4 && segments[1] === 'chat' && segments[3] === 'relay') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleRelayStart(req, res, segments[2], { getRelay, getRunner });
+      return;
+    }
+    if (segments.length === 4 && segments[1] === 'relay' && segments[3] === 'stop') {
+      if (req.method !== 'POST') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleRelayStop(res, segments[2], { getRelay });
+      return;
+    }
+    // Before the chat routes below: /api/chat/<id>/relay is a relay route
+    // that happens to live under a chat's path, and handleChatRoutes would
+    // otherwise answer 404 for it.
     if (segments[1] === 'chat') {
       await handleChatRoutes(req, res, segments, url, {
         getChats,
@@ -1897,6 +2080,7 @@ async function handleRequest(
         chatAbsoluteTimeoutMs,
         approvalStore: getApprovalStore(),
         getRunner,
+        isRelayChatRunning,
         chatSseQueues,
         approvalStreams,
         describeSource,
@@ -1912,7 +2096,7 @@ async function handleRequest(
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner);
+      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay);
       return;
     }
     if (segments.length === 2 && segments[1] === 'approvals') {
@@ -2009,6 +2193,10 @@ export function startServer({
   // make the clock the nearer of the two limits; the default is exactly what
   // the harness would have used anyway.
   chatAbsoluteTimeoutMs = CHAT_ABSOLUTE_TIMEOUT_MS,
+  // How the relay finds its peer CLIs. Overridable so a test can hand it
+  // stubs: a relay test that resolved the real drivers would spawn real,
+  // billed CLIs, which is not something a test suite gets to do.
+  getPeerDriver = getRegisteredPeerDriver,
   bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
@@ -2190,6 +2378,72 @@ export function startServer({
     return runner;
   }
 
+  // The relay dispatcher, opened lazily like everything else here. It is
+  // wired to the SAME limits the triggers answer to: its turns count against
+  // the shared unattended ceiling, and its chats count as busy, because a
+  // relay turn spends the same money on the same account and writes into the
+  // same transcripts. A second budget for a second kind of unattended turn
+  // would be a ceiling with a door in it.
+  let relay = null;
+  function getRelay() {
+    if (!relay) {
+      relay = createRelayDispatcher({
+        dataDir,
+        getChats,
+        approvalStore: getApprovalStore(),
+        getPeerDriver,
+        canStartTurn: () => {
+          const runner = getRunner();
+          return runner.canStartFollowUp('relay');
+        },
+        onTurnStart: (chatId) => relayChatIds.add(chatId),
+        onTurnEnd: (chatId) => relayChatIds.delete(chatId),
+        // The relay's Claude turns run through the ordinary harness, with no
+        // tools at all: in v1 Claude is here to READ the other agent's text
+        // and say what is wrong with it. Anything that acts on the world goes
+        // through the approval path, and an unattended review turn is not the
+        // place to open that door.
+        runClaudeTurn: async ({ chatId, prompt, signal }) => {
+          const result = await runTurn({
+            dataDir,
+            chatId,
+            text: prompt,
+            harness,
+            harnessName,
+            cwd: workspaceDir,
+            permissionMode,
+            allowedTools: [],
+            absoluteTimeoutMs: chatAbsoluteTimeoutMs,
+            signal,
+            origin: 'relay',
+            silent: false,
+          });
+          if (result.error) throw new Error(result.error.message);
+          const text = lastAssistantText(chatId);
+          return parseRelayAnswer(text, result);
+        },
+        log: (message) => console.log(message),
+      });
+    }
+    return relay;
+  }
+
+  // Chats a relay turn is writing into right now. Same job as the runner's
+  // own set: a chat is one conversation, so a typed turn must not land in the
+  // middle of a handoff.
+  const relayChatIds = new Set();
+
+  /** The last thing the assistant said in this chat — a relay turn's actual output. */
+  function lastAssistantText(chatId) {
+    try {
+      const events = getChats().events(chatId);
+      const last = [...events].reverse().find((event) => event.kind === 'assistant');
+      return last?.text ?? '';
+    } catch {
+      return '';
+    }
+  }
+
   // One AbortController per chat with an in-flight turn, keyed by chatId —
   // lets POST /api/chat/<id>/cancel reach across requests to interrupt the
   // SSE request currently streaming that chat's turn.
@@ -2252,6 +2506,8 @@ export function startServer({
       approvalTimeoutMs,
       chatAbsoluteTimeoutMs,
       getApprovalStore,
+      getRelay,
+      isRelayChatRunning: (chatId) => relayChatIds.has(chatId),
       getTriggers,
       getRunner,
       chatSseQueues,

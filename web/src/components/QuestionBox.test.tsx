@@ -68,6 +68,25 @@ test("a card offers approve, deny and dismiss, and dismiss is not one of the dec
   expect(onDecide).toHaveBeenCalledTimes(2);
 });
 
+test("a relay gate reads as a relay decision, not as a tool-use question", () => {
+  // The two are answered by the same route and shown in the same box, but
+  // they ask completely different things: one is "may this tool run", the
+  // other is "should these two agents keep going".
+  const gate = question({
+    kind: "relay.gate",
+    displayName: "Relay: write the batch",
+    description: 'Relay "write the batch": 2 of 2 rounds done. Approve one more round, or deny to stop the run.',
+  });
+  const text = textOf(render(<QuestionCard question={gate} nowMs={NOW} onDecide={() => {}} onDismiss={() => {}} />));
+
+  expect(text).toContain("relay");
+  expect(text).toContain("write the batch");
+  expect(text).toContain("2 of 2 rounds done");
+  // The button says what pressing it does here.
+  expect(text).toContain("Run one more round");
+  expect(text).not.toContain("Approve & run now");
+});
+
 test("a card that was asked more than once says so", () => {
   const text = textOf(render(<QuestionCard question={question({ askedCount: 4 })} nowMs={NOW} onDecide={() => {}} onDismiss={() => {}} />));
   expect(text).toContain("asked 4 times");
