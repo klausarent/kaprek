@@ -3542,3 +3542,120 @@ test('repeats: a request typed three times is offered as an automation, twice is
   expect(repeats[0].count).toBe(3);
   expect(repeats[0].sample).toContain('deployment logs');
 }, 30_000);
+
+// --- plans: guided planning's own routes (Klaus, 02.08.: "man findet den Plan
+// unter einem eigenen Bereich des Projektes wieder") ---
+
+test('plans: an empty workspace lists nothing rather than erroring', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/plans`);
+  expect(res.status).toBe(200);
+  expect((await res.json()).plans).toEqual([]);
+});
+
+test('plans: a plan written in the data dir is listed, read, and ticked over HTTP', async () => {
+  const { url } = await boot();
+  const planDir = path.join(dataDir, 'workspace', 'plans');
+  fs.mkdirSync(planDir, { recursive: true });
+  const planFile = path.join(planDir, '2026-08-02-idea.md');
+  fs.writeFileSync(planFile, '# The idea\n\n- [ ] First step\n- [ ] Second step\n', 'utf8');
+
+  // Registration happens through a turn; here we reach the same store the
+  // route uses by registering through the route's own data dir.
+  const { openPlans } = await import('../plans/store.mjs');
+  const registered = openPlans(dataDir).register({ path: planFile });
+
+  const list = await fetch(`${url}/api/plans`);
+  expect((await list.json()).plans[0].title).toBe('The idea');
+
+  const detail = await fetch(`${url}/api/plans/${registered.id}`);
+  const { plan } = await detail.json();
+  expect(plan.path).toBe(path.resolve(planFile));
+  expect(plan.steps.map((s) => s.text)).toEqual(['First step', 'Second step']);
+
+  const ticked = await fetch(`${url}/api/plans/${registered.id}/step`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ index: 1, done: true }),
+  });
+  expect(ticked.status).toBe(200);
+  expect(fs.readFileSync(planFile, 'utf8')).toContain('- [x] Second step');
+  expect(fs.readFileSync(planFile, 'utf8')).toContain('- [ ] First step');
+});
+
+test('plans: bad step arguments are refused, and a vanished step is a 409', async () => {
+  const { url } = await boot();
+  const planDir = path.join(dataDir, 'workspace', 'plans');
+  fs.mkdirSync(planDir, { recursive: true });
+  const planFile = path.join(planDir, 'p.md');
+  fs.writeFileSync(planFile, '# P\n\n- [ ] Only step\n', 'utf8');
+  const { openPlans } = await import('../plans/store.mjs');
+  const registered = openPlans(dataDir).register({ path: planFile });
+
+  for (const body of [{ index: -1, done: true }, { index: 'first', done: true }, { index: 0, done: 'yes' }]) {
+    const res = await fetch(`${url}/api/plans/${registered.id}/step`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify(body) });
+    expect(res.status).toBe(400);
+  }
+
+  const gone = await fetch(`${url}/api/plans/${registered.id}/step`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ index: 7, done: true }) });
+  expect(gone.status).toBe(409);
+
+  const missing = await fetch(`${url}/api/plans/does-not-exist`);
+  expect(missing.status).toBe(404);
+});
+
+test('plans: a deleted plan file answers 410 instead of pretending', async () => {
+  const { url } = await boot();
+  const planFile = path.join(dataDir, 'workspace', 'plans', 'doomed.md');
+  fs.mkdirSync(path.dirname(planFile), { recursive: true });
+  fs.writeFileSync(planFile, '# Doomed\n\n- [ ] step\n', 'utf8');
+  const { openPlans } = await import('../plans/store.mjs');
+  const registered = openPlans(dataDir).register({ path: planFile });
+  fs.rmSync(planFile);
+
+  const res = await fetch(`${url}/api/plans/${registered.id}`);
+  expect(res.status).toBe(410);
+});
+
+test('chat turn: an unknown guided mode is a 400 before any SSE byte is written', async () => {
+  const { url } = await boot({ harness: { startTurn: async () => ({ sessionId: 's', costUsd: null, usage: null, stopReason: 'result', error: null }) } });
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'plan something', mode: 'freestyle' }),
+  });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toContain('invalid mode');
+});
+
+test('chat turn: a guided turn registers the plan the agent wrote and reports it', async () => {
+  let seenPath = null;
+  const harness = {
+    startTurn: async (options) => {
+      // The agent writes exactly where kaprek told it to.
+      seenPath = /kaprek guided planning[\s\S]*?\n\n {2}(.+)\n/.exec(options.appendSystemPrompt ?? '')?.[1]?.trim() ?? null;
+      if (seenPath) {
+        fs.mkdirSync(path.dirname(seenPath), { recursive: true });
+        fs.writeFileSync(seenPath, '# Newsletter generator\n\n- [ ] First step\n', 'utf8');
+      }
+      options.onEvent({ type: 'text', text: 'Plan written.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'write the plan for the newsletter generator', mode: 'plan' }),
+  });
+  const frames = await readSse(res);
+  const complete = frames.find((f) => f.type === 'turn-complete');
+  expect(complete.guided.mode).toBe('plan');
+  expect(complete.guided.plan.title).toBe('Newsletter generator');
+  expect(complete.guided.protocolBroken).toBe(false);
+
+  const listed = await (await fetch(`${url}/api/plans`)).json();
+  expect(listed.plans).toHaveLength(1);
+  expect(path.isAbsolute(listed.plans[0].path)).toBe(true);
+});

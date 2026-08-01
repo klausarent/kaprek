@@ -43,6 +43,8 @@ import { loadPresets } from '../missions/presets.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
+import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError } from '../plans/store.mjs';
+import { planPathFor, PLAN_MODES } from '../plans/prompt.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
@@ -1380,6 +1382,91 @@ function missionErrorStatus(err) {
  * a lazy singleton like `getBoard()` — the mission store is only ever
  * written through these routes, so one cached projection stays truthful.
  */
+/**
+ * Plan routes: /api/plans, /api/plans/<id>, /api/plans/<id>/step.
+ *
+ * A plan is a markdown file somewhere on the disk that kaprek knows the
+ * absolute path of. These routes are what turn that into something a person
+ * can click — the whole point of the feature (Klaus: "Hier muss man immer
+ * erst den Ordner öffnen und selber durchklicken, weil du niemals absolute
+ * Pfade mit schickst").
+ *
+ * Every error the store raises maps to a status rather than a 500: a plan
+ * outside the allowed roots is 403 and says so, a file that is gone is 410,
+ * and a step that no longer exists is 409 (the file changed underneath the
+ * open page, which is a real thing to tell the user about).
+ */
+async function handlePlanRoutes(req, res, segments, { getPlans }) {
+  const plans = getPlans();
+
+  const fail = (err) => {
+    if (err instanceof PlanNotFoundError) return sendJson(res, 404, { error: 'plan not found' });
+    if (err instanceof PlanOutsideRootError) return sendJson(res, 403, { error: 'that path is outside every directory kaprek may touch' });
+    if (err instanceof PlanFileMissingError) return sendJson(res, 410, { error: 'the plan file is gone' });
+    if (err instanceof RangeError) return sendJson(res, 409, { error: 'that step no longer exists — the file changed' });
+    throw err;
+  };
+
+  // /api/plans
+  if (segments.length === 2) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const url = new URL(req.url, 'http://127.0.0.1');
+    const missionId = url.searchParams.get('missionId');
+    const chatId = url.searchParams.get('chatId');
+    sendJson(res, 200, {
+      plans: plans.list({ ...(missionId ? { missionId } : {}), ...(chatId ? { chatId } : {}) }),
+    });
+    return;
+  }
+
+  // /api/plans/<id>
+  if (segments.length === 3) {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    try {
+      sendJson(res, 200, { plan: plans.read(segments[2]) });
+    } catch (err) {
+      fail(err);
+    }
+    return;
+  }
+
+  // /api/plans/<id>/step
+  if (segments.length === 4 && segments[3] === 'step') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    const { index, done } = body.data ?? {};
+    if (!Number.isInteger(index) || index < 0) {
+      sendJson(res, 400, { error: 'index must be a non-negative integer' });
+      return;
+    }
+    if (typeof done !== 'boolean') {
+      sendJson(res, 400, { error: 'done must be a boolean' });
+      return;
+    }
+    try {
+      sendJson(res, 200, { plan: plans.setStep(segments[2], index, done) });
+    } catch (err) {
+      fail(err);
+    }
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
 async function handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore }) {
   const missions = getMissions();
 
@@ -1593,6 +1680,16 @@ async function handleChatTurn(
     return;
   }
 
+  // A guided mode for this turn: 'brainstorm' asks through quiz cards,
+  // 'plan' writes the plan file. Refused here rather than passed on, so a
+  // typo can never leave the user believing a turn was guided when it ran
+  // like any other.
+  const mode = body.data?.mode ?? null;
+  if (mode !== null && !PLAN_MODES.includes(mode)) {
+    sendJson(res, 400, { error: `invalid mode (${PLAN_MODES.join(' | ')})` });
+    return;
+  }
+
   let chatId = body.data?.chatId;
   let chatEngine;
   if (chatId !== undefined) {
@@ -1751,6 +1848,11 @@ async function handleChatTurn(
       permissionMode,
       approvalMode,
       ...(effort ? { effort } : {}),
+      // The plan's destination is decided HERE, before the turn, and handed
+      // to the agent as an instruction — never asked for afterwards. That
+      // inversion is the fix for the original complaint: a path nobody has
+      // to reconstruct from a sentence.
+      ...(mode ? { mode, planPath: planPathFor({ cwd: turnCwd ?? null, dataDir, topic: text, ts: new Date().toISOString() }) } : {}),
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so
@@ -2247,6 +2349,7 @@ async function handleRequest(
     importSqlite,
     getBoard,
     getMissions,
+    getPlans,
     tmpRoot,
     getChats,
     harness,
@@ -2346,6 +2449,10 @@ async function handleRequest(
     }
     if (segments[1] === 'missions') {
       await handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore });
+      return;
+    }
+    if (segments[1] === 'plans') {
+      await handlePlanRoutes(req, res, segments, { getPlans });
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {
@@ -2574,6 +2681,22 @@ export function startServer({
   function getMissions() {
     if (!missionStore) missionStore = openMissions(dataDir);
     return missionStore;
+  }
+
+  // Plans are re-opened per call rather than cached, for the same reason
+  // getChats() is (below): runTurn registers a plan through its OWN store
+  // instance the moment an agent writes one, so a cached projection here
+  // would miss it.
+  //
+  // The allowed roots are evaluated per access, never captured: a plan may
+  // live in kaprek's own data dir or in a mission's working directory, and
+  // missions come and go while the server runs. Everything else on the disk
+  // is off limits — see openPlans' own doc comment for why that check also
+  // runs on reads and writes, not just on registration.
+  function getPlans() {
+    return openPlans(dataDir, {
+      allowedRoots: () => [dataDir, ...getMissions().list().map((mission) => mission.cwd).filter(Boolean)],
+    });
   }
 
   // Unlike getBoard() above, this deliberately does NOT cache one openChats()
@@ -2850,6 +2973,7 @@ export function startServer({
       importSqlite,
       getBoard,
       getMissions,
+      getPlans,
       tmpRoot,
       getChats,
       harness,
