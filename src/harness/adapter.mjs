@@ -195,3 +195,42 @@ export function isApprovalRequest(request) {
   if (!request || typeof request !== 'object') return false;
   return 'id' in request && 'toolName' in request && 'input' in request;
 }
+
+/**
+ * @typedef {Object} HarnessCapabilities
+ * What one engine can HONESTLY do — declared up front so a caller (or a UI)
+ * can see the differences before picking, instead of discovering them as
+ * silently-ignored options mid-turn.
+ * @property {string} id - registry id, e.g. 'claude-code', 'codex'
+ * @property {string} displayName - what a human sees in a picker
+ * @property {boolean} supportsCostUsd - a real USD figure per turn (codex reports tokens only)
+ * @property {boolean} supportsUpdatedInput - an 'allow' decision may rewrite the tool input
+ * @property {boolean} supportsAllowedTools - the allowedTools option reaches the CLI
+ * @property {boolean} supportsMcpConfig - the mcpConfigPath option reaches the CLI
+ * @property {boolean} supportsSettingsPath - the settingsPath option reaches the CLI
+ */
+
+/** The full key set a HarnessCapabilities declaration must carry. */
+const CAPABILITY_KEYS = Object.freeze([
+  'id',
+  'displayName',
+  'supportsCostUsd',
+  'supportsUpdatedInput',
+  'supportsAllowedTools',
+  'supportsMcpConfig',
+  'supportsSettingsPath',
+]);
+
+/**
+ * Structural check for a HarnessCapabilities declaration: every key present,
+ * booleans actually boolean. A missing key is a lie by omission — the whole
+ * point of the declaration is that absence is impossible.
+ */
+export function isHarnessCapabilities(capabilities) {
+  if (!capabilities || typeof capabilities !== 'object') return false;
+  for (const key of CAPABILITY_KEYS) {
+    if (!(key in capabilities)) return false;
+    if (key.startsWith('supports') && typeof capabilities[key] !== 'boolean') return false;
+  }
+  return typeof capabilities.id === 'string' && typeof capabilities.displayName === 'string';
+}
