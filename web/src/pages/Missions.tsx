@@ -10,7 +10,7 @@ import {
   type Mission,
   type Preset,
 } from "../lib/api";
-import { navigateToMission } from "../App";
+import { navigateToMission, navigateToMissionChat } from "../App";
 
 const STATUS_LABELS: Record<Mission["status"], string> = {
   active: "Active",
@@ -137,9 +137,19 @@ export default function Missions() {
     setError(null);
     try {
       const mission = await createMission(input);
-      // A preset's first prompt is a suggestion for the first chat turn; the
-      // detail page offers "new turn in this mission", so land there.
-      void firstPrompt;
+      // A preset's first prompt is the whole point of picking a preset — hand
+      // it to the chat that is about to open instead of making the person
+      // copy it out of the preset by hand (the gap M0 left open). Session
+      // storage rather than the URL: a first prompt can be a page long.
+      if (firstPrompt.trim()) {
+        try {
+          window.sessionStorage.setItem(`kaprek-first-prompt-${mission.id}`, firstPrompt);
+        } catch {
+          // storage blocked — the mission still opens, just without the draft
+        }
+        navigateToMissionChat(mission.id);
+        return;
+      }
       navigateToMission(mission.id);
     } catch (e) {
       setError((e as Error).message);
@@ -156,7 +166,14 @@ export default function Missions() {
         {error && <div className="error-box">{error}</div>}
         {missions === null && !error && <p>Loading…</p>}
         {missions !== null && missions.length === 0 && (
-          <p className="missions-empty">No missions yet. Name one on the right — a goal, optionally the directory it lives in.</p>
+          <div className="missions-empty">
+            <p>
+              A mission is one piece of work you want done: a goal, and the project directory it lives in. Every chat,
+              task and open question of that work then hangs together in one place — and every turn runs in that
+              directory instead of the sandbox.
+            </p>
+            <p>Name one on the right. Pick a preset if you want the first instruction written for you.</p>
+          </div>
         )}
         {active.map((m) => (
           <MissionListItem key={m.id} mission={m} onOpen={navigateToMission} />

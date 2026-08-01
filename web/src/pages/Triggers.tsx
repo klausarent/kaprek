@@ -745,7 +745,13 @@ export default function Triggers() {
       {triggers === null ? (
         <div className="empty-box">Loading…</div>
       ) : triggers.length === 0 ? (
-        <div className="empty-box">No triggers yet. Nothing runs on its own until you create one.</div>
+        <div className="empty-box">
+            <p>
+              A trigger is a prompt that runs on a schedule, without you. The agent works, and anything it wants to do
+              that needs your say-so waits in the approval inbox until you answer — hours later is fine.
+            </p>
+            <p>Nothing runs on its own until you create one.</p>
+          </div>
       ) : (
         <div className="trigger-list">
           {triggers.map((trigger) => (

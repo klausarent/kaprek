@@ -31,7 +31,7 @@ import {
 } from "../lib/approvals";
 import { applyAgentEvent, clearAwaitingApproval, initialAgentPanel, shouldAutoExpand } from "../lib/agents";
 import { setStatus } from "../lib/status";
-import { navigateToChats } from "../App";
+import { navigateToChats, navigateToMissions } from "../App";
 import EventBlock from "../components/EventBlock";
 import WorkFold from "../components/WorkFold";
 import RepeatHint from "../components/RepeatHint";
@@ -171,6 +171,23 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
       })
       .catch((e) => setLoadError((e as Error).message));
   }, [initialChatId, relayReloads]);
+
+  // A mission created from a preset parks its first prompt for exactly this
+  // moment (see Missions.tsx) — take it once, then clear it so a later visit
+  // to the same mission starts empty.
+  useEffect(() => {
+    if (initialChatId || !missionId) return;
+    try {
+      const key = `kaprek-first-prompt-${missionId}`;
+      const parked = window.sessionStorage.getItem(key);
+      if (parked) {
+        setDraft(parked);
+        window.sessionStorage.removeItem(key);
+      }
+    } catch {
+      // storage blocked — the person types their own opener
+    }
+  }, [initialChatId, missionId]);
 
   // The picker's options — only a brand-new chat needs them; an existing
   // chat's engine is already settled.
@@ -432,6 +449,20 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
           <button type="button" className="link-button" onClick={toggleSimpleView}>
             {simpleView ? "Show every step" : "Simple view"}
           </button>
+          {/* A chat with no mission runs in the sandbox workspace. Say so, and
+              say where the door is — the recorded first run showed nobody
+              finds missions on their own. */}
+          {!missionId && (
+            <>
+              {" · "}
+              <span className="chat-scope-hint">
+                Runs in the kaprek workspace.{" "}
+                <button type="button" className="link-button" onClick={() => navigateToMissions()}>
+                  Work in a project directory
+                </button>
+              </span>
+            </>
+          )}
         </p>
       </header>
 
