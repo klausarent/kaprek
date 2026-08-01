@@ -32,6 +32,8 @@ import { applyAgentEvent, clearAwaitingApproval, initialAgentPanel, shouldAutoEx
 import { setStatus } from "../lib/status";
 import { navigateToChats } from "../App";
 import EventBlock from "../components/EventBlock";
+import WorkFold from "../components/WorkFold";
+import { toSimpleItems } from "../lib/simple";
 import ApprovalDialog from "../components/ApprovalDialog";
 import AgentPanel from "../components/AgentPanel";
 
@@ -99,6 +101,21 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
     const stored = window.localStorage.getItem("kaprek-approval-mode");
     return stored === "edits" || stored === "auto" ? stored : "ask";
   });
+  // Simple view folds the work between answers into one line. Default ON:
+  // the first thing a newcomer sees should read like a conversation, not
+  // like a build log. Remembered, like the approval stance.
+  const [simpleView, setSimpleView] = useState(() => window.localStorage.getItem("kaprek-full-view") !== "1");
+  const toggleSimpleView = () => {
+    setSimpleView((prev) => {
+      const next = !prev;
+      try {
+        window.localStorage.setItem("kaprek-full-view", next ? "0" : "1");
+      } catch {
+        // storage blocked — the toggle still works for this session
+      }
+      return next;
+    });
+  };
   const pickApprovalMode = (mode: ApprovalMode) => {
     setApprovalMode(mode);
     try {
@@ -390,6 +407,10 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
           >
             All chats
           </a>
+          {" · "}
+          <button type="button" className="link-button" onClick={toggleSimpleView}>
+            {simpleView ? "Show every step" : "Simple view"}
+          </button>
         </p>
       </header>
 
@@ -401,6 +422,18 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
       <div className="chat-events">
         {events.length === 0 && !streaming ? (
           <div className="empty-box">Send a message to start a turn.</div>
+        ) : simpleView ? (
+          toSimpleItems(events).map((item) =>
+            item.kind === "event" ? (
+              <EventBlock key={`${chatId ?? "new"}-${item.index}`} event={item.event} />
+            ) : (
+              <WorkFold
+                key={`${chatId ?? "new"}-work-${item.startIndex}`}
+                events={item.events}
+                keyPrefix={`${chatId ?? "new"}-work-${item.startIndex}`}
+              />
+            ),
+          )
         ) : (
           events.map((ev, i) => <EventBlock key={`${chatId ?? "new"}-${i}`} event={ev} />)
         )}

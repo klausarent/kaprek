@@ -1831,3 +1831,32 @@ pre,
   border-color: #c0392b;
   color: #c0392b;
 }
+
+/* --- simple view: folded work runs --- */
+.work-fold {
+  margin: 6px 0;
+}
+.work-fold-toggle {
+  background: none;
+  border: 1px dashed var(--border, #ccc);
+  border-radius: 8px;
+  padding: 6px 10px;
+  color: inherit;
+  opacity: 0.75;
+  font: inherit;
+  font-size: 0.85rem;
+  cursor: pointer;
+  width: 100%;
+  text-align: left;
+}
+.work-fold-toggle:hover {
+  opacity: 1;
+}
+.work-fold-caret {
+  margin-right: 8px;
+}
+.work-fold-body {
+  margin-top: 6px;
+  padding-left: 10px;
+  border-left: 2px solid var(--border, #ccc);
+}
