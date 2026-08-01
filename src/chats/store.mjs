@@ -161,6 +161,8 @@ function applyEvent(chat, wrapper) {
       chat.triggerId = data.triggerId ?? null;
       chat.silent = data.silent ?? false;
       chat.missionId = data.missionId ?? null;
+      // Chats written before engines existed always ran the claude CLI.
+      chat.engine = data.engine ?? 'claude-code';
       chat.createdAt = ts;
       chat.updatedAt = ts;
       break;
@@ -224,6 +226,7 @@ function summarize(chat) {
     triggerId: chat.triggerId ?? null,
     silent: chat.silent ?? false,
     missionId: chat.missionId ?? null,
+    engine: chat.engine ?? 'claude-code',
     relay: chat.relay ?? null,
     createdAt: chat.createdAt,
     updatedAt: chat.updatedAt,
@@ -285,8 +288,12 @@ export function openChats(dataDir) {
      * @param {string|null} [missionId] - the mission this chat belongs to
      *   (see src/missions/store.mjs); the server links the chat onto the
      *   mission via linkChat() in the same request that creates it
+     * @param {string} [engine] - which harness runs this chat's turns (a
+     *   registry id, see src/harness/registry.mjs). Fixed at creation: a
+     *   conversation is one CLI session, and a mid-chat engine switch would
+     *   hand a resume id from one CLI to another.
      */
-    createChat({ title, origin = 'user', triggerId = null, silent = false, missionId = null } = {}) {
+    createChat({ title, origin = 'user', triggerId = null, silent = false, missionId = null, engine = 'claude-code' } = {}) {
       if (title !== undefined && (typeof title !== 'string' || title.trim().length === 0)) {
         throw new InvalidTitleError();
       }
@@ -302,9 +309,12 @@ export function openChats(dataDir) {
       if (missionId !== null && typeof missionId !== 'string') {
         throw new InvalidChatMetaError('missionId', 'must be a string or null');
       }
+      if (typeof engine !== 'string' || engine.trim().length === 0) {
+        throw new InvalidChatMetaError('engine', 'must be a non-empty string');
+      }
       const chatId = crypto.randomUUID();
       const chat = { id: chatId, title: null, origin: 'user', triggerId: null, silent: false, missionId: null, relay: null, createdAt: null, updatedAt: null, eventCount: 0, events: [] };
-      commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent, missionId });
+      commit(chatId, chat, 'chat.created', { title: title ?? null, origin, triggerId, silent, missionId, engine });
       chats.set(chatId, chat);
       return summarize(chat);
     },

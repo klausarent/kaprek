@@ -319,3 +319,32 @@ test('a chat.created line written before missionId existed loads as null', () =>
   const chats = openChats(tmpDir);
   expect(chats.get(chatId).missionId).toBeNull();
 });
+
+// --- engine meta (which harness runs this chat's turns, M1) ---
+
+test('createChat stores an engine and lists it in the summary', () => {
+  const chats = openChats(tmpDir);
+  const chat = chats.createChat({ title: 'T', engine: 'codex' });
+  expect(chat.engine).toBe('codex');
+  expect(chats.get(chat.id).engine).toBe('codex');
+  expect(chats.list().find((c) => c.id === chat.id).engine).toBe('codex');
+});
+
+test('engine defaults to claude-code and rejects non-string values', () => {
+  const chats = openChats(tmpDir);
+  expect(chats.createChat({ title: 'T' }).engine).toBe('claude-code');
+  expect(() => chats.createChat({ title: 'T', engine: 42 })).toThrow(InvalidChatMetaError);
+});
+
+test('a chat.created line written before engine existed loads as claude-code', () => {
+  const chatId = 'aaaaaaaa-0000-0000-0000-000000000002';
+  const dir = path.join(tmpDir, 'chats', chatId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, 'events.jsonl'),
+    `${JSON.stringify({ id: 'e1', ts: new Date().toISOString(), type: 'chat.created', data: { title: 'Old', origin: 'user', triggerId: null, silent: false } })}\n`,
+    'utf8',
+  );
+  const chats = openChats(tmpDir);
+  expect(chats.get(chatId).engine).toBe('claude-code');
+});

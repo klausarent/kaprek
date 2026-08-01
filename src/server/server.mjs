@@ -40,6 +40,7 @@ import {
   InvalidLinkError,
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
+import { getEngine, listEngines } from '../harness/registry.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
@@ -1504,6 +1505,7 @@ async function handleChatTurn(
     getMissions,
     harness,
     harnessName,
+    engineRegistry,
     dataDir,
     chatAbortControllers,
     permissionMode,
@@ -1554,7 +1556,22 @@ async function handleChatTurn(
     }
   }
 
+  // Engine resolution — same stance as the mission above: settled BEFORE any
+  // SSE bytes. The engine is fixed at chat creation (a conversation is one
+  // CLI session; switching engines mid-chat would hand one CLI's resume id
+  // to another), so on a follow-up turn the request may only repeat it.
+  const requestEngine = body.data?.engine;
+  if (requestEngine !== undefined && requestEngine !== null && typeof requestEngine !== 'string') {
+    sendJson(res, 400, { error: 'invalid engine' });
+    return;
+  }
+  if (typeof requestEngine === 'string' && !engineRegistry.getEngine(requestEngine)) {
+    sendJson(res, 400, { error: `unknown engine: ${requestEngine}` });
+    return;
+  }
+
   let chatId = body.data?.chatId;
+  let chatEngine;
   if (chatId !== undefined) {
     if (typeof chatId !== 'string' || !CHAT_ID_RE.test(chatId)) {
       sendJson(res, 400, { error: 'invalid chatId' });
@@ -1584,13 +1601,36 @@ async function handleChatTurn(
         return;
       }
     }
+    if (typeof requestEngine === 'string' && existing.engine !== requestEngine) {
+      sendJson(res, 400, { error: `chat already uses engine ${existing.engine}` });
+      return;
+    }
+    chatEngine = existing.engine ?? 'claude-code';
   } else {
+    chatEngine = requestEngine ?? 'claude-code';
     const title = text.slice(0, 80).trim();
     chatId = chats.createChat({
       ...(title.length > 0 ? { title } : {}),
       missionId: mission ? mission.id : null,
+      engine: chatEngine,
     }).id;
     if (mission) getMissions().linkChat(mission.id, chatId);
+  }
+
+  // Which harness actually runs this turn. An explicitly injected harness
+  // (tests) wins over everything; otherwise the chat's stored engine picks
+  // from the registry. A stored engine the registry no longer knows is a
+  // fail-closed 400, never a silent fallback to the default CLI.
+  let turnHarness = harness;
+  let turnHarnessName = harnessName;
+  if (harness === DEFAULT_HARNESS && chatEngine !== DEFAULT_HARNESS_NAME) {
+    const engineEntry = engineRegistry.getEngine(chatEngine);
+    if (!engineEntry) {
+      sendJson(res, 400, { error: `unknown engine stored on this chat: ${chatEngine}` });
+      return;
+    }
+    turnHarness = { startTurn: engineEntry.startTurn };
+    turnHarnessName = chatEngine;
   }
 
   if (chatAbortControllers.has(chatId)) {
@@ -1682,8 +1722,8 @@ async function handleChatTurn(
       dataDir,
       chatId,
       text,
-      harness,
-      harnessName,
+      harness: turnHarness,
+      harnessName: turnHarnessName,
       cwd: turnCwd,
       permissionMode,
       allowedTools,
@@ -2186,6 +2226,7 @@ async function handleRequest(
     getChats,
     harness,
     harnessName,
+    engineRegistry,
     chatAbortControllers,
     permissionMode,
     allowedTools,
@@ -2290,6 +2331,14 @@ async function handleRequest(
       sendJson(res, 200, { presets: loadPresets(dataDir) });
       return;
     }
+    if (segments.length === 2 && segments[1] === 'engines') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendJson(res, 200, { engines: engineRegistry.listEngines() });
+      return;
+    }
     if (segments.length === 4 && segments[1] === 'chat' && segments[3] === 'relay') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { error: 'method not allowed' });
@@ -2315,6 +2364,7 @@ async function handleRequest(
         getMissions,
         harness,
         harnessName,
+        engineRegistry,
         dataDir,
         chatAbortControllers,
         permissionMode,
@@ -2425,6 +2475,10 @@ export function startServer({
   dataDir = getAppDir(),
   importSqlite,
   tmpRoot = path.join(os.tmpdir(), 'claude'),
+  // An EXPLICITLY injected harness (tests hand a FakeAdapter here) runs
+  // every chat regardless of the chat's stored engine; when these keep
+  // their defaults, the chat's engine picks the harness from the registry
+  // (see resolveChatHarness below).
   harness = DEFAULT_HARNESS,
   harnessName = DEFAULT_HARNESS_NAME,
   permissionMode = 'default',
@@ -2442,6 +2496,10 @@ export function startServer({
   // billed CLIs, which is not something a test suite gets to do.
   getPeerDriver = getRegisteredPeerDriver,
   bundledAppsDir = DEFAULT_BUNDLED_APPS_DIR,
+  // The engine registry behind /api/engines and per-chat harness selection.
+  // Overridable so a test can hand it fake engines — a registry test that
+  // resolved the real ones would spawn real, billed CLIs.
+  engineRegistry = { getEngine, listEngines },
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -2752,6 +2810,7 @@ export function startServer({
       getChats,
       harness,
       harnessName,
+      engineRegistry,
       chatAbortControllers,
       permissionMode,
       allowedTools,

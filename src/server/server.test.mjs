@@ -3374,3 +3374,126 @@ test('chat: a mission whose cwd vanished fails the turn with a 400, no silent wo
   const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'hi', missionId: mission.id }) });
   expect(res.status).toBe(400);
 });
+
+// --- engines: per-chat harness selection (M1) ---
+
+/** A fake registry with two engines whose startTurn records that it ran. */
+function fakeRegistry() {
+  const ran = [];
+  const engineOf = (id) => ({
+    startTurn: async ({ onEvent }) => {
+      ran.push(id);
+      for (const event of fakeScript()) onEvent(event);
+      return { sessionId: 'sess-1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+    capabilities: {
+      id,
+      displayName: id,
+      supportsCostUsd: false,
+      supportsUpdatedInput: false,
+      supportsAllowedTools: false,
+      supportsMcpConfig: false,
+      supportsSettingsPath: false,
+    },
+  });
+  const engines = new Map([
+    ['claude-code', engineOf('claude-code')],
+    ['fake-b', engineOf('fake-b')],
+  ]);
+  return {
+    ran,
+    getEngine: (id) => engines.get(id) ?? null,
+    listEngines: () => [...engines.values()].map((engine) => engine.capabilities),
+  };
+}
+
+test('engines: GET /api/engines lists the registry', async () => {
+  const { url } = await boot({ engineRegistry: fakeRegistry() });
+  const res = await fetch(`${url}/api/engines`);
+  expect(res.status).toBe(200);
+  const { engines } = await res.json();
+  expect(engines.map((engine) => engine.id)).toEqual(['claude-code', 'fake-b']);
+});
+
+test('engines: a new chat created with an engine stores it and runs that engine, and follow-ups keep it', async () => {
+  const registry = fakeRegistry();
+  const { url } = await boot({ engineRegistry: registry });
+
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi', engine: 'fake-b' }),
+  });
+  expect(res.status).toBe(200);
+  const frames = await readSse(res);
+  const chatId = frames.find((frame) => frame.type === 'chat-id').chatId;
+  expect(registry.ran).toEqual(['fake-b']);
+
+  const { chat } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+  expect(chat.engine).toBe('fake-b');
+
+  // The follow-up names no engine and still runs the chat's own.
+  const follow = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'again', chatId }),
+  });
+  expect(follow.status).toBe(200);
+  await readSse(follow);
+  expect(registry.ran).toEqual(['fake-b', 'fake-b']);
+});
+
+test('engines: a follow-up naming a DIFFERENT engine is refused before any SSE bytes', async () => {
+  const registry = fakeRegistry();
+  const { url } = await boot({ engineRegistry: registry });
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi', engine: 'fake-b' }),
+  });
+  const frames = await readSse(res);
+  const chatId = frames.find((frame) => frame.type === 'chat-id').chatId;
+
+  const conflict = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'switch', chatId, engine: 'claude-code' }),
+  });
+  expect(conflict.status).toBe(400);
+  expect((await conflict.json()).error).toContain('fake-b');
+});
+
+test('engines: an unknown engine is a 400 before any chat is created', async () => {
+  const registry = fakeRegistry();
+  const { url } = await boot({ engineRegistry: registry });
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi', engine: 'nope' }),
+  });
+  expect(res.status).toBe(400);
+  const chats = await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json();
+  expect(chats.chats).toHaveLength(0);
+});
+
+test('engines: an explicitly injected harness wins over the chat engine (the test-suite contract)', async () => {
+  const registry = fakeRegistry();
+  const seen = [];
+  const harness = {
+    startTurn: async ({ onEvent }) => {
+      seen.push('injected');
+      for (const event of fakeScript()) onEvent(event);
+      return { sessionId: 'sess-1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness, harnessName: 'fake', engineRegistry: registry });
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'hi', engine: 'fake-b' }),
+  });
+  expect(res.status).toBe(200);
+  await readSse(res);
+  expect(seen).toEqual(['injected']);
+  expect(registry.ran).toEqual([]);
+});
