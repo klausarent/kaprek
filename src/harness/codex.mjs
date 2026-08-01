@@ -49,6 +49,7 @@ export async function startTurn({
   sessionId,
   permissionMode,
   effort,
+  appendSystemPrompt,
   onEvent = () => {},
   onApprovalRequest,
   signal,
@@ -384,12 +385,21 @@ export async function startTurn({
         });
         notify('initialized', {});
         const { approvalPolicy, sandbox } = mapPermissionMode(permissionMode);
+        // kaprek's guided modes (src/plans/prompt.mjs) ride on the thread's
+        // developer instructions — the closest match to claude's
+        // --append-system-prompt, and verified live against codex-cli
+        // 0.144.4 (a smoke test asked the model for a token that existed
+        // only in this field and got it back). `baseInstructions` is the
+        // other candidate and deliberately NOT used: it REPLACES codex' own
+        // base prompt rather than adding to it.
+        const developerInstructions =
+          typeof appendSystemPrompt === 'string' && appendSystemPrompt.trim() !== '' ? { developerInstructions: appendSystemPrompt } : {};
         let thread;
         if (sessionId) {
-          thread = await request('thread/resume', { threadId: sessionId, cwd, approvalPolicy, sandbox });
+          thread = await request('thread/resume', { threadId: sessionId, cwd, approvalPolicy, sandbox, ...developerInstructions });
           threadId = thread?.thread?.id ?? sessionId;
         } else {
-          thread = await request('thread/start', { cwd, approvalPolicy, sandbox, ephemeral: false });
+          thread = await request('thread/start', { cwd, approvalPolicy, sandbox, ephemeral: false, ...developerInstructions });
           threadId = thread?.thread?.id ?? null;
         }
         clocks.onProgress('init');

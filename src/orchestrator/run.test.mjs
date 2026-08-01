@@ -989,3 +989,66 @@ test('approvalMode edits maps to acceptEdits with the edit tools free and everyt
   expect(settings.permissions.ask).not.toContain('Edit');
   expect(settings.permissions.ask).toContain('Bash');
 });
+
+test('a guided turn carries the mode into the harness and hands the quiz back', async () => {
+  const quizText = ['I understood the goal. One thing to settle first.', '', '```kaprek-quiz', '{"questions": [{"id": "scope", "question": "What should it do first?", "options": [{"label": "One flow"}, {"label": "Everything"}]}]}', '```'].join('\n');
+  let seenArgs = null;
+  const harness = {
+    startTurn: async (options) => {
+      seenArgs = options;
+      options.onEvent({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      options.onEvent({ type: 'text', text: quizText });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+
+  const planPath = path.join(tmpDir, 'docs', 'plans', '2026-08-02-idea.md');
+  const result = await runTurn({ dataDir: tmpDir, text: "let's build a small thing", harness, mode: 'brainstorm', planPath });
+
+  expect(seenArgs.appendSystemPrompt).toContain('kaprek-quiz');
+  expect(result.guided.quiz.questions[0].id).toBe('scope');
+  // Nothing written yet, and that is the normal state mid-brainstorm.
+  expect(result.guided.plan).toBeNull();
+  expect(result.guided.protocolBroken).toBe(false);
+});
+
+test('a guided turn that wrote its plan registers it at the path kaprek chose', async () => {
+  const planPath = path.join(tmpDir, 'docs', 'plans', '2026-08-02-idea.md');
+  const harness = {
+    startTurn: async (options) => {
+      fs.mkdirSync(path.dirname(planPath), { recursive: true });
+      fs.writeFileSync(planPath, '# The idea\n\n- [ ] First step\n', 'utf8');
+      options.onEvent({ type: 'text', text: 'Written.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+
+  const result = await runTurn({ dataDir: tmpDir, text: 'write the plan', harness, mode: 'plan', planPath });
+  expect(result.guided.plan.path).toBe(path.resolve(planPath));
+  expect(result.guided.plan.title).toBe('The idea');
+  expect(result.guided.protocolBroken).toBe(false);
+});
+
+test('an agent that ignores the guided mode is reported, not silently tolerated', async () => {
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'text', text: 'Sure, here are my three questions as prose. What is the goal?' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const result = await runTurn({ dataDir: tmpDir, text: "let's plan", harness, mode: 'brainstorm', planPath: path.join(tmpDir, 'docs', 'plans', 'p.md') });
+  expect(result.guided.protocolBroken).toBe(true);
+});
+
+test('an unknown mode never reaches the harness as a guided turn', async () => {
+  let seenArgs = null;
+  const harness = {
+    startTurn: async (options) => {
+      seenArgs = options;
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const result = await runTurn({ dataDir: tmpDir, text: 'hi', harness, mode: 'freestyle' });
+  expect(seenArgs.appendSystemPrompt).toBeUndefined();
+  expect(result.guided).toBeNull();
+});

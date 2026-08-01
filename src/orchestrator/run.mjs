@@ -15,6 +15,9 @@ import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
 import { writeHarnessSettings, mergeAskList, PROFILE_CLI_MODE } from '../harness/settings.mjs';
 import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
+import { buildModePrompt, PLAN_MODES } from '../plans/prompt.mjs';
+import { parseQuiz } from '../plans/quiz.mjs';
+import { openPlans } from '../plans/store.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -238,6 +241,12 @@ export async function runTurn({
   // Reasoning effort for this turn ('low'..'max'); undefined leaves the
   // CLI's own default alone.
   effort,
+  // A guided mode for this turn ('brainstorm' | 'plan'), and the absolute
+  // path its plan must be written to. Both come from the caller: the path is
+  // decided BEFORE the turn so the agent is told where to write rather than
+  // asked afterwards where it wrote (see src/plans/prompt.mjs).
+  mode = null,
+  planPath = null,
   allowedTools,
   absoluteTimeoutMs,
   onEvent,
@@ -282,6 +291,7 @@ export async function runTurn({
   // result as ONE event (matching the parser's digest shape), so a
   // matching tool-end is what actually triggers the store write.
   const pendingTools = new Map();
+  const assistantText = [];
   let cliSessionId = priorSessionId ?? null;
   let model = null;
   let rateLimit = null;
@@ -300,6 +310,9 @@ export async function runTurn({
       case 'text': {
         const sanitized = sanitizeText(event.text, maxTextLen, redact);
         chats.appendEvent(effectiveChatId, { kind: 'assistant', text: sanitized });
+        // Kept for the quiz parser below. The SANITIZED text, so a quiz can
+        // never carry through something the store itself would have redacted.
+        assistantText.push(sanitized);
         onEvent?.({ ...event, text: sanitized });
         break;
       }
@@ -540,6 +553,11 @@ export async function runTurn({
     return { chatId: effectiveChatId, cliSessionId, costUsd: null, stopReason: 'error', timeoutClock: null, error: { message } };
   }
 
+  // A mode the harness does not know about must not silently degrade into an
+  // ordinary turn the user believes is guided.
+  const guidedMode = PLAN_MODES.includes(mode) ? mode : null;
+  const appendSystemPrompt = guidedMode ? buildModePrompt({ mode: guidedMode, planPath }) : undefined;
+
   let turnResult;
   try {
     turnResult = await harness.startTurn({
@@ -548,6 +566,7 @@ export async function runTurn({
       sessionId: priorSessionId,
       permissionMode: effectivePermissionMode,
       effort,
+      ...(appendSystemPrompt === undefined ? {} : { appendSystemPrompt }),
       allowedTools,
       // Spread, not passed as `absoluteTimeoutMs: undefined`: claude-code.mjs
       // reads it as a defaulted destructuring parameter, so an explicit
@@ -635,5 +654,36 @@ export async function runTurn({
     stopReason: turnResult.stopReason,
     timeoutClock: turnResult.timeoutClock ?? null,
     error: turnResult.error,
+    guided: guidedMode ? summarizeGuidedTurn({ dataDir, cwd, chatId: effectiveChatId, mode: guidedMode, planPath, text: assistantText.join('\n') }) : null,
   };
+}
+
+/**
+ * What a guided turn produced: the quiz to show, the plan that appeared, or
+ * neither.
+ *
+ * `protocolBroken` is the honest answer to a real risk both peer reviews
+ * named: the mode is a request, not a guarantee. If an agent ignores it, the
+ * old behaviour is all the user gets — and without saying so, a guided turn
+ * that quietly produced nothing looks identical to one that was never
+ * guided. The UI shows this rather than hiding it.
+ */
+function summarizeGuidedTurn({ dataDir, cwd, chatId, mode, planPath, text }) {
+  const quiz = parseQuiz(text);
+  let plan = null;
+  let planError = null;
+  if (planPath) {
+    try {
+      plan = openPlans(dataDir, { allowedRoots: () => (cwd ? [dataDir, cwd] : [dataDir]) }).register({
+        path: planPath,
+        kind: mode === 'brainstorm' ? 'spec' : 'plan',
+        chatId,
+      });
+    } catch (err) {
+      // The expected case is "the agent has not written it yet", which is
+      // normal for every brainstorming turn before the last one.
+      planError = err?.name === 'PlanFileMissingError' ? null : (err?.message ?? String(err));
+    }
+  }
+  return { mode, planPath, quiz, plan, planError, protocolBroken: quiz === null && plan === null };
 }
