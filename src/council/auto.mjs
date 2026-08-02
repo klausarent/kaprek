@@ -26,6 +26,7 @@
 import fs from 'node:fs';
 import { consultPeers, DEFAULT_PEER_TIMEOUT_MS } from './consult.mjs';
 import { shouldConsult, councilStatus, suggestAssignment } from './roles.mjs';
+import { createPeerHealth } from './health.mjs';
 import { sha256Of } from './store.mjs';
 
 /**
@@ -78,6 +79,10 @@ export function createCouncilRunner({
 } = {}) {
   /** consultationId -> {abort, promise}. Only ever holds runs this process is driving. */
   const active = new Map();
+  // Who is currently not answering. In memory only: a cold start should try
+  // everything once, since the CLI that was broken yesterday is usually the
+  // one that was updated overnight.
+  const health = createPeerHealth();
 
   function peersFor() {
     const installed = availablePeerIds();
@@ -126,6 +131,7 @@ export function createCouncilRunner({
       tried,
       signal: controller.signal,
       timeoutMs,
+      health,
     })
       .then((result) => {
         // The prompt and each peer's raw text stay out of the store: the

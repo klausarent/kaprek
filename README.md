@@ -153,6 +153,13 @@ The "Second opinion" button in a chat works at every level, including `off`.
 At `always` an ordinary turn gets one too, which is the expensive,
 indiscriminate end of the setting and behaves like it says.
 
+A peer that fails to answer twice in a row is skipped for a quarter of an
+hour instead of being waited on for ten minutes again — and it is reported as
+skipped, with the reason, because a quietly dropped peer would turn "two
+engines agreed" into a sentence about one. That memory is per session: a cold
+start tries everything once, since the CLI that was broken yesterday is
+usually the one that was updated overnight.
+
 One honest gap: `decisions` currently behaves exactly like `plans`. The
 moment exists and is respected, but nothing in kaprek can truthfully report
 "that was an architecture decision" yet, and guessing it from the text would

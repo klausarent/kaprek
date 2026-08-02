@@ -182,11 +182,17 @@ export function summarize(answers) {
  * @param {number} [options.timeoutMs] - per peer, not for the whole round: a
  *   slow peer must not shorten the deadline of a fast one
  */
-export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PEER_TIMEOUT_MS, signal, ...packageParts }) {
+export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PEER_TIMEOUT_MS, signal, health = null, ...packageParts }) {
   const prompt = buildPackage(packageParts);
 
   const answers = await Promise.all(
     peers.map(async (peerId) => {
+      // A peer that has failed repeatedly is skipped rather than waited on
+      // for another ten minutes — and it is reported as skipped, with the
+      // reason, because a quietly dropped peer turns "two engines agreed"
+      // into a sentence about one.
+      const state = health?.check(peerId) ?? { ask: true };
+      if (!state.ask) return { peerId, verdict: null, summary: null, risks: [], error: state.reason, raw: null, skipped: true };
       const controller = new AbortController();
       const onAbort = () => controller.abort();
       signal?.addEventListener('abort', onAbort, { once: true });
@@ -206,7 +212,11 @@ export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PE
           }),
         ]);
         const verdict = parseVerdict(raw);
-        if (verdict !== null) return { peerId, ...verdict, error: null, raw };
+        if (verdict !== null) {
+          health?.succeeded(peerId);
+          return { peerId, ...verdict, error: null, raw };
+        }
+        health?.failed(peerId);
         // Quote what it actually said. "Could not be read as a verdict" on
         // its own is unactionable — the first live run reported exactly that
         // twice and told nobody what either peer had answered.
@@ -222,6 +232,7 @@ export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PE
       } catch (err) {
         // One peer failing is a fact to report, never a reason to lose the
         // others' answers.
+        health?.failed(peerId);
         const reason = controller.signal.aborted && !signal?.aborted ? `no answer within ${Math.round(timeoutMs / 1000)}s` : (err?.message ?? String(err));
         return { peerId, verdict: null, summary: null, risks: [], error: reason, raw: null };
       } finally {

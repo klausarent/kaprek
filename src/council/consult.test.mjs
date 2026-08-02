@@ -154,3 +154,41 @@ describe('what leaves the machine', () => {
     expect(buildPackage({ question: 'Should the relay retry twice or three times?' })).toContain('Should the relay retry twice or three times?');
   });
 });
+
+describe('a peer that keeps failing', () => {
+  /** A health tracker that says one peer is resting. */
+  const resting = (peerId) => ({
+    check: (id) => (id === peerId ? { ask: false, reason: 'did not answer 2 times in a row; skipped for about 12 more minutes', until: 0 } : { ask: true }),
+    failed: () => {},
+    succeeded: () => {},
+  });
+
+  test('is skipped rather than waited on again', async () => {
+    const asked = [];
+    const result = await consultPeers({
+      peers: ['codex', 'grok'],
+      health: resting('grok'),
+      askPeer: async (peerId) => {
+        asked.push(peerId);
+        return JSON.stringify({ verdict: 'agree', summary: 'fine' });
+      },
+      question: 'sound?',
+    });
+    expect(asked).toEqual(['codex']);
+  });
+
+  test('and is reported as skipped, with the reason', async () => {
+    const result = await consultPeers({
+      peers: ['codex', 'grok'],
+      health: resting('grok'),
+      askPeer: async () => JSON.stringify({ verdict: 'agree', summary: 'fine' }),
+      question: 'sound?',
+    });
+    // Dropping it quietly would turn "two engines agreed" into a sentence
+    // about one.
+    const skipped = result.unreachable.find((entry) => entry.peerId === 'grok');
+    expect(skipped.error).toMatch(/did not answer 2 times/);
+    expect(result.agreed).toEqual(['codex']);
+    expect(result.consensus).toBe(true);
+  });
+});
