@@ -1371,3 +1371,31 @@ export async function forgetMemory(id: string, reason: string): Promise<void> {
   });
   await throwOnError(res);
 }
+
+/** A rule kaprek noticed and wrote down. Inert until somebody accepts it. */
+export type RuleProposal = {
+  id: string;
+  pattern: string;
+  rule: string;
+  seenIn: string[];
+  status: "proposed" | "accepted" | "rejected";
+  proposedAt: string;
+  decidedAt: string | null;
+  reason: string | null;
+};
+
+export async function fetchProposals(status?: string): Promise<RuleProposal[]> {
+  const res = await apiFetch(`/api/memory/proposals${status ? `?status=${encodeURIComponent(status)}` : ""}`);
+  await throwOnError(res);
+  return (await res.json()).proposals as RuleProposal[];
+}
+
+export async function decideProposal(id: string, status: "accepted" | "rejected", reason?: string): Promise<RuleProposal> {
+  const res = await apiFetch(`/api/memory/proposals/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ status, ...(reason ? { reason } : {}) }),
+  });
+  await throwOnError(res);
+  return (await res.json()).proposal as RuleProposal;
+}

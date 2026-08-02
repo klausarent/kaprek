@@ -4117,12 +4117,13 @@ test('memory: two missions in the SAME project share what was learned', async ()
   const scopes = await (await fetch(`${url}/api/memory/scopes`)).json();
   const projectScope = scopes.scopes.find((scope) => scope.id.startsWith('project:'));
   const recalled = await (await fetch(`${url}/api/memory?scopeId=${encodeURIComponent(projectScope.id)}`)).json();
-  // The fact was written to the MISSION scope, so the project above it does
-  // not see it — visibility runs upwards. The sibling mission does.
-  expect(recalled.memories.map((entry) => entry.text)).not.toContain('the build needs Node 22');
+  // Written at the PROJECT level, so a second mission in the same codebase
+  // reads it — a mission is a task, a project is where knowledge stays.
+  expect(recalled.memories.map((entry) => entry.text)).toContain('the build needs Node 22');
 
   const missionScope = scopes.scopes.find((scope) => scope.id === `mission:${first.missionId}`);
   const fromMission = await (await fetch(`${url}/api/memory?scopeId=${encodeURIComponent(missionScope.id)}`)).json();
+  // And the mission sees it too, because it sits under that project.
   expect(fromMission.memories.map((entry) => entry.text)).toContain('the build needs Node 22');
 });
 

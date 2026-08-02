@@ -45,7 +45,10 @@ async function api(pathname, init = {}) {
  * has no such limit, which is what an SSE client needs.
  */
 function turn({ text, missionId, chatId, engine }) {
-  const body = JSON.stringify({ text, ...(missionId ? { missionId } : {}), ...(chatId ? { chatId } : {}), ...(engine ? { engine } : {}) });
+  // approvalMode 'auto': nobody is watching this script's stream, so a
+  // question would sit unanswered until the ten-minute timeout and look
+  // exactly like a hung turn. The turns here have no tools anyway.
+  const body = JSON.stringify({ text, approvalMode: 'auto', ...(missionId ? { missionId } : {}), ...(chatId ? { chatId } : {}), ...(engine ? { engine } : {}) });
   const target = new URL(`${url}/api/chat/turn`);
   return new Promise((resolve, reject) => {
     const req = http.request(

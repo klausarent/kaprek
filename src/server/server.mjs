@@ -2228,7 +2228,7 @@ async function handleChatTurn(
       ...(mode ? { mode, planPath: guidedPlanPath({ getPlans, chats, chatId, cwd: turnCwd ?? null, dataDir, text }) } : {}),
       // Memory belongs to a body of work, so only a mission chat has a scope
       // — see memoryScopeForChat().
-      memoryScopeId: memoryScopeForChat ? memoryScopeForChat(chatId) : null,
+      memoryScopeId: memoryScopeForChat ? memoryScopeForChat(chatId, mission) : null,
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so
@@ -3454,22 +3454,30 @@ export function startServer({
   }
 
   /**
-   * The memory scope a chat writes and reads in, creating the tree on first
-   * use: mission:<id> under project:<name-of-its-directory> under
-   * person:local.
+   * The memory scope a chat writes and reads in.
+   *
+   * The tree is created on first use — mission:<id> under
+   * project:<directory> under person:local — and the scope returned is the
+   * PROJECT. Two missions in one codebase have to share what they learn, and
+   * visibility only runs upwards.
    *
    * A chat with no mission gets NULL, and that is deliberate. Memory belongs
    * to a body of work; a one-off question in a scratch chat has no business
    * writing into a project's memory, and no business reading one either.
    */
-  function memoryScopeForChat(chatId) {
-    let mission = null;
-    try {
-      const missionId = getChats().get(chatId).missionId;
-      if (!missionId) return null;
-      mission = getMissions().get(missionId);
-    } catch {
-      return null;
+  function memoryScopeForChat(chatId, mission = null) {
+    // The mission first, because on a chat's FIRST turn there is no chat yet
+    // to look one up from: runTurn creates it. Resolving through the chat
+    // only worked from the second turn onwards, which meant the turn that
+    // learns the most — the first — was the one turn with no memory at all.
+    if (!mission) {
+      try {
+        const missionId = getChats().get(chatId).missionId;
+        if (!missionId) return null;
+        mission = getMissions().get(missionId);
+      } catch {
+        return null;
+      }
     }
     if (!mission) return null;
 
@@ -3481,9 +3489,14 @@ export function startServer({
       memory.addScope({ id: 'person:local' });
       const projectId = `project:${path.basename(mission.cwd ?? 'workspace')}`;
       memory.addScope({ id: projectId, parent: 'person:local' });
-      const scopeId = `mission:${mission.id}`;
-      memory.addScope({ id: scopeId, parent: projectId });
-      return scopeId;
+      // The mission exists in the tree as the place this turn is happening…
+      memory.addScope({ id: `mission:${mission.id}`, parent: projectId });
+      // …but what gets LEARNED belongs to the project, not to the errand.
+      // Visibility runs upwards only, so a fact written into mission A would
+      // be invisible to mission B in the same codebase — which is exactly
+      // the case M3 exists to serve. A mission is a task; a project is where
+      // knowledge stays.
+      return projectId;
     } catch (err) {
       // A tree that cannot be built means a turn without memory, never a
       // turn that writes somewhere unintended.
