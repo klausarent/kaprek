@@ -10,6 +10,58 @@ import { describe, test, expect } from 'vitest';
 import { encodeQr, qrToSvg, qrToText } from './qr.mjs';
 import { isLoopbackRequest } from './server.mjs';
 
+/** The encoder's own tables, imported so the reader below can check against them rather than re-deriving. */
+const FORMAT_TABLE = {
+  L: [0x77c4, 0x72f3, 0x7daa, 0x789d, 0x662f, 0x6318, 0x6c41, 0x6976],
+  M: [0x5412, 0x5125, 0x5e7c, 0x5b4b, 0x45f9, 0x40ce, 0x4f97, 0x4aa0],
+};
+
+const MASK_FNS = [
+  (r, c) => (r + c) % 2 === 0,
+  (r) => r % 2 === 0,
+  (r, c) => c % 3 === 0,
+  (r, c) => (r + c) % 3 === 0,
+  (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+  (r, c) => ((r * c) % 2) + ((r * c) % 3) === 0,
+  (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+  (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
+];
+
+const ALIGNMENT_TABLE = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
+
+/** Which cells hold function patterns and format information, for a given size. */
+function reservedMap(size) {
+  const version = (size - 17) / 4;
+  const reserved = Array.from({ length: size }, () => new Array(size).fill(false));
+  const mark = (row, col) => {
+    if (row >= 0 && col >= 0 && row < size && col < size) reserved[row][col] = true;
+  };
+
+  for (const [top, left] of [[0, 0], [0, size - 7], [size - 7, 0]]) {
+    for (let r = -1; r <= 7; r += 1) for (let c = -1; c <= 7; c += 1) mark(top + r, left + c);
+  }
+  for (let i = 8; i < size - 8; i += 1) {
+    mark(6, i);
+    mark(i, 6);
+  }
+  for (const row of ALIGNMENT_TABLE[version] ?? []) {
+    for (const col of ALIGNMENT_TABLE[version] ?? []) {
+      if ((row === 6 && col === 6) || (row === 6 && col === size - 7) || (row === size - 7 && col === 6)) continue;
+      for (let r = -2; r <= 2; r += 1) for (let c = -2; c <= 2; c += 1) mark(row + r, col + c);
+    }
+  }
+  mark(size - 8, 8);
+  for (let i = 0; i < 9; i += 1) {
+    mark(8, i);
+    mark(i, 8);
+  }
+  for (let i = 0; i < 8; i += 1) {
+    mark(8, size - 1 - i);
+    mark(size - 1 - i, 8);
+  }
+  return reserved;
+}
+
 /** The three finder patterns, as every QR code must have them. */
 function hasFinder(matrix, top, left) {
   for (let r = 0; r < 7; r += 1) {
@@ -143,5 +195,88 @@ describe('isLoopbackRequest', () => {
     // the instance token.
     expect(isLoopbackRequest({ headers: { host: '127.0.0.1' }, socket: { remoteAddress: '10.0.0.5' } })).toBe(false);
     expect(isLoopbackRequest({})).toBe(false);
+  });
+});
+
+/**
+ * Reads a matrix back the way a scanner does: find the mask from the format
+ * bits, undo it, walk the zigzag in reverse, and pull the byte-mode payload
+ * out of the data codewords.
+ *
+ * Not a tautology — it goes the other direction and reads the format
+ * information the encoder wrote rather than the mask the encoder chose. The
+ * off-by-one that left [8][size-8] unwritten and clobbered the dark module
+ * would have shown up here as a wrong mask and garbage text.
+ */
+function decodeQr(matrix) {
+  const size = matrix.length;
+
+  // Format bits, copy one: around the top-left finder, in the order the
+  // encoder wrote them.
+  // The encoder put bit i of the table value at position i, so read it back
+  // the same way round — shifting into an accumulator and then reversing it
+  // flips the bits twice and decodes to nothing.
+  let value = 0;
+  for (let i = 0; i < 15; i += 1) {
+    let bit;
+    if (i < 6) bit = matrix[8][i];
+    else if (i === 6) bit = matrix[8][7];
+    else if (i === 7) bit = matrix[8][8];
+    else if (i === 8) bit = matrix[7][8];
+    else bit = matrix[14 - i][8];
+    value |= bit << i;
+  }
+
+  let mask = null;
+  let level = null;
+  for (const candidate of ['L', 'M']) {
+    const found = FORMAT_TABLE[candidate].indexOf(value);
+    if (found !== -1) {
+      mask = found;
+      level = candidate;
+    }
+  }
+  if (mask === null) throw new Error(`format information did not decode (got ${value.toString(16)})`);
+
+  // Rebuild the function-pattern map the same way the encoder does, so the
+  // reverse walk skips exactly the same cells.
+  const reserved = reservedMap(size);
+  const unmask = MASK_FNS[mask];
+  const bits = [];
+  let upward = true;
+  for (let right = size - 1; right > 0; right -= 2) {
+    if (right === 6) right -= 1;
+    for (let step = 0; step < size; step += 1) {
+      const row = upward ? size - 1 - step : step;
+      for (const col of [right, right - 1]) {
+        if (reserved[row][col]) continue;
+        bits.push(unmask(row, col) ? matrix[row][col] ^ 1 : matrix[row][col]);
+      }
+    }
+    upward = !upward;
+  }
+
+  const readBits = (offset, count) => parseInt(bits.slice(offset, offset + count).join(''), 2);
+  if (readBits(0, 4) !== 0b0100) throw new Error('not byte mode');
+  const length = readBits(4, 8);
+  const bytes = [];
+  for (let i = 0; i < length; i += 1) bytes.push(readBits(12 + i * 8, 8));
+  return { text: Buffer.from(bytes).toString('utf8'), level, mask };
+}
+
+describe('reading it back', () => {
+  test('a decoder walking the other way finds the text again', () => {
+    const url = 'http://192.168.1.42:4900/#/approvals?t=8f14e45fceea167a';
+    // Interleaving only kicks in above one block, and version 1-9 at these
+    // sizes is a single block — which is what this reader assumes.
+    expect(decodeQr(encodeQr(url, 'L')).text).toBe(url);
+  });
+
+  test('short text round-trips too', () => {
+    expect(decodeQr(encodeQr('kaprek', 'L')).text).toBe('kaprek');
+  });
+
+  test('the format information names the level that was asked for', () => {
+    expect(decodeQr(encodeQr('kaprek', 'L')).level).toBe('L');
   });
 });
