@@ -1,6 +1,6 @@
-import { describe, expect, test } from "vitest";
+import { describe, expect, it, test } from "vitest";
 import { render, textOf } from "../test/tree";
-import CouncilPanel, { headline } from "./CouncilPanel";
+import CouncilPanel, { headline, autoStatusLine } from "./CouncilPanel";
 import type { Consultation } from "../lib/api";
 
 const base: Consultation = { consensus: true, empty: false, agreed: ["codex", "grok"], dissenting: [], unreachable: [] };
@@ -52,5 +52,40 @@ describe("the panel", () => {
   test("asking shows that it is happening, and nothing shows before it starts", () => {
     expect(textOf(render(<CouncilPanel consultation={null} busy />))).toContain("Asking the other engines");
     expect(textOf(render(<CouncilPanel consultation={null} />))).toBe("");
+  });
+});
+
+describe("autoStatusLine", () => {
+  const base = {
+    id: "x",
+    chatId: "c1",
+    moment: "plan",
+    question: "q",
+    peers: ["codex", "grok"],
+    planPath: "/tmp/plan.md",
+    startedAt: "2026-08-02T09:00:00.000Z",
+    result: null,
+    error: null,
+    stale: false,
+  };
+
+  it("says who is reading while it runs", () => {
+    expect(autoStatusLine({ ...base, status: "running" })).toBe("codex and grok are reading the plan…");
+  });
+
+  it("admits a restart killed it, and that nothing was repeated", () => {
+    expect(autoStatusLine({ ...base, status: "interrupted", error: "kaprek stopped" })).toMatch(/not repeated/);
+  });
+
+  it("carries the reason a review failed instead of a bare status", () => {
+    expect(autoStatusLine({ ...base, status: "failed", error: "no answer within 600s" })).toContain("no answer within 600s");
+  });
+
+  it("warns when the plan changed after the verdict", () => {
+    expect(autoStatusLine({ ...base, status: "completed", stale: true })).toMatch(/earlier version/);
+  });
+
+  it("says nothing extra about a clean, current verdict", () => {
+    expect(autoStatusLine({ ...base, status: "completed" })).toBe("");
   });
 });

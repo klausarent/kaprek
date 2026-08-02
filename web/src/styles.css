@@ -2188,3 +2188,20 @@ pre,
   margin: 6px 0 0;
   padding-left: 20px;
 }
+
+/* A consultation kaprek started by itself, sitting under the plan it is about. */
+.council-auto {
+  margin-top: 0.5rem;
+}
+
+.council-note {
+  font-size: 0.85rem;
+  color: var(--muted);
+  padding: 0.35rem 0.6rem;
+}
+
+/* A verdict about a document that has since changed reads as advice unless
+   it is marked. */
+.council-note-stale {
+  color: var(--warn, #b45309);
+}

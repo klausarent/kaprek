@@ -3758,3 +3758,113 @@ test('council: consulting needs a question', async () => {
   const res = await fetch(`${url}/api/council/consult`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ question: '  ' }) });
   expect(res.status).toBe(400);
 });
+
+/**
+ * A guided plan turn plus a peer that answers instantly. Nothing here spawns
+ * a process: makeCouncilAskPeer is injected, which is the whole reason
+ * startServer accepts it.
+ */
+async function bootPlanCouncil({ answer = () => JSON.stringify({ verdict: 'agree', summary: 'sound', risks: [] }), planBody = '# Counter\n\n- [ ] First step\n' } = {}) {
+  const asked = [];
+  const harness = {
+    startTurn: async (options) => {
+      const target = /\n\n {2}(.+\.md)\n/.exec(options.appendSystemPrompt ?? '')?.[1]?.trim();
+      if (target && planBody !== null) {
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, planBody, 'utf8');
+      }
+      options.onEvent({ type: 'text', text: 'Plan written.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const started = await boot({
+    harness,
+    makeCouncilAskPeer: () => async (peerId, prompt) => {
+      asked.push({ peerId, prompt });
+      return answer(peerId, prompt);
+    },
+  });
+  await fetch(`${started.url}/api/council`, {
+    method: 'PUT',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ level: 'plans', assignment: { lead: 'claude-code', thinker: 'codex', worker: 'codex', peer: ['codex'] } }),
+  });
+  return { ...started, asked };
+}
+
+async function planTurn(url, text = 'plan a line counter') {
+  const res = await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text, mode: 'plan' }) });
+  return readSse(res);
+}
+
+/** Polls until the consultation reaches a terminal state — it runs beside the turn, not inside it. */
+async function settled(url, id) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const { consultation } = await (await fetch(`${url}/api/council/consultations/${id}`)).json();
+    if (consultation.status !== 'running') return consultation;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error('the consultation never finished');
+}
+
+test('council: a written plan starts a consultation on its own, without holding the turn open', async () => {
+  const { url, asked } = await bootPlanCouncil();
+  const frames = await planTurn(url);
+
+  const started = frames.find((f) => f.type === 'council-started');
+  expect(started.peers).toEqual(['codex']);
+  // The turn ends with the turn. Only the id travels on the stream.
+  expect(frames.findIndex((f) => f.type === 'council-started')).toBeLessThan(frames.findIndex((f) => f.type === 'turn-complete'));
+
+  const consultation = await settled(url, started.consultationId);
+  expect(consultation.status).toBe('completed');
+  expect(consultation.result.agreed).toEqual(['codex']);
+  expect(asked[0].prompt).toContain('.md');
+});
+
+test('council: the level decides — at off nothing fires by itself', async () => {
+  const { url } = await bootPlanCouncil();
+  await fetch(`${url}/api/council`, {
+    method: 'PUT',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ level: 'off', assignment: { lead: 'claude-code', thinker: 'codex', worker: 'codex', peer: ['codex'] } }),
+  });
+  const frames = await planTurn(url);
+  expect(frames.find((f) => f.type === 'council-started')).toBeUndefined();
+  const listed = await (await fetch(`${url}/api/council/consultations`)).json();
+  expect(listed.consultations).toHaveLength(0);
+});
+
+test('council: a guided turn that wrote no plan has nothing to review', async () => {
+  const { url } = await bootPlanCouncil({ planBody: null });
+  const frames = await planTurn(url);
+  expect(frames.find((f) => f.type === 'council-started')).toBeUndefined();
+});
+
+test('council: a dissenting peer is reported as dissent, not smoothed into agreement', async () => {
+  const { url } = await bootPlanCouncil({
+    answer: () => JSON.stringify({ verdict: 'disagree', summary: 'step 3 cannot work', risks: ['the file it edits does not exist yet'] }),
+  });
+  const frames = await planTurn(url);
+  const consultation = await settled(url, frames.find((f) => f.type === 'council-started').consultationId);
+  expect(consultation.result.consensus).toBe(false);
+  expect(consultation.result.dissenting[0].summary).toBe('step 3 cannot work');
+});
+
+test('council: consultations are listed for the chat that asked', async () => {
+  const { url } = await bootPlanCouncil();
+  const frames = await planTurn(url);
+  const chatId = frames.find((f) => f.type === 'chat-id').chatId;
+  await settled(url, frames.find((f) => f.type === 'council-started').consultationId);
+
+  const mine = await (await fetch(`${url}/api/council/consultations?chatId=${chatId}`)).json();
+  expect(mine.consultations).toHaveLength(1);
+  const other = await (await fetch(`${url}/api/council/consultations?chatId=chat-that-never-was`)).json();
+  expect(other.consultations).toHaveLength(0);
+});
+
+test('council: an unknown consultation is a 404, not an empty object', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/council/consultations/nope`);
+  expect(res.status).toBe(404);
+});

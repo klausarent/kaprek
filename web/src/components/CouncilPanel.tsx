@@ -4,7 +4,7 @@
 // the valuable part. Agreement gets one line; disagreement gets the peer's
 // own words and its named risks. A council that always renders as "all
 // good" has checked nothing.
-import type { Consultation } from "../lib/api";
+import type { Consultation, ConsultationRecord } from "../lib/api";
 
 /** The one-line headline. Ordered so the interesting answer is never buried. */
 export function headline(consultation: Consultation): string {
@@ -48,6 +48,33 @@ export default function CouncilPanel({ consultation, busy = false }: { consultat
           No answer from {consultation.unreachable.map((entry) => `${entry.peerId} (${entry.error ?? "unknown reason"})`).join(", ")}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * The status line for a consultation kaprek started by itself.
+ *
+ * Its whole job is to be honest about which of four things happened, because
+ * three of them look identical if you only render the result: still running,
+ * finished, died with the process, or reviewing a plan that has since been
+ * edited.
+ */
+export function autoStatusLine(record: ConsultationRecord): string {
+  if (record.status === "running") return `${record.peers.join(" and ")} are reading the plan…`;
+  if (record.status === "interrupted") return "kaprek stopped while this review was running — it was not repeated.";
+  if (record.status === "failed") return `The review did not finish: ${record.error ?? "unknown reason"}`;
+  if (record.stale) return "The plan changed after this review — the verdict below is about the earlier version.";
+  return "";
+}
+
+export function AutoConsultation({ record }: { record: ConsultationRecord | null }) {
+  if (!record) return null;
+  const note = autoStatusLine(record);
+  return (
+    <div className="council-auto">
+      {note !== "" && <div className={record.stale ? "council-note council-note-stale" : "council-note"}>{note}</div>}
+      {record.result && <CouncilPanel consultation={record.result} />}
     </div>
   );
 }

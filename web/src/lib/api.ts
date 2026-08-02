@@ -599,6 +599,12 @@ export type ChatStreamEvent =
   | { type: "result"; sessionId: string | null; costUsd: number | null; usage: Record<string, unknown> | null; isError: boolean }
   | { type: "error"; message: string }
   | ApprovalFrame
+  /**
+   * A consultation started beside this turn. Only the id travels on the
+   * stream — the consultation itself takes minutes and outlives the turn, so
+   * the result is fetched, not streamed.
+   */
+  | { type: "council-started"; chatId: string; consultationId: string; peers: string[] }
   | {
       type: "turn-complete";
       chatId: string;
@@ -1213,4 +1219,33 @@ export async function consultCouncil(input: { question: string; files?: string[]
   });
   await throwOnError(res);
   return (await res.json()).consultation as Consultation;
+}
+
+/** A consultation as the store keeps it: the question, who was asked, and how it ended. */
+export type ConsultationRecord = {
+  id: string;
+  chatId: string;
+  moment: string;
+  question: string;
+  peers: string[];
+  planPath: string | null;
+  status: "running" | "completed" | "failed" | "interrupted";
+  startedAt: string;
+  finishedAt?: string;
+  result: Consultation | null;
+  error: string | null;
+  /** The plan changed after the peers read it — the verdict is about a document that no longer exists in that form. */
+  stale: boolean;
+};
+
+export async function fetchConsultations(chatId?: string): Promise<ConsultationRecord[]> {
+  const res = await apiFetch(`/api/council/consultations${chatId ? `?chatId=${encodeURIComponent(chatId)}` : ""}`);
+  await throwOnError(res);
+  return (await res.json()).consultations as ConsultationRecord[];
+}
+
+export async function fetchConsultation(id: string): Promise<ConsultationRecord> {
+  const res = await apiFetch(`/api/council/consultations/${encodeURIComponent(id)}`);
+  await throwOnError(res);
+  return (await res.json()).consultation as ConsultationRecord;
 }

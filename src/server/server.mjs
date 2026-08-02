@@ -48,6 +48,8 @@ import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '.
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
 import { consultPeers } from '../council/consult.mjs';
 import { makeAskPeer, availablePeerIds } from '../council/ask.mjs';
+import { openConsultations, ConsultationNotFoundError } from '../council/store.mjs';
+import { createCouncilRunner, planQuestion } from '../council/auto.mjs';
 
 /**
  * The wall clock one peer's own turn gets, kept just under the council's own
@@ -1429,13 +1431,49 @@ function guidedPlanPath({ getPlans, chats, chatId, cwd, dataDir, text }) {
 }
 
 /**
+ * Asks the council about a plan a turn just wrote, if the level says so.
+ *
+ * Rule 4 of the automatic council lives here: only a turn that ACTUALLY
+ * produced a plan gets one. A guided turn that ignored its instructions has
+ * nothing to review, and two CLIs reading an empty package is the most
+ * expensive kind of nothing.
+ *
+ * Never throws: an automatic second opinion failing to start must not turn a
+ * finished turn into a broken one.
+ */
+function startCouncilForPlan({ getCouncil, chats, chatId, cwd, dataDir, result }) {
+  const plan = result?.guided?.plan;
+  if (!plan?.path) return null;
+  try {
+    let goal = null;
+    try {
+      goal = chats.events(chatId).find((event) => event.kind === 'user')?.text?.slice(0, 300) ?? null;
+    } catch {
+      // The plan itself is enough of a package; the goal is context, not a requirement.
+    }
+    return getCouncil().maybeConsult({
+      chatId,
+      moment: 'plan',
+      question: planQuestion({ planPath: plan.path, goal }),
+      planPath: plan.path,
+      // Peers read from where the plan is, so a mission plan is reviewed
+      // with the project it belongs to in reach.
+      cwd: cwd ?? dataDir,
+    });
+  } catch (err) {
+    console.warn(`council: could not start a consultation for ${plan.path} (${err.message})`);
+    return null;
+  }
+}
+
+/**
  * Council routes: /api/council (the setup) and /api/council/consult (ask).
  *
  * GET answers with the saved setup AND a suggestion built from what is
  * installed, so a fresh install has something to accept rather than a form
  * to fill in from nothing.
  */
-async function handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry, getMissions }) {
+async function handleCouncilRoutes(req, res, segments, url, { dataDir, engineRegistry, getMissions, getConsultations }) {
   const peers = availablePeerIds({ engineIds: engineRegistry.listEngines().map((engine) => engine.id) });
 
   if (segments.length === 2) {
@@ -1472,6 +1510,29 @@ async function handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry
       return;
     }
     sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  // /api/council/consultations — what the automatic council has produced.
+  // Read-only: consultations are started by a turn or by the button, never
+  // by asking for the list.
+  if (segments[2] === 'consultations') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const store = getConsultations();
+    if (segments.length === 4) {
+      try {
+        sendJson(res, 200, { consultation: store.get(segments[3]) });
+      } catch (err) {
+        if (err instanceof ConsultationNotFoundError) sendJson(res, 404, { error: err.message });
+        else throw err;
+      }
+      return;
+    }
+    const chatId = url.searchParams.get('chatId');
+    sendJson(res, 200, { consultations: store.list({ chatId: chatId && chatId.trim() !== '' ? chatId : null }) });
     return;
   }
 
@@ -1753,6 +1814,7 @@ async function handleChatTurn(
   {
     getChats,
     getPlans,
+    getCouncil,
     getMissions,
     harness,
     harnessName,
@@ -2033,6 +2095,15 @@ async function handleChatTurn(
       }),
       signal: controller.signal,
     });
+    // A plan just landed on disk: the moment a second opinion is worth most
+    // and costs least. The consultation itself does NOT run on this stream —
+    // it takes minutes, and holding the turn open for it would keep the chat
+    // busy and die with the browser tab. What goes out here is only its id,
+    // so the UI can start watching something that already exists.
+    const consulted = startCouncilForPlan({ getCouncil, chats, chatId, cwd: turnCwd ?? null, dataDir, result });
+    if (consulted?.consultation) {
+      await enqueue({ type: 'council-started', chatId, consultationId: consulted.consultation.id, peers: consulted.consultation.peers });
+    }
     await enqueue({ type: 'turn-complete', ...result });
   } catch (err) {
     // A harness/orchestrator throw here is a genuine programming error (see
@@ -2509,6 +2580,8 @@ async function handleRequest(
     getBoard,
     getMissions,
     getPlans,
+    getCouncil,
+    getConsultations,
     tmpRoot,
     getChats,
     harness,
@@ -2615,7 +2688,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'council') {
-      await handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry, getMissions });
+      await handleCouncilRoutes(req, res, segments, url, { dataDir, engineRegistry, getMissions, getConsultations });
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {
@@ -2676,6 +2749,13 @@ async function handleRequest(
       await handleChatRoutes(req, res, segments, url, {
         getChats,
         getMissions,
+        // Both were missing here until 02.08. handleChatTurn destructures
+        // getPlans for guidedPlanPath(), whose "a chat keeps its plan" branch
+        // is wrapped in a try/catch — so the missing dependency did not throw,
+        // it just made every guided turn behave as if the chat had no plan
+        // yet. A silent fallback is the worst kind of missing wire.
+        getPlans,
+        getCouncil,
         harness,
         harnessName,
         engineRegistry,
@@ -2814,6 +2894,12 @@ export function startServer({
   // Overridable so a test can hand it fake engines — a registry test that
   // resolved the real ones would spawn real, billed CLIs.
   engineRegistry = { getEngine, listEngines },
+  // How a council peer is actually reached. Injected for the same reason the
+  // engine registry is: a test must be able to exercise the automatic
+  // council without spawning somebody's real CLI, and an automatic feature
+  // that starts processes on its own is exactly the kind that must never do
+  // so during a test run by accident.
+  makeCouncilAskPeer = makeAskPeer,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -2874,6 +2960,31 @@ export function startServer({
   // JSONL-backed I/O involved makes that cost negligible.
   function getChats() {
     return openChats(dataDir);
+  }
+
+  // Consultations are re-opened per call for the same reason plans are: the
+  // council runner writes through its own instance from a background job
+  // that outlives the request which started it.
+  function getConsultations() {
+    return openConsultations(dataDir);
+  }
+
+  // The automatic council. Built once, because unlike the stores it holds
+  // live state: which consultations this process is driving, and how to
+  // abort them.
+  let council = null;
+  function getCouncil() {
+    if (!council) {
+      council = createCouncilRunner({
+        getConsultations,
+        readConfig: () => readCouncil(dataDir),
+        availablePeerIds: () => availablePeerIds({ engineIds: engineRegistry.listEngines().map((engine) => engine.id) }),
+        makeAskPeer: makeCouncilAskPeer,
+        timeoutMs: PEER_TURN_TIMEOUT_MS,
+        log: (message) => console.log(message),
+      });
+    }
+    return council;
   }
 
   // The apps installed right now, re-read per call rather than cached: an app
@@ -3137,6 +3248,8 @@ export function startServer({
       getBoard,
       getMissions,
       getPlans,
+      getCouncil,
+      getConsultations,
       tmpRoot,
       getChats,
       harness,
@@ -3174,6 +3287,10 @@ export function startServer({
   // closes the server) leaves no dangling interval behind either.
   server.on('close', () => {
     if (runner) runner.stop();
+    // A consultation is a pair of CLI processes reading a repo. Left alone
+    // they outlive the server that started them, invisibly — so the shutdown
+    // aborts them and each records how it ended.
+    if (council) council.stopAll('kaprek is shutting down').catch(() => {});
   });
 
   return new Promise((resolve, reject) => {
@@ -3182,6 +3299,17 @@ export function startServer({
       const addr = server.address();
       boundPort = addr.port;
       getRunner().start();
+      // Anything still marked running belongs to a process that is gone. It
+      // is marked interrupted and never re-asked: nobody knows whether those
+      // peers answered, and asking again spends real turns on a question
+      // that may already have one. Same rule the relay follows for a
+      // dispatch that was in flight at a crash.
+      try {
+        const stranded = getConsultations().interruptRunning();
+        if (stranded.length > 0) console.log(`[kaprek] ${stranded.length} consultation(s) were interrupted by a restart`);
+      } catch (err) {
+        console.warn(`[kaprek] could not check for interrupted consultations: ${err.message}`);
+      }
       // `token` is returned for the process that STARTED the server (the CLI,
       // a test) — it is deliberately not printed anywhere by default; see
       // token.mjs on why it never goes into a log line. `runner` comes back

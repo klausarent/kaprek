@@ -41,8 +41,8 @@ import RepeatHint from "../components/RepeatHint";
 import PlanPrompt, { looksLikePlanning } from "../components/PlanPrompt";
 import QuizCard from "../components/QuizCard";
 import { formatQuizAnswers } from "../lib/quiz";
-import CouncilPanel from "../components/CouncilPanel";
-import { consultCouncil, type Consultation } from "../lib/api";
+import CouncilPanel, { AutoConsultation } from "../components/CouncilPanel";
+import { consultCouncil, fetchConsultation, fetchConsultations, type Consultation, type ConsultationRecord } from "../lib/api";
 import { navigateToPlans } from "../App";
 import { toSimpleItems } from "../lib/simple";
 import { EFFORT_LEVELS } from "../lib/api";
@@ -181,6 +181,24 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
       .catch((e) => setLoadError((e as Error).message));
   }, [initialChatId, relayReloads]);
 
+  // The council's last word on this chat, restored on open. A review that
+  // outlives the turn has to outlive the tab too, or the automatic part is
+  // only automatic for whoever stays on the page.
+  useEffect(() => {
+    if (!initialChatId) return;
+    let cancelled = false;
+    fetchConsultations(initialChatId)
+      .then((records) => {
+        if (!cancelled && records.length > 0) setAutoConsultation(records[0]);
+      })
+      .catch(() => {
+        // No council configured, or nothing asked yet. Neither is worth an error.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [initialChatId]);
+
   // A mission created from a preset parks its first prompt for exactly this
   // moment (see Missions.tsx) — take it once, then clear it so a later visit
   // to the same mission starts empty.
@@ -259,6 +277,32 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // What the other engines said about the last thing worth asking about.
   const [consultation, setConsultation] = useState<Consultation | null>(null);
   const [consulting, setConsulting] = useState(false);
+  // A consultation the server started on its own after a plan. It runs beside
+  // the chat and takes minutes, so what is held here is its id — the result
+  // is polled, and survives a reload because the server keeps it.
+  const [autoConsultation, setAutoConsultation] = useState<ConsultationRecord | null>(null);
+
+  // Polls a running consultation until it ends. Polling rather than a second
+  // stream: it ticks four times a minute for a few minutes, and a socket held
+  // open for that is more moving parts than the question is worth.
+  useEffect(() => {
+    if (autoConsultation?.status !== "running") return;
+    const id = autoConsultation.id;
+    let stop = false;
+    const timer = window.setInterval(() => {
+      fetchConsultation(id)
+        .then((record) => {
+          if (!stop) setAutoConsultation(record);
+        })
+        .catch(() => {
+          // A failed poll is a poll; the next one may well succeed.
+        });
+    }, 15_000);
+    return () => {
+      stop = true;
+      window.clearInterval(timer);
+    };
+  }, [autoConsultation?.id, autoConsultation?.status]);
 
   const canSend = draft.trim().length > 0 && !streaming;
 
@@ -416,6 +460,23 @@ Is this the right approach?`,
       case "result":
         // Superseded by 'turn-complete' below, which carries the same
         // sessionId/costUsd plus the orchestrator's own stopReason/error.
+        break;
+      case "council-started":
+        // Placed on screen as running before anything is known about it: a
+        // review nobody can see starting looks exactly like no review.
+        setAutoConsultation({
+          id: event.consultationId,
+          chatId: event.chatId,
+          moment: "plan",
+          question: "",
+          peers: event.peers,
+          planPath: null,
+          status: "running",
+          startedAt: new Date().toISOString(),
+          result: null,
+          error: null,
+          stale: false,
+        });
         break;
       case "turn-complete":
         setLastTurn({ costUsd: event.costUsd, stopReason: event.stopReason, errorMessage: event.error?.message ?? null });
@@ -608,7 +669,10 @@ Is this the right approach?`,
         </div>
       )}
 
+      {/* Asked for by the button. */}
       {(consultation || consulting) && <CouncilPanel consultation={consultation} busy={consulting} />}
+      {/* Asked for by nobody: the council fired on its own after a plan. */}
+      <AutoConsultation record={autoConsultation} />
 
       {planOffer && !streaming && (
         <PlanPrompt
