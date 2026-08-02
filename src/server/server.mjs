@@ -1504,7 +1504,11 @@ function guidedPlanPath({ getPlans, chats, chatId, cwd, dataDir, text }) {
  */
 function startCouncilForPlan({ getCouncil, chats, chatId, cwd, dataDir, result }) {
   const plan = result?.guided?.plan;
-  if (!plan?.path) return null;
+  // No plan: this is the 'turn' moment, which only the `always` level acts
+  // on. It was defined from the start and had no caller, so the level did
+  // nothing however it was set — a setting that silently means "off" is
+  // worse than one that is not offered.
+  if (!plan?.path) return startCouncilForTurn({ getCouncil, chats, chatId, cwd, dataDir });
   try {
     let goal = null;
     try {
@@ -1658,6 +1662,34 @@ async function handleMemoryRoutes(req, res, segments, url, { dataDir }) {
   }
 
   sendJson(res, 405, { error: 'method not allowed' });
+}
+
+/**
+ * The 'turn' moment: after an ordinary turn, for whoever set the level to
+ * `always`.
+ *
+ * The question is built from the exchange that just happened, because that
+ * is all there is at this moment — no plan, no stated decision. Which is
+ * also why only `always` acts on it: this is the expensive, indiscriminate
+ * end of the setting, and it should behave like it says.
+ */
+function startCouncilForTurn({ getCouncil, chats, chatId, cwd, dataDir }) {
+  try {
+    const events = chats.events(chatId);
+    const lastUser = [...events].reverse().find((event) => event.kind === 'user')?.text;
+    const lastAssistant = [...events].reverse().find((event) => event.kind === 'assistant')?.text;
+    if (!lastUser) return null;
+    return getCouncil().maybeConsult({
+      chatId,
+      moment: 'turn',
+      question: `Someone asked: ${lastUser.slice(0, 800)}\n\nThe answer was: ${(lastAssistant ?? '(nothing)').slice(0, 1500)}\n\nIs that right, and is anything important missing?`,
+      cwd: cwd ?? dataDir,
+    });
+  } catch {
+    // A second opinion failing to start must never turn a finished turn into
+    // a broken one.
+    return null;
+  }
 }
 
 /**

@@ -26,9 +26,17 @@ export const COUNCIL_ROLES = ['lead', 'thinker', 'worker', 'peer'];
  * How eagerly kaprek asks a peer WITHOUT being asked. The button to consult
  * one is always there; this only governs what happens on its own.
  *   off        never
- *   plans      before writing a plan, and after (the default)
- *   decisions  also at architecture and data-model decisions
- *   always     every round
+ *   plans      when a plan has just been written (the default)
+ *   decisions  the same, for now — see below
+ *   always     that, plus after every ordinary turn
+ *
+ * HONEST NOTE ON 'decisions': the moment exists and is respected, but
+ * nothing in kaprek currently reports one. A turn does not know it just made
+ * an architecture decision, and guessing from the text would produce a
+ * setting that fires on the word "decided". Until something can say so
+ * truthfully, 'decisions' behaves exactly like 'plans' — which is written
+ * down here rather than left for someone to discover by watching nothing
+ * happen.
  */
 export const COUNCIL_LEVELS = ['off', 'plans', 'decisions', 'always'];
 

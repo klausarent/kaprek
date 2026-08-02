@@ -150,6 +150,13 @@ opinion to get instead of asking one model to review itself.
 
 `off` / `plans` / `decisions` / `always` govern what kaprek asks **unasked**.
 The "Second opinion" button in a chat works at every level, including `off`.
+At `always` an ordinary turn gets one too, which is the expensive,
+indiscriminate end of the setting and behaves like it says.
+
+One honest gap: `decisions` currently behaves exactly like `plans`. The
+moment exists and is respected, but nothing in kaprek can truthfully report
+"that was an architecture decision" yet, and guessing it from the text would
+give you a setting that fires on the word "decided".
 
 At `plans` and above, writing a plan is the moment that fires by itself: the
 peers get the plan's path and read the file. That consultation does **not**
