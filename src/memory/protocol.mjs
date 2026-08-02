@@ -62,17 +62,19 @@ export function parseRemember(answer) {
  * ask for it. Stale entries are marked rather than dropped, because "this was
  * true in May and nobody rechecked" is something the agent should weigh.
  *
- * Returns an empty string when there is nothing to say, so a caller can
- * append it unconditionally.
+ * ALWAYS carries the how-to-write half, even with nothing to show. The
+ * first live run failed exactly here: an empty store meant an empty block,
+ * so the agent was never told the format — and the turn that learns the
+ * most, the first one in a project, was the one that could not write.
+ * Whether memory applies at all is the caller's decision (a scope, or none).
  */
 export function buildMemoryPrompt(entries = []) {
-  if (entries.length === 0) return '';
-
   const line = (entry) => `- ${entry.text}${entry.stale ? ' (last verified over 90 days ago — treat as possibly out of date)' : ''}`;
   const profiles = entries.filter((entry) => entry.kind === 'profile');
   const facts = entries.filter((entry) => entry.kind === 'fact');
 
   const sections = ['## What kaprek remembers about this work', ''];
+  if (entries.length === 0) sections.push('Nothing yet — this is the first turn that could write any of it down.', '');
   if (profiles.length > 0) sections.push(...profiles.map(line), '');
   if (facts.length > 0) sections.push('Learned earlier, in this project or by another agent working on it:', ...facts.map(line), '');
   sections.push(

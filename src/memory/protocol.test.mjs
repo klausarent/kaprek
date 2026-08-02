@@ -58,8 +58,13 @@ describe('parseRemember', () => {
 });
 
 describe('buildMemoryPrompt', () => {
-  test('says nothing when there is nothing', () => {
-    expect(buildMemoryPrompt([])).toBe('');
+  test('still explains how to write, even with nothing to show', () => {
+    // The first live M3 run died here: an empty store meant an empty block,
+    // so the agent never learned the format, so nothing was ever written,
+    // so the store stayed empty.
+    const prompt = buildMemoryPrompt([]);
+    expect(prompt).toContain(REMEMBER_FENCE);
+    expect(prompt).toMatch(/Nothing yet/);
   });
 
   test('puts the profile before the facts', () => {
