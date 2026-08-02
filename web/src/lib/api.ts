@@ -1435,3 +1435,43 @@ export async function decideProposal(id: string, status: "accepted" | "rejected"
   await throwOnError(res);
   return (await res.json()).proposal as RuleProposal;
 }
+
+// ---------------------------------------------------------------------------
+// kaprek Home (GET /api/home — src/missions/home.mjs)
+//
+// The same machine underneath. What differs is what gets asked and what gets
+// shown.
+// ---------------------------------------------------------------------------
+
+export type HomeQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  options: string[];
+  freeText?: boolean;
+};
+
+export type HomeMission = {
+  id: string;
+  title: string;
+  blurb: string;
+  questions: HomeQuestion[];
+  /** What finished looks like, in something a person can point at. */
+  done: string;
+};
+
+export async function fetchHomeMissions(): Promise<HomeMission[]> {
+  const res = await apiFetch("/api/home");
+  await throwOnError(res);
+  return (await res.json()).missions as HomeMission[];
+}
+
+export async function startHomeMission(id: string, cwd: string, answers: Record<string, string>): Promise<{ mission: { id: string }; firstPrompt: string; done: string }> {
+  const res = await apiFetch(`/api/home/${encodeURIComponent(id)}/start`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ cwd, answers }),
+  });
+  await throwOnError(res);
+  return await res.json();
+}

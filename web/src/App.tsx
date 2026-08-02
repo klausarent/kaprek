@@ -28,6 +28,7 @@ import Plans from "./pages/Plans";
 import CouncilPage from "./pages/Council";
 import Setup from "./pages/Setup";
 import Memory from "./pages/Memory";
+import Home from "./pages/Home";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
 
@@ -46,7 +47,8 @@ export type Route =
   | { name: "plans" }
   | { name: "council" }
   | { name: "setup" }
-  | { name: "memory" };
+  | { name: "memory" }
+  | { name: "home" };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -78,6 +80,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "plans") {
     return { name: "plans" };
+  }
+  if (parts[0] === "home") {
+    return { name: "home" };
   }
   if (parts[0] === "memory") {
     return { name: "memory" };
@@ -181,6 +186,10 @@ export function navigateToPlans() {
 
 export function navigateToCouncil() {
   window.location.hash = "#/council";
+}
+
+export function navigateToHome() {
+  window.location.hash = "#/home";
 }
 
 export function navigateToMemory() {
@@ -357,6 +366,16 @@ export default function App() {
             Council
           </a>
           <a
+            href="#/home"
+            className={route.name === "home" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToHome();
+            }}
+          >
+            Make something
+          </a>
+          <a
             href="#/memory"
             className={route.name === "memory" ? "active" : ""}
             onClick={(e) => {
@@ -433,6 +452,8 @@ export default function App() {
           <Triggers />
         ) : route.name === "approvals" ? (
           <Approvals />
+        ) : route.name === "home" ? (
+          <Home />
         ) : route.name === "memory" ? (
           <Memory />
         ) : route.name === "setup" ? (

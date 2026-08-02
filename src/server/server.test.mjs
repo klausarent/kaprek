@@ -4299,3 +4299,36 @@ test('workflows: an unknown version is refused on import', async () => {
   const res = await postJson(`${url}/api/workflows/preview`, { workflow: { version: 99, id: 'x', title: 'x', preset: { firstPrompt: 'x' } } });
   expect(res.status).toBe(400);
 });
+
+test('home: the four guided missions, each with at most three questions', async () => {
+  const { url } = await boot();
+  const { missions } = await (await fetch(`${url}/api/home`)).json();
+  expect(missions.map((mission) => mission.id)).toEqual(['game', 'trip', 'tool', 'reel']);
+  for (const mission of missions) expect(mission.questions.length).toBeLessThanOrEqual(3);
+});
+
+test('home: starting one produces an ordinary mission and its first prompt', async () => {
+  const projectDir = fs.mkdtempSync(path.join(tmpRootDir, 'home-'));
+  const { url } = await boot();
+
+  const res = await postJson(`${url}/api/home/game/start`, {
+    cwd: projectDir,
+    answers: { about: 'Catching things that fall', who: 'A young child', look: 'Bright and simple shapes' },
+  });
+  expect(res.status).toBe(201);
+  const body = await res.json();
+
+  // The same missions store as everything else — no second product.
+  const listed = await (await fetch(`${url}/api/missions`)).json();
+  expect(listed.missions.map((mission) => mission.id)).toContain(body.mission.id);
+
+  expect(body.firstPrompt).toContain('A young child');
+  expect(body.firstPrompt).toMatch(/Do not ask more/);
+  expect(body.done).toContain('double-click');
+});
+
+test('home: an unknown guided mission is a 404, and a missing folder a 400', async () => {
+  const { url } = await boot();
+  expect((await postJson(`${url}/api/home/nope/start`, { cwd: 'x' })).status).toBe(404);
+  expect((await postJson(`${url}/api/home/game/start`, {})).status).toBe(400);
+});

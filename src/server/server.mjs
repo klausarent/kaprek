@@ -41,6 +41,7 @@ import {
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
 import { InvalidWorkflowError, buildWorkflow, importSummary, loadWorkflows, saveWorkflow, validateWorkflow } from '../missions/workflow.mjs';
+import { HOME_MISSIONS, buildHomePrompt, homeMission } from '../missions/home.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
@@ -2954,6 +2955,49 @@ async function handleRequest(
       });
       return;
     }
+    // /api/home — the four guided missions, named after what a person wants.
+    if (segments[1] === 'home') {
+      if (segments.length === 2 && req.method === 'GET') {
+        sendJson(res, 200, { missions: HOME_MISSIONS });
+        return;
+      }
+      // POST /api/home/<id>/start — answers in, a real mission out. The same
+      // missions, the same engines, the same everything: what differs is
+      // only what was asked and what gets shown.
+      if (segments.length === 4 && segments[3] === 'start' && req.method === 'POST') {
+        const mission = homeMission(segments[2]);
+        if (!mission) {
+          sendJson(res, 404, { error: `no such guided mission: ${segments[2]}` });
+          return;
+        }
+        const body = await readJsonBody(req);
+        if (!body.ok) {
+          sendJson(res, body.status, { error: body.error });
+          return;
+        }
+        const cwd = body.data?.cwd;
+        if (typeof cwd !== 'string' || cwd.trim() === '') {
+          sendJson(res, 400, { error: 'a folder to work in is required' });
+          return;
+        }
+        try {
+          const created = getMissions().create({ title: mission.title, goal: mission.done, cwd });
+          sendJson(res, 201, {
+            mission: created,
+            // Handed back rather than started here: the browser opens a chat
+            // with it, which is the same path an ordinary mission takes.
+            firstPrompt: buildHomePrompt(mission, body.data?.answers ?? {}),
+            done: mission.done,
+          });
+        } catch (err) {
+          sendJson(res, 400, { error: err.message });
+        }
+        return;
+      }
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+
     // /api/workflows — a way of working as one file you can hand over.
     if (segments[1] === 'workflows') {
       if (segments.length === 2 && req.method === 'GET') {

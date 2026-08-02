@@ -319,6 +319,40 @@ What holds either way:
 - On a machine with no network address, `--lan` stays on loopback and says
   so rather than printing a QR for an address that does not exist.
 
+## Make something (`#/home`)
+
+Four things you might want, three questions each, and a result you can point
+at:
+
+- **Build a small game** — one file you double-click, and it plays
+- **Plan a city trip** — a plan per day you can print or put on your phone
+- **Build a small tool** — something that does one job and runs again tomorrow
+- **Make a reel with a teleprompter** — a script you read off the screen while filming
+
+There is no second product behind this. Each one becomes an ordinary mission
+with an ordinary preset, run by the same engines through the same approval
+inbox. What differs is what gets asked and what gets shown: no engine picker,
+no permission mode, no token count, nothing on screen that only means
+something to someone who already knows how this works.
+
+At most three questions, because a fourth is a sign the first three were
+vague. Then it works, and tells you where the result is and what it
+remembered for next time.
+
+## Sharing a way of working
+
+A workflow is one file that carries how a recurring job is done: the preset
+that starts it, the relay recipe that runs it, the council level it wants,
+and the handful of facts a newcomer to that work needs. `POST /api/workflows`
+writes one; `POST /api/workflows/preview` shows what taking someone else's
+would change *before* anything is written, since a workflow sets the council
+level and adds a recipe.
+
+Absolute paths and anything naming a secret are refused at export rather than
+stripped out. A file with a hole where a path used to be still looks
+complete, and the person receiving it finds out at run time — the person
+exporting is the one who can fix it.
+
 ## Running it unattended
 
 **Start with the machine** — off unless you ask, and it is one file:
