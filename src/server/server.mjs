@@ -65,6 +65,7 @@ import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
 import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUNDS_PER_GATE } from '../relay/dispatcher.mjs';
+import { loadRecipes } from '../relay/recipes.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
@@ -1238,7 +1239,7 @@ export function parseRelayAnswer(text, result = {}) {
  * start one: a scheduled job that can start an agent-to-agent loop is exactly
  * the shape of thing that runs all night without anyone deciding it should.
  */
-async function handleRelayStart(req, res, chatId, { getRelay, getRunner }) {
+async function handleRelayStart(req, res, chatId, { getRelay, getRunner, dataDir }) {
   if (!CHAT_ID_RE.test(chatId)) {
     sendJson(res, 400, { error: 'invalid chat id' });
     return;
@@ -1261,6 +1262,19 @@ async function handleRelayStart(req, res, chatId, { getRelay, getRunner }) {
   const route = Array.isArray(body.data?.route) && body.data.route.length > 0 ? body.data.route : [...RELAY_DEFAULT_ROUTE];
   const maxRounds = Number.isInteger(body.data?.maxRounds) && body.data.maxRounds > 0 ? body.data.maxRounds : RELAY_ROUNDS_PER_GATE;
 
+  // A named recipe is resolved BEFORE the run starts. An id nobody knows is
+  // a 400 rather than a silent fallback to the default pairing: someone who
+  // asked for three agents and got two would find out three handoffs later.
+  let recipe = null;
+  const recipeId = body.data?.recipeId;
+  if (typeof recipeId === 'string' && recipeId.trim() !== '') {
+    recipe = loadRecipes(dataDir).find((candidate) => candidate.id === recipeId) ?? null;
+    if (!recipe) {
+      sendJson(res, 400, { error: `unknown recipe: ${recipeId}` });
+      return;
+    }
+  }
+
   // Same busy rule a chat turn gets: one conversation, one thing writing into
   // it at a time.
   if (getRunner && getRunner().isChatRunning(chatId)) {
@@ -1269,8 +1283,8 @@ async function handleRelayStart(req, res, chatId, { getRelay, getRunner }) {
   }
 
   try {
-    const started = await relay.startRun({ chatId, goal, route, maxRounds });
-    sendJson(res, 200, { runId: started.runId, status: started.status, route: started.route, maxRounds: started.maxRounds });
+    const started = await relay.startRun({ chatId, goal, ...(recipe ? { recipe } : { route, maxRounds }) });
+    sendJson(res, 200, { runId: started.runId, status: started.status, route: started.route, maxRounds: started.maxRounds, recipeId: started.recipeId });
   } catch (err) {
     sendJson(res, 409, { error: err.message });
   }
@@ -2726,12 +2740,20 @@ async function handleRequest(
       sendJson(res, 200, { engines: engineRegistry.listEngines() });
       return;
     }
+    if (segments.length === 2 && segments[1] === 'recipes') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendJson(res, 200, { recipes: loadRecipes(dataDir) });
+      return;
+    }
     if (segments.length === 4 && segments[1] === 'chat' && segments[3] === 'relay') {
       if (req.method !== 'POST') {
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleRelayStart(req, res, segments[2], { getRelay, getRunner });
+      await handleRelayStart(req, res, segments[2], { getRelay, getRunner, dataDir });
       return;
     }
     if (segments.length === 4 && segments[1] === 'relay' && segments[3] === 'stop') {
@@ -3102,31 +3124,40 @@ export function startServer({
         // own approval could ever lapse (panel Fix-Runde 1, M5).
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
         releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
-        makeUiApprovalHandler: (chatId, { turnDeadlineAt = null, mode = 'interactive', triggerId = null } = {}) =>
-          makeApprovalHandler({
-            chatId,
-            mode,
-            triggerId,
-            // The instant this turn's wall clock kills it, handed down by the
-            // runner because only it knows when the turn started. Caps every
-            // deadline an INTERACTIVE handler publishes (see
-            // effectiveApprovalDeadline); a deferred question outlives the
-            // turn by design and is not capped to it.
-            turnDeadlineAt,
-            enqueue: (frame) => deliverApprovalFrame(chatId, frame),
-            pendingApprovals,
-            // Two different meanings behind one parameter. Deferred: how long
-            // the filed question stays answerable in the inbox, nothing is
-            // waiting (APPROVAL_INBOX_TTL_MS). Interactive, which for a
-            // trigger means someone pressed "run now" and is watching the
-            // dialog: the ordinary ten minutes a person gets.
-            approvalTimeoutMs: mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs,
-            approvalStore: getApprovalStore(),
-            describeSource: describeApprovalSource,
-          }),
+        makeUiApprovalHandler: uiApprovalHandlerFor,
       });
     }
     return runner;
+  }
+
+  /**
+   * The approval handler an unattended turn gets: trigger turns, and relay
+   * steps that were given tools. One definition, two callers — a second copy
+   * of this is a second place for the deferred/interactive distinction to
+   * drift.
+   */
+  function uiApprovalHandlerFor(chatId, { turnDeadlineAt = null, mode = 'interactive', triggerId = null } = {}) {
+    return makeApprovalHandler({
+      chatId,
+      mode,
+      triggerId,
+      // The instant this turn's wall clock kills it, handed down by the
+      // runner because only it knows when the turn started. Caps every
+      // deadline an INTERACTIVE handler publishes (see
+      // effectiveApprovalDeadline); a deferred question outlives the turn by
+      // design and is not capped to it.
+      turnDeadlineAt,
+      enqueue: (frame) => deliverApprovalFrame(chatId, frame),
+      pendingApprovals,
+      // Two different meanings behind one parameter. Deferred: how long the
+      // filed question stays answerable in the inbox, nothing is waiting
+      // (APPROVAL_INBOX_TTL_MS). Interactive, which for a trigger means
+      // someone pressed "run now" and is watching the dialog: the ordinary
+      // ten minutes a person gets.
+      approvalTimeoutMs: mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs,
+      approvalStore: getApprovalStore(),
+      describeSource: describeApprovalSource,
+    });
   }
 
   // The relay dispatcher, opened lazily like everything else here. It is
@@ -3154,20 +3185,64 @@ export function startServer({
         // and say what is wrong with it. Anything that acts on the world goes
         // through the approval path, and an unattended review turn is not the
         // place to open that door.
-        runClaudeTurn: async ({ chatId, prompt, signal }) => {
+        // One relay step that runs as a full harness turn — Claude or Codex,
+        // resolved through the same registry an ordinary chat turn uses. The
+        // engine is not a property of the relay, it is what the recipe's step
+        // asked for.
+        runHarnessTurn: async ({ chatId, prompt, signal, engine = DEFAULT_HARNESS_NAME, tools = 'none' }) => {
+          let stepHarness = harness;
+          let stepHarnessName = harnessName;
+          // Unlike a chat turn, a relay step's engine is NAMED by the recipe
+          // rather than defaulted from the chat. So anything other than the
+          // default engine is resolved through the registry even when a
+          // harness was injected: a recipe naming codex must never quietly
+          // run on claude because codex was missing. An engine the registry
+          // does not know is an error, never a fallback.
+          if (engine !== DEFAULT_HARNESS_NAME) {
+            const entry = engineRegistry.getEngine(engine);
+            if (!entry) throw new Error(`this recipe asks for the engine "${engine}", which is not installed`);
+            stepHarness = { startTurn: entry.startTurn };
+            stepHarnessName = engine;
+          }
+
+          // Where the step works. A relay inside a mission runs in that
+          // mission's directory, so an 'apply' step writes where the project
+          // is rather than into kaprek's scratch workspace.
+          let cwd = workspaceDir;
+          try {
+            const missionId = getChats().get(chatId).missionId;
+            if (missionId) cwd = getMissions().get(missionId).cwd ?? workspaceDir;
+          } catch {
+            // No mission, or one this store cannot resolve: the workspace is
+            // the safe answer, never someone else's directory.
+          }
+
           const result = await runTurn({
             dataDir,
             chatId,
             text: prompt,
-            harness,
-            harnessName,
-            cwd: workspaceDir,
+            harness: stepHarness,
+            harnessName: stepHarnessName,
+            cwd,
             permissionMode,
-            allowedTools: [],
+            // v1's rule, now per step: a step that did not ask for tools gets
+            // none. A step that did gets the CLI's own default set, and every
+            // action it takes goes through the approval handler below.
+            allowedTools: tools === 'full' ? allowedTools : [],
             absoluteTimeoutMs: chatAbsoluteTimeoutMs,
             signal,
             origin: 'relay',
             silent: false,
+            // THE M1 ACCEPTANCE, finally whole: a relay step's approval is
+            // filed in the deferred inbox instead of being auto-denied, so a
+            // batch running overnight parks on the question and waits for a
+            // person — the same inbox, the same answer route, the same
+            // 24-hour window as a trigger's.
+            ...(tools === 'full'
+              ? {
+                  onApprovalRequest: uiApprovalHandlerFor(chatId, { mode: 'deferred' }),
+                }
+              : {}),
           });
           if (result.error) throw new Error(result.error.message);
           const text = lastAssistantText(chatId);

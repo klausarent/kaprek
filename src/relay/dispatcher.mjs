@@ -285,7 +285,16 @@ export function createRelayDispatcher({
     try {
       const answer =
         HARNESS_AGENTS.includes(peerId)
-          ? await runHarnessTurn({ chatId, prompt, signal, runId: relay.runId, engine: engineIdFor(peerId) })
+          ? await runHarnessTurn({
+              chatId,
+              prompt,
+              signal,
+              runId: relay.runId,
+              engine: engineIdFor(peerId),
+              // Fail-closed: a step that did not ask for tools gets none, and
+              // an unknown step (a hand-edited relay state) gets none either.
+              tools: (relay.recipe?.steps ?? []).find((step) => step.agent === peerId)?.tools ?? 'none',
+            })
           : await (() => {
               const driver = getPeerDriver(peerId);
               if (!driver) throw new Error(`no driver for peer "${peerId}"`);

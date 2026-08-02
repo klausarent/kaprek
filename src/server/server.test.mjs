@@ -3868,3 +3868,147 @@ test('council: an unknown consultation is a 404, not an empty object', async () 
   const res = await fetch(`${url}/api/council/consultations/nope`);
   expect(res.status).toBe(404);
 });
+
+// ---------------------------------------------------------------------------
+// M2: recipes over http, and codex taking a real handoff
+// ---------------------------------------------------------------------------
+
+/**
+ * A relay whose harness steps run on a fake registry, so a recipe naming
+ * codex can be exercised without codex being installed.
+ */
+function recipeRegistry(onTurn) {
+  const ran = [];
+  const engineOf = (id) => ({
+    id,
+    startTurn: async (options) => {
+      ran.push({ id, cwd: options.cwd, allowedTools: options.allowedTools, prompt: options.prompt });
+      const answer = onTurn ? onTurn({ id, options, call: ran.length }) : null;
+      options.onEvent({ type: 'text', text: answer ?? JSON.stringify({ status: 'handoff', message: `${id} did the work` }) });
+      return { sessionId: `s-${ran.length}`, costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+    capabilities: { id, name: id, supportsResume: true, supportsMcpConfig: false, supportsSettingsPath: false },
+  });
+  const engines = new Map([
+    ['claude-code', engineOf('claude-code')],
+    ['codex', engineOf('codex')],
+  ]);
+  return { ran, getEngine: (id) => engines.get(id) ?? null, listEngines: () => [...engines.values()].map((engine) => engine.capabilities) };
+}
+
+/** Writes a user recipe into the data dir the server reads from. */
+function writeRecipe(recipe) {
+  const dir = path.join(dataDir, 'recipes');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${recipe.id}.json`), JSON.stringify(recipe), 'utf8');
+}
+
+test('recipes: GET /api/recipes lists the builtins and anything the user added', async () => {
+  writeRecipe({
+    id: 'mine',
+    title: 'My own pairing',
+    steps: [{ id: 'write', agent: 'grok' }],
+    edges: [{ from: 'write', to: 'write' }],
+  });
+  const { url } = await boot();
+  const { recipes } = await (await fetch(`${url}/api/recipes`)).json();
+  expect(recipes.map((recipe) => recipe.id)).toContain('write-review');
+  expect(recipes.find((recipe) => recipe.id === 'mine').builtin).toBe(false);
+  // Every listed recipe is already normalized, so a UI never has to guess a default.
+  expect(recipes.every((recipe) => Number.isInteger(recipe.budgets.maxRounds))).toBe(true);
+});
+
+test('recipes: starting a relay with an unknown recipe is refused before anything runs', async () => {
+  const { url } = await bootRelay({ harness: relayReviewHarness(['handoff']), harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+
+  const res = await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'write the batch', recipeId: 'does-not-exist' });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toMatch(/unknown recipe/);
+  // Nothing was started.
+  const { chat } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+  expect(chat.relay).toBeNull();
+});
+
+test('recipes: a codex step takes a real handoff, in the mission directory, with tools only where the recipe says so', async () => {
+  const registry = recipeRegistry();
+  const grok = stubGrokDriver();
+  const missionDir = fs.mkdtempSync(path.join(tmpRootDir, 'mission-'));
+  const { url } = await boot({ harness: relayReviewHarness(['handoff', 'handoff']), harnessName: 'claude-code', engineRegistry: registry, getPeerDriver: (id) => (id === 'grok' ? grok : null) });
+
+  const mission = await (
+    await postJson(`${url}/api/missions`, { title: 'apply things', goal: 'apply things', cwd: missionDir })
+  ).json();
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed', missionId: mission.mission.id }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+
+  writeRecipe({
+    id: 'apply-it',
+    title: 'write then apply',
+    steps: [
+      { id: 'write', agent: 'grok' },
+      { id: 'apply', agent: 'codex', tools: 'full' },
+    ],
+    edges: [
+      { from: 'write', to: 'apply' },
+      { from: 'apply', to: 'write' },
+    ],
+    budgets: { maxRounds: 1 },
+  });
+
+  const started = await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'apply the batch', recipeId: 'apply-it' });
+  expect(started.status).toBe(200);
+  expect((await started.json()).recipeId).toBe('apply-it');
+
+  await vi.waitFor(
+    async () => {
+      const codexRun = registry.ran.find((entry) => entry.id === 'codex');
+      if (!codexRun) {
+        const { chat, events } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+        throw new Error(`codex has not run yet; ran=${JSON.stringify(registry.ran.map((r) => r.id))} relay=${JSON.stringify(chat?.relay?.status)} events=${JSON.stringify((events ?? []).filter((e) => e.kind === 'relay').map((e) => [e.eventType, e.reason ?? e.from ?? '']))}`);
+      }
+      return codexRun;
+    },
+    { timeout: 10_000 },
+  );
+
+  const codexRun = registry.ran.find((entry) => entry.id === 'codex');
+  // It ran where the project is, not in kaprek's scratch workspace.
+  expect(fs.realpathSync(codexRun.cwd)).toBe(fs.realpathSync(missionDir));
+  // 'full' means the CLI's own default tool set, expressed as "no allowlist".
+  expect(codexRun.allowedTools).not.toEqual([]);
+}, 30_000);
+
+test('recipes: a step that did not ask for tools gets none', async () => {
+  const registry = recipeRegistry();
+  const grok = stubGrokDriver();
+  const { url } = await boot({ harness: relayReviewHarness(['handoff', 'handoff']), harnessName: 'claude-code', engineRegistry: registry, getPeerDriver: (id) => (id === 'grok' ? grok : null) });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'seed' }));
+  const chatId = (await (await fetch(`${url}/api/chat/list?includeSilent=1`)).json()).chats[0].id;
+
+  writeRecipe({
+    id: 'read-only',
+    title: 'write then review',
+    steps: [
+      { id: 'write', agent: 'grok' },
+      { id: 'review', agent: 'codex' },
+    ],
+    edges: [
+      { from: 'write', to: 'review' },
+      { from: 'review', to: 'write' },
+    ],
+    budgets: { maxRounds: 1 },
+  });
+  await postJson(`${url}/api/chat/${chatId}/relay`, { goal: 'review the batch', recipeId: 'read-only' });
+
+  await vi.waitFor(
+    async () => {
+      if (!registry.ran.some((entry) => entry.id === 'codex')) throw new Error('codex has not run yet');
+      return true;
+    },
+    { timeout: 10_000 },
+  );
+  // v1's rule, now per step: no tools unless the recipe says so.
+  expect(registry.ran.find((entry) => entry.id === 'codex').allowedTools).toEqual([]);
+}, 30_000);

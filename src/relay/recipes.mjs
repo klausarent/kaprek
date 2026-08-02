@@ -28,8 +28,27 @@ export const RECIPE_AGENTS = ['grok', 'claude', 'codex'];
 /** What kaprek does when a budget runs out or a peer keeps failing. */
 export const ESCALATION_LEVELS = ['notify', 'question', 'stop'];
 
+/**
+ * What a step may touch.
+ *
+ * 'none' is the default and the only safe one: v1's review turn ran with no
+ * tools at all, deliberately — an unattended turn is not the place to open
+ * that door by accident. A step that has to change files says so, and then
+ * every action it takes goes through the approval inbox like any other.
+ *
+ * Only harness steps can be 'full'; a text peer driver has no tools to give.
+ */
+export const STEP_TOOLS = ['none', 'full'];
+
 /** The recipe used when a caller names none. */
 export const DEFAULT_RECIPE_ID = 'write-review';
+
+/**
+ * Agents kaprek drives itself, and which can therefore be given tools.
+ * Mirrors HARNESS_AGENTS in dispatcher.mjs; duplicated as a plain list here
+ * so recipe validation does not have to import the dispatcher.
+ */
+const HARNESS_AGENTS_IN_RECIPES = ['claude', 'codex'];
 
 /** Thrown by validateRecipe. Carries the offending field so a UI can point at it. */
 export class InvalidRecipeError extends Error {
@@ -62,7 +81,9 @@ export const BUILTIN_RECIPES = Object.freeze([
     steps: [
       { id: 'write', agent: 'grok' },
       { id: 'review', agent: 'claude' },
-      { id: 'apply', agent: 'codex' },
+      // The one step that touches files. Every action it takes still goes
+      // through the approval inbox.
+      { id: 'apply', agent: 'codex', tools: 'full' },
     ],
     edges: [
       { from: 'write', to: 'review' },
@@ -115,7 +136,13 @@ export function validateRecipe(recipe, knownAgents = RECIPE_AGENTS) {
     if (seen.has(step.id)) throw new InvalidRecipeError(`${field}.id`, `duplicate step id "${step.id}" — edges could not tell the two apart`);
     seen.add(step.id);
     enumValue(step.agent, knownAgents, `${field}.agent`);
-    return { id: step.id, agent: step.agent };
+    const tools = enumValue(step.tools ?? 'none', STEP_TOOLS, `${field}.tools`);
+    // A text peer has no tools to hand out. Saying so at validation time is
+    // better than a step that looks empowered in the recipe and is not.
+    if (tools === 'full' && !HARNESS_AGENTS_IN_RECIPES.includes(step.agent)) {
+      throw new InvalidRecipeError(`${field}.tools`, `${step.agent} runs as a text peer and cannot be given tools — only ${HARNESS_AGENTS_IN_RECIPES.join(' and ')} can`);
+    }
+    return { id: step.id, agent: step.agent, tools };
   });
 
   const edges = Array.isArray(recipe.edges) ? recipe.edges : [];
