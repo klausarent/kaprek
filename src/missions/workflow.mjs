@@ -31,7 +31,11 @@ export class InvalidWorkflowError extends Error {
 
 /** Anything that looks like it belongs to one machine or one account. */
 const SECRET_HINT = /\b([A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\b|\bsk-[A-Za-z0-9]{8,}|\bghp_[A-Za-z0-9]{8,}/;
-const ABSOLUTE_PATH = /(^|[\s"'(=])([A-Za-z]:[\\/]|\/(?:home|Users|root)\/)/;
+// Windows drive letters, UNC shares, ~ expansions, and any absolute POSIX
+// path — not just the three home directories the first version knew about.
+// /opt, /var, /tmp and \\server\share name one machine just as much as
+// /home/klaus does. (Grok's review.)
+const ABSOLUTE_PATH = /(^|[\s"'(=])([A-Za-z]:[\\/]|\\\\[^\\\s]+\\|~[/\\]|\/[A-Za-z_][\w.-]*\/)/;
 
 /**
  * Refuses text that should not cross a machine boundary.
@@ -40,6 +44,21 @@ const ABSOLUTE_PATH = /(^|[\s"'(=])([A-Za-z]:[\\/]|\/(?:home|Users|root)\/)/;
  * path used to be still looks like a workflow, and the person who receives it
  * finds out at run time. The person EXPORTING is the one who can fix it.
  */
+/** Walks a value and checks every string in it, wherever it sits. */
+function assertEveryString(value, field) {
+  if (typeof value === 'string') {
+    assertPortable(value, field);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((entry, index) => assertEveryString(entry, `${field}[${index}]`));
+    return;
+  }
+  if (value && typeof value === 'object') {
+    for (const [key, entry] of Object.entries(value)) assertEveryString(entry, `${field}.${key}`);
+  }
+}
+
 function assertPortable(value, field) {
   if (typeof value !== 'string' || value === '') return;
   if (SECRET_HINT.test(value)) {
@@ -66,10 +85,12 @@ export function buildWorkflow({ id, title, description = '', preset, recipe = nu
   if (typeof title !== 'string' || title.trim() === '') throw new InvalidWorkflowError('title', 'a workflow needs a title');
   if (!preset || typeof preset.firstPrompt !== 'string') throw new InvalidWorkflowError('preset', 'a workflow needs a preset with a first prompt');
 
-  assertPortable(preset.firstPrompt, 'preset.firstPrompt');
-  assertPortable(preset.goalTemplate, 'preset.goalTemplate');
-  assertPortable(description, 'description');
-  profile.forEach((line, index) => assertPortable(line, `profile[${index}]`));
+  // EVERY string that ends up in the file, not the four that were obvious.
+  // A path in preset.description or a token in a recipe's title travels just
+  // as far as one in the first prompt, and a hand-kept list of fields was
+  // already out of step with the shape the day it was written. (Grok's
+  // review.)
+  assertEveryString({ title, description, preset, recipe, profile }, 'workflow');
 
   return {
     version: WORKFLOW_VERSION,
@@ -161,7 +182,10 @@ export function loadWorkflows(dataDir) {
  */
 export function importSummary(workflow) {
   const lines = [`Adds the way of working "${workflow.title}".`];
-  if (workflow.recipe) {
+  // A hand-edited file can carry a recipe with no steps. That belongs in the
+  // 400 the route returns, not in a crash inside the sentence meant to
+  // explain the file. (Grok's review.)
+  if (Array.isArray(workflow.recipe?.steps) && workflow.recipe.steps.length > 0) {
     const chain = workflow.recipe.steps.map((step) => step.agent).join(' → ');
     const writes = workflow.recipe.steps.filter((step) => step.tools === 'full').map((step) => step.id);
     lines.push(`Relay recipe: ${chain}${writes.length > 0 ? ` (${writes.join(', ')} may change files)` : ''}.`);

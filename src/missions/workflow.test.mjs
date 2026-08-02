@@ -124,3 +124,35 @@ describe('importSummary', () => {
     expect(importSummary(workflow())).toHaveLength(1);
   });
 });
+
+describe('what Grok found', () => {
+  test('an absolute path anywhere, not just under a home directory', () => {
+    for (const bad of ['Read /opt/tools/notes.md', 'Read /var/log/app.log', 'Read \\\\fileserver\\share\\notes.md', 'Read ~/notes.md']) {
+      expect(() => buildWorkflow({ id: 'x', title: 't', preset: { ...preset, firstPrompt: bad } })).toThrow(/absolute path/);
+    }
+  });
+
+  test('a relative path is still fine', () => {
+    expect(() => buildWorkflow({ id: 'x', title: 't', preset: { ...preset, firstPrompt: 'Read docs/style.md and ./notes.md' } })).not.toThrow();
+  });
+
+  test('checks fields the first version did not: preset.description, the title, the recipe', () => {
+    expect(() => buildWorkflow({ id: 'x', title: 't', preset: { ...preset, description: 'Lives in /opt/marketing' } })).toThrow(/absolute path/);
+    expect(() => buildWorkflow({ id: 'x', title: 'Uses OPENAI_API_KEY', preset })).toThrow(/secret/);
+    expect(() =>
+      buildWorkflow({
+        id: 'x',
+        title: 't',
+        preset,
+        recipe: { id: 'r', title: 'Runs in /home/klaus/repo', steps: [], edges: [], budgets: {}, escalation: {} },
+      }),
+    ).toThrow(/absolute path/);
+  });
+
+  test('a recipe with no steps does not crash the summary', () => {
+    // It belongs in the route's 400, not in a crash inside the sentence
+    // meant to explain the file.
+    expect(() => importSummary({ ...workflow(), recipe: { id: 'r', title: 'r' } })).not.toThrow();
+    expect(() => importSummary({ ...workflow(), recipe: { id: 'r', title: 'r', steps: [] } })).not.toThrow();
+  });
+});

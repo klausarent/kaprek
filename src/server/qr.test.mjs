@@ -29,6 +29,44 @@ const MASK_FNS = [
 
 const ALIGNMENT_TABLE = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
 
+/** Version information, versions 7-10. The encoder's table, read back independently below. */
+const VERSION_TABLE = { 7: 0x07c94, 8: 0x085bc, 9: 0x09a99, 10: 0x0a4d3 };
+
+/** Block layout per version, level L only — what the reader needs to undo interleaving. */
+const BLOCKS_L = {
+  1: [1, 19, 0, 0],
+  2: [1, 34, 0, 0],
+  3: [1, 55, 0, 0],
+  4: [1, 80, 0, 0],
+  5: [1, 108, 0, 0],
+  6: [2, 68, 0, 0],
+  7: [2, 78, 0, 0],
+  8: [2, 97, 0, 0],
+  9: [2, 116, 0, 0],
+  10: [4, 68, 2, 69],
+};
+
+/**
+ * Undoes the interleaving the encoder applied.
+ *
+ * The first version of this reader assumed one block, which is true only up
+ * to version 5. It therefore could not read the codes where the version
+ * information lives — the same blind spot that let the missing version
+ * information survive a green suite in the first place.
+ */
+function deinterleave(words, version) {
+  const [g1Blocks, g1Words, g2Blocks, g2Words] = BLOCKS_L[version];
+  const sizes = [...Array(g1Blocks).fill(g1Words), ...Array(g2Blocks).fill(g2Words)];
+  const blocks = sizes.map(() => []);
+  let index = 0;
+  for (let position = 0; position < Math.max(...sizes); position += 1) {
+    for (let block = 0; block < blocks.length; block += 1) {
+      if (position < sizes[block]) blocks[block].push(words[index++]);
+    }
+  }
+  return blocks.flat();
+}
+
 /** Which cells hold function patterns and format information, for a given size. */
 function reservedMap(size) {
   const version = (size - 17) / 4;
@@ -48,6 +86,12 @@ function reservedMap(size) {
     for (const col of ALIGNMENT_TABLE[version] ?? []) {
       if ((row === 6 && col === 6) || (row === 6 && col === size - 7) || (row === size - 7 && col === 6)) continue;
       for (let r = -2; r <= 2; r += 1) for (let c = -2; c <= 2; c += 1) mark(row + r, col + c);
+    }
+  }
+  if (version >= 7) {
+    for (let i = 0; i < 18; i += 1) {
+      mark(size - 11 + (i % 3), Math.floor(i / 3));
+      mark(Math.floor(i / 3), size - 11 + (i % 3));
     }
   }
   mark(size - 8, 8);
@@ -256,7 +300,16 @@ function decodeQr(matrix) {
     upward = !upward;
   }
 
-  const readBits = (offset, count) => parseInt(bits.slice(offset, offset + count).join(''), 2);
+  // Bits back into codewords, codewords back into their blocks, and only
+  // then into a payload.
+  const allWords = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) allWords.push(parseInt(bits.slice(i, i + 8).join(''), 2));
+  const version = (size - 17) / 4;
+  const dataWordCount = BLOCKS_L[version][0] * BLOCKS_L[version][1] + BLOCKS_L[version][2] * BLOCKS_L[version][3];
+  const dataWords = deinterleave(allWords.slice(0, dataWordCount), version);
+
+  const dataBits = dataWords.flatMap((word) => Array.from({ length: 8 }, (_, i) => (word >> (7 - i)) & 1));
+  const readBits = (offset, count) => parseInt(dataBits.slice(offset, offset + count).join(''), 2);
   if (readBits(0, 4) !== 0b0100) throw new Error('not byte mode');
   const length = readBits(4, 8);
   const bytes = [];
@@ -278,5 +331,59 @@ describe('reading it back', () => {
 
   test('the format information names the level that was asked for', () => {
     expect(decodeQr(encodeQr('kaprek', 'L')).level).toBe('L');
+  });
+});
+
+describe('version information (version 7 and up)', () => {
+  /** Reads the 18 version bits back out of both copies. */
+  function readVersionBits(matrix) {
+    const size = matrix.length;
+    let bottomLeft = 0;
+    let topRight = 0;
+    for (let i = 0; i < 18; i += 1) {
+      bottomLeft |= matrix[size - 11 + (i % 3)][Math.floor(i / 3)] << i;
+      topRight |= matrix[Math.floor(i / 3)][size - 11 + (i % 3)] << i;
+    }
+    return { bottomLeft, topRight };
+  }
+
+  test('a version 7 code carries it, in both copies', () => {
+    // Missing entirely until Grok's review: every code from version 7 on was
+    // structurally invalid, and both the encoder and the round-trip reader
+    // were blind to it in the same way.
+    // Level L holds 136 bytes at version 6, so 150 is the first thing that
+    // needs version 7.
+    const matrix = encodeQr('x'.repeat(150), 'L');
+    expect(matrix.length).toBe(45);
+    const { bottomLeft, topRight } = readVersionBits(matrix);
+    expect(bottomLeft).toBe(VERSION_TABLE[7]);
+    expect(topRight).toBe(VERSION_TABLE[7]);
+  });
+
+  test('versions 8 to 10 carry their own', () => {
+    for (const [version, bytes] of [
+      [8, 180],
+      [9, 210],
+      [10, 250],
+    ]) {
+      const matrix = encodeQr('x'.repeat(bytes), 'L');
+      expect(matrix.length).toBe(version * 4 + 17);
+      expect(readVersionBits(matrix).bottomLeft).toBe(VERSION_TABLE[version]);
+    }
+  });
+
+  test('a small code has none, and no payload was written there instead', () => {
+    const matrix = encodeQr('kaprek', 'L');
+    expect(matrix.length).toBe(21);
+    // Version 1-6 has no version information at all — writing something
+    // there would be as wrong as leaving it out at 7.
+    expect(readVersionBits(matrix).bottomLeft).not.toBe(VERSION_TABLE[7]);
+  });
+
+  test('a version 7 payload still reads back', () => {
+    // The reservation has to happen before the zigzag, or the data walk
+    // writes eight codewords into cells placeVersion then overwrites.
+    const text = 'https://192.168.178.63:4900/#/approvals?t=' + 'a'.repeat(110);
+    expect(decodeQr(encodeQr(text, 'L')).text).toBe(text);
   });
 });

@@ -34,6 +34,24 @@ const VERSIONS = [
 /** Where the alignment pattern centres sit, per version (version 1 has none). */
 const ALIGNMENT = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
 
+/**
+ * Version information, for versions 7 and up.
+ *
+ * Eighteen bits in two copies, beside the top-right and bottom-left finders.
+ * Missing entirely until Grok's review pointed it out — every code from
+ * version 7 on was structurally invalid, which is around 78 bytes at level M.
+ * A kaprek URL is shorter than that, so it never showed up in use, and the
+ * round-trip test could not see it because the reader did not read version
+ * information either. Two blind spots lining up is how this kind of thing
+ * survives a green suite.
+ */
+const VERSION_BITS = {
+  7: 0x07c94,
+  8: 0x085bc,
+  9: 0x09a99,
+  10: 0x0a4d3,
+};
+
 /** Pre-computed format information bits, [level][mask]. Level L = 01, M = 00. */
 const FORMAT_BITS = {
   L: [0x77c4, 0x72f3, 0x7daa, 0x789d, 0x662f, 0x6318, 0x6c41, 0x6976],
@@ -188,6 +206,19 @@ function baseMatrix(version) {
     }
   }
 
+  // Version information (7 and up): three by six modules beside the
+  // top-right and bottom-left finders. Reserved BEFORE the data walk, or the
+  // zigzag writes payload into them and placeVersion overwrites it later —
+  // silently losing eight codewords.
+  if (version >= 7) {
+    for (let i = 0; i < 18; i += 1) {
+      const row = Math.floor(i / 3);
+      const col = i % 3;
+      reserved[size - 11 + col][row] = true;
+      reserved[row][size - 11 + col] = true;
+    }
+  }
+
   // The dark module, and the reserved format areas.
   place(size - 8, 8, 1);
   for (let i = 0; i < 9; i += 1) {
@@ -233,6 +264,21 @@ function placeData(base, words, mask) {
       }
     }
     upward = !upward;
+  }
+  return grid;
+}
+
+/** The 18 version bits, bottom-left and top-right, for version >= 7. */
+function placeVersion(grid, version) {
+  const bits = VERSION_BITS[version];
+  if (bits === undefined) return grid;
+  const size = grid.length;
+  for (let i = 0; i < 18; i += 1) {
+    const bit = (bits >> i) & 1;
+    const row = Math.floor(i / 3);
+    const col = i % 3;
+    grid[size - 11 + col][row] = bit;
+    grid[row][size - 11 + col] = bit;
   }
   return grid;
 }
@@ -315,7 +361,7 @@ export function encodeQr(text, level = 'M') {
 
   let best = null;
   for (let mask = 0; mask < 8; mask += 1) {
-    const grid = placeFormat(placeData(base, words, mask), level, mask);
+    const grid = placeVersion(placeFormat(placeData(base, words, mask), level, mask), spec.version);
     const score = penalty(grid);
     if (best === null || score < best.score) best = { grid, score };
   }

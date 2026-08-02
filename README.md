@@ -397,7 +397,12 @@ log, whatever you already use.
 
 Never through a shell, and the question's text is never part of a command
 line: an agent chooses what a tool is called, and that text must not become
-something a shell interprets. A notifier that fails, hangs, or does not exist
+something a shell interprets.
+
+Where that guarantee ends is worth knowing: kaprek passes those values as
+literals, but your notifier is your script. `echo $KAPREK_TOOL` unquoted in a
+shell script re-opens exactly the door kaprek just closed — quote your
+variables. A notifier that fails, hangs, or does not exist
 changes nothing about the question — it stays in the inbox either way.
 
 kaprek ships no channels of its own on purpose. A built-in list of them is

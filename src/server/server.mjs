@@ -168,17 +168,16 @@ const MIME_TYPES = {
  * Host header defeats this because an attacker-controlled page cannot make
  * the browser send a Host header naming our loopback address.
  */
-function isAllowedHost(hostHeader, port, lanAddress = null) {
+function isAllowedHost(hostHeader, port, lanAddress = null, fromLoopback = true) {
   if (typeof hostHeader !== 'string' || hostHeader.length === 0) return false;
   const host = hostHeader.toLowerCase();
-  const allowed = new Set([
-    `127.0.0.1:${port}`,
-    `localhost:${port}`,
-    `[::1]:${port}`,
-    '127.0.0.1',
-    'localhost',
-    '[::1]',
-  ]);
+  // A request that did not come from this machine may not claim to be
+  // talking to loopback. With a wide binding it can reach the socket, and
+  // "Host: 127.0.0.1" would otherwise sail through the rebinding check that
+  // exists precisely to bound which names are acceptable. (Grok's review.)
+  const allowed = fromLoopback
+    ? new Set([`127.0.0.1:${port}`, `localhost:${port}`, `[::1]:${port}`, '127.0.0.1', 'localhost', '[::1]'])
+    : new Set();
   // With --lan, this machine's own LAN address is allowed too — and ONLY
   // that one literal address. Rebinding still cannot get through: an
   // attacker's page cannot make a browser send a Host header naming an
@@ -2869,7 +2868,7 @@ async function handleRequest(
   res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
 
   // No body details on rejection — don't echo the offending Host header back.
-  if (!isAllowedHost(req.headers.host, port, lanAddress)) {
+  if (!isAllowedHost(req.headers.host, port, lanAddress, isLoopbackRequest(req))) {
     sendJson(res, 400, { error: 'bad request' });
     return;
   }
@@ -3890,7 +3889,11 @@ export function startServer({
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, lan ? '0.0.0.0' : '127.0.0.1', () => {
+    // Bound to the world only when there is an address to name. --lan on a
+    // machine with no network printed "still listening on localhost only"
+    // and then listened everywhere anyway — the message was right and the
+    // socket was not, which is the worse half to get wrong. (Grok's review.)
+    server.listen(port, lanAddress ? '0.0.0.0' : '127.0.0.1', () => {
       const addr = server.address();
       boundPort = addr.port;
       getRunner().start();
