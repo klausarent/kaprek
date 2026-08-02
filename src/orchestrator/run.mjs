@@ -20,6 +20,7 @@ import { parseQuiz } from '../plans/quiz.mjs';
 import { openPlans } from '../plans/store.mjs';
 import { openMemory } from '../memory/store.mjs';
 import { buildMemoryPrompt, parseRemember } from '../memory/protocol.mjs';
+import { buildCheckpoint, buildRehydrationPrompt, readCheckpoint, shouldCheckpoint, wasCompacted, writeCheckpoint } from '../memory/checkpoint.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -307,6 +308,7 @@ export async function runTurn({
   // result as ONE event (matching the parser's digest shape), so a
   // matching tool-end is what actually triggers the store write.
   const pendingTools = new Map();
+  let toolCallCount = 0;
   const assistantText = [];
   let cliSessionId = priorSessionId ?? null;
   let model = null;
@@ -348,6 +350,17 @@ export async function runTurn({
       }
       case 'tool-start':
         pendingTools.set(event.id, { name: event.name, input: event.input, ts: new Date().toISOString() });
+        // A working note at 20, 40 and 80 calls. What survives a compaction
+        // is whatever was written somewhere the compaction cannot reach.
+        toolCallCount += 1;
+        if (shouldCheckpoint(toolCallCount)) {
+          try {
+            writeCheckpoint(dataDir, buildCheckpoint({ chatId: effectiveChatId, events: openChats(dataDir).events(effectiveChatId), toolCalls: toolCallCount }));
+          } catch {
+            // Best-effort by design: a note that cannot be written must not
+            // take the turn with it.
+          }
+        }
         onEvent?.({ ...event, input: redactInputObject(event.input, redact) });
         break;
       case 'tool-end': {
@@ -577,7 +590,11 @@ export async function runTurn({
   // work. Read BEFORE the turn so the agent starts with it instead of
   // rediscovering it, and layered so the profile survives any trimming.
   const memoryPrompt = memoryScopeId ? buildMemoryPrompt(recallForScope({ dataDir, scopeId: memoryScopeId })) : '';
-  const combined = [guidedPrompt, memoryPrompt].filter((part) => part !== '').join('\n\n');
+  // Only after a compaction: before that the model still has the
+  // conversation, and handing it back would spend context on something that
+  // is already in context.
+  const rehydration = wasCompacted(chats.events(effectiveChatId)) ? buildRehydrationPrompt(readCheckpoint(dataDir, effectiveChatId)) : '';
+  const combined = [guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
   const appendSystemPrompt = combined === '' ? undefined : combined;
 
   let turnResult;
