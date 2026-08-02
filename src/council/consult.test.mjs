@@ -1,4 +1,4 @@
-import { test, expect, vi } from 'vitest';
+import { describe, test, expect, vi } from 'vitest';
 import { buildPackage, parseVerdict, summarize, consultPeers } from './consult.mjs';
 
 const ask = (answers) => vi.fn(async (peerId) => {
@@ -129,4 +129,28 @@ test('summarize keeps concerns and disagreement apart from agreement', () => {
   expect(summary.dissenting[0].risks).toEqual(['two processes']);
   expect(summary.unreachable[0].peerId).toBe('c');
   expect(summary.consensus).toBe(false);
+});
+
+describe('what leaves the machine', () => {
+  test('a key in the question never reaches the peer', () => {
+    // This text goes to another vendor's CLI, which sends it to that
+    // vendor's servers. It is the one place where redaction matters more
+    // than it does in a log the owner reads.
+    const prompt = buildPackage({ question: 'Is sk-proj-abcdefghijklmnopqrstuvwxyz123456 the right key to use here?' });
+    expect(prompt).not.toContain('sk-proj-abcdefghijklmnopqrstuvwxyz123456');
+  });
+
+  test('the constraints and the tried list are cleaned too', () => {
+    const prompt = buildPackage({
+      question: 'sound?',
+      constraints: ['Use the token ghp_abcdefghijklmnopqrstuvwxyz0123456789'],
+      tried: ['Already tried sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+    });
+    expect(prompt).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
+    expect(prompt).not.toContain('sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  });
+
+  test('ordinary text is left alone', () => {
+    expect(buildPackage({ question: 'Should the relay retry twice or three times?' })).toContain('Should the relay retry twice or three times?');
+  });
 });

@@ -20,6 +20,22 @@
 // Codex' review flagged exactly this: with a consultation sitting between
 // the quiz and the plan, one hung peer could otherwise hold up the whole
 // flow.
+import { redactSecrets } from '../parser/parse.mjs';
+
+/**
+ * Everything in the package goes through the same redaction the transcript
+ * does — and it matters MORE here, not less.
+ *
+ * A chat log is read by the person whose secrets are in it. This text is
+ * handed to another vendor's CLI, which sends it to that vendor's servers.
+ * The "second opinion" button builds its question out of the last thing the
+ * user typed and the last thing the agent answered, so a key that appeared
+ * mid-conversation would ride along with it. Codex' review named this and it
+ * was deferred; it should not have been.
+ */
+function clean(value) {
+  return typeof value === 'string' ? redactSecrets(value) : value;
+}
 
 /** How a peer is asked to summarize its position. */
 export const VERDICTS = ['agree', 'concerns', 'disagree'];
@@ -47,13 +63,13 @@ export const DEFAULT_PEER_TIMEOUT_MS = 10 * 60 * 1000;
  * @param {string[]} [options.tried] - what has already been ruled out
  */
 export function buildPackage({ question, files = [], constraints = [], tried = [] }) {
-  const section = (title, items) => (items.length > 0 ? `\n## ${title}\n${items.map((item) => `- ${item}`).join('\n')}\n` : '');
+  const section = (title, items) => (items.length > 0 ? `\n## ${title}\n${items.map((item) => `- ${clean(item)}`).join('\n')}\n` : '');
   return `You are being asked for an independent second opinion. You have not
 seen the conversation this came from, and you do not need it — everything
 that matters is below.
 
 ## The question
-${question}
+${clean(question)}
 ${section('Files worth reading', files)}${section('Constraints the answer must respect', constraints)}${section('Already tried or ruled out', tried)}
 ## How to answer
 Read what you need, then reply with ONE json object and nothing else:
