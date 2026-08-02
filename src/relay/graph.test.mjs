@@ -359,3 +359,61 @@ test('recipe: a legacy start is a recipe too, and still books its route', async 
   expect(relay.recipeId).toBe('legacy-route');
   expect(eventsOfType(chatId, 'message').map((event) => event.from)).toEqual(['grok', 'claude']);
 });
+
+test('recipe: a step with tools is told it has them; a step without is told it has not', async () => {
+  const prompts = [];
+  const { chatId, dispatcher } = setup({
+    peers: { grok: stubPeer('grok') },
+    harness: ({ prompt }) => {
+      prompts.push(prompt);
+      return { status: 'handoff', message: 'done' };
+    },
+  });
+  const run = await dispatcher.startRun({
+    chatId,
+    goal: 'ship it',
+    recipe: {
+      id: 'mixed',
+      title: 'review then apply',
+      steps: [
+        { id: 'review', agent: 'claude' },
+        { id: 'apply', agent: 'codex', tools: 'full' },
+      ],
+      edges: [
+        { from: 'review', to: 'apply' },
+        { from: 'apply', to: 'review' },
+      ],
+      budgets: { maxRounds: 1 },
+    },
+  });
+  await dispatcher.waitFor(run.runId);
+
+  // The live M2 run failed here: codex had tools and file access, and the
+  // prompt told it "you have no tools, no file access", so it described the
+  // change instead of making it.
+  expect(prompts[0]).toContain('no tools');
+  expect(prompts[1]).toContain('your usual tools');
+  expect(prompts[1]).not.toContain('no tools');
+});
+
+test('recipe: a peer asking for a human is not presented as a question about rounds', async () => {
+  const asking = {
+    id: 'grok',
+    available: () => true,
+    async runTurn() {
+      return { status: 'needs_human', message: 'I need to know which database this targets' };
+    },
+  };
+  const { chatId, dispatcher } = setup({ peers: { grok: asking } });
+  const run = await dispatcher.startRun({
+    chatId,
+    goal: 'ship it',
+    recipe: { id: 'solo', title: 'solo', steps: [{ id: 'write', agent: 'grok' }], edges: [{ from: 'write', to: 'write' }], budgets: { maxRounds: 5 } },
+  });
+  await dispatcher.waitFor(run.runId);
+
+  const relay = relayOf(chatId);
+  expect(relay.status).toBe('waiting_gate');
+  expect(relay.gateReason).toBe('ask');
+  expect(eventsOfType(chatId, 'gate.requested').at(-1).textPreview).toMatch(/decision only you can make/);
+});

@@ -8,7 +8,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { startServer } from './src/server/server.mjs';
+import { startServer } from '../src/server/server.mjs';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-m2-'));
 const missionDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-m2-project-'));

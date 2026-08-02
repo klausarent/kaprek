@@ -3196,6 +3196,7 @@ export function startServer({
           const runner = getRunner();
           return runner.canStartFollowUp('relay');
         },
+        resolveCwd: relayCwdFor,
         onTurnStart: (chatId) => relayChatIds.add(chatId),
         onTurnEnd: (chatId) => relayChatIds.delete(chatId),
         // The relay's Claude turns run through the ordinary harness, with no
@@ -3225,15 +3226,10 @@ export function startServer({
 
           // Where the step works. A relay inside a mission runs in that
           // mission's directory, so an 'apply' step writes where the project
-          // is rather than into kaprek's scratch workspace.
-          let cwd = workspaceDir;
-          try {
-            const missionId = getChats().get(chatId).missionId;
-            if (missionId) cwd = getMissions().get(missionId).cwd ?? workspaceDir;
-          } catch {
-            // No mission, or one this store cannot resolve: the workspace is
-            // the safe answer, never someone else's directory.
-          }
+          // is rather than into kaprek's scratch workspace. The same path is
+          // named in the prompt (see buildPeerPrompt), because "make the
+          // change" is not actionable without knowing where.
+          const cwd = relayCwdFor(chatId);
 
           const result = await runTurn({
             dataDir,
@@ -3276,6 +3272,22 @@ export function startServer({
   // own set: a chat is one conversation, so a typed turn must not land in the
   // middle of a handoff.
   const relayChatIds = new Set();
+
+  /**
+   * Where a relay step for this chat works: the mission's directory when the
+   * chat belongs to one, the shared workspace otherwise. Fail-closed — a
+   * mission this store cannot resolve gets the workspace, never someone
+   * else's directory.
+   */
+  function relayCwdFor(chatId) {
+    try {
+      const missionId = getChats().get(chatId).missionId;
+      if (missionId) return getMissions().get(missionId).cwd ?? workspaceDir;
+    } catch {
+      // Unknown chat or mission: the workspace is the safe answer.
+    }
+    return workspaceDir;
+  }
 
   /** The last thing the assistant said in this chat — a relay turn's actual output. */
   function lastAssistantText(chatId) {

@@ -167,7 +167,7 @@ export function readBodyForPrompt(dataDir, bodyRef) {
  * is no session and no memory, so this text IS the peer's world - which is
  * also why the whole thing is reconstructable from the log.
  */
-export function buildPeerPrompt({ goal, role, round, maxRounds, previous, previousFrom }) {
+export function buildPeerPrompt({ goal, role, round, maxRounds, previous, previousFrom, tools = 'none', cwd = null }) {
   const lines = [
     `You are taking part in a controlled two-agent handoff. Your role: ${role}.`,
     `The operator's goal for this run: ${goal}`,
@@ -178,7 +178,9 @@ export function buildPeerPrompt({ goal, role, round, maxRounds, previous, previo
     '            "needs_human" when you cannot proceed without a decision only a person can make.',
     '  message - your actual work: the draft, the review, the revision. Not a summary of what you would do.',
     '',
-    'You have no tools, no file access and no web search. Work from the text below alone.',
+    tools === 'full'
+      ? `You are running${cwd ? ` in ${cwd}` : ''} with your usual tools. Actually make the change the goal asks for — anything that needs permission will be put to a person, so do the work rather than describing it. Put a short summary of what you changed in "message".`
+      : 'You have no tools, no file access and no web search. Work from the text below alone.',
   ];
   if (previous) {
     lines.push('', `--- what ${previousFrom} produced ---`, previous, '--- end ---');
@@ -221,6 +223,10 @@ export function createRelayDispatcher({
   canStartTurn = () => ({ allowed: true, reason: null }),
   onTurnStart = () => {},
   onTurnEnd = () => {},
+  // Where a harness step will stand. The dispatcher does not resolve mission
+  // directories itself; it only needs the answer so a step that has tools can
+  // be told where it is.
+  resolveCwd = null,
   now = Date.now,
   // How a retry backs off. Injected so a test can prove the backoff happened
   // without spending 45 real seconds on it.
@@ -273,13 +279,19 @@ export function createRelayDispatcher({
       dispatchId,
     });
 
+    const step = (relay.recipe?.steps ?? []).find((candidate) => candidate.agent === peerId);
     const prompt = buildPeerPrompt({
       goal: relay.goal,
       role: roleFor(relay, peerId),
+      tools: step?.tools ?? 'none',
       round: relay.rounds + 1,
       maxRounds: relay.maxRounds,
       previous,
       previousFrom,
+      // The working directory a harness step will actually stand in. Known
+      // to the server, not here, so a step that has tools is told where it
+      // is only when the caller could say.
+      cwd: relay.cwd ?? null,
     });
 
     try {
@@ -293,7 +305,7 @@ export function createRelayDispatcher({
               engine: engineIdFor(peerId),
               // Fail-closed: a step that did not ask for tools gets none, and
               // an unknown step (a hand-edited relay state) gets none either.
-              tools: (relay.recipe?.steps ?? []).find((step) => step.agent === peerId)?.tools ?? 'none',
+              tools: step?.tools ?? 'none',
             })
           : await (() => {
               const driver = getPeerDriver(peerId);
@@ -387,13 +399,18 @@ export function createRelayDispatcher({
     // chats. A gate has to use the same shape or the answer route would look
     // it up under a key that does not exist.
     const requestId = reason === 'rounds' ? `relay:${relay.runId}:round-${relay.rounds}` : `relay:${relay.runId}:${reason}-${relay.turns}`;
+    // Four gates, four questions. They used to share one sentence about
+    // rounds, which was true for one of them — the live M2 run showed a peer
+    // asking for a decision and kaprek presenting it as "0 of 1 rounds done".
     const approvalKey = `${chatId}:${requestId}`;
     const question =
       reason === 'edge'
         ? `Relay "${relay.goal}": the next step is ${detail?.to ?? 'the next agent'}, and this recipe asks before that handoff. Approve to let it run once, or deny to stop the run.`
-        : reason === 'peer'
-          ? `Relay "${relay.goal}": the handoff to ${detail?.to ?? 'the next agent'} kept failing (${detail?.error ?? 'unknown reason'}). Approve to try the run again, or deny to stop it.`
-          : [`Relay "${relay.goal}": ${relay.rounds} of ${relay.maxRounds} rounds done.`, 'Approve one more round, or deny to stop the run.'].join(' ');
+        : reason === 'ask'
+          ? `Relay "${relay.goal}": ${detail?.to ?? 'an agent'} says it needs a decision only you can make. Its message is below. Approve to let the run continue, or deny to stop it.`
+          : reason === 'peer'
+            ? `Relay "${relay.goal}": the handoff to ${detail?.to ?? 'the next agent'} kept failing (${detail?.error ?? 'unknown reason'}). Approve to try the run again, or deny to stop it.`
+            : [`Relay "${relay.goal}": ${relay.rounds} of ${relay.maxRounds} rounds done.`, 'Approve one more round, or deny to stop the run.'].join(' ');
 
     try {
       await approvalStore.put({
@@ -582,7 +599,7 @@ export function createRelayDispatcher({
       if (answer.status === 'done') return finish(chatId, relay, 'completed', `${peerId} reported the goal is met`);
       // A peer asking for a human is not a failure and does not wait for the
       // round to end: whatever it needs decided, it needs decided now.
-      if (answer.status === 'needs_human') return requestGate(chatId, relay, answer.textPreview);
+      if (answer.status === 'needs_human') return requestGate(chatId, relay, answer.textPreview, 'ask', { to: peerId });
 
       // THE EDGE GATE. Asked BEFORE the step on the other side runs, so the
       // decision is about something that has not happened yet — which is the
@@ -663,6 +680,7 @@ export function createRelayDispatcher({
         turns: 0,
         roundPos: 0,
         artifactDir: artifactDirFor(runId).split(path.sep).join('/'),
+        cwd: resolveCwd ? resolveCwd(chatId) : path.join(dataDir, 'workspace'),
         startedAt: now(),
       };
       saveRelay(chatId, relay);
