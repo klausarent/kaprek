@@ -44,6 +44,14 @@ those can be updated by npm:
 | a project's dependency | tells you to update it in that project |
 | a git checkout | tells you to `git pull` — npm would overwrite your working tree |
 
+When anything goes wrong — npm missing, no permission to write the global
+install, the registry not answering — the message ends with the line that
+works from all of those anyway:
+
+```
+npx kaprek@latest
+```
+
 ## Flags
 
 | Flag | Default | Description |

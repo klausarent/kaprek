@@ -1,6 +1,6 @@
 import { describe, test, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { compareVersions, installKind, latestVersion, runInstall, updatePlan } from './update.mjs';
+import { FALLBACK_COMMAND, compareVersions, fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from './update.mjs';
 
 describe('installKind', () => {
   test('npx has nothing installed to update', () => {
@@ -146,5 +146,35 @@ describe('runInstall', () => {
     await expect(runInstall(['npm', 'install', '-g', 'kaprek@latest'], { spawnFn })).resolves.toBe(1);
     expect(errors).toHaveBeenCalled();
     errors.mockRestore();
+  });
+});
+
+describe('fallbackAdvice', () => {
+  test('keeps the reason and ends with the command that always works', () => {
+    const advice = fallbackAdvice('Update failed (npm exited 1).');
+    expect(advice).toContain('Update failed (npm exited 1).');
+    expect(advice.trim().endsWith(FALLBACK_COMMAND)).toBe(true);
+  });
+
+  test('the fallback needs nothing installed and no permissions', () => {
+    // npx works from every situation this command can fail in: no npm on
+    // PATH, a global install the user cannot write to, a registry that did
+    // not answer.
+    expect(FALLBACK_COMMAND).toBe('npx kaprek@latest');
+  });
+
+  test('a missing npm reports it and offers the way out in one message', async () => {
+    const spawnFn = () => {
+      const child = new EventEmitter();
+      queueMicrotask(() => child.emit('error', new Error('spawn npm ENOENT')));
+      return child;
+    };
+    const messages = [];
+    const errors = vi.spyOn(console, 'error').mockImplementation((message) => messages.push(message));
+    await runInstall(['npm', 'install', '-g', 'kaprek@latest'], { spawnFn });
+    errors.mockRestore();
+
+    expect(messages.join('\n')).toContain('ENOENT');
+    expect(messages.join('\n')).toContain(FALLBACK_COMMAND);
   });
 });

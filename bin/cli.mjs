@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { encodeQr, qrToText } from '../src/server/qr.mjs';
-import { installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
+import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
 import {
@@ -163,7 +163,9 @@ async function runUpdateCommand(args) {
   try {
     latest = await latestVersion();
   } catch (err) {
-    console.error(err.message);
+    // Not knowing whether there is an update is no reason to leave someone
+    // stuck: the fallback fetches the newest version regardless.
+    console.error(fallbackAdvice(err.message));
     process.exitCode = 1;
     return;
   }
@@ -180,7 +182,7 @@ async function runUpdateCommand(args) {
   if (code === 0) {
     console.log(`kaprek ${latest} installed. Start it again to use it.`);
   } else {
-    console.error(`Update failed (npm exited ${code}). You can run it yourself: ${plan.command.join(' ')}`);
+    console.error(fallbackAdvice(`Update failed (npm exited ${code}). You can try it yourself: ${plan.command.join(' ')}`));
     process.exitCode = code;
   }
 }

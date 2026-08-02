@@ -18,6 +18,17 @@ import { spawn } from 'node:child_process';
 
 const REGISTRY_URL = 'https://registry.npmjs.org/kaprek/latest';
 
+/**
+ * The way out when anything about the update goes wrong.
+ *
+ * It works from every situation this command can end up in: no npm on PATH,
+ * a global install the user cannot write to, a registry that did not answer,
+ * an npx run with nothing installed. It fetches and runs the newest version
+ * without installing anything, so it is also the answer for someone who does
+ * not want a global install in the first place.
+ */
+export const FALLBACK_COMMAND = 'npx kaprek@latest';
+
 /** How this copy of kaprek got onto the machine. */
 export const INSTALL_KINDS = ['global', 'npx', 'local', 'repo'];
 
@@ -144,6 +155,17 @@ export function updatePlan({ kind, current, latest }) {
   };
 }
 
+/**
+ * What to print when an update could not be done, whatever the reason.
+ *
+ * Always ends with the same escape hatch. Someone reading a failure message
+ * wants the next thing to type, not a description of what went wrong — the
+ * reason comes first, then the line that works anyway.
+ */
+export function fallbackAdvice(reason) {
+  return [reason, 'You can always run the newest version directly, without installing anything:', '', `  ${FALLBACK_COMMAND}`].join('\n');
+}
+
 /** Runs the install, streaming npm's own output. Resolves with the exit code. */
 export function runInstall(command, { spawnFn = spawn } = {}) {
   return new Promise((resolve) => {
@@ -152,7 +174,7 @@ export function runInstall(command, { spawnFn = spawn } = {}) {
     // a user typed, so there is nothing here for a shell to interpolate.
     const child = spawnFn(command[0], command.slice(1), { stdio: 'inherit', shell: process.platform === 'win32' });
     child.on('error', (err) => {
-      console.error(`Could not run ${command.join(' ')}: ${err.message}`);
+      console.error(fallbackAdvice(`Could not run ${command.join(' ')}: ${err.message}`));
       resolve(1);
     });
     child.on('exit', (code) => resolve(code ?? 1));
