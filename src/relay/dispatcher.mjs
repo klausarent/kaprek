@@ -23,6 +23,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { appendRun } from '../orchestrator/runs.mjs';
+import { routeFromLegacy, stepsOf, validateRecipe } from './recipes.mjs';
 
 /** Full rounds (every peer on the route once) before the run must ask a human. Conservative on purpose: two rounds is enough to see whether the pair is converging, and short enough that a bad run costs little. */
 export const RELAY_ROUNDS_PER_GATE = 2;
@@ -38,6 +39,21 @@ export const RELAY_PREVIEW_CHARS = 4000;
 
 /** How much of the previous peer's body is quoted into the next peer's prompt. Past this it gets the preview and the path. */
 export const RELAY_CONTEXT_LIMIT_BYTES = 256 * 1024;
+
+/**
+ * Steps that run as a full harness turn (tools, approvals, a real working
+ * directory) rather than as a text-only peer driver.
+ *
+ * The distinction is not about the vendor: it is about whether kaprek drives
+ * that engine itself through src/harness, in which case a relay step gets the
+ * same machinery an ordinary chat turn does — including the approval inbox.
+ */
+export const HARNESS_AGENTS = Object.freeze(['claude', 'codex']);
+
+/** The engine id a harness step resolves to. Recipes name agents; the registry knows engines. */
+export function engineIdFor(agent) {
+  return agent === 'claude' ? 'claude-code' : agent;
+}
 
 /** v1 route: one peer writes, Claude reviews. Fixed, not configurable per turn. */
 export const RELAY_DEFAULT_ROUTE = Object.freeze(['grok', 'claude']);
@@ -60,8 +76,23 @@ function sha256(value) {
  * one, so the log can be asked "did this already happen?" instead of guessing.
  * That is what makes replay-after-crash a decision rather than an accident.
  */
-export function dispatchIdFor(runId, sourceEventId, targetPeer) {
-  return sha256(`${runId}\u0000${sourceEventId}\u0000${targetPeer}`);
+export function dispatchIdFor(runId, sourceEventId, targetPeer, attempt = 0) {
+  // Attempt 0 hashes exactly as it did before retries existed, so every
+  // dispatch id already written to a log still means what it meant.
+  const suffix = attempt > 0 ? `\u0000retry-${attempt}` : '';
+  return sha256(`${runId}\u0000${sourceEventId}\u0000${targetPeer}${suffix}`);
+}
+
+/**
+ * How long to wait before retrying a failed dispatch: 15s, then 30s.
+ *
+ * Backoff rather than an immediate retry, because the failure this exists
+ * for is a peer CLI that was briefly unavailable — the ten-minute grok
+ * flake in the v1 acceptance run. Trying again in the same second
+ * reproduces the same failure and calls it a second attempt.
+ */
+export function retryDelayMs(attempt) {
+  return 15_000 * 2 ** (attempt - 1);
 }
 
 /**
@@ -76,6 +107,21 @@ export function participantsHashOf(relay) {
 
 export function budgetSnapshotHashOf(relay) {
   return sha256(JSON.stringify([relay.maxRounds ?? null, relay.hardMaxTurns ?? null]));
+}
+
+/**
+ * What a step is asked to do, derived from its position rather than its name.
+ *
+ * v1 hard-coded "claude reviews, everyone else writes". With a recipe the
+ * pairing is the user's, so the first step produces and every later one
+ * reviews what came before — the shape of a handoff, not a property of a
+ * vendor. Recipes that want something else say so in the goal, which every
+ * peer sees.
+ */
+export function roleFor(relay, peerId) {
+  const steps = relay.recipe?.steps ?? [];
+  const isFirst = steps.length === 0 ? peerId !== 'claude' : steps[0]?.agent === peerId;
+  return isFirst ? 'produce the work the goal asks for' : "review the other agent's work and say plainly what is wrong with it";
 }
 
 /** A run's artifact directory, relative to dataDir. Deliberately NOT under workspace/: agents watch the workspace, and a relay writing there would be a loop with extra steps. */
@@ -168,10 +214,17 @@ export function createRelayDispatcher({
   approvalStore,
   getPeerDriver,
   runClaudeTurn,
+  // How a harness step runs. Defaults to the v1 injection point so every
+  // existing caller and test keeps working; the server passes a version that
+  // knows about engines (see M2 task 3).
+  runHarnessTurn = ({ engine, ...rest }) => runClaudeTurn(rest),
   canStartTurn = () => ({ allowed: true, reason: null }),
   onTurnStart = () => {},
   onTurnEnd = () => {},
   now = Date.now,
+  // How a retry backs off. Injected so a test can prove the backoff happened
+  // without spending 45 real seconds on it.
+  wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
   log = () => {},
 } = {}) {
   /** runId -> {chatId, abort, promise}. Only ever holds runs this process is driving. */
@@ -203,8 +256,8 @@ export function createRelayDispatcher({
   }
 
   /** Runs one peer's turn and records it. Returns the peer's answer, or null when the turn failed (already recorded as dispatch.failed). */
-  async function runPeerTurn({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal }) {
-    const dispatchId = dispatchIdFor(relay.runId, sourceEventId, peerId);
+  async function runPeerTurn({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal, attempt = 0 }) {
+    const dispatchId = dispatchIdFor(relay.runId, sourceEventId, peerId, attempt);
     if (alreadyDispatched(chatId, dispatchId)) {
       log(`relay ${relay.runId}: dispatch ${dispatchId.slice(0, 8)} already has a result, skipping`);
       return null;
@@ -222,7 +275,7 @@ export function createRelayDispatcher({
 
     const prompt = buildPeerPrompt({
       goal: relay.goal,
-      role: peerId === 'claude' ? 'review the other agent\'s work and say plainly what is wrong with it' : 'produce the work the goal asks for',
+      role: roleFor(relay, peerId),
       round: relay.rounds + 1,
       maxRounds: relay.maxRounds,
       previous,
@@ -231,8 +284,8 @@ export function createRelayDispatcher({
 
     try {
       const answer =
-        peerId === 'claude'
-          ? await runClaudeTurn({ chatId, prompt, signal, runId: relay.runId })
+        HARNESS_AGENTS.includes(peerId)
+          ? await runHarnessTurn({ chatId, prompt, signal, runId: relay.runId, engine: engineIdFor(peerId) })
           : await (() => {
               const driver = getPeerDriver(peerId);
               if (!driver) throw new Error(`no driver for peer "${peerId}"`);
@@ -248,7 +301,7 @@ export function createRelayDispatcher({
       // runTurn() itself, so booking them here too would double every claude
       // line; the peers have no other path into the ledger. Best-effort like
       // run.mjs's own appendRun: a ledger write must never fail the turn.
-      if (peerId !== 'claude') {
+      if (!HARNESS_AGENTS.includes(peerId)) {
         try {
           appendRun(dataDir, {
             chatId,
@@ -285,7 +338,7 @@ export function createRelayDispatcher({
       });
       return { ...answer, ...body, dispatchId };
     } catch (err) {
-      if (peerId !== 'claude') {
+      if (!HARNESS_AGENTS.includes(peerId)) {
         try {
           appendRun(dataDir, {
             chatId,
@@ -311,18 +364,27 @@ export function createRelayDispatcher({
     }
   }
 
-  /** Files the gate question in the deferred inbox and parks the run. */
-  async function requestGate(chatId, relay, lastPreview) {
+  /**
+   * Files the gate question in the deferred inbox and parks the run.
+   *
+   * @param {'rounds'|'edge'|'peer'} reason - what stopped it. A round gate
+   *   buys one more round; an edge gate buys ONE passage of that edge. They
+   *   are spent differently (see resumeAfterGate), so the run has to remember
+   *   which kind it is waiting at.
+   */
+  async function requestGate(chatId, relay, lastPreview, reason = 'rounds', detail = null) {
     // The store keys entries by `chatId:requestId` (see
     // server.mjs::approvalKey) because a bare request id is not unique across
     // chats. A gate has to use the same shape or the answer route would look
     // it up under a key that does not exist.
-    const requestId = `relay:${relay.runId}:round-${relay.rounds}`;
+    const requestId = reason === 'rounds' ? `relay:${relay.runId}:round-${relay.rounds}` : `relay:${relay.runId}:${reason}-${relay.turns}`;
     const approvalKey = `${chatId}:${requestId}`;
-    const question = [
-      `Relay "${relay.goal}": ${relay.rounds} of ${relay.maxRounds} rounds done.`,
-      'Approve one more round, or deny to stop the run.',
-    ].join(' ');
+    const question =
+      reason === 'edge'
+        ? `Relay "${relay.goal}": the next step is ${detail?.to ?? 'the next agent'}, and this recipe asks before that handoff. Approve to let it run once, or deny to stop the run.`
+        : reason === 'peer'
+          ? `Relay "${relay.goal}": the handoff to ${detail?.to ?? 'the next agent'} kept failing (${detail?.error ?? 'unknown reason'}). Approve to try the run again, or deny to stop it.`
+          : [`Relay "${relay.goal}": ${relay.rounds} of ${relay.maxRounds} rounds done.`, 'Approve one more round, or deny to stop the run.'].join(' ');
 
     try {
       await approvalStore.put({
@@ -333,7 +395,7 @@ export function createRelayDispatcher({
         kind: RELAY_GATE_KIND,
         toolName: 'relay',
         displayName: `Relay: ${relay.goal}`.slice(0, 120),
-        input: { runId: relay.runId, route: relay.route, rounds: relay.rounds, preview: (lastPreview ?? '').slice(0, 1000) },
+        input: { runId: relay.runId, route: relay.route, rounds: relay.rounds, reason, ...(detail ? { edge: detail } : {}), preview: (lastPreview ?? '').slice(0, 1000) },
         description: question,
         requestedAt: now(),
         deadlineAt: now() + 24 * 60 * 60_000,
@@ -348,9 +410,9 @@ export function createRelayDispatcher({
       log(`relay ${relay.runId}: could not file the gate question (${err.message})`);
     }
 
-    const parked = { ...relay, status: 'waiting_gate', gateKey: approvalKey };
+    const parked = { ...relay, status: 'waiting_gate', gateKey: approvalKey, gateReason: reason };
     saveRelay(chatId, parked);
-    appendRelayEvent(chatId, { eventType: 'gate.requested', runId: relay.runId, round: relay.rounds, approvalKey, textPreview: question });
+    appendRelayEvent(chatId, { eventType: 'gate.requested', runId: relay.runId, round: relay.rounds, reason, approvalKey, textPreview: question });
     return parked;
   }
 
@@ -367,15 +429,58 @@ export function createRelayDispatcher({
     return done;
   }
 
+  /** A run-level note that blocks nothing. The 'notify' escalation level, and how a skipped step leaves a trace. */
+  function notice(chatId, relay, text) {
+    appendRelayEvent(chatId, { eventType: 'notice', runId: relay.runId, round: relay.rounds, turn: relay.turns, textPreview: text });
+  }
+
+  /**
+   * One step, with retries.
+   *
+   * A retry gets its own dispatch id, so the log shows two attempts rather
+   * than one attempt with a confusing outcome — and the crash-replay question
+   * ("did this already happen?") stays answerable for each of them.
+   */
+  async function runStepWithRetry({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal }) {
+    const retries = relay.recipe?.budgets?.retriesPerDispatch ?? 0;
+    for (let attempt = 0; ; attempt += 1) {
+      onTurnStart(chatId);
+      let answer;
+      try {
+        answer = await runPeerTurn({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal, attempt });
+      } finally {
+        onTurnEnd(chatId);
+      }
+      if (answer) return answer;
+      if (attempt >= retries || signal?.aborted) return null;
+
+      const delayMs = retryDelayMs(attempt + 1);
+      appendRelayEvent(chatId, {
+        eventType: 'dispatch.retry',
+        runId: relay.runId,
+        to: peerId,
+        round: relay.rounds + 1,
+        turn: relay.turns + 1,
+        attempt: attempt + 1,
+        delayMs,
+      });
+      await wait(delayMs);
+    }
+  }
+
   /**
    * Drives the run until it must stop: goal met, gate due, budget spent, or
    * nothing changing. One turn at a time, always - a relay that fans out is a
    * relay nobody can follow.
+   *
+   * v2 walks a recipe's edges rather than a fixed ring. A "round" is still a
+   * return to the first step, so the round gate means what it always meant.
    */
   async function drive(chatId, { signal } = {}) {
     let relay = relayOf(chatId);
     if (!relay || relay.status !== 'active') return relay;
 
+    const walk = stepsOf(relay.recipe);
     const startedAt = now();
     let lastHashByPeer = relay.lastHashByPeer ?? {};
     let previous = relay.lastBodyRef ? readBodyForPrompt(dataDir, relay.lastBodyRef) : null;
@@ -390,16 +495,31 @@ export function createRelayDispatcher({
       const gate = canStartTurn();
       if (!gate.allowed) return finish(chatId, relay, 'stopped', gate.reason ?? 'no turn slot available');
 
-      const peerId = relay.route[relay.roundPos ?? 0];
-      onTurnStart(chatId);
-      let answer;
-      try {
-        answer = await runPeerTurn({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal });
-      } finally {
-        onTurnEnd(chatId);
-      }
+      const step = walk.get(relay.stepId) ?? walk.first;
+      const peerId = step.agent;
+      const answer = await runStepWithRetry({ chatId, relay, peerId, sourceEventId, previous, previousFrom, signal });
 
-      if (!answer) return finish(chatId, relay, 'stopped', `the handoff to ${peerId} failed`);
+      if (!answer) {
+        // Every retry is spent. What happens now is the recipe's decision,
+        // not this module's.
+        const onFailure = relay.recipe?.escalation?.onPeerFailure ?? 'stop';
+        const failure = `the handoff to ${peerId} failed`;
+        if (onFailure === 'question') return requestGate(chatId, { ...relay, turns: relay.turns + 1 }, previous, 'peer', { to: peerId, error: failure });
+        if (onFailure === 'notify') {
+          // Skip the step and carry on with what the last one produced. The
+          // turn still counts: it was attempted, it cost time, and letting a
+          // failing step be free is how a run loops until the wall clock.
+          relay = { ...relay, turns: relay.turns + 1 };
+          saveRelay(chatId, relay);
+          notice(chatId, relay, `${failure} — carrying on without it, as this recipe asks`);
+          const skipTo = walk.next(relay.stepId ?? walk.first.id);
+          if (!skipTo) return finish(chatId, relay, 'stopped', `${failure}, and it was the last step`);
+          relay = { ...relay, stepId: skipTo.to.id };
+          saveRelay(chatId, relay);
+          continue;
+        }
+        return finish(chatId, relay, 'stopped', failure);
+      }
 
       // NO PROGRESS. The same peer producing byte-identical output twice is
       // not a handoff, it is a loop that happens to cost money. Compared by
@@ -410,13 +530,35 @@ export function createRelayDispatcher({
       }
       lastHashByPeer = { ...lastHashByPeer, [peerId]: answer.bodySha256 };
 
-      const nextPos = ((relay.roundPos ?? 0) + 1) % relay.route.length;
-      const completedRound = nextPos === 0;
+      // WHERE THE HANDOFF GOES. The edge decides, not a position in a list —
+      // and the edge is also what carries requiresHuman, which is why the
+      // walker hands back both.
+      const currentStepId = relay.stepId ?? walk.first.id;
+      const hop = walk.next(currentStepId);
+      // A recipe may simply end. Reaching a step with no edge out of it is
+      // the run finishing, not an error.
+      if (!hop) {
+        relay = {
+          ...relay,
+          turns: relay.turns + 1,
+          lastHashByPeer,
+          lastBodyRef: answer.bodyRef,
+          lastFrom: peerId,
+          lastDispatchId: answer.dispatchId,
+        };
+        saveRelay(chatId, relay);
+        return finish(chatId, relay, 'completed', 'the recipe has no step after this one');
+      }
+
+      const completedRound = hop.to.id === walk.first.id;
       relay = {
         ...relay,
         turns: relay.turns + 1,
         rounds: completedRound ? relay.rounds + 1 : relay.rounds,
-        roundPos: nextPos,
+        stepId: hop.to.id,
+        // Kept in step with stepId so a v1 reader (and participantsHashOf)
+        // still sees a route it understands.
+        roundPos: relay.recipe.steps.findIndex((candidate) => candidate.id === hop.to.id),
         lastHashByPeer,
         lastBodyRef: answer.bodyRef,
         lastFrom: peerId,
@@ -432,7 +574,25 @@ export function createRelayDispatcher({
       // A peer asking for a human is not a failure and does not wait for the
       // round to end: whatever it needs decided, it needs decided now.
       if (answer.status === 'needs_human') return requestGate(chatId, relay, answer.textPreview);
-      if (completedRound && relay.rounds >= relay.maxRounds) return requestGate(chatId, relay, answer.textPreview);
+
+      // THE EDGE GATE. Asked BEFORE the step on the other side runs, so the
+      // decision is about something that has not happened yet — which is the
+      // only kind of decision worth asking for. The voucher buys exactly one
+      // passage: the run parks with stepId already set to the target, so
+      // resuming runs that step and the next arrival at this edge asks again.
+      if (hop.edge.requiresHuman) return requestGate(chatId, relay, answer.textPreview, 'edge', { from: currentStepId, to: hop.to.id });
+
+      if (completedRound && relay.rounds >= relay.maxRounds) {
+        const onBudget = relay.recipe?.escalation?.onBudget ?? 'question';
+        if (onBudget === 'stop') return finish(chatId, relay, 'stopped', `the round budget is spent (${relay.maxRounds})`);
+        if (onBudget === 'notify') {
+          // Carry on under the hard turn ceiling alone. A deliberate choice
+          // with a real backstop, not an unbounded run.
+          notice(chatId, relay, `round budget spent (${relay.maxRounds}); this recipe asks to carry on to the turn ceiling of ${relay.hardMaxTurns}`);
+        } else {
+          return requestGate(chatId, relay, answer.textPreview);
+        }
+      }
     }
   }
 
@@ -458,24 +618,38 @@ export function createRelayDispatcher({
      * that has not finished - a chat is one conversation, and two relays
      * writing into it would produce a transcript nobody can read.
      */
-    async startRun({ chatId, goal, route = RELAY_DEFAULT_ROUTE, maxRounds = RELAY_ROUNDS_PER_GATE }) {
+    async startRun({ chatId, goal, recipe = null, route = RELAY_DEFAULT_ROUTE, maxRounds = RELAY_ROUNDS_PER_GATE }) {
       if (typeof goal !== 'string' || goal.trim().length === 0) throw new Error('a relay run needs a goal');
       const existing = relayOf(chatId);
       if (existing && ['active', 'waiting_gate'].includes(existing.status)) {
         throw new Error('this chat already has a relay run in progress');
       }
-      for (const peerId of route) {
-        if (peerId !== 'claude' && !getPeerDriver(peerId)) throw new Error(`unknown peer "${peerId}"`);
+
+      // A run without a recipe is the v1 call shape, translated. Both paths
+      // end up walking a graph, so there is exactly one thing to reason about
+      // afterwards.
+      const active_recipe = recipe ? validateRecipe(recipe) : routeFromLegacy({ route, maxRounds });
+      for (const step of active_recipe.steps) {
+        // 'claude' and 'codex' are harnesses, resolved by the server; anything
+        // else has to be a peer driver that exists right now. Checked before
+        // the run starts, because discovering it three handoffs in wastes
+        // every turn spent up to that point.
+        if (!['claude', 'codex'].includes(step.agent) && !getPeerDriver(step.agent)) throw new Error(`unknown peer "${step.agent}"`);
       }
 
       const runId = crypto.randomUUID();
       const relay = {
         runId,
         status: 'active',
-        route: [...route],
+        recipe: active_recipe,
+        recipeId: active_recipe.id,
+        stepId: active_recipe.steps[0].id,
+        // The flat agent list, kept because a voucher is bound to it (see
+        // participantsHashOf) and because the UI has always shown it.
+        route: active_recipe.steps.map((step) => step.agent),
         goal: goal.trim(),
-        maxRounds,
-        hardMaxTurns: RELAY_MAX_TURNS,
+        maxRounds: active_recipe.budgets.maxRounds,
+        hardMaxTurns: active_recipe.budgets.hardMaxTurns,
         rounds: 0,
         turns: 0,
         roundPos: 0,
@@ -483,7 +657,7 @@ export function createRelayDispatcher({
         startedAt: now(),
       };
       saveRelay(chatId, relay);
-      appendRelayEvent(chatId, { eventType: 'run.created', runId, goal: relay.goal, route: relay.route });
+      appendRelayEvent(chatId, { eventType: 'run.created', runId, goal: relay.goal, route: relay.route, recipeId: relay.recipeId });
       launch(chatId, relay);
       return relay;
     },
@@ -526,12 +700,21 @@ export function createRelayDispatcher({
         throw new Error('this approval was given for a different route or budget and can no longer be spent');
       }
 
-      appendRelayEvent(chatId, { eventType: 'gate.resolved', runId: relay.runId, round: relay.rounds, approvalKey: voucher.approvalKey ?? null });
-      // ONE voucher, ONE round. The ceiling moves by exactly one, so the next
-      // gate is due the moment that round ends - not two rounds later, and
-      // not "until the peers feel finished". Raising it by the original
-      // maxRounds instead would quietly double the run on every approval.
-      const resumed = { ...relay, status: 'active', maxRounds: relay.maxRounds + 1, gateKey: null };
+      appendRelayEvent(chatId, { eventType: 'gate.resolved', runId: relay.runId, round: relay.rounds, reason: relay.gateReason ?? 'rounds', approvalKey: voucher.approvalKey ?? null });
+      // WHAT A VOUCHER BUYS depends on which gate it answers.
+      //
+      // A ROUND gate: one more round. The ceiling moves by exactly one, so
+      // the next gate is due the moment that round ends — not two rounds
+      // later, and not "until the peers feel finished". Raising it by the
+      // original maxRounds instead would quietly double the run on every
+      // approval.
+      //
+      // An EDGE or PEER gate: nothing at all. The run parked with stepId
+      // already pointing at the step on the far side, so resuming runs that
+      // step and the round budget is untouched — approving one handoff must
+      // not also buy a round the operator never agreed to.
+      const roundGate = (relay.gateReason ?? 'rounds') === 'rounds';
+      const resumed = { ...relay, status: 'active', maxRounds: roundGate ? relay.maxRounds + 1 : relay.maxRounds, gateKey: null, gateReason: null };
       saveRelay(chatId, resumed);
       launch(chatId, resumed);
       return resumed;

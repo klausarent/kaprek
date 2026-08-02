@@ -105,6 +105,14 @@ const EVENT_SHAPES = {
       'route',
       'dispatchId',
       'approvalKey',
+      // v2 (recipes): which recipe a run is walking, and — for a retry — which
+      // attempt this was and how long it waited first. Whitelisted rather
+      // than passed through, because a field the shape does not name is
+      // dropped silently, which is how a retry event ends up in the log
+      // saying nothing about the retry.
+      'recipeId',
+      'attempt',
+      'delayMs',
     ],
   },
 };
