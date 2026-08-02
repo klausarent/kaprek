@@ -192,7 +192,11 @@ add to. `GET /api/recipes` lists what is available; the relay panel picks one.
   `stop`, `question` (ask you), or `notify` (carry on past the broken step and
   say so).
 - **The deferred inbox is the only human gate.** Round gates, edge gates and
-  peer-failure questions all land there.
+  peer-failure questions all land there — as does every approval a step with
+  tools asks for. A relay step *waits* on its question rather than ending and
+  being replayed later, so the answer reaches the process (and the engine)
+  that asked it. The honest limit: that question lives as long as the relay
+  turn does, not for 24 hours.
 
 Refusals happen before a run starts, not three handoffs in: an unknown agent,
 an unknown recipe id, a duplicate step id, or a step no edge leads to.
