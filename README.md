@@ -238,6 +238,12 @@ one nobody can reason about. Forgetting is an event with a reason, and
 evidence is a pointer into a session, never a copied excerpt. `#/memory`
 shows one scope at a time; there is deliberately no "everything" view.
 
+When the same failure pattern shows up three times, kaprek writes down the
+rule it would add and asks. Until someone accepts it, that proposal reaches
+no prompt at all — a system that turns its own observations into active rules
+re-educates itself out of sight. Accepted rules go into the prompt as
+instructions; a rejected one is not proposed again.
+
 Not built, deliberately: vector search, embeddings, automatic summarizing of
 raw transcripts, syncing between machines.
 
