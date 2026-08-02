@@ -1149,3 +1149,68 @@ export async function setPlanStep(id: string, index: number, done: boolean): Pro
   await throwOnError(res);
   return (await res.json()).plan as PlanDetail;
 }
+
+// ---------------------------------------------------------------------------
+// Council (/api/council)
+// ---------------------------------------------------------------------------
+
+export type CouncilLevel = "off" | "plans" | "decisions" | "always";
+export type CouncilRole = "lead" | "thinker" | "worker" | "peer";
+
+export type CouncilAssignment = {
+  lead: string | null;
+  thinker: string | null;
+  worker: string | null;
+  peer: string[];
+};
+
+export type Council = {
+  level: CouncilLevel;
+  assignment: CouncilAssignment;
+  configured: boolean;
+  suggested: boolean;
+  problem: string | null;
+  status: { possible: boolean; peers: string[]; reason: string | null };
+};
+
+export type CouncilSetup = { council: Council; available: string[]; levels: CouncilLevel[]; roles: CouncilRole[] };
+
+export type PeerVerdict = "agree" | "concerns" | "disagree";
+
+export type Consultation = {
+  consensus: boolean;
+  empty: boolean;
+  agreed: string[];
+  dissenting: { peerId: string; verdict: PeerVerdict; summary: string; risks: string[] }[];
+  unreachable: { peerId: string; error: string | null }[];
+  answers?: { peerId: string; verdict: PeerVerdict | null; summary: string | null; risks: string[]; error: string | null }[];
+  /** Set when there was nobody to ask — not an error, a real answer. */
+  reason?: string | null;
+};
+
+export async function fetchCouncil(): Promise<CouncilSetup> {
+  const res = await apiFetch("/api/council");
+  await throwOnError(res);
+  return (await res.json()) as CouncilSetup;
+}
+
+export async function saveCouncil(level: CouncilLevel, assignment: CouncilAssignment): Promise<Council> {
+  const res = await apiFetch("/api/council", {
+    method: "PUT",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ level, assignment }),
+  });
+  await throwOnError(res);
+  return (await res.json()).council as Council;
+}
+
+/** Asks every peer the same question. Works at every level, including off. */
+export async function consultCouncil(input: { question: string; files?: string[]; constraints?: string[]; tried?: string[]; missionId?: string }): Promise<Consultation> {
+  const res = await apiFetch("/api/council/consult", {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify(input),
+  });
+  await throwOnError(res);
+  return (await res.json()).consultation as Consultation;
+}

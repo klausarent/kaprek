@@ -25,6 +25,7 @@ import Approvals from "./pages/Approvals";
 import QuestionBox from "./components/QuestionBox";
 import Apps from "./pages/Apps";
 import Plans from "./pages/Plans";
+import CouncilPage from "./pages/Council";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
 
@@ -40,7 +41,8 @@ export type Route =
   | { name: "triggers" }
   | { name: "approvals" }
   | { name: "apps" }
-  | { name: "plans" };
+  | { name: "plans" }
+  | { name: "council" };
 
 function parseHash(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -72,6 +74,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "plans") {
     return { name: "plans" };
+  }
+  if (parts[0] === "council") {
+    return { name: "council" };
   }
   if (parts[0] === "apps") {
     return { name: "apps" };
@@ -162,6 +167,10 @@ export function navigateToApps() {
 
 export function navigateToPlans() {
   window.location.hash = "#/plans";
+}
+
+export function navigateToCouncil() {
+  window.location.hash = "#/council";
 }
 
 /**
@@ -320,6 +329,16 @@ export default function App() {
             Plans
           </a>
           <a
+            href="#/council"
+            className={route.name === "council" ? "active" : ""}
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToCouncil();
+            }}
+          >
+            Council
+          </a>
+          <a
             href="#/approvals"
             className={route.name === "approvals" ? "active" : ""}
             onClick={(e) => {
@@ -376,6 +395,8 @@ export default function App() {
           <Triggers />
         ) : route.name === "approvals" ? (
           <Approvals />
+        ) : route.name === "council" ? (
+          <CouncilPage />
         ) : route.name === "plans" ? (
           <Plans />
         ) : route.name === "apps" ? (

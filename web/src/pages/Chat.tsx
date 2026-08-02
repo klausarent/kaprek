@@ -41,6 +41,8 @@ import RepeatHint from "../components/RepeatHint";
 import PlanPrompt, { looksLikePlanning } from "../components/PlanPrompt";
 import QuizCard from "../components/QuizCard";
 import { formatQuizAnswers } from "../lib/quiz";
+import CouncilPanel from "../components/CouncilPanel";
+import { consultCouncil, type Consultation } from "../lib/api";
 import { navigateToPlans } from "../App";
 import { toSimpleItems } from "../lib/simple";
 import { EFFORT_LEVELS } from "../lib/api";
@@ -254,8 +256,44 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // an offer.
   const [planOffer, setPlanOffer] = useState(false);
   const [planOfferMuted, setPlanOfferMuted] = useState(false);
+  // What the other engines said about the last thing worth asking about.
+  const [consultation, setConsultation] = useState<Consultation | null>(null);
+  const [consulting, setConsulting] = useState(false);
 
   const canSend = draft.trim().length > 0 && !streaming;
+
+  /**
+   * Asks every configured peer about the turn that just happened. The
+   * question is the user's own last message plus what the agent answered —
+   * a peer never gets the conversation, only a stated question.
+   */
+  const askTheOthers = async () => {
+    const lastUser = [...events].reverse().find((event) => event.kind === "user");
+    const lastAssistant = [...events].reverse().find((event) => event.kind === "assistant");
+    if (!lastUser) return;
+    setConsulting(true);
+    setConsultation(null);
+    try {
+      setConsultation(
+        await consultCouncil({
+          question: `A request was made:
+
+${(lastUser as { text: string }).text}
+
+The proposed answer was:
+
+${(lastAssistant as { text?: string })?.text ?? "(nothing yet)"}
+
+Is this the right approach?`,
+          ...(missionId ? { missionId } : {}),
+        }),
+      );
+    } catch (err) {
+      setStreamError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setConsulting(false);
+    }
+  };
 
   const handleSend = async ({ mode, text: override }: { mode?: PlanMode; text?: string } = {}) => {
     const text = (override ?? draft).trim();
@@ -570,6 +608,8 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         </div>
       )}
 
+      {(consultation || consulting) && <CouncilPanel consultation={consultation} busy={consulting} />}
+
       {planOffer && !streaming && (
         <PlanPrompt
           onPick={(mode) => {
@@ -650,9 +690,14 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
               Stop
             </button>
           ) : (
-            <button type="button" className="btn" onClick={() => void handleSend()} disabled={!canSend}>
-              Send
-            </button>
+            <>
+              <button type="button" className="link-button" onClick={() => void askTheOthers()} disabled={consulting || events.length === 0}>
+                Second opinion
+              </button>
+              <button type="button" className="btn" onClick={() => void handleSend()} disabled={!canSend}>
+                Send
+              </button>
+            </>
           )}
         </div>
       </div>

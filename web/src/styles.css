@@ -2099,3 +2099,92 @@ pre,
   white-space: pre-wrap;
   font-size: 0.85rem;
 }
+
+/* --- council: roles, and what the other engines said -------------------- */
+
+.council-intro {
+  max-width: 60ch;
+  opacity: 0.85;
+}
+.council-note {
+  margin: 10px 0;
+  padding: 8px 12px;
+  border: 1px dashed var(--border, #ccc);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+.council-role {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border, #ccc);
+}
+.council-role-title {
+  font-weight: 600;
+}
+.council-role-detail {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+.council-peers,
+.council-level {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border, #ccc);
+}
+.council-peer {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  padding: 4px 0;
+  cursor: pointer;
+}
+.council-peer-disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.council-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 16px;
+}
+
+.council-panel {
+  margin: 10px 0;
+  padding: 12px;
+  border: 1px solid var(--border, #ccc);
+  border-radius: 8px;
+  font-size: 0.9rem;
+}
+.council-panel-dissent {
+  border-color: #d08b2c;
+}
+.council-headline {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.council-agreed,
+.council-unreachable {
+  font-size: 0.85rem;
+  opacity: 0.7;
+}
+.council-dissent {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border, #ccc);
+}
+.council-dissent p {
+  margin: 6px 0 0;
+}
+.council-verdict {
+  margin-left: 8px;
+  font-size: 0.8rem;
+  opacity: 0.7;
+  text-transform: uppercase;
+}
+.council-risks {
+  margin: 6px 0 0;
+  padding-left: 20px;
+}
