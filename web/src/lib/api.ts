@@ -69,6 +69,8 @@ export type RelayEvent = {
     | "dispatch.started"
     | "message"
     | "dispatch.failed"
+    | "dispatch.retry"
+    | "notice"
     | "gate.requested"
     | "gate.resolved"
     | "run.completed"
@@ -90,6 +92,10 @@ export type RelayEvent = {
   reason?: string | null;
   goal?: string | null;
   route?: string[] | null;
+  recipeId?: string | null;
+  /** Retry bookkeeping: which attempt, and how long it waited first. */
+  attempt?: number | null;
+  delayMs?: number | null;
 };
 
 /** The relay run a chat is hosting, if any. */
@@ -103,6 +109,11 @@ export type RelayRun = {
   rounds: number;
   turns: number;
   artifactDir?: string;
+  /** Which recipe this run is walking, and where in it. */
+  recipeId?: string;
+  stepId?: string;
+  /** Which kind of gate it is parked at, when it is parked. */
+  gateReason?: "rounds" | "edge" | "peer" | null;
 };
 
 export type DigestEvent = ToolEvent | TextEvent | SubagentEvent | CompactEvent | ApprovalEvent | RelayEvent;
@@ -932,8 +943,30 @@ export function fetchApprovalInbox(): Promise<{ approvals: InboxApproval[] }> {
 // ---------------------------------------------------------------------------
 
 /** Starts a handoff run on a chat. The route is fixed in v1; the goal is the operator's one input. */
-export function startRelayRun(chatId: string, goal: string, maxRounds?: number): Promise<{ runId: string; status: string; route: string[] }> {
-  return postJson(`/api/chat/${encodeURIComponent(chatId)}/relay`, maxRounds === undefined ? { goal } : { goal, maxRounds });
+/** A recipe: who takes part in a relay run, in what order, under what budget. */
+export type Recipe = {
+  id: string;
+  title: string;
+  description: string;
+  steps: { id: string; agent: string; tools: "none" | "full" }[];
+  edges: { from: string; to: string; requiresHuman: boolean }[];
+  budgets: { maxRounds: number; hardMaxTurns: number; retriesPerDispatch: number };
+  escalation: { onPeerFailure: string; onBudget: string };
+  builtin: boolean;
+};
+
+export async function fetchRecipes(): Promise<Recipe[]> {
+  const res = await apiFetch("/api/recipes");
+  await throwOnError(res);
+  return (await res.json()).recipes as Recipe[];
+}
+
+export function startRelayRun(chatId: string, goal: string, options: { maxRounds?: number; recipeId?: string } = {}): Promise<{ runId: string; status: string; route: string[]; recipeId?: string }> {
+  return postJson(`/api/chat/${encodeURIComponent(chatId)}/relay`, {
+    goal,
+    ...(options.maxRounds === undefined ? {} : { maxRounds: options.maxRounds }),
+    ...(options.recipeId ? { recipeId: options.recipeId } : {}),
+  });
 }
 
 export function stopRelayRun(runId: string): Promise<{ ok: true }> {

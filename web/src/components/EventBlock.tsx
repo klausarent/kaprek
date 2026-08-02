@@ -58,6 +58,16 @@ export default function EventBlock({
   }
 }
 
+/**
+ * What a gate is asking about. Three different questions used to render as
+ * "one more round?", which is only true for one of them.
+ */
+export function gateLabel(event: RelayEvent): string {
+  if (event.reason === "edge") return "waiting for you: approve this handoff?";
+  if (event.reason === "peer") return "waiting for you: a handoff kept failing — try again?";
+  return "waiting for you: one more round?";
+}
+
 /** One relay step. Reads as a line in the conversation, because that is what it is. */
 export function RelayBlock({ event }: { event: RelayEvent }) {
   const round = event.round ? `round ${event.round}` : null;
@@ -84,8 +94,12 @@ export function RelayBlock({ event }: { event: RelayEvent }) {
     "run.created": `Relay run started: ${event.goal ?? ""}`,
     "dispatch.started": `handing off to ${event.to ?? "?"}`,
     "dispatch.failed": `the handoff to ${event.to ?? "?"} failed: ${event.reason ?? ""}`,
-    "gate.requested": "waiting for you: one more round?",
-    "gate.resolved": "approved — one more round",
+    // A retry is worth its own line: two attempts that look like one leave
+    // someone reading the log wondering why a peer answered twice.
+    "dispatch.retry": `retrying ${event.to ?? "?"} (attempt ${event.attempt ?? "?"}) after ${Math.round((event.delayMs ?? 0) / 1000)}s`,
+    "gate.requested": gateLabel(event),
+    "gate.resolved": event.reason === "edge" ? "approved — one handoff" : "approved — one more round",
+    "notice": event.textPreview ?? "",
     "run.completed": "Relay run finished",
     "run.stopped": `Relay run stopped: ${event.reason ?? ""}`,
     "run.interrupted": `Relay run interrupted: ${event.reason ?? ""}`,

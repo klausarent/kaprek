@@ -1,5 +1,5 @@
-import { test, expect, vi } from "vitest";
-import { RelayControls, relayStatusLine } from "./RelayPanel";
+import { describe, test, expect, vi } from "vitest";
+import { RelayControls, recipeSummary, relayStatusLine } from "./RelayPanel";
 import { RelayBlock } from "./EventBlock";
 import type { RelayEvent, RelayRun } from "../lib/api";
 import { findByType, findOneByText, render, textOf, click } from "../test/tree";
@@ -95,4 +95,68 @@ test("run-level events read as plain sentences", () => {
   expect(
     textOf(render(<RelayBlock event={relayEvent({ eventType: "run.interrupted", reason: "kaprek stopped while a handoff was in flight" })} />)),
   ).toContain("in flight");
+});
+
+describe("recipeSummary", () => {
+  const base = {
+    id: "r",
+    title: "t",
+    description: "",
+    budgets: { maxRounds: 2, hardMaxTurns: 12, retriesPerDispatch: 0 },
+    escalation: { onPeerFailure: "stop", onBudget: "question" },
+    builtin: true,
+  };
+
+  test("names the chain and says where it will ask", () => {
+    const summary = recipeSummary({
+      ...base,
+      steps: [
+        { id: "write", agent: "grok", tools: "none" },
+        { id: "review", agent: "claude", tools: "none" },
+      ],
+      edges: [
+        { from: "write", to: "review", requiresHuman: false },
+        { from: "review", to: "write", requiresHuman: false },
+      ],
+    });
+    expect(summary).toContain("grok → claude");
+    expect(summary).toContain("round gate only");
+  });
+
+  test("says plainly which step may change files", () => {
+    const summary = recipeSummary({
+      ...base,
+      steps: [
+        { id: "write", agent: "grok", tools: "none" },
+        { id: "apply", agent: "codex", tools: "full" },
+      ],
+      edges: [
+        { from: "write", to: "apply", requiresHuman: true },
+        { from: "apply", to: "write", requiresHuman: false },
+      ],
+    });
+    expect(summary).toContain("apply may change files");
+    expect(summary).toContain("asks you at 1 handoff");
+  });
+});
+
+describe("relayStatusLine at a gate", () => {
+  const parked = {
+    runId: "r",
+    status: "waiting_gate" as const,
+    route: ["grok", "codex"],
+    goal: "g",
+    maxRounds: 2,
+    hardMaxTurns: 12,
+    rounds: 1,
+    turns: 2,
+  };
+
+  test("an edge gate says which handoff it is holding", () => {
+    expect(relayStatusLine({ ...parked, gateReason: "edge", stepId: "apply" })).toContain("hands off to apply");
+  });
+
+  test("a failing peer is not described as a round question", () => {
+    expect(relayStatusLine({ ...parked, gateReason: "peer" })).toContain("kept failing");
+  });
 });

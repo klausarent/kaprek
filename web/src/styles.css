@@ -2205,3 +2205,10 @@ pre,
 .council-note-stale {
   color: var(--warn, #b45309);
 }
+
+/* What a recipe will do, under the picker: the chain, who may write, where it asks. */
+.relay-recipe-summary {
+  font-size: 0.8rem;
+  color: var(--muted);
+  padding: 0.2rem 0;
+}
