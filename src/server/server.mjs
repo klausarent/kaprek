@@ -68,6 +68,7 @@ import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUN
 import { loadRecipes } from '../relay/recipes.mjs';
 import { engineIdsByReadiness, nextSteps, scanEnvironment } from '../scan/environment.mjs';
 import { openMemory, MemoryNotFoundError, InvalidMemoryError } from '../memory/store.mjs';
+import { notify, readNotify, writeNotify, InvalidNotifyError } from './notify.mjs';
 import { InvalidScopeError } from '../memory/scopes.mjs';
 import { openPolicy, ProposalNotFoundError } from '../memory/policy.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
@@ -943,7 +944,7 @@ function makeApprovalHandler({
  * one approved action (see handleApprovalDecision). Nothing is registered in
  * `pendingApprovals` and no timer is armed, because nothing is waiting.
  */
-function makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approvalTimeoutMs, triggerId, describeSource }) {
+function makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approvalTimeoutMs, triggerId, describeSource, onDeferred = () => {} }) {
   return async (request) => {
     const requestedAt = Date.now();
     let entry;
@@ -984,6 +985,20 @@ function makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approval
       requestedAt: entry.requestedAt,
       deadlineAt: entry.deadlineAt,
     }).catch(() => {});
+
+    // A deferred question is one nobody is watching — that is the whole
+    // definition. Telling someone is therefore the only way it gets
+    // answered before its deadline, and it happens here rather than at the
+    // call sites so no path can quietly skip it.
+    //
+    // Not awaited: a notifier is fire-and-forget, and a turn that has just
+    // parked a question must not wait on somebody's shell script.
+    try {
+      onDeferred({ entry, request });
+    } catch {
+      // Already best-effort by contract; a broken notifier cannot be allowed
+      // to change what the agent is told.
+    }
 
     return { behavior: 'deny', message: DEFERRAL_MESSAGE };
   };
@@ -2938,6 +2953,30 @@ async function handleRequest(
       });
       return;
     }
+    // /api/notify — the one command kaprek runs when a question is parked.
+    if (segments.length === 2 && segments[1] === 'notify') {
+      if (req.method === 'GET') {
+        sendJson(res, 200, { notify: readNotify(dataDir) });
+        return;
+      }
+      if (req.method === 'PUT') {
+        const body = await readJsonBody(req);
+        if (!body.ok) {
+          sendJson(res, body.status, { error: body.error });
+          return;
+        }
+        try {
+          sendJson(res, 200, { notify: writeNotify(dataDir, body.data?.command) });
+        } catch (err) {
+          if (err instanceof InvalidNotifyError) sendJson(res, 400, { error: err.message });
+          else throw err;
+        }
+        return;
+      }
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+
     // /api/memory — what kaprek remembers, per scope.
     if (segments[1] === 'memory') {
       await handleMemoryRoutes(req, res, segments, url, { dataDir });
@@ -3384,6 +3423,19 @@ export function startServer({
       approvalTimeoutMs: overrideTimeoutMs ?? (mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs),
       approvalStore: getApprovalStore(),
       describeSource: describeApprovalSource,
+      onDeferred: ({ entry, request }) => {
+        // The address a person can actually reach: the LAN one when --lan is
+        // on, since a notification that points at 127.0.0.1 is useless on
+        // the phone it just arrived on.
+        const answerUrl = `${lanAddress ? `http://${lanAddress}:${boundPort}` : `http://127.0.0.1:${boundPort}`}/#/approvals`;
+        const question = entry.description ?? request.description ?? `${request.toolName ?? 'An agent'} is waiting for a decision.`;
+        void notify({
+          dataDir,
+          text: `${question}\n\nAnswer: ${answerUrl}`,
+          context: { chatId: entry.chatId, toolName: entry.toolName, source: entry.source, url: answerUrl },
+          log: (message) => console.log(message),
+        });
+      },
     });
   }
 

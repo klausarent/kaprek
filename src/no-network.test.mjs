@@ -66,10 +66,17 @@ const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 //   - src/cli/update.mjs spawns `npm install -g kaprek@latest` when someone
 //     typed `kaprek update`, and is ALSO the one file allowed to make a
 //     real outbound request (see ALLOWED_REGISTRY_FILE below).
+//   - src/server/notify.mjs runs the ONE command the user put in
+//     notify.json when a question is parked. kaprek ships no channels of its
+//     own (that is on the kill list by name), so this is how a person gets
+//     told. Pinned below: never through a shell, and the question's text
+//     goes in on stdin rather than as an argument — an agent chooses what a
+//     tool is called, and that text must never become part of a command line.
 const ALLOWED_CHILD_PROCESS_FILES = [
   path.join(ROOT, 'bin', 'cli.mjs'),
   path.join(ROOT, 'src', 'triggers', 'clipboard.mjs'),
   path.join(ROOT, 'src', 'cli', 'update.mjs'),
+  path.join(ROOT, 'src', 'server', 'notify.mjs'),
 ];
 const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
 
@@ -136,6 +143,14 @@ test('static guard: no network-client or subprocess APIs outside test files (exc
     }
   }
   expect(violations).toEqual([]);
+});
+
+test('the notifier never runs anything through a shell', () => {
+  const content = fs.readFileSync(path.join(ROOT, 'src', 'server', 'notify.mjs'), 'utf8');
+  // The exemption above is only defensible while this holds: the command
+  // comes from a file the user wrote, but the TEXT comes from an agent.
+  expect(content).toMatch(/shell:\s*false/);
+  expect(content).not.toMatch(/shell:\s*true/);
 });
 
 test('the update command talks to the npm registry and to nothing else', () => {

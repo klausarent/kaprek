@@ -319,6 +319,42 @@ What holds either way:
 - On a machine with no network address, `--lan` stays on loopback and says
   so rather than printing a QR for an address that does not exist.
 
+## Running it unattended
+
+**Start with the machine** — off unless you ask, and it is one file:
+
+```
+kaprek autostart install    # writes it
+kaprek autostart status     # shows the path AND the contents
+kaprek autostart uninstall  # deletes exactly that file
+```
+
+Startup folder on Windows, a LaunchAgent on macOS, a `.desktop` file on
+Linux. No registry keys, no scheduled tasks, no service — "what did that tool
+install on my machine" has to have a short answer, and `status` prints the
+file so you can delete it by hand if you would rather not trust the
+uninstall.
+
+**Being told a question is waiting.** A deferred question is by definition
+one nobody is watching, so kaprek runs one command you choose:
+
+```
+PUT /api/notify  {"command": ["ntfy", "publish", "my-topic"]}
+```
+
+The question goes in on stdin; `KAPREK_CHAT_ID`, `KAPREK_TOOL`,
+`KAPREK_SOURCE` and `KAPREK_URL` go in as environment variables. What happens
+next is not kaprek's business — a phone push, a desktop toast, a line in a
+log, whatever you already use.
+
+Never through a shell, and the question's text is never part of a command
+line: an agent chooses what a tool is called, and that text must not become
+something a shell interprets. A notifier that fails, hangs, or does not exist
+changes nothing about the question — it stays in the inbox either way.
+
+kaprek ships no channels of its own on purpose. A built-in list of them is
+never finished, and every entry is a dependency or a vendor.
+
 ## Search
 
 Full-text search across every indexed session, backed by SQLite FTS5. Requires Node 22+, since it uses the built-in `node:sqlite` module — on older Node it degrades cleanly, the UI reports search as unavailable instead of crashing. Only redacted content is indexed, same as the digest view. Build or refresh the index from the reindex button in the search view (`#/search`), or `POST /api/search/reindex`.

@@ -4243,3 +4243,15 @@ test('lan: the token is only handed to loopback, never over the network', async 
   const local = await (await fetch(`${url}/`)).text();
   expect(local).toContain(token);
 });
+
+test('notify: nothing configured by default, and a shell string is refused', async () => {
+  const { url } = await boot();
+  expect((await (await fetch(`${url}/api/notify`)).json()).notify.configured).toBe(false);
+
+  const bad = await fetch(`${url}/api/notify`, { method: 'PUT', headers: APP_JSON_HEADERS, body: JSON.stringify({ command: 'ntfy publish topic' }) });
+  expect(bad.status).toBe(400);
+
+  const good = await fetch(`${url}/api/notify`, { method: 'PUT', headers: APP_JSON_HEADERS, body: JSON.stringify({ command: ['ntfy', 'publish', 'topic'] }) });
+  expect(good.status).toBe(200);
+  expect((await (await fetch(`${url}/api/notify`)).json()).notify.command).toEqual(['ntfy', 'publish', 'topic']);
+});

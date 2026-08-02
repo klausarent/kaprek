@@ -9,6 +9,7 @@ import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { encodeQr, qrToText } from '../src/server/qr.mjs';
 import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
+import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
 import {
@@ -20,6 +21,7 @@ import {
 
 const USAGE = `Usage: kaprek [options]
        kaprek update [--check]
+       kaprek autostart <install|uninstall|status>
        kaprek hooks <install|uninstall|status>
 
 Options:
@@ -35,6 +37,11 @@ Options:
 Update:
   update         Check npm for a newer kaprek and install it if there is one
   update --check Only look; change nothing
+
+Autostart (start kaprek when you log in — off unless you ask):
+  autostart install    Write one file to this machine's startup folder
+  autostart uninstall  Delete exactly that file
+  autostart status     Show whether it is there, and print its path
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop hook to ~/.claude/settings.json
@@ -187,8 +194,51 @@ async function runUpdateCommand(args) {
   }
 }
 
+/** `kaprek autostart <install|uninstall|status>`. Never throws. */
+function runAutostartCommand(args) {
+  const sub = args[0];
+  const scriptPath = fileURLToPath(import.meta.url);
+
+  try {
+    if (sub === 'install') {
+      const result = autostart.install({ scriptPath });
+      console.log(`kaprek will start when you log in. One file, and this is it:`);
+      console.log(`  ${result.path}`);
+      console.log('Delete that file (or run `kaprek autostart uninstall`) to stop it.');
+    } else if (sub === 'uninstall') {
+      const result = autostart.uninstall();
+      console.log(result.removed ? `Removed ${result.path}` : `Nothing to remove (no file at ${result.path ?? 'this platform has no known autostart folder'})`);
+    } else if (sub === 'status') {
+      const result = autostart.status();
+      if (!result.supported) {
+        console.log(`kaprek does not know where autostart entries live on ${process.platform}.`);
+        return;
+      }
+      console.log(`Autostart: ${result.installed ? 'on' : 'off'}`);
+      console.log(`File: ${result.path}`);
+      if (result.contents) {
+        console.log('Contents:');
+        for (const line of result.contents.trim().split(/\r?\n/)) console.log(`  ${line}`);
+      }
+    } else {
+      console.error('Usage: kaprek autostart <install|uninstall|status>');
+      process.exitCode = 1;
+      return;
+    }
+    process.exitCode = 0;
+  } catch (err) {
+    console.error(`autostart ${sub} failed: ${err.message}`);
+    process.exitCode = 1;
+  }
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+
+  if (argv[0] === 'autostart') {
+    runAutostartCommand(argv.slice(1));
+    return;
+  }
 
   if (argv[0] === 'update') {
     await runUpdateCommand(argv.slice(1));
