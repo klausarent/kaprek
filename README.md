@@ -44,6 +44,7 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Missions: name a goal once, point it at a real project directory, and every chat, task, and pending question of that work hangs together — see [Missions](#missions).
 - Two engines: chats run on your Claude Code CLI by default, or on your Codex CLI — picked per chat, same approval flow, same inbox — see [Engines](#engines).
 - Guided planning: say what you want to build and answer a few cards instead of a wall of questions; the plan lands at a path kaprek chose and shows up under [Plans](#plans) — with its full path, so you never go hunting through folders for it.
+- Council: put your engines in four roles (lead, thinker, worker, peer) and ask the ones you are not using for a second opinion — kaprek shows where they disagree rather than smoothing it over. See [Council](#council).
 
 ## Missions
 
@@ -88,6 +89,35 @@ your git see the same truth), and starts a chat that works through it.
 A guided turn where the agent answered in prose anyway says so. The mode is
 an instruction to a model, not a guarantee, and a quiet failure would leave
 you with the old wall of text wearing a new label.
+
+## Council
+
+Four jobs, and whichever engines you have doing them:
+
+| Role | Does |
+| --- | --- |
+| `lead` | Splits the work and puts the answers back together. |
+| `thinker` | Architecture, algorithms, the analysis worth paying for. |
+| `worker` | Boilerplate, tests, mechanical edits. |
+| `peer` | Independent second opinion. Several are fine. |
+
+No model name is wired into kaprek. Running Codex as the lead with Claude on
+the peer bench is two dropdowns on `#/council`, and the suggestion you start
+from is built from what is actually installed on your machine.
+
+A consultation sends every peer the same package — the question, the files
+worth reading, the constraints, what was already ruled out — in parallel and
+read-only. A peer never sees your conversation: an investigation's thread
+does not survive being handed over, and a peer answering from half the
+context answers confidently and wrongly.
+
+Peers answer with a verdict (`agree` / `concerns` / `disagree`), so one
+dissenter means no consensus and you see the disagreement in the peer's own
+words. If only one engine is installed, kaprek says there is no second
+opinion to get instead of asking one model to review itself.
+
+`off` / `plans` / `decisions` / `always` govern what kaprek asks **unasked**.
+The "Second opinion" button in a chat works at every level, including `off`.
 
 ## Engines
 

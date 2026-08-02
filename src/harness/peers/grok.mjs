@@ -121,17 +121,27 @@ export function resolveGrokCli(env = process.env, { platform = process.platform 
   return { command: 'grok', argsPrefix: [], useShell: false };
 }
 
-/** The argv for one turn, minus the binary. Exported so a test can assert the contract rather than trusting a comment. */
-export function buildGrokArgs({ promptPath, cwd, maxTurns = 1 }) {
+/**
+ * The argv for one turn, minus the binary. Exported so a test can assert the
+ * contract rather than trusting a comment.
+ *
+ * `tools` is empty by default — a relay turn is a text hand-off and must not
+ * touch the disk. A COUNCIL turn (src/council/ask.mjs) passes the read-only
+ * set and a higher turn budget: the first live consultation failed with
+ * "max turns reached" because a peer asked to read three files had exactly
+ * one turn to do it in. `--permission-mode plan` still forbids writing
+ * either way.
+ */
+export function buildGrokArgs({ promptPath, cwd, maxTurns = 1, tools = '', schema = PEER_OUTPUT_SCHEMA }) {
   return [
     '--prompt-file',
     promptPath,
     '--output-format',
     'json',
     '--json-schema',
-    JSON.stringify(PEER_OUTPUT_SCHEMA),
+    JSON.stringify(schema),
     '--tools',
-    '',
+    tools,
     '--disable-web-search',
     '--no-subagents',
     '--no-memory',
@@ -154,7 +164,7 @@ export function buildGrokArgs({ promptPath, cwd, maxTurns = 1 }) {
  * `text` is not JSON means the model ignored the schema. The messages say
  * which, because the two need completely different fixes.
  */
-export function parseGrokStdout(stdout) {
+export function parseGrokStdout(stdout, { validate = true } = {}) {
   let envelope;
   try {
     envelope = JSON.parse(stdout);
@@ -162,7 +172,15 @@ export function parseGrokStdout(stdout) {
     const head = stdout.slice(0, 400).trim();
     throw new Error(`grok did not print JSON (${err.message}); first bytes: ${head || '(empty)'}`);
   }
-  const answer = parsePeerAnswer(envelope?.text ?? envelope);
+  // A relay turn must answer in the relay's own {status, message} shape, and
+  // parsePeerAnswer enforces it. A COUNCIL turn answers in a different shape
+  // entirely (verdict/summary/risks, see src/council/consult.mjs), so it
+  // takes the envelope's text as-is and validates it itself — the first live
+  // consultation failed here, with a perfectly good verdict rejected for not
+  // being a relay hand-off.
+  const answer = validate
+    ? parsePeerAnswer(envelope?.text ?? envelope)
+    : { status: 'done', message: typeof envelope?.text === 'string' ? envelope.text : JSON.stringify(envelope?.text ?? envelope ?? {}) };
   return {
     ...answer,
     usage: envelope?.usage ?? null,
@@ -207,7 +225,7 @@ function killTree(child) {
  * the tree, and stdout past the cap ends the turn instead of growing until
  * the process runs out of memory.
  */
-export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, signal, logDir = null, spawnFn = spawn, env = process.env } = {}) {
+export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, signal, logDir = null, spawnFn = spawn, env = process.env, maxTurns, tools, schema, validate = true } = {}) {
   if (typeof prompt !== 'string' || prompt.trim().length === 0) throw new Error('a peer turn needs a prompt');
 
   const startedAt = Date.now();
@@ -219,7 +237,7 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
   fs.writeFileSync(promptPath, prompt, 'utf8');
 
   const { command, argsPrefix = [], useShell } = resolveGrokCli(env);
-  const args = [...argsPrefix, ...buildGrokArgs({ promptPath, cwd })];
+  const args = [...argsPrefix, ...buildGrokArgs({ promptPath, cwd, ...(maxTurns ? { maxTurns } : {}), ...(tools ? { tools } : {}), ...(schema ? { schema } : {}) })];
 
   const result = await new Promise((resolve) => {
     const child = spawnFn(command, args, {
@@ -292,7 +310,7 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
     throw err;
   }
 
-  const parsed = parseGrokStdout(result.stdout);
+  const parsed = parseGrokStdout(result.stdout, { validate });
   return { ...parsed, durationMs: Date.now() - startedAt, rawLogPath };
 }
 

@@ -24,8 +24,16 @@
 /** How a peer is asked to summarize its position. */
 export const VERDICTS = ['agree', 'concerns', 'disagree'];
 
-/** A peer gets this long to answer before it counts as unreachable. */
-export const DEFAULT_PEER_TIMEOUT_MS = 4 * 60 * 1000;
+/**
+ * A peer gets this long to answer before it counts as unreachable.
+ *
+ * Generous on purpose: measured against codex-cli 0.144.4, reading three
+ * files inside its read-only sandbox took most of four minutes, and the turn
+ * died mid-sentence with nothing to show. A consultation runs beside the
+ * work rather than in front of it, so waiting is cheap; a review cut off
+ * before it answers is not.
+ */
+export const DEFAULT_PEER_TIMEOUT_MS = 10 * 60 * 1000;
 
 /**
  * The package a peer receives. Deliberately not the chat: everything here is
@@ -53,6 +61,11 @@ Read what you need, then reply with ONE json object and nothing else:
 {"verdict": "agree" | "concerns" | "disagree",
  "summary": "your position in two or three sentences",
  "risks": ["the specific thing that goes wrong, if any"]}
+
+Answer directly. Do not run a planning, brainstorming, or skill workflow
+first — you are one voice in a review, not the owner of this task, and a
+peer that spends its turn organizing itself never gets to the verdict.
+Read only what you need; skim rather than audit.
 
 Do not modify any file. Disagree if you disagree — a second opinion that
 echoes the first is worthless, and "concerns" is not a polite way of saying
@@ -177,9 +190,19 @@ export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PE
           }),
         ]);
         const verdict = parseVerdict(raw);
-        return verdict === null
-          ? { peerId, verdict: null, summary: null, risks: [], error: 'the answer could not be read as a verdict', raw }
-          : { peerId, ...verdict, error: null, raw };
+        if (verdict !== null) return { peerId, ...verdict, error: null, raw };
+        // Quote what it actually said. "Could not be read as a verdict" on
+        // its own is unactionable — the first live run reported exactly that
+        // twice and told nobody what either peer had answered.
+        const head = String(raw ?? '').trim().replace(/\s+/g, ' ').slice(0, 200);
+        return {
+          peerId,
+          verdict: null,
+          summary: null,
+          risks: [],
+          error: head === '' ? 'the peer answered with nothing' : `the answer could not be read as a verdict: ${head}`,
+          raw,
+        };
       } catch (err) {
         // One peer failing is a fact to report, never a reason to lose the
         // others' answers.

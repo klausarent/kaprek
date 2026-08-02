@@ -48,6 +48,14 @@ import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '.
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
 import { consultPeers } from '../council/consult.mjs';
 import { makeAskPeer, availablePeerIds } from '../council/ask.mjs';
+
+/**
+ * The wall clock one peer's own turn gets, kept just under the council's own
+ * per-peer deadline (DEFAULT_PEER_TIMEOUT_MS) so a peer that runs long is
+ * ended by its harness — with a stopReason kaprek can report — rather than
+ * by the race in consultPeers, which can only say "no answer".
+ */
+const PEER_TURN_TIMEOUT_MS = 9 * 60 * 1000;
 import { planPathFor, PLAN_MODES } from '../plans/prompt.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
@@ -1507,7 +1515,7 @@ async function handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry
 
     const consultation = await consultPeers({
       peers: status.peers,
-      askPeer: makeAskPeer({ cwd }),
+      askPeer: makeAskPeer({ cwd, timeoutMs: PEER_TURN_TIMEOUT_MS }),
       question,
       files: Array.isArray(body.data?.files) ? body.data.files.filter((f) => typeof f === 'string') : [],
       constraints: Array.isArray(body.data?.constraints) ? body.data.constraints.filter((c) => typeof c === 'string') : [],

@@ -35,6 +35,12 @@ export function mapPermissionMode(mode) {
   // Full auto: the operator explicitly chose to run ungated (kaprek's
   // 'auto' approval stance) — mirrors claude's bypassPermissions.
   if (mode === 'bypassPermissions') return { approvalPolicy: 'never', sandbox: 'danger-full-access' };
+  // A peer reviewing code (see src/council/ask.mjs): reads freely, writes
+  // nothing, and is never asked for permission — because nobody is watching
+  // a consultation, and 'untrusted' would stall it on the first file it
+  // wants to open. The read-only SANDBOX is what enforces "reviews cannot
+  // collide", not the approval policy.
+  if (mode === 'plan') return { approvalPolicy: 'never', sandbox: 'read-only' };
   return { approvalPolicy: 'untrusted', sandbox: 'read-only' };
 }
 
