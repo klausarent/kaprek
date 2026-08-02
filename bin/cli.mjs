@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { encodeQr, qrToText } from '../src/server/qr.mjs';
+import { installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
 import {
@@ -18,6 +19,7 @@ import {
 } from '../src/lib/instance-lock.mjs';
 
 const USAGE = `Usage: kaprek [options]
+       kaprek update [--check]
        kaprek hooks <install|uninstall|status>
 
 Options:
@@ -29,6 +31,10 @@ Options:
                 code for answering approvals from a phone. Off by default;
                 the instance token stays required either way.
   -h, --help    Show this help message
+
+Update:
+  update         Check npm for a newer kaprek and install it if there is one
+  update --check Only look; change nothing
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop hook to ~/.claude/settings.json
@@ -141,8 +147,51 @@ function runHooksCommand(args) {
   }
 }
 
+/**
+ * `kaprek update` — the only command that talks to the internet, and it says
+ * so before it does. Never throws: a failed update check must not look like
+ * a broken install.
+ */
+async function runUpdateCommand(args) {
+  const checkOnly = args.includes('--check');
+  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const current = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
+  const kind = installKind(packageRoot);
+
+  console.log('Asking the npm registry which version is newest. (This is the one thing kaprek sends off this machine, and only when you ask for it.)');
+  let latest;
+  try {
+    latest = await latestVersion();
+  } catch (err) {
+    console.error(err.message);
+    process.exitCode = 1;
+    return;
+  }
+
+  const plan = updatePlan({ kind, current, latest });
+  console.log(plan.message);
+  if (plan.action !== 'install') return;
+  if (checkOnly) {
+    console.log(`Run: ${plan.command.join(' ')}  (or kaprek update, without --check)`);
+    return;
+  }
+
+  const code = await runInstall(plan.command);
+  if (code === 0) {
+    console.log(`kaprek ${latest} installed. Start it again to use it.`);
+  } else {
+    console.error(`Update failed (npm exited ${code}). You can run it yourself: ${plan.command.join(' ')}`);
+    process.exitCode = code;
+  }
+}
+
 async function main() {
   const argv = process.argv.slice(2);
+
+  if (argv[0] === 'update') {
+    await runUpdateCommand(argv.slice(1));
+    return;
+  }
 
   if (argv[0] === 'hooks') {
     runHooksCommand(argv.slice(1));

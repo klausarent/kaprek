@@ -63,7 +63,14 @@ const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 //   - src/triggers/clipboard.mjs runs `powershell -NoProfile -Command
 //     Get-Clipboard` via execFile (no shell) for the clipboard trigger: the
 //     zero-dependency way to read the local clipboard on Windows.
-const ALLOWED_CHILD_PROCESS_FILES = [path.join(ROOT, 'bin', 'cli.mjs'), path.join(ROOT, 'src', 'triggers', 'clipboard.mjs')];
+//   - src/cli/update.mjs spawns `npm install -g kaprek@latest` when someone
+//     typed `kaprek update`, and is ALSO the one file allowed to make a
+//     real outbound request (see ALLOWED_REGISTRY_FILE below).
+const ALLOWED_CHILD_PROCESS_FILES = [
+  path.join(ROOT, 'bin', 'cli.mjs'),
+  path.join(ROOT, 'src', 'triggers', 'clipboard.mjs'),
+  path.join(ROOT, 'src', 'cli', 'update.mjs'),
+];
 const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
 
 function isAllowedChildProcessSource(file) {
@@ -77,6 +84,15 @@ function isAllowedChildProcessSource(file) {
 // cannot quietly widen into a real network call. Every other network
 // pattern, fetch() first among them, stays forbidden in that file too.
 const ALLOWED_LOOPBACK_CONNECT_FILE = path.join(ROOT, 'src', 'lib', 'instance-lock.mjs');
+
+// THE ONE FILE THAT MAY LEAVE THIS MACHINE, and it exists to be that: an
+// update command that cannot ask what the newest version is would be a
+// button that does nothing. It is confined to the npm registry (pinned by
+// the test below), it runs only when someone typed `kaprek update`, and it
+// prints what it is about to do first. Nothing else in the tree may do this
+// — the guard is what keeps "kaprek does not phone home" a fact rather than
+// an intention.
+const ALLOWED_REGISTRY_FILE = path.join(ROOT, 'src', 'cli', 'update.mjs');
 
 /** Recursively collects all .mjs file paths under `dir`. */
 function collectMjsFiles(dir) {
@@ -111,12 +127,24 @@ test('static guard: no network-client or subprocess APIs outside test files (exc
     for (const pattern of FORBIDDEN_PATTERNS) {
       if (isAllowedChildProcessFile && CHILD_PROCESS_PATTERNS.includes(pattern)) continue;
       if (file === ALLOWED_LOOPBACK_CONNECT_FILE && pattern === LOOPBACK_CONNECT_PATTERN) continue;
+      // The update command's registry call. Confined by the test below to
+      // registry.npmjs.org and nothing else.
+      if (file === ALLOWED_REGISTRY_FILE && NETWORK_PATTERNS.includes(pattern)) continue;
       if (pattern.test(content)) {
         violations.push(`${path.relative(ROOT, file)}: matches ${pattern}`);
       }
     }
   }
   expect(violations).toEqual([]);
+});
+
+test('the update command talks to the npm registry and to nothing else', () => {
+  const content = fs.readFileSync(ALLOWED_REGISTRY_FILE, 'utf8');
+  // Every absolute URL in the file, so a second host cannot be added
+  // without this failing. The exemption above is only defensible while this
+  // stays exactly one address.
+  const urls = [...content.matchAll(/https?:\/\/[^'"`\s)]+/g)].map((match) => match[0]);
+  expect(urls).toEqual(['https://registry.npmjs.org/kaprek/latest']);
 });
 
 test('the instance lock only ever talks to 127.0.0.1', () => {

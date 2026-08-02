@@ -23,6 +23,27 @@ No install and no config for kaprek itself, and it has no account of its own. Ct
 
 Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI installed and signed in — kaprek runs your CLI and never asks for an API key.
 
+## Updating
+
+```
+kaprek update          # look, and install if there is something newer
+kaprek update --check  # only look
+```
+
+This is the one command that talks to the internet, and it says so before it
+does. There is no check on start: a tool that phones home every time it boots
+is a tool nobody can reason about.
+
+What it does depends on how kaprek got onto the machine, because only one of
+those can be updated by npm:
+
+| Installed as | `kaprek update` |
+| --- | --- |
+| global (`npm i -g kaprek`) | installs the new version |
+| through `npx` | tells you to run `npx kaprek@latest` — nothing is installed to update, and without `@latest` npx reuses its cache |
+| a project's dependency | tells you to update it in that project |
+| a git checkout | tells you to `git pull` — npm would overwrite your working tree |
+
 ## Flags
 
 | Flag | Default | Description |
@@ -348,6 +369,12 @@ Two limits worth knowing. The action is replayed from the input kaprek stored, a
 kaprek runs agent turns. That changes the honest answer to "does anything leave my machine", so this section states it plainly rather than in a slogan.
 
 **Stays on your machine.** Chat logs (`<dataDir>/chats/`), trigger configuration (`triggers.json`), the run and cost log (`runs.jsonl`), everything an agent writes in the workspace (`<dataDir>/workspace/`), the board, the search index and preserved artifacts. kaprek operates no server of its own, has no account, and sends none of this anywhere. The static guard test `src/no-network.test.mjs` fails the build if a network call is added to `src/` or `bin/`.
+
+**The one exception, and it is a command you type.** `kaprek update` asks the
+npm registry which version is newest — an update command that cannot do that
+would be a button that does nothing. It runs only when asked, prints what it
+is about to do first, and the same guard test pins it to
+`registry.npmjs.org` and nothing else. There is no check on start.
 
 **Goes to Anthropic.** Everything an agent actually processes. kaprek starts your local `claude` CLI as a subprocess, and that CLI talks to Anthropic under your account and your agreement with them — kaprek neither adds to nor removes from what the CLI sends. That includes:
 
