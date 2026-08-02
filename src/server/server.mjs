@@ -3885,6 +3885,11 @@ export function startServer({
     // they outlive the server that started them, invisibly — so the shutdown
     // aborts them and each records how it ended.
     if (council) council.stopAll('kaprek is shutting down').catch(() => {});
+    // Same for a relay mid-handoff. Without this it kept dispatching after
+    // the server closed — in the suite that showed up as a run writing its
+    // gate question into a directory the test had already deleted, which is
+    // the same bug wearing a test's clothes.
+    if (relay) relay.stopAll('kaprek is shutting down').catch(() => {});
   });
 
   return new Promise((resolve, reject) => {

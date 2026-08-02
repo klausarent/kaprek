@@ -417,3 +417,32 @@ test('recipe: a peer asking for a human is not presented as a question about rou
   expect(relay.gateReason).toBe('ask');
   expect(eventsOfType(chatId, 'gate.requested').at(-1).textPreview).toMatch(/decision only you can make/);
 });
+
+test('recipe: shutting down stops a run mid-handoff', async () => {
+  let release;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  const slow = {
+    id: 'grok',
+    available: () => true,
+    async runTurn({ signal }) {
+      await Promise.race([gate, new Promise((_, reject) => signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true }))]);
+      return { status: 'handoff', message: 'eventually' };
+    },
+  };
+  const { chatId, dispatcher } = setup({ peers: { grok: slow } });
+  await dispatcher.startRun({
+    chatId,
+    goal: 'ship it',
+    recipe: { id: 'solo', title: 'solo', steps: [{ id: 'write', agent: 'grok' }], edges: [{ from: 'write', to: 'write' }] },
+  });
+  expect(dispatcher.activeRunCount()).toBe(1);
+
+  // Without this, the run kept dispatching after the server closed — writing
+  // into a data directory that, in the suite, had already been deleted.
+  const stopped = await dispatcher.stopAll();
+  expect(stopped).toBe(1);
+  expect(dispatcher.activeRunCount()).toBe(0);
+  release();
+});

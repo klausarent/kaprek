@@ -815,6 +815,23 @@ export function createRelayDispatcher({
       return true;
     },
 
+    /**
+     * Stops every run this process is driving, and waits for each to record
+     * how it ended.
+     *
+     * The shutdown counterpart the council already had. Without it a relay
+     * kept handing off after the server closed — visible in the test suite
+     * as a run writing its gate question into a data directory the test had
+     * already deleted, and outside it as CLI turns nobody is watching for a
+     * kaprek that is gone.
+     */
+    async stopAll(reason = 'kaprek is shutting down') {
+      const running = [...active.values()];
+      for (const entry of running) entry.abort();
+      await Promise.all(running.map((entry) => entry.promise.catch(() => {})));
+      return running.length;
+    },
+
     activeRunCount() {
       return active.size;
     },
