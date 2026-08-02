@@ -1052,3 +1052,26 @@ test('an unknown mode never reaches the harness as a guided turn', async () => {
   expect(seenArgs.appendSystemPrompt).toBeUndefined();
   expect(result.guided).toBeNull();
 });
+
+test('a session id is only resumed by the harness that issued it', async () => {
+  const seen = [];
+  const harnessFor = (name) => ({
+    startTurn: async (options) => {
+      seen.push({ name, resumed: options.sessionId ?? null });
+      options.onEvent({ type: 'text', text: 'ok' });
+      return { sessionId: `${name}-session`, costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  });
+
+  const first = await runTurn({ dataDir: tmpDir, text: 'one', harness: harnessFor('claude-code'), harnessName: 'claude-code', cwd: tmpDir });
+  // Same harness: resumes its own session.
+  await runTurn({ dataDir: tmpDir, chatId: first.chatId, text: 'two', harness: harnessFor('claude-code'), harnessName: 'claude-code', cwd: tmpDir });
+  // Different harness in the SAME chat — a relay recipe does this on purpose.
+  // Handing it the other engine's thread id is how the live M2 run died with
+  // "no rollout found for thread id".
+  await runTurn({ dataDir: tmpDir, chatId: first.chatId, text: 'three', harness: harnessFor('codex'), harnessName: 'codex', cwd: tmpDir });
+
+  expect(seen[0].resumed).toBeNull();
+  expect(seen[1].resumed).toBe('claude-code-session');
+  expect(seen[2].resumed).toBeNull();
+});

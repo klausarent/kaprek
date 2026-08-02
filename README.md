@@ -45,6 +45,8 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Two engines: chats run on your Claude Code CLI by default, or on your Codex CLI — picked per chat, same approval flow, same inbox — see [Engines](#engines).
 - Guided planning: say what you want to build and answer a few cards instead of a wall of questions; the plan lands at a path kaprek chose and shows up under [Plans](#plans) — with its full path, so you never go hunting through folders for it.
 - Council: put your engines in four roles (lead, thinker, worker, peer) and ask the ones you are not using for a second opinion — kaprek shows where they disagree rather than smoothing it over. See [Council](#council).
+- Recipes: a relay run's shape is a file, not code — who takes part, which handoff asks you first, which step may touch files. See [Relays and recipes](#relays-and-recipes).
+- Setup page (`#/setup`): which agent CLIs are installed and signed in on this machine, where their config lives, which MCP servers they have, and which keys your `.env` defines — paths and names only, never a value.
 
 ## Missions
 
@@ -119,6 +121,14 @@ opinion to get instead of asking one model to review itself.
 `off` / `plans` / `decisions` / `always` govern what kaprek asks **unasked**.
 The "Second opinion" button in a chat works at every level, including `off`.
 
+At `plans` and above, writing a plan is the moment that fires by itself: the
+peers get the plan's path and read the file. That consultation does **not**
+hold the turn open — it takes minutes, it runs beside the chat, and its
+result lands in `#/chat` when it is done, whether or not the tab stayed open.
+One consultation per chat at a time, two in total. A verdict about a plan you
+edited afterwards is marked as stale rather than shown as review, and one
+interrupted by a restart says so instead of being quietly asked again.
+
 ## Engines
 
 A new chat picks which already-installed, already-authenticated CLI runs its
@@ -136,8 +146,59 @@ wherever the turn is running. Honest differences, declared by the registry
 usage but **no dollar figure** (cost shows as unknown, never as a made-up
 number), an approval cannot rewrite the proposed input on allow, and
 Claude-specific options (allowed tools, MCP config, settings files) do not
-apply. Trigger and relay turns stay on the default engine for now —
-multi-engine orchestration is the next milestone, not a checkbox.
+apply.
+
+A chat's own engine is still fixed at creation. A **relay recipe** is the one
+place where several engines work inside one chat on purpose — see below.
+
+## Relays and recipes
+
+A relay is a controlled handoff between agents: each step is an event in the
+chat log, under a budget, with a human gate. A **recipe** says who takes part
+and in what order — it is data, and `<dataDir>/recipes/*.json` is yours to
+add to. `GET /api/recipes` lists what is available; the relay panel picks one.
+
+```json
+{
+  "id": "write-review-apply",
+  "title": "Draft, review, then apply",
+  "steps": [
+    { "id": "write",  "agent": "grok" },
+    { "id": "review", "agent": "claude" },
+    { "id": "apply",  "agent": "codex", "tools": "full" }
+  ],
+  "edges": [
+    { "from": "write",  "to": "review" },
+    { "from": "review", "to": "apply", "requiresHuman": true },
+    { "from": "apply",  "to": "write" }
+  ],
+  "budgets": { "maxRounds": 2, "hardMaxTurns": 12, "retriesPerDispatch": 1 },
+  "escalation": { "onPeerFailure": "stop", "onBudget": "question" }
+}
+```
+
+- **Edges carry the policy.** `requiresHuman` asks *before* the step on the
+  far side runs, which is the only moment the answer can still change
+  anything. The approval buys exactly one passage of that edge and no extra
+  round; the same edge asks again next time round.
+- **Tools are per step and fail-closed.** A step gets none unless it says
+  `"tools": "full"`, and only `claude` and `codex` steps can — a text peer has
+  no tools to give. A step that has them runs in the mission's own directory,
+  and every action it takes goes through the approval inbox with the same
+  24-hour window a trigger's question gets. That is what lets an overnight
+  batch park on a question instead of being auto-denied.
+- **Retries are budgeted**, with 15s then 30s of backoff, each attempt in the
+  log under its own dispatch id. When they are spent, `escalation` decides:
+  `stop`, `question` (ask you), or `notify` (carry on past the broken step and
+  say so).
+- **The deferred inbox is the only human gate.** Round gates, edge gates and
+  peer-failure questions all land there.
+
+Refusals happen before a run starts, not three handoffs in: an unknown agent,
+an unknown recipe id, a duplicate step id, or a step no edge leads to.
+
+Starting a relay from a trigger stays deliberately closed — an unattended
+loop that starts itself is the one thing on the kill list.
 
 ## Search
 

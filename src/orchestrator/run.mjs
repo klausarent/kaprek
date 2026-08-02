@@ -284,7 +284,17 @@ export async function runTurn({
   onChatResolved?.(effectiveChatId);
 
   const priorMeta = readHarnessMeta(dataDir, effectiveChatId);
-  const priorSessionId = priorMeta?.cliSessionId ?? undefined;
+  // A session id belongs to the harness that issued it. The sidecar has
+  // always recorded which one that was; nobody checked, which was harmless
+  // only while a chat meant exactly one engine for its whole life.
+  //
+  // A relay recipe breaks that: grok drafts, claude reviews, codex applies —
+  // all in one chat, on purpose. Codex was handed claude's thread id and
+  // answered "no rollout found for thread id …", killing the step that was
+  // supposed to do the actual work. Resuming only your own session turns
+  // that into a fresh thread, which is what a relay step wants anyway: the
+  // prompt carries everything the step is allowed to know.
+  const priorSessionId = priorMeta && priorMeta.harness === harnessName ? (priorMeta.cliSessionId ?? undefined) : undefined;
 
   // tool-start is buffered here (id -> {name, input, ts}) instead of written
   // immediately: the chat store's 'tool' event carries both the call and its

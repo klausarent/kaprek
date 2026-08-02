@@ -4012,3 +4012,26 @@ test('recipes: a step that did not ask for tools gets none', async () => {
   // v1's rule, now per step: no tools unless the recipe says so.
   expect(registry.ran.find((entry) => entry.id === 'codex').allowedTools).toEqual([]);
 }, 30_000);
+
+test('environment: reports what is on this machine, and never a value from it', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/environment`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+
+  // Every known CLI gets an entry, present or not: an absence you can see is
+  // worth more than a list that quietly omits it.
+  expect(body.environment.clis.map((cli) => cli.id)).toContain('claude-code');
+  expect(body.environment.clis.every((cli) => typeof cli.installed === 'boolean')).toBe(true);
+  // Env files are reported as paths plus KEY NAMES.
+  expect(body.environment.envFiles.every((file) => Array.isArray(file.keys))).toBe(true);
+  // The council question, answered from what is actually installed.
+  expect(body.suggestedCouncil).toHaveProperty('lead');
+  expect(Array.isArray(body.nextSteps)).toBe(true);
+});
+
+test('environment: is read-only', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/environment`, { method: 'POST', headers: APP_JSON_HEADERS, body: '{}' });
+  expect(res.status).toBe(405);
+});

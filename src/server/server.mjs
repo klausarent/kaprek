@@ -66,6 +66,7 @@ import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUNDS_PER_GATE } from '../relay/dispatcher.mjs';
 import { loadRecipes } from '../relay/recipes.mjs';
+import { engineIdsByReadiness, nextSteps, scanEnvironment } from '../scan/environment.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
@@ -2738,6 +2739,23 @@ async function handleRequest(
         return;
       }
       sendJson(res, 200, { engines: engineRegistry.listEngines() });
+      return;
+    }
+    // GET /api/environment — what is installed, signed in, and configured on
+    // this machine. Paths and names only: see src/scan/environment.mjs.
+    if (segments.length === 2 && segments[1] === 'environment') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      const scan = scanEnvironment({ projectDirs: getMissions().list().map((mission) => mission.cwd).filter(Boolean) });
+      sendJson(res, 200, {
+        environment: scan,
+        nextSteps: nextSteps(scan),
+        // The council's own question, answered from what is actually here
+        // rather than from whatever the registry happens to hold.
+        suggestedCouncil: suggestAssignment(engineIdsByReadiness(scan)),
+      });
       return;
     }
     if (segments.length === 2 && segments[1] === 'recipes') {

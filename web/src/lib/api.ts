@@ -1282,3 +1282,41 @@ export async function fetchConsultation(id: string): Promise<ConsultationRecord>
   await throwOnError(res);
   return (await res.json()).consultation as ConsultationRecord;
 }
+
+// ---------------------------------------------------------------------------
+// Environment (GET /api/environment — src/scan/environment.mjs)
+//
+// Paths and names only. If a value ever shows up in one of these types,
+// something has gone wrong on the server side, not here.
+// ---------------------------------------------------------------------------
+
+export type CliStatus = {
+  id: string;
+  label: string;
+  command: string;
+  installed: boolean;
+  commandPath: string | null;
+  configDirs: string[];
+  signedIn: boolean;
+  mcpServers: string[];
+};
+
+export type EnvironmentScan = {
+  home: string;
+  platform: string;
+  clis: CliStatus[];
+  /** Key NAMES per file. Never values. */
+  envFiles: { path: string; keys: string[] }[];
+};
+
+export type EnvironmentReport = {
+  environment: EnvironmentScan;
+  nextSteps: { id: string; text: string }[];
+  suggestedCouncil: CouncilAssignment;
+};
+
+export async function fetchEnvironment(): Promise<EnvironmentReport> {
+  const res = await apiFetch("/api/environment");
+  await throwOnError(res);
+  return (await res.json()) as EnvironmentReport;
+}
