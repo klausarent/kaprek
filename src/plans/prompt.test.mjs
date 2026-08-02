@@ -38,6 +38,18 @@ test('the path is derived from date and topic, and stays inside the working dire
   expect(path.basename(planPath)).toBe('2026-08-02-newsletter-generator-v2.md');
 });
 
+test('a whole sentence becomes a name someone would recognize', () => {
+  // The first live run named a file
+  // 2026-08-02-lass-uns-einen-kleinen-zaehler-bauen-der-zeilen-in-einer-dat.md
+  // — the prompt, not a name.
+  const planPath = planPathFor({ cwd: CWD, topic: 'Lass uns einen kleinen Zaehler bauen, der Zeilen in einer Datei zaehlt', ts: '2026-08-02T01:00:00.000Z' });
+  expect(path.basename(planPath)).toBe('2026-08-02-zaehler-zeilen-datei-zaehlt.md');
+});
+
+test('a topic of nothing but small words still names the file after them', () => {
+  expect(path.basename(planPathFor({ cwd: CWD, topic: 'lass uns das machen', ts: '2026-08-02T01:00:00.000Z' }))).toBe('2026-08-02-lass-uns-das-machen.md');
+});
+
 test('a topic that is empty or all punctuation still yields a usable filename', () => {
   const planPath = planPathFor({ cwd: CWD, topic: '???', ts: '2026-08-02T01:00:00.000Z' });
   expect(path.basename(planPath)).toBe('2026-08-02-plan.md');

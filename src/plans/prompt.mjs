@@ -28,22 +28,44 @@ const WORKSPACE_PLANS = ['workspace', 'plans'];
 const PROJECT_PLANS = ['docs', 'plans'];
 
 /**
- * A filename-safe slug. Anything that is not a letter, digit, or dash is a
- * separator; the result can therefore never contain a path separator, a
- * drive letter, or `..`, which is what keeps a hostile or careless topic
- * from steering the file out of its directory.
+ * Words that carry no meaning in a filename. The topic is usually a whole
+ * sentence ("lass uns einen kleinen Zähler bauen, der Zeilen zählt"), and
+ * the first live run produced
+ * `2026-08-02-lass-uns-einen-kleinen-zaehler-bauen-der-zeilen-in-einer-dat.md`
+ * — a name nobody would type or recognize. Dropping the scaffolding leaves
+ * the nouns.
+ */
+const FILLER = new Set([
+  'lass', 'lasst', 'uns', 'ich', 'wir', 'du', 'bitte', 'mal', 'kurz', 'einen', 'eine', 'einem', 'einer', 'ein', 'der', 'die', 'das', 'den', 'dem',
+  'und', 'oder', 'fuer', 'mit', 'von', 'zu', 'in', 'im', 'auf', 'kleines', 'kleiner', 'kleine', 'kleinen',
+  'lets', 'let', 'us', 'we', 'i', 'a', 'an', 'the', 'and', 'or', 'for', 'with', 'of', 'to', 'small', 'little', 'please', 'want', 'need', 'would', 'like',
+  'bauen', 'baue', 'machen', 'mache', 'erstellen', 'entwickeln', 'build', 'make', 'create', 'plan', 'planen',
+]);
+
+/** How many meaningful words end up in the filename. */
+const SLUG_WORDS = 5;
+
+/**
+ * A filename-safe slug of the topic's first few meaningful words. Anything
+ * that is not a letter or digit is a separator, so the result can never
+ * contain a path separator, a drive letter, or `..` — which is what keeps a
+ * hostile or careless topic from steering the file out of its directory.
  */
 function slug(topic) {
-  const cleaned = String(topic ?? '')
+  const words = String(topic ?? '')
     .toLowerCase()
     .replace(/ä/g, 'ae')
     .replace(/ö/g, 'oe')
     .replace(/ü/g, 'ue')
     .replace(/ß/g, 'ss')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60)
-    .replace(/-+$/, '');
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+
+  const meaningful = words.filter((word) => !FILLER.has(word) && word.length > 1);
+  // If filtering left nothing (a topic made entirely of small words), fall
+  // back to the raw words rather than to the generic name.
+  const chosen = (meaningful.length > 0 ? meaningful : words).slice(0, SLUG_WORDS);
+  const cleaned = chosen.join('-').slice(0, 50).replace(/-+$/, '');
   return cleaned === '' ? 'plan' : cleaned;
 }
 

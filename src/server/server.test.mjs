@@ -3659,3 +3659,44 @@ test('chat turn: a guided turn registers the plan the agent wrote and reports it
   expect(listed.plans).toHaveLength(1);
   expect(path.isAbsolute(listed.plans[0].path)).toBe(true);
 });
+
+test('chat turn: a follow-up keeps writing to the same plan, named after the chat topic', async () => {
+  const paths = [];
+  const harness = {
+    startTurn: async (options) => {
+      const match = /\n\n {2}(.+\.md)\n/.exec(options.appendSystemPrompt ?? '');
+      const target = match?.[1]?.trim();
+      if (target) {
+        paths.push(target);
+        fs.mkdirSync(path.dirname(target), { recursive: true });
+        fs.writeFileSync(target, '# Line counter\n\n- [ ] First step\n', 'utf8');
+      }
+      options.onEvent({ type: 'text', text: 'Done.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+
+  const first = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'Lass uns einen Zeilenzaehler bauen', mode: 'plan' }),
+  });
+  const firstFrames = await readSse(first);
+  const chatId = firstFrames.find((f) => f.type === 'chat-id').chatId;
+  // The name comes from the topic, not from the whole sentence.
+  expect(path.basename(paths[0])).toMatch(/^\d{4}-\d{2}-\d{2}-zeilenzaehler\.md$/);
+
+  // A follow-up whose prompt is a quiz answer must not name a second file
+  // after "My answers" — it deepens the plan that already exists.
+  const second = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ chatId, text: 'My answers:\n\n- Which language?\n  Node', mode: 'plan' }),
+  });
+  await readSse(second);
+  expect(paths[1]).toBe(paths[0]);
+
+  const listed = await (await fetch(`${url}/api/plans`)).json();
+  expect(listed.plans).toHaveLength(1);
+});

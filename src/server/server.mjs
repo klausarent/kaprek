@@ -1383,6 +1383,40 @@ function missionErrorStatus(err) {
  * written through these routes, so one cached projection stays truthful.
  */
 /**
+ * Where THIS chat's guided plan lives.
+ *
+ * Two rules, both learned from the first live run:
+ *   1. A chat that already has a plan keeps writing to it. A second guided
+ *      turn should deepen the plan, not start a rival copy of it.
+ *   2. The name comes from the chat's FIRST message, not the current one.
+ *      Answering a quiz produces "My answers: ..." as the prompt, which
+ *      named a real file
+ *      `2026-08-02-my-answers-womit-soll-der-zaehler-laufen-node-js-...md`.
+ *      A chat has one topic; it is the one it opened with.
+ */
+function guidedPlanPath({ getPlans, chats, chatId, cwd, dataDir, text }) {
+  if (chatId) {
+    try {
+      const existing = getPlans().list({ chatId })[0];
+      if (existing) return existing.path;
+    } catch {
+      // No plan store yet, or it could not be read — fall through to a fresh path.
+    }
+  }
+
+  let topic = text;
+  if (chatId) {
+    try {
+      const first = chats.events(chatId).find((event) => event.kind === 'user');
+      if (first?.text) topic = first.text;
+    } catch {
+      // An unreadable chat log just means the current prompt names the file.
+    }
+  }
+  return planPathFor({ cwd, dataDir, topic, ts: new Date().toISOString() });
+}
+
+/**
  * Plan routes: /api/plans, /api/plans/<id>, /api/plans/<id>/step.
  *
  * A plan is a markdown file somewhere on the disk that kaprek knows the
@@ -1594,6 +1628,7 @@ async function handleChatTurn(
   res,
   {
     getChats,
+    getPlans,
     getMissions,
     harness,
     harnessName,
@@ -1852,7 +1887,7 @@ async function handleChatTurn(
       // to the agent as an instruction — never asked for afterwards. That
       // inversion is the fix for the original complaint: a path nobody has
       // to reconstruct from a sentence.
-      ...(mode ? { mode, planPath: planPathFor({ cwd: turnCwd ?? null, dataDir, topic: text, ts: new Date().toISOString() }) } : {}),
+      ...(mode ? { mode, planPath: guidedPlanPath({ getPlans, chats, chatId, cwd: turnCwd ?? null, dataDir, text }) } : {}),
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so
