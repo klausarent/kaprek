@@ -43,6 +43,7 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Preserves a session's scratchpad work products (scripts, data, images) before OS temp cleanup deletes them — see [Artifact preservation](#artifact-preservation).
 - Missions: name a goal once, point it at a real project directory, and every chat, task, and pending question of that work hangs together — see [Missions](#missions).
 - Two engines: chats run on your Claude Code CLI by default, or on your Codex CLI — picked per chat, same approval flow, same inbox — see [Engines](#engines).
+- Guided planning: say what you want to build and answer a few cards instead of a wall of questions; the plan lands at a path kaprek chose and shows up under [Plans](#plans) — with its full path, so you never go hunting through folders for it.
 
 ## Missions
 
@@ -69,6 +70,24 @@ Presets pre-fill a new mission: two generic ones ship built in (`blank` and
 `<dataDir>/presets/` — `{id, title, description, goalTemplate, firstPrompt}`.
 A user preset with a builtin's id replaces it; an invalid file is skipped with
 a warning, never a crash.
+
+## Plans
+
+Say something like "let's build a small line counter" and kaprek offers to
+work through it as a quiz: a few questions, each with two to four options and
+a description of what choosing it means, plus a box for the answer nobody
+listed. Answering sends the next turn with each question quoted next to your
+answer.
+
+When there is enough to design with, the agent writes the plan — to a path
+kaprek decided BEFORE the turn started, not one it reports afterwards. That
+inversion is the point. `#/plans` lists every plan, shows its absolute path
+with a copy button, ticks steps straight into the file (so your editor and
+your git see the same truth), and starts a chat that works through it.
+
+A guided turn where the agent answered in prose anyway says so. The mode is
+an instruction to a model, not a guarantee, and a quiet failure would leave
+you with the old wall of text wearing a new label.
 
 ## Engines
 
