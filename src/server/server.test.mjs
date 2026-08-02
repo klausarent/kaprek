@@ -4232,3 +4232,14 @@ test('lan: a machine with no network address stays on localhost and says so', as
   // find; reporting one that does not exist would be worse.
   expect(lanUrl).toBeNull();
 });
+
+test('lan: the token is only handed to loopback, never over the network', async () => {
+  // Serving index.html with the token in it would give it to everyone on the
+  // network who loads the page, and the QR code would be theatre.
+  const webDist = fs.mkdtempSync(path.join(tmpRootDir, 'webdist-'));
+  fs.writeFileSync(path.join(webDist, 'index.html'), '<html><head><title>kaprek</title></head><body></body></html>', 'utf8');
+  const { url, token } = await boot({ webDist, lan: true, lanAddressOf: () => '127.0.0.1' });
+
+  const local = await (await fetch(`${url}/`)).text();
+  expect(local).toContain(token);
+});

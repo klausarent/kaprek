@@ -2703,7 +2703,18 @@ function injectTokenMeta(html, token) {
   return `${html.slice(0, insertAt)}\n    ${meta}${html.slice(insertAt)}`;
 }
 
-/** Serves static files from webDist with SPA fallback to index.html. HTML documents get the instance token injected (see injectTokenMeta); everything else is streamed as-is. */
+/**
+ * Whether this request came from this machine.
+ *
+ * The socket's peer address, not a header: a header is whatever the client
+ * says, and this decides who is handed the instance token.
+ */
+export function isLoopbackRequest(req) {
+  const address = req?.socket?.remoteAddress ?? '';
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+/** Serves static files from webDist with SPA fallback to index.html. HTML documents get the instance token injected (see injectTokenMeta); everything else is streamed as-is — and a null token means the page is served WITHOUT one, see the call site. */
 function serveStatic(res, webDist, pathname, instanceToken) {
   if (!webDist || !fs.existsSync(webDist)) {
     if (pathname === '/') {
@@ -2735,7 +2746,8 @@ function serveStatic(res, webDist, pathname, instanceToken) {
   const extension = path.extname(filePath).toLowerCase();
   const contentType = MIME_TYPES[extension] || 'application/octet-stream';
   if (extension === '.html') {
-    const html = injectTokenMeta(fs.readFileSync(filePath, 'utf8'), instanceToken);
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const html = instanceToken ? injectTokenMeta(raw, instanceToken) : raw;
     // no-store because this document carries the instance token: a cached copy
     // is the token sitting in the browser's on-disk cache, outliving the
     // session it was minted for.
@@ -3042,7 +3054,15 @@ async function handleRequest(
     sendJson(res, 405, { error: 'method not allowed' });
     return;
   }
-  serveStatic(res, webDist, url.pathname, instanceToken);
+  // THE TOKEN IS ONLY GIVEN AWAY OVER LOOPBACK.
+  //
+  // index.html normally carries the instance token in a meta tag, which is
+  // how the browser on this machine gets it without anyone typing it. Over
+  // --lan that would hand the token to everyone on the network who loads the
+  // page, and the token would protect nothing — the QR code would be
+  // theatre. A request that did not come from this machine gets the page
+  // WITHOUT the token and has to bring one (the QR puts it in the URL).
+  serveStatic(res, webDist, url.pathname, isLoopbackRequest(req) ? instanceToken : null);
 }
 
 /**

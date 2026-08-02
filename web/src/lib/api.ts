@@ -199,10 +199,46 @@ function readTokenMeta(): string | null {
   return content.length > 0 ? content : null;
 }
 
+const TOKEN_STORAGE_KEY = "kaprek-token";
+
+/**
+ * The token a QR code put in the URL.
+ *
+ * Only used when the page arrived WITHOUT a meta tag, which is what happens
+ * over --lan: the server hands the token to loopback requests only, so a
+ * phone has to bring its own. It is stored per tab and stripped from the
+ * address bar immediately — a token sitting in a URL ends up in history, in
+ * a screenshot, and in whatever the next person to pick up the phone sees.
+ */
+function readTokenFromUrl(): string | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const stored = window.sessionStorage.getItem(TOKEN_STORAGE_KEY);
+    if (stored) return stored;
+  } catch {
+    // Storage blocked: fall through to the URL, which still works for this
+    // page load.
+  }
+
+  // The token rides in the hash, after the route: #/approvals?t=...
+  const hash = window.location.hash ?? "";
+  const query = hash.includes("?") ? hash.slice(hash.indexOf("?") + 1) : "";
+  const token = new URLSearchParams(query).get("t");
+  if (!token) return null;
+
+  try {
+    window.sessionStorage.setItem(TOKEN_STORAGE_KEY, token);
+  } catch {
+    // Nothing to do — the token still works for this page load.
+  }
+  window.location.hash = hash.slice(0, hash.indexOf("?"));
+  return token;
+}
+
 // Read once, at module load: the token never changes for the lifetime of a
 // served page, and re-querying the DOM per request would only invite a
 // mid-session read of a token some other script had replaced.
-const instanceToken = readTokenMeta();
+const instanceToken = readTokenMeta() ?? readTokenFromUrl();
 
 /** False when index.html carried no token meta tag — see MissingTokenError. */
 export function hasInstanceToken(): boolean {

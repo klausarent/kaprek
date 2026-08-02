@@ -8,6 +8,7 @@
 // implied by a green suite.
 import { describe, test, expect } from 'vitest';
 import { encodeQr, qrToSvg, qrToText } from './qr.mjs';
+import { isLoopbackRequest } from './server.mjs';
 
 /** The three finder patterns, as every QR code must have them. */
 function hasFinder(matrix, top, left) {
@@ -123,5 +124,24 @@ describe('qrToSvg', () => {
     const dark = matrix.flat().filter((cell) => cell === 1).length;
     // The +1 is the white background rect.
     expect(qrToSvg(matrix).match(/<rect/g)).toHaveLength(dark + 1);
+  });
+});
+
+describe('isLoopbackRequest', () => {
+  test('recognizes the three shapes a local peer arrives as', () => {
+    for (const address of ['127.0.0.1', '::1', '::ffff:127.0.0.1']) {
+      expect(isLoopbackRequest({ socket: { remoteAddress: address } })).toBe(true);
+    }
+  });
+
+  test('a network peer is not loopback', () => {
+    expect(isLoopbackRequest({ socket: { remoteAddress: '192.168.1.77' } })).toBe(false);
+  });
+
+  test('reads the socket, never a header', () => {
+    // A header is whatever the client says, and this decides who is handed
+    // the instance token.
+    expect(isLoopbackRequest({ headers: { host: '127.0.0.1' }, socket: { remoteAddress: '10.0.0.5' } })).toBe(false);
+    expect(isLoopbackRequest({})).toBe(false);
   });
 });

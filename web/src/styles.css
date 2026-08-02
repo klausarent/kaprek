@@ -2306,3 +2306,36 @@ pre,
   padding: 0.6rem 0.75rem;
   margin-bottom: 0.75rem;
 }
+
+/* A phone answering an approval over --lan. Everything else on the page is
+   a desktop layout that happens to shrink; the inbox has to be usable with
+   one thumb, at arm's length, in a hurry. */
+@media (max-width: 640px) {
+  .approval-inbox-item {
+    padding: 0.75rem 0.6rem;
+  }
+
+  .approval-inbox-item pre {
+    max-height: 40vh;
+    font-size: 0.75rem;
+  }
+
+  /* Full-width, stacked, and big enough to hit without aiming. Allow and
+     deny are deliberately NOT adjacent halves of one row: a mis-tap there
+     costs an approval nobody meant to give. */
+  .approval-inbox-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .approval-inbox-actions .btn {
+    width: 100%;
+    padding: 0.9rem 1rem;
+    font-size: 1rem;
+  }
+
+  nav a {
+    padding: 0.6rem 0.5rem;
+  }
+}

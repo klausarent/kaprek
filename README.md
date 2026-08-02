@@ -254,6 +254,42 @@ instructions; a rejected one is not proposed again.
 Not built, deliberately: vector search, embeddings, automatic summarizing of
 raw transcripts, syncing between machines.
 
+## Answering from a phone (`--lan`)
+
+kaprek listens on `127.0.0.1`. `kaprek --lan` also listens on this machine's
+network address and prints a QR code:
+
+```
+http://127.0.0.1:4900
+
+Also reachable at http://192.168.1.42:4900 — anyone on this network who has
+the token can answer your questions.
+The token is in the QR code below. Scan it with your phone:
+
+  █▀▀▀▀▀█ ▀▄█▀▄ █▀▀▀▀▀█
+  ...
+```
+
+Scan it and the phone lands on the approvals inbox, where allow and deny are
+full-width buttons a thumb can hit. An overnight batch parks on its question
+and the answer reaches the turn that is waiting for it.
+
+What holds either way:
+
+- **The token is only handed out over loopback.** Normally kaprek puts it in
+  the page it serves, which is how the browser on this machine gets it
+  without anyone typing. A request from the network gets the page *without*
+  it and has to bring one — that is what the QR carries, and it is why the
+  QR is not decoration. The phone keeps it per tab and strips it out of the
+  address bar.
+- **The Host check gains exactly one address**, this machine's own. A
+  hostname pointed at that IP is still refused, so DNS rebinding gets no
+  further than it did before.
+- **`--lan` is a flag, not a setting.** Opening a port to a network should
+  not be something you can switch on once and forget.
+- On a machine with no network address, `--lan` stays on loopback and says
+  so rather than printing a QR for an address that does not exist.
+
 ## Search
 
 Full-text search across every indexed session, backed by SQLite FTS5. Requires Node 22+, since it uses the built-in `node:sqlite` module — on older Node it degrades cleanly, the UI reports search as unavailable instead of crashing. Only redacted content is indexed, same as the digest view. Build or refresh the index from the reindex button in the search view (`#/search`), or `POST /api/search/reindex`.
