@@ -4035,3 +4035,121 @@ test('environment: is read-only', async () => {
   const res = await fetch(`${url}/api/environment`, { method: 'POST', headers: APP_JSON_HEADERS, body: '{}' });
   expect(res.status).toBe(405);
 });
+
+// ---------------------------------------------------------------------------
+// M3: memory with scopes, over http and inside a turn
+// ---------------------------------------------------------------------------
+
+/** A harness that writes a kaprek-remember block, and records what it was told. */
+function rememberingHarness(toRemember) {
+  const prompts = [];
+  return {
+    prompts,
+    startTurn: async (options) => {
+      prompts.push(options.appendSystemPrompt ?? '');
+      const block = toRemember ? ['```kaprek-remember', JSON.stringify(toRemember), '```'].join('\n') : '';
+      options.onEvent({ type: 'text', text: `Done.\n\n${block}` });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+}
+
+async function missionChat(url, { title = 'a mission', cwd }) {
+  const mission = await (await postJson(`${url}/api/missions`, { title, goal: title, cwd })).json();
+  const res = await fetch(`${url}/api/chat/turn`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ text: 'go', missionId: mission.mission.id }),
+  });
+  const frames = await readSse(res);
+  return { missionId: mission.mission.id, chatId: frames.find((f) => f.type === 'chat-id').chatId, frames };
+}
+
+test('memory: a turn in a mission writes what it learned, and the next one is told', async () => {
+  const projectDir = fs.mkdtempSync(path.join(tmpRootDir, 'project-'));
+  const harness = rememberingHarness({ text: 'the deploy token lives in the CI settings, not in .env', kind: 'fact' });
+  const { url } = await boot({ harness });
+
+  const first = await missionChat(url, { cwd: projectDir });
+  const complete = first.frames.find((f) => f.type === 'turn-complete');
+  expect(complete.remembered.map((entry) => entry.text)).toEqual(['the deploy token lives in the CI settings, not in .env']);
+  // The first turn had nothing to be told.
+  expect(harness.prompts[0]).not.toContain('deploy token');
+
+  // A second turn in the same mission starts with it.
+  await readSse(await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'again', chatId: first.chatId }) }));
+  expect(harness.prompts[1]).toContain('the deploy token lives in the CI settings');
+  expect(harness.prompts[1]).toContain('trust what you find');
+});
+
+test('memory: a chat outside a mission neither reads nor writes', async () => {
+  const harness = rememberingHarness({ text: 'something a scratch chat thought was worth keeping' });
+  const { url } = await boot({ harness });
+
+  const frames = await readSse(await fetch(`${url}/api/chat/turn`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ text: 'just asking' }) }));
+  // No scope, so nothing is written — memory belongs to a body of work.
+  expect(frames.find((f) => f.type === 'turn-complete').remembered).toEqual([]);
+  expect(harness.prompts[0] ?? '').not.toContain('What kaprek remembers');
+});
+
+test('memory: one mission does not read another project mission', async () => {
+  const projectA = fs.mkdtempSync(path.join(tmpRootDir, 'project-a-'));
+  const projectB = fs.mkdtempSync(path.join(tmpRootDir, 'project-b-'));
+  const harness = rememberingHarness({ text: 'a secret about project A' });
+  const { url } = await boot({ harness });
+
+  await missionChat(url, { title: 'mission in A', cwd: projectA });
+  const second = await missionChat(url, { title: 'mission in B', cwd: projectB });
+
+  // The prompt of the mission in B must not carry A's fact: different
+  // project, different branch of the tree.
+  const promptForB = harness.prompts[harness.prompts.length - 1];
+  expect(promptForB).not.toContain('a secret about project A');
+  expect(second.chatId).toBeTruthy();
+});
+
+test('memory: two missions in the SAME project share what was learned', async () => {
+  const projectDir = fs.mkdtempSync(path.join(tmpRootDir, 'shared-'));
+  const { url } = await boot({ harness: rememberingHarness({ text: 'the build needs Node 22' }) });
+  const first = await missionChat(url, { title: 'first mission', cwd: projectDir });
+
+  // Read it back the way a second agent would: through the project scope.
+  const scopes = await (await fetch(`${url}/api/memory/scopes`)).json();
+  const projectScope = scopes.scopes.find((scope) => scope.id.startsWith('project:'));
+  const recalled = await (await fetch(`${url}/api/memory?scopeId=${encodeURIComponent(projectScope.id)}`)).json();
+  // The fact was written to the MISSION scope, so the project above it does
+  // not see it — visibility runs upwards. The sibling mission does.
+  expect(recalled.memories.map((entry) => entry.text)).not.toContain('the build needs Node 22');
+
+  const missionScope = scopes.scopes.find((scope) => scope.id === `mission:${first.missionId}`);
+  const fromMission = await (await fetch(`${url}/api/memory?scopeId=${encodeURIComponent(missionScope.id)}`)).json();
+  expect(fromMission.memories.map((entry) => entry.text)).toContain('the build needs Node 22');
+});
+
+test('memory: reading requires a scope', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/memory`);
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toMatch(/scopeId is required/);
+});
+
+test('memory: a person can write, verify and withdraw a memory by hand', async () => {
+  const { url } = await boot();
+  await postJson(`${url}/api/memory/scopes`, { id: 'person:local' });
+  const created = await (await postJson(`${url}/api/memory`, { scopeId: 'person:local', text: 'kaprek runs on 127.0.0.1 only', kind: 'profile', origin: 'person' })).json();
+  expect(created.memory.kind).toBe('profile');
+
+  const verified = await (await postJson(`${url}/api/memory/${created.memory.id}/verify`, {})).json();
+  expect(verified.memory.stale).toBe(false);
+
+  const forgotten = await fetch(`${url}/api/memory/${created.memory.id}`, { method: 'DELETE', headers: APP_JSON_HEADERS, body: JSON.stringify({ reason: 'no longer true' }) });
+  expect(forgotten.status).toBe(200);
+  const left = await (await fetch(`${url}/api/memory?scopeId=person:local`)).json();
+  expect(left.memories).toEqual([]);
+});
+
+test('memory: an unknown scope is refused rather than created on the fly', async () => {
+  const { url } = await boot();
+  const res = await postJson(`${url}/api/memory`, { scopeId: 'project:never-made', text: 'x', origin: 'person' });
+  expect(res.status).toBe(400);
+});

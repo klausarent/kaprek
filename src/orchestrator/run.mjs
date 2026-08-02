@@ -18,6 +18,8 @@ import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
 import { buildModePrompt, PLAN_MODES } from '../plans/prompt.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { openPlans } from '../plans/store.mjs';
+import { openMemory } from '../memory/store.mjs';
+import { buildMemoryPrompt, parseRemember } from '../memory/protocol.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -246,6 +248,10 @@ export async function runTurn({
   // decided BEFORE the turn so the agent is told where to write rather than
   // asked afterwards where it wrote (see src/plans/prompt.mjs).
   mode = null,
+  // Which scope this turn reads and writes memory in. Null means no memory
+  // at all: a chat outside any mission must not silently write into a
+  // project's memory, and must not read one either.
+  memoryScopeId = null,
   planPath = null,
   allowedTools,
   absoluteTimeoutMs,
@@ -566,7 +572,13 @@ export async function runTurn({
   // A mode the harness does not know about must not silently degrade into an
   // ordinary turn the user believes is guided.
   const guidedMode = PLAN_MODES.includes(mode) ? mode : null;
-  const appendSystemPrompt = guidedMode ? buildModePrompt({ mode: guidedMode, planPath }) : undefined;
+  const guidedPrompt = guidedMode ? buildModePrompt({ mode: guidedMode, planPath }) : '';
+  // What earlier turns — possibly on another engine — wrote down about this
+  // work. Read BEFORE the turn so the agent starts with it instead of
+  // rediscovering it, and layered so the profile survives any trimming.
+  const memoryPrompt = memoryScopeId ? buildMemoryPrompt(recallForScope({ dataDir, scopeId: memoryScopeId })) : '';
+  const combined = [guidedPrompt, memoryPrompt].filter((part) => part !== '').join('\n\n');
+  const appendSystemPrompt = combined === '' ? undefined : combined;
 
   let turnResult;
   try {
@@ -665,7 +677,47 @@ export async function runTurn({
     timeoutClock: turnResult.timeoutClock ?? null,
     error: turnResult.error,
     guided: guidedMode ? summarizeGuidedTurn({ dataDir, cwd, chatId: effectiveChatId, mode: guidedMode, planPath, text: assistantText.join('\n') }) : null,
+    // Anything the agent asked to keep. Written AFTER the turn, with the
+    // owner attached here rather than by the agent — a step that could name
+    // its own scope could write into one it may not read.
+    remembered: memoryScopeId ? rememberFromTurn({ dataDir, scopeId: memoryScopeId, chatId: effectiveChatId, text: assistantText.join('\n') }) : [],
   };
+}
+
+/**
+ * What this scope already knows, for the system prompt.
+ *
+ * Never throws: a memory store that cannot be read is a turn without memory,
+ * not a failed turn.
+ */
+function recallForScope({ dataDir, scopeId }) {
+  try {
+    return openMemory(dataDir).recall({ scopeId, limit: 20 });
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Writes down what the agent asked to keep.
+ *
+ * The scope comes from the caller, the text from the agent, and neither can
+ * supply the other's half. Failures are swallowed for the same reason as
+ * above — an unwritten memory must not lose a finished turn.
+ */
+function rememberFromTurn({ dataDir, scopeId, chatId, text }) {
+  const wanted = parseRemember(text);
+  if (wanted.length === 0) return [];
+  const written = [];
+  try {
+    const memory = openMemory(dataDir);
+    for (const entry of wanted) {
+      written.push(memory.remember({ scopeId, text: entry.text, kind: entry.kind, confidence: entry.confidence, origin: `chat:${chatId}` }));
+    }
+  } catch (err) {
+    console.warn(`memory: could not write what this turn learned (${err.message})`);
+  }
+  return written.map((entry) => ({ id: entry.id, text: entry.text, kind: entry.kind }));
 }
 
 /**

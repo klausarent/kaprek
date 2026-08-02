@@ -67,6 +67,8 @@ import { createTriggerRunner } from '../triggers/runner.mjs';
 import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUNDS_PER_GATE } from '../relay/dispatcher.mjs';
 import { loadRecipes } from '../relay/recipes.mjs';
 import { engineIdsByReadiness, nextSteps, scanEnvironment } from '../scan/environment.mjs';
+import { openMemory, MemoryNotFoundError, InvalidMemoryError } from '../memory/store.mjs';
+import { InvalidScopeError } from '../memory/scopes.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
@@ -1482,6 +1484,113 @@ function startCouncilForPlan({ getCouncil, chats, chatId, cwd, dataDir, result }
 }
 
 /**
+ * Memory routes: /api/memory (recall + remember), /api/memory/scopes,
+ * /api/memory/<id>/verify, DELETE /api/memory/<id>.
+ *
+ * Reading REQUIRES a scope. There is no "everything" view on purpose — a
+ * route that returned every memory regardless of scope would undo the one
+ * property M3 exists to have, and it would do it from the outside where no
+ * scope check applies.
+ */
+async function handleMemoryRoutes(req, res, segments, url, { dataDir }) {
+  const memory = openMemory(dataDir);
+
+  if (segments.length === 3 && segments[2] === 'scopes') {
+    if (req.method === 'GET') {
+      sendJson(res, 200, { scopes: memory.scopes() });
+      return;
+    }
+    if (req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (!body.ok) {
+        sendJson(res, body.status, { error: body.error });
+        return;
+      }
+      try {
+        sendJson(res, 201, { scope: memory.addScope({ id: body.data?.id, parent: body.data?.parent ?? null }) });
+      } catch (err) {
+        if (err instanceof InvalidScopeError) sendJson(res, 400, { error: err.message, field: err.field });
+        else throw err;
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  if (segments.length === 4 && segments[3] === 'verify') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    try {
+      sendJson(res, 200, { memory: memory.verify(segments[2]) });
+    } catch (err) {
+      if (err instanceof MemoryNotFoundError) sendJson(res, 404, { error: err.message });
+      else throw err;
+    }
+    return;
+  }
+
+  if (segments.length === 3) {
+    if (req.method !== 'DELETE') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req).catch(() => ({ ok: true, data: {} }));
+    try {
+      sendJson(res, 200, { memory: memory.forget(segments[2], body.data?.reason ?? null) });
+    } catch (err) {
+      if (err instanceof MemoryNotFoundError) sendJson(res, 404, { error: err.message });
+      else throw err;
+    }
+    return;
+  }
+
+  if (segments.length === 2 && req.method === 'GET') {
+    const scopeId = url.searchParams.get('scopeId');
+    if (!scopeId) {
+      sendJson(res, 400, { error: 'scopeId is required — memory is always read from somewhere' });
+      return;
+    }
+    sendJson(res, 200, {
+      memories: memory.recall({
+        scopeId,
+        query: url.searchParams.get('q') ?? '',
+        includeEvidence: url.searchParams.get('evidence') === '1',
+        includeForgotten: url.searchParams.get('forgotten') === '1',
+      }),
+    });
+    return;
+  }
+
+  if (segments.length === 2 && req.method === 'POST') {
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    try {
+      sendJson(res, 201, {
+        memory: memory.remember({
+          scopeId: body.data?.scopeId,
+          text: body.data?.text,
+          kind: body.data?.kind ?? 'fact',
+          origin: body.data?.origin ?? 'person',
+          ...(typeof body.data?.confidence === 'number' ? { confidence: body.data.confidence } : {}),
+        }),
+      });
+    } catch (err) {
+      if (err instanceof InvalidMemoryError) sendJson(res, 400, { error: err.message, field: err.field });
+      else throw err;
+    }
+    return;
+  }
+
+  sendJson(res, 405, { error: 'method not allowed' });
+}
+
+/**
  * Council routes: /api/council (the setup) and /api/council/consult (ask).
  *
  * GET answers with the saved setup AND a suggestion built from what is
@@ -1830,6 +1939,7 @@ async function handleChatTurn(
     getChats,
     getPlans,
     getCouncil,
+    memoryScopeForChat,
     getMissions,
     harness,
     harnessName,
@@ -2089,6 +2199,9 @@ async function handleChatTurn(
       // inversion is the fix for the original complaint: a path nobody has
       // to reconstruct from a sentence.
       ...(mode ? { mode, planPath: guidedPlanPath({ getPlans, chats, chatId, cwd: turnCwd ?? null, dataDir, text }) } : {}),
+      // Memory belongs to a body of work, so only a mission chat has a scope
+      // — see memoryScopeForChat().
+      memoryScopeId: memoryScopeForChat ? memoryScopeForChat(chatId) : null,
       allowedTools,
       // Not awaited here: onEvent is called synchronously from deep inside
       // the harness (see claude-code.mjs's readline 'line' handler), so
@@ -2597,6 +2710,7 @@ async function handleRequest(
     getPlans,
     getCouncil,
     getConsultations,
+    memoryScopeForChat,
     tmpRoot,
     getChats,
     harness,
@@ -2758,6 +2872,11 @@ async function handleRequest(
       });
       return;
     }
+    // /api/memory — what kaprek remembers, per scope.
+    if (segments[1] === 'memory') {
+      await handleMemoryRoutes(req, res, segments, url, { dataDir });
+      return;
+    }
     if (segments.length === 2 && segments[1] === 'recipes') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: 'method not allowed' });
@@ -2796,6 +2915,7 @@ async function handleRequest(
         // yet. A silent fallback is the worst kind of missing wire.
         getPlans,
         getCouncil,
+        memoryScopeForChat,
         harness,
         harnessName,
         engineRegistry,
@@ -3306,6 +3426,45 @@ export function startServer({
     return workspaceDir;
   }
 
+  /**
+   * The memory scope a chat writes and reads in, creating the tree on first
+   * use: mission:<id> under project:<name-of-its-directory> under
+   * person:local.
+   *
+   * A chat with no mission gets NULL, and that is deliberate. Memory belongs
+   * to a body of work; a one-off question in a scratch chat has no business
+   * writing into a project's memory, and no business reading one either.
+   */
+  function memoryScopeForChat(chatId) {
+    let mission = null;
+    try {
+      const missionId = getChats().get(chatId).missionId;
+      if (!missionId) return null;
+      mission = getMissions().get(missionId);
+    } catch {
+      return null;
+    }
+    if (!mission) return null;
+
+    try {
+      const memory = openMemory(dataDir);
+      // 'local' rather than a name: kaprek does not know who is sitting
+      // there, and inventing an identity to hang a tree off would be the
+      // wrong kind of guess. M6's family setup is where a person gets a name.
+      memory.addScope({ id: 'person:local' });
+      const projectId = `project:${path.basename(mission.cwd ?? 'workspace')}`;
+      memory.addScope({ id: projectId, parent: 'person:local' });
+      const scopeId = `mission:${mission.id}`;
+      memory.addScope({ id: scopeId, parent: projectId });
+      return scopeId;
+    } catch (err) {
+      // A tree that cannot be built means a turn without memory, never a
+      // turn that writes somewhere unintended.
+      console.warn(`memory: could not resolve a scope for chat ${chatId} (${err.message})`);
+      return null;
+    }
+  }
+
   /** The last thing the assistant said in this chat — a relay turn's actual output. */
   function lastAssistantText(chatId) {
     try {
@@ -3372,6 +3531,7 @@ export function startServer({
       getPlans,
       getCouncil,
       getConsultations,
+      memoryScopeForChat,
       tmpRoot,
       getChats,
       harness,
