@@ -1,6 +1,6 @@
 {
   "name": "kaprek",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Local agent workspace around the Claude Code and Codex CLIs you already have: session viewer with search, chat turns, guided planning, a council of your other engines, scheduled triggers, and a deferred approval inbox. No API key, no account, no network of its own.",
   "type": "module",
   "license": "Apache-2.0",

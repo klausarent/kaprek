@@ -217,7 +217,7 @@ async function main() {
 
   let started;
   try {
-    started = await startWithPortRetry(opts.port, { rootDir: opts.dir, redact: opts.redact, webDist, dataDir });
+    started = await startWithPortRetry(opts.port, { rootDir: opts.dir, redact: opts.redact, webDist, dataDir, lan: opts.lan });
   } catch (err) {
     console.error(`Failed to start server: ${err.message}`);
     // Otherwise this process keeps holding the lock handle although no server
