@@ -172,11 +172,15 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
     if (!initialChatId) return;
     setLoadError(null);
     fetchChat(initialChatId)
-      .then(({ chat, events: stored }) => {
+      .then(({ chat, events: stored, openQuiz }) => {
         setChatId(initialChatId);
         setEvents(stored.map(toDigestEvent));
         setRelay(chat?.relay ?? null);
         setEngine(chat?.engine ?? "claude-code");
+        // A question that was on screen before the reload is still on screen
+        // after it. The server reads it back out of the transcript, so there
+        // is nothing here to keep in step with anything.
+        if (openQuiz) setGuided({ mode: "brainstorm", planPath: null, quiz: openQuiz, plan: null, planError: null, protocolBroken: false });
       })
       .catch((e) => setLoadError((e as Error).message));
   }, [initialChatId, relayReloads]);

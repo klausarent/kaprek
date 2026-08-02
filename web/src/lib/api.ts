@@ -784,8 +784,10 @@ export function fetchChatList(filter: { triggerId?: string; includeSilent?: bool
   return getJson<{ chats: ChatSummary[] }>(`/api/chat/list${qs ? `?${qs}` : ""}`).then((r) => r.chats);
 }
 
-export function fetchChat(chatId: string): Promise<{ chat: ChatSummary; events: ChatStoredEvent[] }> {
-  return getJson<{ chat: ChatSummary; events: ChatStoredEvent[] }>(`/api/chat/${encodeURIComponent(chatId)}`);
+export function fetchChat(chatId: string): Promise<{ chat: ChatSummary; events: ChatStoredEvent[]; openQuiz?: Quiz }> {
+  // openQuiz is present when the last thing the agent said was a question
+  // nobody has answered yet — so reloading the page does not lose it.
+  return getJson<{ chat: ChatSummary; events: ChatStoredEvent[]; openQuiz?: Quiz }>(`/api/chat/${encodeURIComponent(chatId)}`);
 }
 
 export function cancelChatTurn(chatId: string): Promise<{ cancelled: boolean }> {

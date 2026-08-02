@@ -46,6 +46,7 @@ import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError } from '../plans/store.mjs';
+import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
 import { consultPeers } from '../council/consult.mjs';
@@ -2424,7 +2425,17 @@ function handleChatGet(res, getChats, chatId) {
   try {
     const chat = chats.get(chatId);
     const events = chats.events(chatId);
-    sendJson(res, 200, { chat, events });
+    // The open question, if the last thing said was one.
+    //
+    // Reloading the page used to lose a quiz that had not been answered yet:
+    // it arrived on a stream, and the stream was gone. Nothing needed
+    // storing to fix that — the answer was already in the transcript, which
+    // is the source the stream was reading from anyway. A second store for
+    // "the quiz currently on screen" would have been a second thing to keep
+    // in step with it.
+    const lastAssistant = [...events].reverse().find((event) => event.kind === 'assistant')?.text ?? '';
+    const quiz = parseQuiz(lastAssistant);
+    sendJson(res, 200, { chat, events, ...(quiz && !quiz.done ? { openQuiz: quiz } : {}) });
   } catch (err) {
     if (err instanceof ChatNotFoundError) {
       sendJson(res, 404, { error: err.message });

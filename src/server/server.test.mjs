@@ -4332,3 +4332,36 @@ test('home: an unknown guided mission is a 404, and a missing folder a 400', asy
   expect((await postJson(`${url}/api/home/nope/start`, { cwd: 'x' })).status).toBe(404);
   expect((await postJson(`${url}/api/home/game/start`, {})).status).toBe(400);
 });
+
+test('chat: an unanswered quiz survives a reload', async () => {
+  // It used to arrive on a stream and be gone when the stream was: a
+  // refresh mid-question lost the question.
+  const quiz = ['```kaprek-quiz', JSON.stringify({ questions: [{ id: 'lang', header: 'Language', question: 'Which language?', options: [{ label: 'German' }, { label: 'English' }] }] }), '```'].join('\n');
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'text', text: `Let me ask first.\n\n${quiz}` });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+
+  const frames = await readSse(await postJson(`${url}/api/chat/turn`, { text: 'plan a thing', mode: 'brainstorm' }));
+  const chatId = frames.find((frame) => frame.type === 'chat-id').chatId;
+
+  const reloaded = await (await fetch(`${url}/api/chat/${chatId}`)).json();
+  expect(reloaded.openQuiz.questions[0].question).toBe('Which language?');
+});
+
+test('chat: a finished quiz is not offered again on reload', async () => {
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'text', text: 'All done, nothing to ask.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+  const frames = await readSse(await postJson(`${url}/api/chat/turn`, { text: 'hello' }));
+  const chatId = frames.find((frame) => frame.type === 'chat-id').chatId;
+
+  expect((await (await fetch(`${url}/api/chat/${chatId}`)).json()).openQuiz).toBeUndefined();
+});
