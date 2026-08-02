@@ -17,7 +17,10 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-m3-'));
 const projectDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-m3-project-'));
 fs.writeFileSync(path.join(projectDir, 'README.md'), '# A tiny project\n', 'utf8');
 
-const { url, token } = await startServer({ port: 0, rootDir: dataDir, dataDir, webDist: null });
+// No tools for these turns. The acceptance is about what an agent KNOWS,
+// not what it can do, and a turn that goes looking through the project can
+// sit silent long enough to trip fetch's own body timeout.
+const { url, token } = await startServer({ port: 0, rootDir: dataDir, dataDir, webDist: null, allowedTools: [] });
 const H = { 'x-kaprek-token': token, 'x-app-request': '1', 'Content-Type': 'application/json' };
 const say = (...args) => console.log(new Date().toISOString().slice(11, 19), ...args);
 say('server on', url, '| project', projectDir);
