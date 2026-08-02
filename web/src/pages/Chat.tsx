@@ -17,6 +17,9 @@ import {
   type DigestEvent,
   type Engine,
   type RelayRun,
+  type GuidedResult,
+  type PlanMode,
+  type QuizAnswer,
 } from "../lib/api";
 import EngineBadge from "../components/EngineBadge";
 import { upsertQuestion } from "../lib/questions";
@@ -35,6 +38,10 @@ import { navigateToChats, navigateToMissions } from "../App";
 import EventBlock from "../components/EventBlock";
 import WorkFold from "../components/WorkFold";
 import RepeatHint from "../components/RepeatHint";
+import PlanPrompt, { looksLikePlanning } from "../components/PlanPrompt";
+import QuizCard from "../components/QuizCard";
+import { formatQuizAnswers } from "../lib/quiz";
+import { navigateToPlans } from "../App";
 import { toSimpleItems } from "../lib/simple";
 import { EFFORT_LEVELS } from "../lib/api";
 import ApprovalDialog from "../components/ApprovalDialog";
@@ -239,12 +246,24 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
     return () => setStatus({ turnRunning: false, approvalsOpen: 0 });
   }, []);
 
+  // What the last guided turn produced: a quiz to answer, a plan that was
+  // written, or the honest admission that the agent ignored the mode.
+  const [guided, setGuided] = useState<GuidedResult | null>(null);
+  // Whether the "this sounds like planning" offer is on screen. Declining it
+  // is remembered for the session — an offer that returns after a no is not
+  // an offer.
+  const [planOffer, setPlanOffer] = useState(false);
+  const [planOfferMuted, setPlanOfferMuted] = useState(false);
+
   const canSend = draft.trim().length > 0 && !streaming;
 
-  const handleSend = async () => {
-    const text = draft.trim();
+  const handleSend = async ({ mode, text: override }: { mode?: PlanMode; text?: string } = {}) => {
+    const text = (override ?? draft).trim();
     if (!text || streaming) return;
-    setDraft("");
+    // A new turn supersedes whatever the last one asked or offered.
+    setGuided(null);
+    setPlanOffer(false);
+    if (override === undefined) setDraft("");
     setStreamError(null);
     setLastTurn(null);
     setRateLimitHint(null);
@@ -268,6 +287,7 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         engine: chatId ? undefined : engine,
         approvalMode,
         effort: effort === "default" ? undefined : effort,
+        ...(mode ? { mode } : {}),
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),
@@ -361,6 +381,9 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
         break;
       case "turn-complete":
         setLastTurn({ costUsd: event.costUsd, stopReason: event.stopReason, errorMessage: event.error?.message ?? null });
+        // A guided turn hands back its quiz, its plan, or the admission that
+        // the agent ignored the mode.
+        setGuided(event.guided ?? null);
         // The server resolved (denied) every approval still pending for this
         // chat when the turn ended — see cleanupApprovalsForChat — so nothing
         // left in the stack for it can still be answered.
@@ -515,12 +538,63 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
       {rateLimitHint && <div className="chat-rate-limit-hint">{rateLimitHint}</div>}
       {turnLine && <div className="chat-turn-line">{turnLine}</div>}
 
+      {guided?.quiz && !guided.quiz.done && (
+        <QuizCard
+          quiz={guided.quiz}
+          busy={streaming}
+          onSubmit={(answers: Record<string, QuizAnswer>) => void handleSend({ mode: guided.mode, text: formatQuizAnswers(guided.quiz!, answers) })}
+          onSkip={() => setGuided(null)}
+        />
+      )}
+
+      {guided?.plan && (
+        <div className="plan-written">
+          <span>
+            Plan written: <strong>{guided.plan.title}</strong>
+          </span>
+          <code className="plan-path">{guided.plan.path}</code>
+          <span className="plan-written-actions">
+            <button type="button" className="btn btn-small" onClick={() => navigateToPlans()}>
+              Open it
+            </button>
+            <button type="button" className="link-button" onClick={() => void navigator.clipboard?.writeText(guided.plan!.path)}>
+              Copy path
+            </button>
+          </span>
+        </div>
+      )}
+
+      {guided?.protocolBroken && (
+        <div className="chat-turn-line">
+          That turn ran in {guided.mode} mode, but the agent answered in prose instead of using the quiz — the answer above is all there is.
+        </div>
+      )}
+
+      {planOffer && !streaming && (
+        <PlanPrompt
+          onPick={(mode) => {
+            setPlanOffer(false);
+            void handleSend({ mode });
+          }}
+          onDismiss={() => {
+            setPlanOffer(false);
+            setPlanOfferMuted(true);
+          }}
+        />
+      )}
+
       <div className="chat-composer">
         <textarea
           className="chat-composer-input"
           placeholder="Message Claude Code… (Enter to send, Shift+Enter for a new line)"
           value={draft}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setDraft(next);
+            // Offered while typing, not after sending: proposing a different
+            // way to work once the work has started is an interruption.
+            setPlanOffer(!planOfferMuted && !streaming && looksLikePlanning(next));
+          }}
           onKeyDown={handleKeyDown}
           disabled={streaming}
           rows={3}
@@ -576,7 +650,7 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
               Stop
             </button>
           ) : (
-            <button type="button" className="btn" onClick={handleSend} disabled={!canSend}>
+            <button type="button" className="btn" onClick={() => void handleSend()} disabled={!canSend}>
               Send
             </button>
           )}

@@ -606,7 +606,56 @@ export type ChatStreamEvent =
       costUsd: number | null;
       stopReason: "result" | "aborted" | "error" | "timeout";
       error: { message: string } | null;
+      guided?: GuidedResult | null;
     };
+
+/** A guided mode for one turn: quiz cards, or the plan file. */
+export type PlanMode = "brainstorm" | "plan";
+
+export type QuizQuestion = {
+  id: string;
+  header: string;
+  question: string;
+  options: { label: string; description?: string }[];
+  multiSelect: boolean;
+  allowOther: boolean;
+};
+
+export type Quiz = { questions: QuizQuestion[]; done: boolean };
+
+/** One answered question, keyed by question id in the answer map. */
+export type QuizAnswer = { selected?: string[]; other?: string };
+
+export type PlanSummary = {
+  id: string;
+  path: string;
+  title: string;
+  kind: "spec" | "plan";
+  status: "draft" | "active" | "done" | "archived";
+  chatId: string | null;
+  missionId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  exists: boolean;
+};
+
+export type PlanStep = { index: number; line: number; text: string; done: boolean };
+
+export type PlanDetail = PlanSummary & { content: string; steps: PlanStep[]; truncated: boolean };
+
+/**
+ * What a guided turn produced. `protocolBroken` is the honest signal that
+ * the agent ignored the mode — no quiz, no file. The UI says so rather than
+ * leaving a guided turn indistinguishable from an ordinary one.
+ */
+export type GuidedResult = {
+  mode: PlanMode;
+  planPath: string | null;
+  quiz: Quiz | null;
+  plan: PlanSummary | null;
+  planError: string | null;
+  protocolBroken: boolean;
+};
 
 // The persisted shape of one chat-store event (src/chats/store.mjs's
 // EVENT_SHAPES). Unlike the live 'tool-start' event above, `input` here is
@@ -768,6 +817,7 @@ export async function streamChatTurn({
   engine,
   approvalMode,
   effort,
+  mode,
   text,
   onEvent,
   signal,
@@ -783,6 +833,8 @@ export async function streamChatTurn({
   approvalMode?: ApprovalMode;
   /** Per-turn reasoning effort; omitted leaves the CLI's own default. */
   effort?: Effort;
+  /** Guided mode for this turn; omitted runs an ordinary turn. */
+  mode?: PlanMode;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -794,6 +846,7 @@ export async function streamChatTurn({
       ...(chatId ? { chatId } : { ...(missionId ? { missionId } : {}), ...(engine ? { engine } : {}) }),
       ...(approvalMode ? { approvalMode } : {}),
       ...(effort ? { effort } : {}),
+      ...(mode ? { mode } : {}),
       text,
     }),
     signal,
@@ -1062,4 +1115,37 @@ export async function fireTrigger(
     onEvent?.(frame);
   });
   return last;
+}
+
+// ---------------------------------------------------------------------------
+// Plans (/api/plans)
+// ---------------------------------------------------------------------------
+
+/** Every plan kaprek knows about, newest first. */
+export async function fetchPlans({ missionId, chatId }: { missionId?: string; chatId?: string } = {}): Promise<PlanSummary[]> {
+  const params = new URLSearchParams();
+  if (missionId) params.set("missionId", missionId);
+  if (chatId) params.set("chatId", chatId);
+  const query = params.toString();
+  const res = await apiFetch(`/api/plans${query ? `?${query}` : ""}`);
+  await throwOnError(res);
+  return (await res.json()).plans as PlanSummary[];
+}
+
+/** One plan with its current content and steps, read from disk. */
+export async function fetchPlan(id: string): Promise<PlanDetail> {
+  const res = await apiFetch(`/api/plans/${encodeURIComponent(id)}`);
+  await throwOnError(res);
+  return (await res.json()).plan as PlanDetail;
+}
+
+/** Ticks or unticks one step, rewriting that line in the plan file. */
+export async function setPlanStep(id: string, index: number, done: boolean): Promise<PlanDetail> {
+  const res = await apiFetch(`/api/plans/${encodeURIComponent(id)}/step`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ index, done }),
+  });
+  await throwOnError(res);
+  return (await res.json()).plan as PlanDetail;
 }
