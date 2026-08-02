@@ -44,6 +44,10 @@ import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError } from '../plans/store.mjs';
+import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
+import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
+import { consultPeers } from '../council/consult.mjs';
+import { makeAskPeer, availablePeerIds } from '../council/ask.mjs';
 import { planPathFor, PLAN_MODES } from '../plans/prompt.mjs';
 import { runTurn } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
@@ -1417,6 +1421,118 @@ function guidedPlanPath({ getPlans, chats, chatId, cwd, dataDir, text }) {
 }
 
 /**
+ * Council routes: /api/council (the setup) and /api/council/consult (ask).
+ *
+ * GET answers with the saved setup AND a suggestion built from what is
+ * installed, so a fresh install has something to accept rather than a form
+ * to fill in from nothing.
+ */
+async function handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry, getMissions }) {
+  const peers = availablePeerIds({ engineIds: engineRegistry.listEngines().map((engine) => engine.id) });
+
+  if (segments.length === 2) {
+    if (req.method === 'GET') {
+      const saved = readCouncil(dataDir);
+      const assignment = saved.configured ? saved.assignment : suggestAssignment(peers);
+      sendJson(res, 200, {
+        council: {
+          ...saved,
+          level: saved.configured ? saved.level : DEFAULT_LEVEL,
+          assignment,
+          suggested: !saved.configured,
+          status: councilStatus(assignment),
+        },
+        available: peers,
+        levels: COUNCIL_LEVELS,
+        roles: COUNCIL_ROLES,
+      });
+      return;
+    }
+    if (req.method === 'PUT') {
+      const body = await readJsonBody(req);
+      if (!body.ok) {
+        sendJson(res, body.status, { error: body.error });
+        return;
+      }
+      try {
+        const saved = writeCouncil(dataDir, { level: body.data?.level, assignment: body.data?.assignment }, peers);
+        sendJson(res, 200, { council: { ...saved, suggested: false, status: councilStatus(saved.assignment) } });
+      } catch (err) {
+        if (err instanceof InvalidCouncilError) sendJson(res, 400, { error: err.message, errors: err.errors });
+        else throw err;
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
+
+  // /api/council/consult — the button. Works at every level, including off.
+  if (segments.length === 3 && segments[2] === 'consult') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    const question = body.data?.question;
+    if (typeof question !== 'string' || question.trim() === '') {
+      sendJson(res, 400, { error: 'question must be a non-empty string' });
+      return;
+    }
+
+    const saved = readCouncil(dataDir);
+    const assignment = saved.configured ? saved.assignment : suggestAssignment(peers);
+    const status = councilStatus(assignment);
+    if (!status.possible) {
+      // Not an error: "there is nobody to ask" is a real answer, and a far
+      // better one than a model reviewing itself.
+      sendJson(res, 200, { consultation: { empty: true, consensus: false, agreed: [], dissenting: [], unreachable: [], reason: status.reason } });
+      return;
+    }
+
+    // The mission's own directory when the caller names one — a peer reads
+    // the files it was pointed at, so it has to stand where they are.
+    let cwd = dataDir;
+    if (typeof body.data?.missionId === 'string') {
+      try {
+        cwd = getMissions().get(body.data.missionId).cwd ?? dataDir;
+      } catch {
+        // An unknown mission just means the default working directory.
+      }
+    }
+
+    const consultation = await consultPeers({
+      peers: status.peers,
+      askPeer: makeAskPeer({ cwd }),
+      question,
+      files: Array.isArray(body.data?.files) ? body.data.files.filter((f) => typeof f === 'string') : [],
+      constraints: Array.isArray(body.data?.constraints) ? body.data.constraints.filter((c) => typeof c === 'string') : [],
+      tried: Array.isArray(body.data?.tried) ? body.data.tried.filter((t) => typeof t === 'string') : [],
+    });
+    // The full prompt and each peer's raw text are dropped from the response:
+    // the caller needs the verdicts, and the raw answers can be long enough
+    // to bury them.
+    sendJson(res, 200, {
+      consultation: {
+        consensus: consultation.consensus,
+        empty: consultation.empty,
+        agreed: consultation.agreed,
+        dissenting: consultation.dissenting,
+        unreachable: consultation.unreachable,
+        answers: consultation.answers.map(({ peerId, verdict, summary, risks, error }) => ({ peerId, verdict, summary, risks, error })),
+      },
+    });
+    return;
+  }
+
+  sendJson(res, 404, { error: 'not found' });
+}
+
+/**
  * Plan routes: /api/plans, /api/plans/<id>, /api/plans/<id>/step.
  *
  * A plan is a markdown file somewhere on the disk that kaprek knows the
@@ -2488,6 +2604,10 @@ async function handleRequest(
     }
     if (segments[1] === 'plans') {
       await handlePlanRoutes(req, res, segments, { getPlans });
+      return;
+    }
+    if (segments[1] === 'council') {
+      await handleCouncilRoutes(req, res, segments, { dataDir, engineRegistry, getMissions });
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {

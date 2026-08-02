@@ -3700,3 +3700,61 @@ test('chat turn: a follow-up keeps writing to the same plan, named after the cha
   const listed = await (await fetch(`${url}/api/plans`)).json();
   expect(listed.plans).toHaveLength(1);
 });
+
+// --- council: roles, levels, and asking a peer (Klaus, 02.08.: "Die
+// Rückfragen mit den anderen KIs finden noch nicht statt") ---
+
+test('council: a fresh install gets a suggestion, not an empty form', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/council`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.council.suggested).toBe(true);
+  expect(body.council.level).toBe('plans');
+  expect(body.council.assignment.lead).toBeTruthy();
+  expect(body.available).toContain('claude-code');
+  expect(body.levels).toEqual(['off', 'plans', 'decisions', 'always']);
+});
+
+test('council: a saved setup survives, and an impossible one is refused', async () => {
+  const { url } = await boot();
+  const saved = await fetch(`${url}/api/council`, {
+    method: 'PUT',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ level: 'decisions', assignment: { lead: 'claude-code', thinker: 'codex', worker: 'claude-code', peer: ['codex'] } }),
+  });
+  expect(saved.status).toBe(200);
+  expect((await saved.json()).council.status.possible).toBe(true);
+
+  const reread = await (await fetch(`${url}/api/council`)).json();
+  expect(reread.council.suggested).toBe(false);
+  expect(reread.council.level).toBe('decisions');
+
+  // The lead as its own peer is the one rule the feature rests on.
+  const bad = await fetch(`${url}/api/council`, {
+    method: 'PUT',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ level: 'plans', assignment: { lead: 'codex', thinker: 'codex', worker: 'codex', peer: ['codex'] } }),
+  });
+  expect(bad.status).toBe(400);
+  expect((await bad.json()).error).toContain('second opinion');
+
+  const stillThere = await (await fetch(`${url}/api/council`)).json();
+  expect(stillThere.council.level).toBe('decisions');
+});
+
+test('council: an unknown level is refused rather than saved', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/council`, {
+    method: 'PUT',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ level: 'constantly', assignment: { lead: 'claude-code', thinker: 'codex', worker: 'codex', peer: ['codex'] } }),
+  });
+  expect(res.status).toBe(400);
+});
+
+test('council: consulting needs a question', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/council/consult`, { method: 'POST', headers: APP_JSON_HEADERS, body: JSON.stringify({ question: '  ' }) });
+  expect(res.status).toBe(400);
+});
