@@ -4255,3 +4255,47 @@ test('notify: nothing configured by default, and a shell string is refused', asy
   expect(good.status).toBe(200);
   expect((await (await fetch(`${url}/api/notify`)).json()).notify.command).toEqual(['ntfy', 'publish', 'topic']);
 });
+
+test('workflows: export bundles what is set up, import shows what it would change first', async () => {
+  const { url } = await boot();
+  const preset = { id: 'piece', title: 'Marketing piece', firstPrompt: 'Research, draft, check against the style rules, stop before publishing.' };
+
+  const exported = await postJson(`${url}/api/workflows`, {
+    id: 'marketing-piece',
+    title: 'Marketing piece',
+    preset,
+    recipeId: 'write-review',
+    councilLevel: 'plans',
+    profile: ['This project publishes in German.'],
+  });
+  expect(exported.status).toBe(201);
+  const { workflow } = await exported.json();
+  expect(workflow.recipe.id).toBe('write-review');
+
+  // A file from a colleague: what does taking it actually do?
+  const preview = await postJson(`${url}/api/workflows/preview`, { workflow });
+  expect(preview.status).toBe(200);
+  const { changes } = await preview.json();
+  expect(changes.join('\n')).toContain('grok → claude');
+  expect(changes.join('\n')).toContain('plans');
+
+  const listed = await (await fetch(`${url}/api/workflows`)).json();
+  expect(listed.workflows.map((entry) => entry.id)).toEqual(['marketing-piece']);
+});
+
+test('workflows: an absolute path is refused at export, not stripped', async () => {
+  const { url } = await boot();
+  const res = await postJson(`${url}/api/workflows`, {
+    id: 'leaky',
+    title: 'Leaky',
+    preset: { id: 'leaky', title: 'Leaky', firstPrompt: 'Read C:\\Users\\klaus\\notes.md first' },
+  });
+  expect(res.status).toBe(400);
+  expect((await res.json()).error).toMatch(/absolute path/);
+});
+
+test('workflows: an unknown version is refused on import', async () => {
+  const { url } = await boot();
+  const res = await postJson(`${url}/api/workflows/preview`, { workflow: { version: 99, id: 'x', title: 'x', preset: { firstPrompt: 'x' } } });
+  expect(res.status).toBe(400);
+});

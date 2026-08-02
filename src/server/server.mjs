@@ -40,6 +40,7 @@ import {
   InvalidLinkError,
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
+import { InvalidWorkflowError, buildWorkflow, importSummary, loadWorkflows, saveWorkflow, validateWorkflow } from '../missions/workflow.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
@@ -2953,6 +2954,78 @@ async function handleRequest(
       });
       return;
     }
+    // /api/workflows — a way of working as one file you can hand over.
+    if (segments[1] === 'workflows') {
+      if (segments.length === 2 && req.method === 'GET') {
+        sendJson(res, 200, { workflows: loadWorkflows(dataDir) });
+        return;
+      }
+      // POST /api/workflows — export: bundle what is set up right now.
+      if (segments.length === 2 && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        if (!body.ok) {
+          sendJson(res, body.status, { error: body.error });
+          return;
+        }
+        try {
+          const recipe = typeof body.data?.recipeId === 'string' ? (loadRecipes(dataDir).find((entry) => entry.id === body.data.recipeId) ?? null) : null;
+          const saved = saveWorkflow(
+            dataDir,
+            buildWorkflow({
+              id: body.data?.id,
+              title: body.data?.title,
+              description: body.data?.description ?? '',
+              preset: body.data?.preset,
+              recipe,
+              councilLevel: body.data?.councilLevel ?? null,
+              profile: Array.isArray(body.data?.profile) ? body.data.profile : [],
+            }),
+          );
+          sendJson(res, 201, { workflow: saved.workflow, path: saved.path });
+        } catch (err) {
+          if (err instanceof InvalidWorkflowError) sendJson(res, 400, { error: err.message, field: err.field });
+          else throw err;
+        }
+        return;
+      }
+      // POST /api/workflows/preview — what importing this file would change,
+      // said before anything is written. A workflow sets the council level
+      // and adds a recipe; both change how later runs behave.
+      if (segments.length === 3 && segments[2] === 'preview' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        if (!body.ok) {
+          sendJson(res, body.status, { error: body.error });
+          return;
+        }
+        try {
+          const workflow = validateWorkflow(body.data?.workflow);
+          sendJson(res, 200, { workflow, changes: importSummary(workflow) });
+        } catch (err) {
+          if (err instanceof InvalidWorkflowError) sendJson(res, 400, { error: err.message, field: err.field });
+          else throw err;
+        }
+        return;
+      }
+      // PUT /api/workflows — import, once someone has seen the preview.
+      if (segments.length === 2 && req.method === 'PUT') {
+        const body = await readJsonBody(req);
+        if (!body.ok) {
+          sendJson(res, body.status, { error: body.error });
+          return;
+        }
+        try {
+          const saved = saveWorkflow(dataDir, validateWorkflow(body.data?.workflow));
+          sendJson(res, 200, { workflow: saved.workflow, path: saved.path });
+        } catch (err) {
+          if (err instanceof InvalidWorkflowError) sendJson(res, 400, { error: err.message, field: err.field });
+          else throw err;
+        }
+        return;
+      }
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+
     // /api/notify — the one command kaprek runs when a question is parked.
     if (segments.length === 2 && segments[1] === 'notify') {
       if (req.method === 'GET') {
