@@ -232,6 +232,13 @@ The agent supplies the text; kaprek attaches the owner. An agent that could
 name its own scope could write into one it may not read. A chat outside any
 mission has no scope and neither reads nor writes.
 
+The profile is frozen for the length of a conversation: a profile line
+written while a chat is running takes effect in the next one. It sits at the
+head of every prompt in that chat, which is exactly what a provider's prefix
+cache keys on — changing it mid-conversation would throw away every cached
+token for the rest of it. Facts are not frozen; they arrive as they are
+learned.
+
 Every statement carries an origin and an age. Past 90 days without a verify
 it still comes back, marked stale — an agent that forgets on a schedule is
 one nobody can reason about. Forgetting is an event with a reason, and

@@ -68,9 +68,16 @@ export function parseRemember(answer) {
  * most, the first one in a project, was the one that could not write.
  * Whether memory applies at all is the caller's decision (a scope, or none).
  */
-export function buildMemoryPrompt(entries = []) {
+export function buildMemoryPrompt(entries = [], { frozenSince = null } = {}) {
   const line = (entry) => `- ${entry.text}${entry.stale ? ' (last verified over 90 days ago — treat as possibly out of date)' : ''}`;
-  const profiles = entries.filter((entry) => entry.kind === 'profile');
+  // THE FROZEN BLOCK (the Hermes pattern). The profile is the stable head of
+  // every prompt in this conversation, which is exactly what a provider's
+  // prefix cache keys on. A profile line added mid-conversation would change
+  // that head and throw away every cached token for the rest of it — so a
+  // profile written after this chat started takes effect in the NEXT one.
+  // Facts are not frozen: they sit below the profile and are meant to arrive
+  // the moment they are learned.
+  const profiles = entries.filter((entry) => entry.kind === 'profile' && (frozenSince === null || entry.createdAt <= frozenSince));
   const facts = entries.filter((entry) => entry.kind === 'fact');
 
   const sections = ['## What kaprek remembers about this work', ''];

@@ -89,3 +89,29 @@ describe('buildMemoryPrompt', () => {
     expect(buildMemoryPrompt([{ text: 'x', kind: 'fact', stale: false }])).toMatch(/never a secret/);
   });
 });
+
+describe('the frozen block', () => {
+  const profile = (createdAt) => ({ text: `profile from ${createdAt}`, kind: 'profile', stale: false, createdAt });
+  const fact = (createdAt) => ({ text: `fact from ${createdAt}`, kind: 'fact', stale: false, createdAt });
+
+  test('a profile written before this chat began is in', () => {
+    const prompt = buildMemoryPrompt([profile('2026-08-01T09:00:00.000Z')], { frozenSince: '2026-08-02T09:00:00.000Z' });
+    expect(prompt).toContain('profile from 2026-08-01');
+  });
+
+  test('a profile written after it began waits for the next chat', () => {
+    // The prompt's head is what a prefix cache keys on. Changing it
+    // mid-conversation throws away every cached token for the rest of it.
+    const prompt = buildMemoryPrompt([profile('2026-08-02T10:00:00.000Z')], { frozenSince: '2026-08-02T09:00:00.000Z' });
+    expect(prompt).not.toContain('profile from 2026-08-02');
+  });
+
+  test('facts are not frozen — they are meant to arrive as they are learned', () => {
+    const prompt = buildMemoryPrompt([fact('2026-08-02T10:00:00.000Z')], { frozenSince: '2026-08-02T09:00:00.000Z' });
+    expect(prompt).toContain('fact from 2026-08-02');
+  });
+
+  test('without a freeze line nothing is held back', () => {
+    expect(buildMemoryPrompt([profile('2026-08-02T10:00:00.000Z')])).toContain('profile from 2026-08-02');
+  });
+});

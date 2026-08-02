@@ -590,7 +590,11 @@ export async function runTurn({
   // What earlier turns — possibly on another engine — wrote down about this
   // work. Read BEFORE the turn so the agent starts with it instead of
   // rediscovering it, and layered so the profile survives any trimming.
-  const memoryPrompt = memoryScopeId ? buildMemoryPrompt(recallForScope({ dataDir, scopeId: memoryScopeId })) : '';
+  // The chat's own start is the freeze line: a profile written after this
+  // conversation began waits for the next one, so the prompt's head stays
+  // byte-identical across the turns of one chat.
+  const frozenSince = chatStartedAt(chats, effectiveChatId);
+  const memoryPrompt = memoryScopeId ? buildMemoryPrompt(recallForScope({ dataDir, scopeId: memoryScopeId }), { frozenSince }) : '';
   // Only after a compaction: before that the model still has the
   // conversation, and handing it back would spend context on something that
   // is already in context.
@@ -704,6 +708,15 @@ export async function runTurn({
     // its own scope could write into one it may not read.
     remembered: memoryScopeId ? rememberFromTurn({ dataDir, scopeId: memoryScopeId, chatId: effectiveChatId, text: assistantText.join('\n') }) : [],
   };
+}
+
+/** When this chat began — the line a profile change has to be older than to count. */
+function chatStartedAt(chats, chatId) {
+  try {
+    return chats.get(chatId).createdAt ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** The rules that were accepted. Never throws: no policy file means no rules. */
