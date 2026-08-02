@@ -74,12 +74,23 @@ export function writeNotify(dataDir, command) {
 
 /** What the command is told about the question, as environment variables. */
 export function notifyEnv({ chatId = null, toolName = null, source = null, url = null } = {}) {
+  // Every value has to be a string. The caller's `source` is an object
+  // (describeApprovalSource returns {kind, triggerId, title}), and passing
+  // it straight through made this variable literally "[object Object]" in
+  // every real notification — the tests only ever passed strings, so nothing
+  // said so. (Grok's review.)
+  const text = (value) => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'string') return value;
+    if (typeof value === 'object') return value.kind ?? JSON.stringify(value);
+    return String(value);
+  };
   return {
-    KAPREK_CHAT_ID: chatId ?? '',
-    KAPREK_TOOL: toolName ?? '',
-    KAPREK_SOURCE: source ?? '',
+    KAPREK_CHAT_ID: text(chatId),
+    KAPREK_TOOL: text(toolName),
+    KAPREK_SOURCE: text(source),
     // Where to answer it. The whole point of being told.
-    KAPREK_URL: url ?? '',
+    KAPREK_URL: text(url),
   };
 }
 
@@ -114,7 +125,17 @@ export async function notify({ dataDir, text, context = {}, spawnFn = spawn, tim
     }
 
     const timer = setTimeout(() => {
+      // Ask, then insist. A notifier that ignores SIGTERM would otherwise
+      // keep running while notify() has already reported it as timed out.
+      // (Grok's review.)
       child.kill();
+      setTimeout(() => {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // Already gone, which is the outcome either way.
+        }
+      }, 2000).unref?.();
       log(`notify: ${command[0]} did not finish within ${Math.round(timeoutMs / 1000)}s`);
       resolve({ ran: true, reason: 'timed out' });
     }, timeoutMs);

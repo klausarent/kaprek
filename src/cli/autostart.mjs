@@ -74,7 +74,11 @@ export function autostartFile({ platform = process.platform, command, args = [] 
   if (platform === 'win32') {
     // start "" /min so the console window does not sit in the way; the empty
     // title argument is start's own quirk and not optional.
-    return ['@echo off', `rem ${OWNERSHIP_MARKER}`, `start "" /min "${command}" ${argv.join(' ')}`, ''].join('\r\n');
+    // Each argument quoted: extraArgs is a parameter, and a value carrying a
+    // space or an `&` would otherwise change what the startup entry runs.
+    // (Grok's review.)
+    const quoted = argv.map((entry) => `"${String(entry).replace(/"/g, '')}"`).join(' ');
+    return ['@echo off', `rem ${OWNERSHIP_MARKER}`, `start "" /min "${command}" ${quoted}`, ''].join('\r\n');
   }
   if (platform === 'darwin') {
     const programArgs = [command, ...argv].map((entry) => `    <string>${xmlEscape(entry)}</string>`).join('\n');

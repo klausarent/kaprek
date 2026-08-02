@@ -26,7 +26,7 @@ const workflow = (overrides = {}) => buildWorkflow({ id: 'marketing-piece', titl
 describe('buildWorkflow', () => {
   test('bundles the four things that make a way of working', () => {
     const built = workflow({
-      recipe: { id: 'r', title: 'r', steps: [{ id: 'draft', agent: 'grok', tools: 'none' }], edges: [], budgets: {}, escalation: {} },
+      recipe: { id: 'r', title: 'r', steps: [{ id: 'draft', agent: 'grok' }], edges: [{ from: 'draft', to: 'draft' }] },
       councilLevel: 'plans',
       profile: ['This project publishes in German.'],
     });
@@ -101,12 +101,13 @@ describe('importSummary', () => {
           id: 'r',
           title: 'r',
           steps: [
-            { id: 'draft', agent: 'grok', tools: 'none' },
+            { id: 'draft', agent: 'grok' },
             { id: 'apply', agent: 'codex', tools: 'full' },
           ],
-          edges: [],
-          budgets: {},
-          escalation: {},
+          edges: [
+            { from: 'draft', to: 'apply' },
+            { from: 'apply', to: 'draft' },
+          ],
         },
         councilLevel: 'decisions',
         profile: ['a note'],
@@ -144,7 +145,7 @@ describe('what Grok found', () => {
         id: 'x',
         title: 't',
         preset,
-        recipe: { id: 'r', title: 'Runs in /home/klaus/repo', steps: [], edges: [], budgets: {}, escalation: {} },
+        recipe: { id: 'r', title: 'Runs in /home/klaus/repo', steps: [{ id: 'a', agent: 'grok' }], edges: [{ from: 'a', to: 'a' }] },
       }),
     ).toThrow(/absolute path/);
   });
@@ -154,5 +155,38 @@ describe('what Grok found', () => {
     // meant to explain the file.
     expect(() => importSummary({ ...workflow(), recipe: { id: 'r', title: 'r' } })).not.toThrow();
     expect(() => importSummary({ ...workflow(), recipe: { id: 'r', title: 'r', steps: [] } })).not.toThrow();
+  });
+});
+
+describe('what the second review found', () => {
+  test('secrets in any casing, and the ones with no name at all', () => {
+    const bad = [
+      'set api_key=abc123 before running',
+      'the password: hunter2 is in the vault',
+      'use xoxb-1234567890-abcdefghij for slack',
+      'npm_abcdefghij1234567890 goes in .npmrc',
+      'AKIAIOSFODNN7EXAMPLE is the access key id',
+      'bearer eyJhbGciOiJIUzI1NiIs.eyJzdWIiOiIxMjM0NTY3ODkw',
+      'clone from https://klaus:hunter2@git.example.com/repo',
+    ];
+    for (const text of bad) {
+      expect(() => buildWorkflow({ id: 'x', title: 't', preset: { ...preset, firstPrompt: text } })).toThrow(/secret/);
+    }
+  });
+
+  test('a broken recipe is refused at export, not stored for later', () => {
+    // Otherwise it sits in the catalog until somebody runs it.
+    expect(() =>
+      buildWorkflow({ id: 'x', title: 't', preset, recipe: { id: 'r', title: 'r', steps: [{ id: 'a', agent: 'nope' }], edges: [] } }),
+    ).toThrow(/agent/);
+  });
+
+  test('a council level has to be one of the four', () => {
+    expect(() => buildWorkflow({ id: 'x', title: 't', preset, councilLevel: 'sometimes' })).toThrow(/councilLevel/);
+    expect(() => buildWorkflow({ id: 'x', title: 't', preset, councilLevel: 'plans' })).not.toThrow();
+  });
+
+  test('ordinary wording is still allowed through', () => {
+    expect(() => buildWorkflow({ id: 'x', title: 'Keyboard shortcuts', preset: { ...preset, firstPrompt: 'The key question is what the reader wants.' } })).not.toThrow();
   });
 });

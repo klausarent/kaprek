@@ -18,6 +18,8 @@
 // complete and is not.
 import fs from 'node:fs';
 import path from 'node:path';
+import { validateRecipe } from '../relay/recipes.mjs';
+import { COUNCIL_LEVELS } from '../council/roles.mjs';
 
 export const WORKFLOW_VERSION = 1;
 
@@ -30,7 +32,30 @@ export class InvalidWorkflowError extends Error {
 }
 
 /** Anything that looks like it belongs to one machine or one account. */
-const SECRET_HINT = /\b([A-Z0-9_]*(?:TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL)[A-Z0-9_]*)\b|\bsk-[A-Za-z0-9]{8,}|\bghp_[A-Za-z0-9]{8,}/;
+// Case-insensitive on the identifiers, because `api_key=` and `password:`
+// are how they are written half the time — plus the shapes that need no name
+// at all: OpenAI, GitHub, Slack, npm, AWS, JWTs, PEM blocks, and a URL
+// carrying credentials. The first version caught SHOUTING_IDENTIFIERS only.
+// (Both reviews.)
+const SECRET_HINT = new RegExp(
+  [
+    // A SHOUTING identifier on its own: naming which key is needed already
+    // tells a stranger more than a shared file should.
+    '\\b[A-Z0-9_]*(?:TOKEN|SECRET|API_?KEY|PASSWORD|CREDENTIAL)[A-Z0-9_]*\\b',
+    // Any casing when it is being assigned — `api_key=`, `password:`.
+    '\\b[A-Za-z0-9_]*(?:token|secret|api[_-]?key|password|passwd|credential)[A-Za-z0-9_]*\\b\\s*[:=]',
+    // Shapes that need no name at all.
+    'sk-[A-Za-z0-9_-]{8,}',
+    'ghp_[A-Za-z0-9]{8,}',
+    'xox[baprs]-[A-Za-z0-9-]{8,}',
+    'npm_[A-Za-z0-9]{8,}',
+    'AKIA[0-9A-Z]{12,}',
+    'eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}',
+    '-----BEGIN [A-Z ]*PRIVATE KEY-----',
+    // A URL carrying credentials.
+    '://[^\\s/@]+:[^\\s/@]+@',
+  ].join('|'),
+);
 // Windows drive letters, UNC shares, ~ expansions, and any absolute POSIX
 // path — not just the three home directories the first version knew about.
 // /opt, /var, /tmp and \\server\share name one machine just as much as
@@ -85,12 +110,22 @@ export function buildWorkflow({ id, title, description = '', preset, recipe = nu
   if (typeof title !== 'string' || title.trim() === '') throw new InvalidWorkflowError('title', 'a workflow needs a title');
   if (!preset || typeof preset.firstPrompt !== 'string') throw new InvalidWorkflowError('preset', 'a workflow needs a preset with a first prompt');
 
+  // A recipe is validated as a recipe, not merely scanned as text. Without
+  // this an imported file could carry a broken graph, or a step with
+  // tools: 'full' that nothing had checked, sitting in the catalog until
+  // somebody ran it. (Both reviews.)
+  const checkedRecipe = recipe === null || recipe === undefined ? null : validateRecipe(recipe);
+  // A council level is one of four words, or nothing.
+  if (councilLevel !== null && !COUNCIL_LEVELS.includes(councilLevel)) {
+    throw new InvalidWorkflowError('councilLevel', `councilLevel must be one of ${COUNCIL_LEVELS.join(', ')} (got ${JSON.stringify(councilLevel)})`);
+  }
+
   // EVERY string that ends up in the file, not the four that were obvious.
   // A path in preset.description or a token in a recipe's title travels just
   // as far as one in the first prompt, and a hand-kept list of fields was
   // already out of step with the shape the day it was written. (Grok's
   // review.)
-  assertEveryString({ title, description, preset, recipe, profile }, 'workflow');
+  assertEveryString({ title, description, preset, recipe: checkedRecipe, profile }, 'workflow');
 
   return {
     version: WORKFLOW_VERSION,
@@ -104,7 +139,7 @@ export function buildWorkflow({ id, title, description = '', preset, recipe = nu
       goalTemplate: preset.goalTemplate ?? '',
       firstPrompt: preset.firstPrompt,
     },
-    recipe,
+    recipe: checkedRecipe,
     councilLevel,
     // Facts the work depends on, which is what makes a workflow more than a
     // prompt: the person receiving it gets the context the author had.
