@@ -19,6 +19,7 @@ export function parseArgs(argv) {
     dir: defaultDir(),
     redact: true,
     open: true,
+    lan: false,
     help: false,
   };
 
@@ -49,6 +50,12 @@ export function parseArgs(argv) {
         break;
       case '--no-open':
         result.open = false;
+        break;
+      // Off unless asked for, and asked for on the command line rather than
+      // in a settings file: opening a port to the network is not something
+      // that should be possible to turn on once and forget.
+      case '--lan':
+        result.lan = true;
         break;
       case '--help':
       case '-h':

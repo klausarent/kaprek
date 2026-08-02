@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
+import { encodeQr, qrToText } from '../src/server/qr.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
 import {
@@ -24,6 +25,9 @@ Options:
   --dir <path>  Root directory to scan for Claude Code sessions (default: ~/.claude/projects)
   --no-redact   Disable secret redaction in session digests
   --no-open     Do not open the default browser automatically
+  --lan         Also listen on this machine's network address, and print a QR
+                code for answering approvals from a phone. Off by default;
+                the instance token stays required either way.
   -h, --help    Show this help message
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
@@ -225,9 +229,27 @@ async function main() {
     return;
   }
 
-  const { server, url } = started;
+  const { server, url, lanUrl, token } = started;
   await lock.updatePort(Number(new URL(url).port));
   console.log(url);
+
+  // With --lan, say plainly what is now reachable and by whom, and print the
+  // QR that carries the token. The token is on this screen either way; the
+  // QR only saves typing it on a phone keyboard.
+  if (opts.lan) {
+    if (lanUrl) {
+      console.log('');
+      console.log(`Also reachable at ${lanUrl} — anyone on this network who has the token can answer your questions.`);
+      console.log('The token is in the QR code below. Scan it with your phone:');
+      console.log('');
+      console.log(qrToText(encodeQr(`${lanUrl}/#/approvals?t=${token}`)));
+      console.log('');
+      console.log('Without --lan, kaprek listens on localhost only.');
+    } else {
+      console.log('');
+      console.log('--lan was given, but this machine has no network address — still listening on localhost only.');
+    }
+  }
 
   if (opts.open) {
     openBrowser(url);

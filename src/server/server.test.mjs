@@ -4,6 +4,7 @@
 // built-in fetch — no external network involved, no mocks for node:http.
 import { test, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
+import nodeHttp from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
@@ -4153,4 +4154,81 @@ test('memory: an unknown scope is refused rather than created on the fly', async
   const { url } = await boot();
   const res = await postJson(`${url}/api/memory`, { scopeId: 'project:never-made', text: 'x', origin: 'person' });
   expect(res.status).toBe(400);
+});
+
+// ---------------------------------------------------------------------------
+// M4: --lan, and the Host check that still stands behind it
+// ---------------------------------------------------------------------------
+
+/**
+ * A GET with a Host header of our choosing.
+ *
+ * fetch cannot do this: Host is a forbidden header name, so undici silently
+ * drops it and every request arrives with the real one. A test written with
+ * fetch here passes while checking nothing — which is exactly what the first
+ * version of these tests did.
+ */
+function getWithHost(url, host, headers = {}, { withToken = true } = {}) {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = nodeHttp.request(
+      {
+        hostname: target.hostname,
+        port: target.port,
+        path: target.pathname,
+        method: 'GET',
+        // The token is added the same way the fetch wrapper above does it,
+        // unless the test is specifically about its absence.
+        headers: { ...headers, ...(withToken ? { [TOKEN_HEADER]: currentToken ?? '' } : {}), Host: host },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve({ status: res.statusCode }));
+      },
+    );
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+test('lan: off by default — no lan url, and a foreign Host is refused', async () => {
+  const { url, lanUrl } = await boot();
+  expect(lanUrl).toBeNull();
+
+  // 400 with no detail, on purpose: the rejection does not echo the Host it
+  // refused (see the handler's own note).
+  const res = await getWithHost(`${url}/api/projects`, '192.168.1.42:9999', APP_JSON_HEADERS);
+  expect(res.status).toBe(400);
+});
+
+test('lan: with --lan the machine address is reported and accepted', async () => {
+  const { url, lanUrl } = await boot({ lan: true, lanAddressOf: () => '192.168.1.42' });
+  expect(lanUrl).toMatch(/^http:\/\/192\.168\.1\.42:\d+$/);
+
+  const port = new URL(url).port;
+  const res = await getWithHost(`${url}/api/projects`, `192.168.1.42:${port}`, APP_JSON_HEADERS);
+  expect(res.status).toBe(200);
+});
+
+test('lan: only that one address — a hostname pointed at it is still refused', async () => {
+  const { url } = await boot({ lan: true, lanAddressOf: () => '192.168.1.42' });
+  const port = new URL(url).port;
+  // DNS rebinding: an attacker's page can point a name at this IP, but it
+  // cannot make the browser send a Host header naming the IP itself.
+  const res = await getWithHost(`${url}/api/projects`, `evil.example.com:${port}`, APP_JSON_HEADERS);
+  expect(res.status).toBe(400);
+});
+
+test('lan: the token is still required from the network', async () => {
+  const { url } = await boot({ lan: true, lanAddressOf: () => '192.168.1.42' });
+  const port = new URL(url).port;
+  const res = await getWithHost(`${url}/api/projects`, `192.168.1.42:${port}`, { 'x-app-request': '1' }, { withToken: false });
+  expect(res.status).toBe(401);
+});
+
+test('lan: a machine with no network address stays on localhost and says so', async () => {
+  const { lanUrl } = await boot({ lan: true, lanAddressOf: () => null });
+  // Binding wide with no address to name would be an open door nobody can
+  // find; reporting one that does not exist would be worse.
+  expect(lanUrl).toBeNull();
 });

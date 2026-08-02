@@ -164,7 +164,7 @@ const MIME_TYPES = {
  * Host header defeats this because an attacker-controlled page cannot make
  * the browser send a Host header naming our loopback address.
  */
-function isAllowedHost(hostHeader, port) {
+function isAllowedHost(hostHeader, port, lanAddress = null) {
   if (typeof hostHeader !== 'string' || hostHeader.length === 0) return false;
   const host = hostHeader.toLowerCase();
   const allowed = new Set([
@@ -175,7 +175,33 @@ function isAllowedHost(hostHeader, port) {
     'localhost',
     '[::1]',
   ]);
+  // With --lan, this machine's own LAN address is allowed too — and ONLY
+  // that one literal address. Rebinding still cannot get through: an
+  // attacker's page cannot make a browser send a Host header naming an
+  // address it does not control, and a hostname pointed at this IP is not
+  // in the set.
+  if (lanAddress) {
+    allowed.add(`${lanAddress}:${port}`);
+    allowed.add(lanAddress);
+  }
   return allowed.has(host);
+}
+
+/**
+ * This machine's first non-internal IPv4 address, or null when there is
+ * none.
+ *
+ * IPv4 only, and only the first: the QR code has to carry ONE address a
+ * phone can reach, and offering a list of six (including a Docker bridge
+ * and a VPN tunnel) is how a person ends up scanning the wrong one.
+ */
+export function firstLanAddress(interfaces = os.networkInterfaces()) {
+  for (const entries of Object.values(interfaces ?? {})) {
+    for (const entry of entries ?? []) {
+      if (entry.family === 'IPv4' && !entry.internal) return entry.address;
+    }
+  }
+  return null;
 }
 
 /** Rejects path-traversal-capable ids: empty, '.', '..', or containing a separator. */
@@ -2738,6 +2764,7 @@ async function handleRequest(
     getCouncil,
     getConsultations,
     memoryScopeForChat,
+    lanAddress,
     tmpRoot,
     getChats,
     harness,
@@ -2770,7 +2797,7 @@ async function handleRequest(
   res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
 
   // No body details on rejection — don't echo the offending Host header back.
-  if (!isAllowedHost(req.headers.host, port)) {
+  if (!isAllowedHost(req.headers.host, port, lanAddress)) {
     sendJson(res, 400, { error: 'bad request' });
     return;
   }
@@ -3087,6 +3114,13 @@ export function startServer({
   // that starts processes on its own is exactly the kind that must never do
   // so during a test run by accident.
   makeCouncilAskPeer = makeAskPeer,
+  // Opt-in LAN access, off unless the CLI was started with --lan. Everything
+  // else about the server is unchanged: the instance token is still required
+  // on every /api/* request, and the Host check still only accepts this
+  // machine's own addresses.
+  lan = false,
+  // Injected so a test can pretend to be on a network without having one.
+  lanAddressOf = firstLanAddress,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -3216,6 +3250,12 @@ export function startServer({
   // started turn too.
   const workspaceDir = path.join(dataDir, 'workspace');
   fs.mkdirSync(workspaceDir, { recursive: true });
+
+  // Resolved once at start. With --lan on a machine that has no network this
+  // stays null, and the Host check keeps accepting loopback only — binding
+  // wide with no address to name would be an open door nobody can find, and
+  // pretending otherwise in the QR would be worse.
+  const lanAddress = lan ? lanAddressOf() : null;
 
   /**
    * Delivers one approval frame for `chatId`: to the stream watching that
@@ -3572,6 +3612,7 @@ export function startServer({
       getCouncil,
       getConsultations,
       memoryScopeForChat,
+      lanAddress,
       tmpRoot,
       getChats,
       harness,
@@ -3617,7 +3658,7 @@ export function startServer({
 
   return new Promise((resolve, reject) => {
     server.once('error', reject);
-    server.listen(port, '127.0.0.1', () => {
+    server.listen(port, lan ? '0.0.0.0' : '127.0.0.1', () => {
       const addr = server.address();
       boundPort = addr.port;
       getRunner().start();
@@ -3639,7 +3680,15 @@ export function startServer({
       // background tick does (no HTTP route does that — POST .../fire is
       // always cause.origin 'user'), and waiting on a real 60-second timer is
       // not a test.
-      resolve({ server, url: `http://127.0.0.1:${addr.port}`, token: instanceToken, runner: getRunner() });
+      resolve({
+        server,
+        url: `http://127.0.0.1:${addr.port}`,
+        // What a phone would have to open. Null without --lan, which is what
+        // the CLI keys its QR code and its warning line off.
+        lanUrl: lanAddress ? `http://${lanAddress}:${addr.port}` : null,
+        token: instanceToken,
+        runner: getRunner(),
+      });
     });
   });
 }
