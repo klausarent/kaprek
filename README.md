@@ -46,6 +46,7 @@ Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI 
 - Guided planning: say what you want to build and answer a few cards instead of a wall of questions; the plan lands at a path kaprek chose and shows up under [Plans](#plans) — with its full path, so you never go hunting through folders for it.
 - Council: put your engines in four roles (lead, thinker, worker, peer) and ask the ones you are not using for a second opinion — kaprek shows where they disagree rather than smoothing it over. See [Council](#council).
 - Recipes: a relay run's shape is a file, not code — who takes part, which handoff asks you first, which step may touch files. See [Relays and recipes](#relays-and-recipes).
+- Memory with scopes: what one agent learned is there for the next one, and a scope that is not on your path upwards is invisible — see [Memory](#memory).
 - Setup page (`#/setup`): which agent CLIs are installed and signed in on this machine, where their config lives, which MCP servers they have, and which keys your `.env` defines — paths and names only, never a value.
 
 ## Missions
@@ -203,6 +204,42 @@ an unknown recipe id, a duplicate step id, or a step no edge leads to.
 
 Starting a relay from a trigger stays deliberately closed — an unattended
 loop that starts itself is the one thing on the kill list.
+
+## Memory
+
+What was learned while working, kept per scope, so the next agent starts
+with it instead of rediscovering it.
+
+A scope is `person:` → `project:` → `mission:`, and **visibility runs
+upwards, never down**. A mission sees its project sees its person; a person
+does not see into their missions, and two trees that do not share a parent
+see nothing of each other. That single rule is both halves of what memory
+has to do: what Codex learned about a project is there for Claude, and a
+scope belonging to somebody else's work is not readable from yours. Both are
+tests, not assurances.
+
+A turn inside a mission is given what its scope knows — profile first, then
+facts, evidence only on request — and can add to it by answering with a
+fenced block:
+
+````
+```kaprek-remember
+{"text": "the deploy token lives in the CI settings, not in .env", "kind": "fact"}
+```
+````
+
+The agent supplies the text; kaprek attaches the owner. An agent that could
+name its own scope could write into one it may not read. A chat outside any
+mission has no scope and neither reads nor writes.
+
+Every statement carries an origin and an age. Past 90 days without a verify
+it still comes back, marked stale — an agent that forgets on a schedule is
+one nobody can reason about. Forgetting is an event with a reason, and
+evidence is a pointer into a session, never a copied excerpt. `#/memory`
+shows one scope at a time; there is deliberately no "everything" view.
+
+Not built, deliberately: vector search, embeddings, automatic summarizing of
+raw transcripts, syncing between machines.
 
 ## Search
 

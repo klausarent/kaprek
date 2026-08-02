@@ -1320,3 +1320,54 @@ export async function fetchEnvironment(): Promise<EnvironmentReport> {
   await throwOnError(res);
   return (await res.json()) as EnvironmentReport;
 }
+
+// ---------------------------------------------------------------------------
+// Memory (GET/POST /api/memory — src/memory/store.mjs)
+// ---------------------------------------------------------------------------
+
+export type MemoryScope = { id: string; kind: string; label: string; parent: string | null };
+
+export type MemoryEntry = {
+  id: string;
+  scopeId: string;
+  kind: "profile" | "fact" | "evidence";
+  text: string;
+  origin: string;
+  confidence: number;
+  createdAt: string;
+  lastVerifiedAt: string;
+  evidenceRef: { sessionId: string; eventIndex: number } | null;
+  forgotten: boolean;
+  forgottenReason?: string | null;
+  /** Older than 90 days without a verify. Shown, never hidden. */
+  stale: boolean;
+  ageMs: number;
+};
+
+export async function fetchMemoryScopes(): Promise<MemoryScope[]> {
+  const res = await apiFetch("/api/memory/scopes");
+  await throwOnError(res);
+  return (await res.json()).scopes as MemoryScope[];
+}
+
+export async function fetchMemories(scopeId: string, query = ""): Promise<MemoryEntry[]> {
+  const params = new URLSearchParams({ scopeId, ...(query ? { q: query } : {}) });
+  const res = await apiFetch(`/api/memory?${params.toString()}`);
+  await throwOnError(res);
+  return (await res.json()).memories as MemoryEntry[];
+}
+
+export async function verifyMemory(id: string): Promise<MemoryEntry> {
+  const res = await apiFetch(`/api/memory/${encodeURIComponent(id)}/verify`, { method: "POST", headers: { ...APP_HEADERS, "Content-Type": "application/json" }, body: "{}" });
+  await throwOnError(res);
+  return (await res.json()).memory as MemoryEntry;
+}
+
+export async function forgetMemory(id: string, reason: string): Promise<void> {
+  const res = await apiFetch(`/api/memory/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ reason }),
+  });
+  await throwOnError(res);
+}

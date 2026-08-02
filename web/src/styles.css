@@ -2262,3 +2262,39 @@ pre,
   padding: 0.4rem 0;
   border-bottom: 1px solid var(--border);
 }
+
+/* #/memory — one scope at a time. */
+.memory-controls {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0.75rem 0;
+}
+
+.memory-row {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  margin-bottom: 0.5rem;
+}
+
+/* Old enough that it is worth a second look — shown, never hidden. */
+.memory-row-stale {
+  border-left: 3px solid var(--warn, #b45309);
+}
+
+.memory-row-head {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+
+.memory-text {
+  margin: 0.35rem 0;
+}
+
+.memory-actions {
+  display: flex;
+  gap: 0.75rem;
+}
