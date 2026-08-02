@@ -18,6 +18,13 @@ const READ_ONLY_TOOLS = 'read_file,grep,list_dir';
 const REVIEW_MAX_TURNS = 40;
 
 /**
+ * How long a peer may be silent before kaprek gives up on it. Generous
+ * because a reviewer's silence means it is reading, not that it is stuck —
+ * the opposite of a chat turn, where two minutes of nothing is a hung CLI.
+ */
+const PEER_IDLE_MS = 6 * 60 * 1000;
+
+/**
  * What a council answer looks like, for drivers that can constrain output to
  * a schema. Mirrors what src/council/consult.mjs::parseVerdict accepts —
  * a peer forced into the RELAY's {status, message} shape had its perfectly
@@ -88,6 +95,14 @@ export function makeAskPeer({ cwd, timeoutMs } = {}) {
       },
       signal,
       ...(timeoutMs ? { absoluteTimeoutMs: timeoutMs } : {}),
+      // A reviewer is quiet while it reads. Live run: codex died on the
+      // IDLE clock at two minutes — not the wall clock — because reading
+      // inside its read-only sandbox emits nothing for minutes at a time,
+      // and reported "answered with nothing". Raising the wall clock alone
+      // fixed nothing; this is the clock that was actually firing.
+      idleMs: PEER_IDLE_MS,
+      toolLeaseMs: PEER_IDLE_MS,
+      timeoutMs: timeoutMs ?? undefined,
     });
     if (turn?.error) throw new Error(turn.error.message);
     // A turn that ended any other way than by finishing produced whatever
