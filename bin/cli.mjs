@@ -330,7 +330,7 @@ async function main() {
     return;
   }
 
-  const { server, url, lanUrl, token } = started;
+  const { server, url, lanUrl, token, approvalToken } = started;
   await lock.updatePort(Number(new URL(url).port));
   console.log(url);
 
@@ -340,12 +340,17 @@ async function main() {
   if (opts.lan) {
     if (lanUrl) {
       console.log('');
-      console.log(`Also reachable at ${lanUrl} — anyone on this network who has the token can answer your questions.`);
-      console.log('The token is in the QR code below. Scan it with your phone:');
+      console.log(`Also reachable at ${lanUrl} — for answering questions, and only that.`);
+      console.log('Scan this with your phone:');
       console.log('');
-      console.log(qrToText(encodeQr(`${lanUrl}/#/approvals?t=${token}`)));
+      // The QR carries a token that may read the inbox and answer one
+      // question. Not the instance token: that authorises every route,
+      // including the one whose job is to run a command. (Codex' review.)
+      console.log(qrToText(encodeQr(`${lanUrl}/#/approvals?t=${approvalToken}`)));
       console.log('');
-      console.log('Without --lan, kaprek listens on localhost only.');
+      console.log('That code lets a phone answer approvals. It cannot start chats,');
+      console.log('change settings, or read your transcripts, and it is gone when');
+      console.log('kaprek stops. Without --lan, kaprek listens on localhost only.');
     } else {
       console.log('');
       console.log('--lan was given, but this machine has no network address — still listening on localhost only.');

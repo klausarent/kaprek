@@ -20,7 +20,9 @@ function fakeSpawn(calls, { fail = false, hang = false } = {}) {
   return (command, args, options) => {
     calls.push({ command, args, options });
     const child = new EventEmitter();
-    child.stdin = { end: (value) => calls.push({ stdin: value }) };
+    // .on too: the real stream gets an error listener so an EPIPE from a
+    // notifier that closed stdin early does not take the process down.
+    child.stdin = { end: (value) => calls.push({ stdin: value }), on: () => {} };
     child.kill = () => calls.push({ killed: true });
     if (fail) queueMicrotask(() => child.emit('error', new Error('spawn ENOENT')));
     else if (!hang) queueMicrotask(() => child.emit('exit', 0));

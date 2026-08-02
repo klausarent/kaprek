@@ -91,11 +91,22 @@ export function latestVersion({ timeoutMs = 8000, get = https.get } = {}) {
       res.setEncoding('utf8');
       res.on('data', (chunk) => {
         body += chunk;
+        // A slow drip or an enormous answer must not grow without limit —
+        // the thing being read is one version string. (Codex' review.)
+        if (body.length > 64 * 1024) {
+          res.destroy();
+          reject(new Error('the npm registry sent more than a version number'));
+        }
       });
       res.on('end', () => {
         try {
           const version = JSON.parse(body).version;
-          if (typeof version !== 'string') throw new Error('no version in the answer');
+          // Checked before it reaches a terminal or a comparison: an answer
+          // is not a promise, and control characters in it would be printed
+          // as-is. (Codex' review.)
+          if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+            throw new Error('the registry did not answer with a version number');
+          }
           resolve(version);
         } catch (err) {
           reject(new Error(`could not read the registry's answer: ${err.message}`));

@@ -8,6 +8,7 @@
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
@@ -214,6 +215,19 @@ function isSafeId(id) {
   if (id.includes('/') || id.includes('\\')) return false;
   if (id.includes('..')) return false;
   return true;
+}
+
+/**
+ * What the phone's token may reach: the inbox, and answering one question.
+ *
+ * A whitelist of exact routes rather than a prefix. `/api/approvals*` would
+ * be the same code today and a wider permission after the next route that
+ * happens to start with those letters.
+ */
+export function approvalTokenAllows(pathname, method) {
+  if (pathname === '/api/approvals' && method === 'GET') return true;
+  if (/^\/api\/approvals\/[^/]+$/.test(pathname) && method === 'POST') return true;
+  return false;
 }
 
 /** Rejects task ids that aren't a well-formed UUID (board task ids are crypto.randomUUID()). */
@@ -2836,6 +2850,7 @@ async function handleRequest(
     getConsultations,
     memoryScopeForChat,
     lanAddress,
+    approvalToken,
     tmpRoot,
     getChats,
     harness,
@@ -2891,9 +2906,19 @@ async function handleRequest(
   // index.html-only exception would ship an app that never loads. Static
   // delivery is read-only and exposes nothing beyond the shipped web build.
   if (segments[0] === 'api' && !timingSafeTokenEqual(req.headers[TOKEN_HEADER], instanceToken)) {
-    res.writeHead(401);
-    res.end();
-    return;
+    // The phone's token: valid, but only for answering questions. Anything
+    // else it asks for is a 403 with a reason rather than a bare 401 — the
+    // token IS good, the route is not for it.
+    const isApprovalToken = approvalToken !== null && timingSafeTokenEqual(req.headers[TOKEN_HEADER], approvalToken);
+    if (!isApprovalToken) {
+      res.writeHead(401);
+      res.end();
+      return;
+    }
+    if (!approvalTokenAllows(url.pathname, req.method)) {
+      sendJson(res, 403, { error: 'this token may only answer approvals' });
+      return;
+    }
   }
 
   // CSRF hardening: every non-GET route requires this custom header. A
@@ -3352,6 +3377,23 @@ export function startServer({
   // that ever ends up in a prompt, a tool input or a CLI reply is stored as
   // [REDACTED] instead of verbatim in a transcript on disk.
   const instanceToken = ensureInstanceToken(dataDir);
+
+  // A SECOND token, for the phone, that may do exactly one thing.
+  //
+  // The QR was described as "answer approvals from your phone" and carried
+  // the instance token, which authorises every route there is — including
+  // PUT /api/notify, whose whole job is to run a command. Someone who
+  // scanned that QR, or later picked up the phone, could point the notifier
+  // at powershell and wait for the next question. Codex' review found this
+  // and it is the worst thing in today's code.
+  //
+  // So the QR carries this instead: generated per run, never written to
+  // disk, and accepted on the approval routes and nowhere else. Losing it to
+  // a restart is the point — a token that outlives the evening it was shown
+  // on a screen is a key under the doormat.
+  const approvalToken = lan ? crypto.randomBytes(24).toString('base64url') : null;
+
+
   registerSecret(instanceToken);
 
   // Board is opened lazily on first access to a board route, not eagerly at
@@ -3844,6 +3886,7 @@ export function startServer({
       getConsultations,
       memoryScopeForChat,
       lanAddress,
+      approvalToken,
       tmpRoot,
       getChats,
       harness,
@@ -3927,6 +3970,9 @@ export function startServer({
         // the CLI keys its QR code and its warning line off.
         lanUrl: lanAddress ? `http://${lanAddress}:${addr.port}` : null,
         token: instanceToken,
+        // What the QR should carry: enough to answer a question, and nothing
+        // else. Null without --lan, because there is no phone to give it to.
+        approvalToken,
         runner: getRunner(),
       });
     });

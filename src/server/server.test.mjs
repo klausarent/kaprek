@@ -4365,3 +4365,40 @@ test('chat: a finished quiz is not offered again on reload', async () => {
 
   expect((await (await fetch(`${url}/api/chat/${chatId}`)).json()).openQuiz).toBeUndefined();
 });
+
+test('lan: the phone token answers approvals and nothing else', async () => {
+  const { url, approvalToken, token } = await boot({ lan: true, lanAddressOf: () => '127.0.0.1' });
+  expect(approvalToken).toBeTruthy();
+  expect(approvalToken).not.toBe(token);
+
+  const withPhone = (path, method = 'GET') =>
+    rawFetch(`${url}${path}`, { method, headers: { [TOKEN_HEADER]: approvalToken, 'x-app-request': '1', 'Content-Type': 'application/json' }, ...(method === 'POST' ? { body: '{}' } : {}) });
+
+  // The inbox: yes.
+  expect((await withPhone('/api/approvals')).status).toBe(200);
+
+  // Everything else: no. PUT /api/notify is the one that matters — its whole
+  // job is to run a command, and the QR used to carry a token that could set
+  // it. (Codex' review.)
+  for (const [path, method] of [
+    ['/api/notify', 'PUT'],
+    ['/api/chat/turn', 'POST'],
+    ['/api/projects', 'GET'],
+    ['/api/memory/scopes', 'POST'],
+    ['/api/workflows', 'POST'],
+    ['/api/council', 'GET'],
+  ]) {
+    const res = await withPhone(path, method);
+    expect(`${method} ${path}: ${res.status}`).toBe(`${method} ${path}: 403`);
+  }
+});
+
+test('lan: without the flag there is no phone token at all', async () => {
+  expect((await boot()).approvalToken).toBeNull();
+});
+
+test('lan: a made-up token is still a plain 401', async () => {
+  const { url } = await boot({ lan: true, lanAddressOf: () => '127.0.0.1' });
+  const res = await rawFetch(`${url}/api/approvals`, { headers: { [TOKEN_HEADER]: 'not-a-real-token', 'x-app-request': '1' } });
+  expect(res.status).toBe(401);
+});

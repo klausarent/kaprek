@@ -319,12 +319,16 @@ and the answer reaches the turn that is waiting for it.
 
 What holds either way:
 
-- **The token is only handed out over loopback.** Normally kaprek puts it in
-  the page it serves, which is how the browser on this machine gets it
-  without anyone typing. A request from the network gets the page *without*
-  it and has to bring one — that is what the QR carries, and it is why the
-  QR is not decoration. The phone keeps it per tab and strips it out of the
-  address bar.
+- **The QR carries a second, narrower token.** It may read the inbox and
+  answer one question. That is the whole list — it cannot start a chat, read
+  a transcript, or change a setting, and `PUT /api/notify` is refused
+  outright, which matters because that route's job is to run a command. The
+  token is generated per run and never written to disk, so it dies when
+  kaprek stops.
+- **The instance token is only handed out over loopback.** kaprek normally
+  puts it in the page it serves, which is how the browser on this machine
+  gets it without anyone typing. A request from the network gets the page
+  *without* it and has to bring its own.
 - **The Host check gains exactly one address**, this machine's own. A
   hostname pointed at that IP is still refused, so DNS rebinding gets no
   further than it did before.

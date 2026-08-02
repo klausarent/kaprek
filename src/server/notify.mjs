@@ -61,9 +61,13 @@ export function writeNotify(dataDir, command) {
   if (!Array.isArray(command)) throw new InvalidNotifyError('command must be an array like ["ntfy", "publish", "my-topic"] — not a shell string');
   const parts = command.filter((part) => typeof part === 'string' && part.trim() !== '');
   if (parts.length === 0) throw new InvalidNotifyError('command must have at least the program to run');
-  fs.mkdirSync(dataDir, { recursive: true });
+  // 0600, and the directory 0700: a notify command usually carries a webhook
+  // URL or a token as a plain argument, and the default 0644 hands it to
+  // every other account on the machine. (Codex' review.) A no-op on Windows,
+  // where ACLs inherit from the user profile.
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   const tmp = `${configPath(dataDir)}.tmp-${process.pid}`;
-  fs.writeFileSync(tmp, `${JSON.stringify({ command: parts }, null, 2)}\n`, 'utf8');
+  fs.writeFileSync(tmp, `${JSON.stringify({ command: parts }, null, 2)}\n`, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, configPath(dataDir));
   return { command: parts, configured: true };
 }
@@ -125,6 +129,10 @@ export async function notify({ dataDir, text, context = {}, spawnFn = spawn, tim
       resolve({ ran: true });
     });
 
+    // A notifier that closes stdin early turns this into an EPIPE, which is
+    // an unhandled 'error' event on the stream and takes the process with
+    // it. (Codex' review.)
+    child.stdin?.on('error', () => {});
     try {
       child.stdin?.end(String(text ?? ''));
     } catch {

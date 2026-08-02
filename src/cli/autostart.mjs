@@ -14,6 +14,27 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+/**
+ * Written into every entry, so uninstall can tell kaprek's file from
+ * something else that happens to share the name. Without it, `autostart
+ * uninstall` deleted whatever sat at that path. (Codex' review.)
+ */
+const OWNERSHIP_MARKER = 'written by kaprek autostart';
+
+/** XML text escaping for the plist: an `&` or `<` in a path makes the file invalid. */
+function xmlEscape(value) {
+  return String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/**
+ * .desktop Exec escaping. A space splits arguments, and %f/%u are field codes
+ * the desktop replaces with file names — a path containing either launches
+ * something other than what was meant.
+ */
+function desktopExec(parts) {
+  return parts.map((part) => `"${String(part).replace(/(["\\`$])/g, '\\$1').replace(/%/g, '%%')}"`).join(' ');
+}
+
 /** What the entry is called on each platform, so status/uninstall can find it. */
 const ENTRY_NAME = {
   win32: 'kaprek.cmd',
@@ -53,10 +74,10 @@ export function autostartFile({ platform = process.platform, command, args = [] 
   if (platform === 'win32') {
     // start "" /min so the console window does not sit in the way; the empty
     // title argument is start's own quirk and not optional.
-    return ['@echo off', `start "" /min "${command}" ${argv.join(' ')}`, ''].join('\r\n');
+    return ['@echo off', `rem ${OWNERSHIP_MARKER}`, `start "" /min "${command}" ${argv.join(' ')}`, ''].join('\r\n');
   }
   if (platform === 'darwin') {
-    const programArgs = [command, ...argv].map((entry) => `    <string>${entry}</string>`).join('\n');
+    const programArgs = [command, ...argv].map((entry) => `    <string>${xmlEscape(entry)}</string>`).join('\n');
     return [
       '<?xml version="1.0" encoding="UTF-8"?>',
       '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
@@ -68,12 +89,13 @@ export function autostartFile({ platform = process.platform, command, args = [] 
       programArgs,
       '  </array>',
       '  <key>RunAtLoad</key><true/>',
+      `  <key>Comment</key><string>${OWNERSHIP_MARKER}</string>`,
       '</dict>',
       '</plist>',
       '',
     ].join('\n');
   }
-  return ['[Desktop Entry]', 'Type=Application', 'Name=kaprek', `Exec=${command} ${argv.join(' ')}`, 'X-GNOME-Autostart-enabled=true', ''].join('\n');
+  return ['[Desktop Entry]', 'Type=Application', 'Name=kaprek', `Exec=${desktopExec([command, ...argv])}`, 'X-GNOME-Autostart-enabled=true', `Comment=${OWNERSHIP_MARKER}`, ''].join('\n');
 }
 
 /** How this machine would launch kaprek, given how it is installed right now. */
@@ -99,6 +121,18 @@ export function install({ platform = process.platform, home = os.homedir(), env 
 export function uninstall({ platform = process.platform, home = os.homedir(), env = process.env } = {}) {
   const target = autostartPath(platform, home, env);
   if (!target || !fs.existsSync(target)) return { removed: false, path: target };
+  // Only kaprek's own file. Something else at that path belongs to somebody
+  // else, and deleting it because it shares a name is not an uninstall.
+  // (Codex' review.)
+  let contents = '';
+  try {
+    contents = fs.readFileSync(target, 'utf8');
+  } catch {
+    return { removed: false, path: target, reason: 'the file could not be read' };
+  }
+  if (!contents.includes(OWNERSHIP_MARKER)) {
+    return { removed: false, path: target, reason: 'that file was not written by kaprek — delete it yourself if you meant to' };
+  }
   fs.rmSync(target);
   return { removed: true, path: target };
 }

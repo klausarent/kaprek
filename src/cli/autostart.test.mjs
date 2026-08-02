@@ -84,3 +84,37 @@ describe('install, status, uninstall', () => {
     expect(status({ platform: 'aix', home, env: {} }).supported).toBe(false);
   });
 });
+
+describe('what Codex found', () => {
+  test('a path with & or < does not break the plist', () => {
+    const file = autostartFile({ platform: 'darwin', command: '/opt/tools & things/<node>' });
+    expect(file).toContain('&amp;');
+    expect(file).toContain('&lt;node&gt;');
+    // The raw characters would make the XML invalid or change what it says.
+    expect(file).not.toMatch(/<string>[^<]*&(?!amp;|lt;|gt;)/);
+  });
+
+  test('a path with spaces or a field code survives the .desktop Exec line', () => {
+    const file = autostartFile({ platform: 'linux', command: '/home/someone/my tools/kaprek %f' });
+    // Quoted, and % doubled — an unquoted space splits arguments and %f is a
+    // field code the desktop replaces with a filename.
+    expect(file).toMatch(/Exec="[^"]*my tools[^"]*"/);
+    expect(file).toContain('%%f');
+  });
+
+  test('uninstall leaves a file kaprek did not write', () => {
+    const target = autostartPath('linux', home, {});
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, '[Desktop Entry]\nName=something else\n', 'utf8');
+
+    const result = uninstall({ platform: 'linux', home, env: {} });
+    expect(result.removed).toBe(false);
+    expect(result.reason).toMatch(/not written by kaprek/);
+    expect(fs.existsSync(target)).toBe(true);
+  });
+
+  test('and still removes its own', () => {
+    install({ platform: 'linux', home, env: {}, scriptPath: '/x/cli.mjs' });
+    expect(uninstall({ platform: 'linux', home, env: {} }).removed).toBe(true);
+  });
+});
