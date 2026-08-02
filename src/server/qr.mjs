@@ -17,7 +17,7 @@
 // code and no more correct.
 
 /** Data codeword capacity and ECC block layout per version, for level L and M. */
-const VERSIONS = [
+export const VERSIONS = [
   // [version, totalCodewords, {L: [eccPerBlock, group1Blocks, group1Words, group2Blocks, group2Words], M: [...]}]
   [1, 26, { L: [7, 1, 19, 0, 0], M: [10, 1, 16, 0, 0] }],
   [2, 44, { L: [10, 1, 34, 0, 0], M: [16, 1, 28, 0, 0] }],
@@ -28,8 +28,16 @@ const VERSIONS = [
   [7, 196, { L: [20, 2, 78, 0, 0], M: [18, 4, 31, 0, 0] }],
   [8, 242, { L: [24, 2, 97, 0, 0], M: [22, 2, 38, 2, 39] }],
   [9, 292, { L: [30, 2, 116, 0, 0], M: [22, 3, 36, 2, 37] }],
-  [10, 346, { L: [18, 4, 68, 2, 69], M: [26, 4, 43, 1, 44] }],
+  [10, 346, { L: [18, 2, 68, 2, 69], M: [26, 4, 43, 1, 44] }],
 ];
+
+/**
+ * Every row must satisfy data + blocks*ecc === total, or the encoder accepts
+ * more data than the matrix holds and placeData() silently cuts the stream
+ * at the edge. Version 10 at level L claimed 4x68+2x69 data words with 6x18
+ * ecc — 518 codewords in a 346-codeword matrix, so a 400-byte input was
+ * accepted and truncated. (Codex' review; asserted in the tests.)
+ */
 
 /** Where the alignment pattern centres sit, per version (version 1 has none). */
 const ALIGNMENT = [[], [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
@@ -287,7 +295,12 @@ function placeFormat(grid, level, mask) {
   const size = grid.length;
   const bits = FORMAT_BITS[level][mask];
   for (let i = 0; i < 15; i += 1) {
-    const bit = (bits >> i) & 1;
+    // MSB first: position 0 carries bit 14. Written the other way round
+    // until a real decoder was pointed at it — OpenCV recognised the code and
+    // returned nothing, because a scanner that cannot read the format
+    // information cannot know the mask. Checked against a reference matrix:
+    // its bits, read MSB-first, land exactly on this table's L/mask-3 entry.
+    const bit = (bits >> (14 - i)) & 1;
     // Copy one: around the top-left finder.
     if (i < 6) grid[8][i] = bit;
     else if (i === 6) grid[8][7] = bit;

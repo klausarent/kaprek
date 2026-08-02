@@ -7,7 +7,7 @@
 // it — that is the live acceptance, and it is stated as such rather than
 // implied by a green suite.
 import { describe, test, expect } from 'vitest';
-import { encodeQr, qrToSvg, qrToText } from './qr.mjs';
+import { VERSIONS as VERSIONS_FOR_TEST, encodeQr, qrToSvg, qrToText } from './qr.mjs';
 import { isLoopbackRequest } from './server.mjs';
 
 /** The encoder's own tables, imported so the reader below can check against them rather than re-deriving. */
@@ -268,7 +268,9 @@ function decodeQr(matrix) {
     else if (i === 7) bit = matrix[8][8];
     else if (i === 8) bit = matrix[7][8];
     else bit = matrix[14 - i][8];
-    value |= bit << i;
+    // MSB first, matching the encoder — and matching a reference matrix from
+    // an independent encoder, which is what settled it.
+    value |= bit << (14 - i);
   }
 
   let mask = null;
@@ -385,5 +387,27 @@ describe('version information (version 7 and up)', () => {
     // writes eight codewords into cells placeVersion then overwrites.
     const text = 'https://192.168.178.63:4900/#/approvals?t=' + 'a'.repeat(110);
     expect(decodeQr(encodeQr(text, 'L')).text).toBe(text);
+  });
+});
+
+describe('the version tables add up', () => {
+  test('data words plus ecc words equal the version total, every row', () => {
+    // Version 10 at L claimed 518 codewords in a 346-codeword matrix, so a
+    // 400-byte input was accepted and then cut off at the matrix edge.
+    // (Codex' review.) An arithmetic invariant catches the whole class.
+    for (const [version, total, levels] of VERSIONS_FOR_TEST) {
+      for (const [level, [ecc, g1Blocks, g1Words, g2Blocks, g2Words]] of Object.entries(levels)) {
+        const data = g1Blocks * g1Words + g2Blocks * g2Words;
+        const blocks = g1Blocks + g2Blocks;
+        expect(`v${version}/${level}: ${data + blocks * ecc}`).toBe(`v${version}/${level}: ${total}`);
+      }
+    }
+  });
+
+  test('what it refuses matches what it can hold', () => {
+    // 271 bytes is the documented ceiling at L; one more must be refused
+    // rather than truncated.
+    expect(() => encodeQr('x'.repeat(271), 'L')).not.toThrow();
+    expect(() => encodeQr('x'.repeat(400), 'L')).toThrow(/too much data/);
   });
 });
