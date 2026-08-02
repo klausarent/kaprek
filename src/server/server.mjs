@@ -69,6 +69,7 @@ import { loadRecipes } from '../relay/recipes.mjs';
 import { engineIdsByReadiness, nextSteps, scanEnvironment } from '../scan/environment.mjs';
 import { openMemory, MemoryNotFoundError, InvalidMemoryError } from '../memory/store.mjs';
 import { InvalidScopeError } from '../memory/scopes.mjs';
+import { openPolicy, ProposalNotFoundError } from '../memory/policy.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
@@ -1494,6 +1495,32 @@ function startCouncilForPlan({ getCouncil, chats, chatId, cwd, dataDir, result }
  */
 async function handleMemoryRoutes(req, res, segments, url, { dataDir }) {
   const memory = openMemory(dataDir);
+
+  // /api/memory/proposals — rules kaprek noticed and wrote down, waiting for
+  // a person. Nothing here affects a turn until it is accepted.
+  if (segments[2] === 'proposals') {
+    const policy = openPolicy(dataDir);
+    if (segments.length === 3 && req.method === 'GET') {
+      sendJson(res, 200, { proposals: policy.list({ status: url.searchParams.get('status') }) });
+      return;
+    }
+    if (segments.length === 4 && req.method === 'POST') {
+      const body = await readJsonBody(req);
+      if (!body.ok) {
+        sendJson(res, body.status, { error: body.error });
+        return;
+      }
+      try {
+        sendJson(res, 200, { proposal: policy.decide(segments[3], body.data?.status, body.data?.reason ?? null) });
+      } catch (err) {
+        if (err instanceof ProposalNotFoundError) sendJson(res, 404, { error: err.message });
+        else sendJson(res, 400, { error: err.message });
+      }
+      return;
+    }
+    sendJson(res, 405, { error: 'method not allowed' });
+    return;
+  }
 
   if (segments.length === 3 && segments[2] === 'scopes') {
     if (req.method === 'GET') {

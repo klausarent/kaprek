@@ -11,6 +11,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import http from 'node:http';
 import { startServer } from '../src/server/server.mjs';
 
 const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-m3-'));
@@ -35,36 +36,49 @@ async function api(pathname, init = {}) {
   }
 }
 
-/** One turn, drained. Returns the assistant text and the turn-complete frame. */
-async function turn({ text, missionId, chatId, engine }) {
-  const res = await fetch(`${url}/api/chat/turn`, {
-    method: 'POST',
-    headers: H,
-    body: JSON.stringify({ text, ...(missionId ? { missionId } : {}), ...(chatId ? { chatId } : {}), ...(engine ? { engine } : {}) }),
+/**
+ * One turn, drained over node:http rather than fetch.
+ *
+ * fetch's body timeout (undici, five minutes without a frame) kills a
+ * perfectly healthy turn that is still thinking: the first two attempts at
+ * this acceptance died there while the server carried on working. node:http
+ * has no such limit, which is what an SSE client needs.
+ */
+function turn({ text, missionId, chatId, engine }) {
+  const body = JSON.stringify({ text, ...(missionId ? { missionId } : {}), ...(chatId ? { chatId } : {}), ...(engine ? { engine } : {}) });
+  const target = new URL(`${url}/api/chat/turn`);
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      { hostname: target.hostname, port: target.port, path: target.pathname, method: 'POST', headers: { ...H, 'Content-Length': Buffer.byteLength(body) } },
+      (res) => {
+        let raw = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => {
+          raw += chunk;
+        });
+        res.on('end', () => {
+          const frames = raw
+            .split('\n')
+            .filter((line) => line.startsWith('data: '))
+            .map((line) => {
+              try {
+                return JSON.parse(line.slice(6));
+              } catch {
+                return null;
+              }
+            })
+            .filter(Boolean);
+          resolve({
+            chatId: frames.find((frame) => frame.type === 'chat-id')?.chatId ?? chatId,
+            complete: frames.find((frame) => frame.type === 'turn-complete'),
+            text: frames.filter((frame) => frame.type === 'text').map((frame) => frame.text).join(''),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    req.end(body);
   });
-  const reader = res.body.getReader();
-  let raw = '';
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    raw += Buffer.from(value).toString('utf8');
-  }
-  const frames = raw
-    .split('\n')
-    .filter((line) => line.startsWith('data: '))
-    .map((line) => {
-      try {
-        return JSON.parse(line.slice(6));
-      } catch {
-        return null;
-      }
-    })
-    .filter(Boolean);
-  return {
-    chatId: frames.find((frame) => frame.type === 'chat-id')?.chatId ?? chatId,
-    complete: frames.find((frame) => frame.type === 'turn-complete'),
-    text: frames.filter((frame) => frame.type === 'text').map((frame) => frame.text).join(''),
-  };
 }
 
 const SECRET = 'the build must be started with the flag --allow-forge-42';

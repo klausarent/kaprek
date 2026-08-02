@@ -21,6 +21,7 @@ import { openPlans } from '../plans/store.mjs';
 import { openMemory } from '../memory/store.mjs';
 import { buildMemoryPrompt, parseRemember } from '../memory/protocol.mjs';
 import { buildCheckpoint, buildRehydrationPrompt, readCheckpoint, shouldCheckpoint, wasCompacted, writeCheckpoint } from '../memory/checkpoint.mjs';
+import { buildRulesPrompt, openPolicy } from '../memory/policy.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -594,7 +595,11 @@ export async function runTurn({
   // conversation, and handing it back would spend context on something that
   // is already in context.
   const rehydration = wasCompacted(chats.events(effectiveChatId)) ? buildRehydrationPrompt(readCheckpoint(dataDir, effectiveChatId)) : '';
-  const combined = [guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
+  // Rules a PERSON accepted, so they are phrased as instructions — unlike
+  // the memory block, which is explicitly what previous turns wrote down. A
+  // proposal nobody has answered reaches no prompt at all.
+  const rulesPrompt = buildRulesPrompt(activeRules(dataDir));
+  const combined = [rulesPrompt, guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
   const appendSystemPrompt = combined === '' ? undefined : combined;
 
   let turnResult;
@@ -699,6 +704,15 @@ export async function runTurn({
     // its own scope could write into one it may not read.
     remembered: memoryScopeId ? rememberFromTurn({ dataDir, scopeId: memoryScopeId, chatId: effectiveChatId, text: assistantText.join('\n') }) : [],
   };
+}
+
+/** The rules that were accepted. Never throws: no policy file means no rules. */
+function activeRules(dataDir) {
+  try {
+    return openPolicy(dataDir).activeRules();
+  } catch {
+    return [];
+  }
 }
 
 /**
