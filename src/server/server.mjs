@@ -3154,7 +3154,7 @@ export function startServer({
    * of this is a second place for the deferred/interactive distinction to
    * drift.
    */
-  function uiApprovalHandlerFor(chatId, { turnDeadlineAt = null, mode = 'interactive', triggerId = null } = {}) {
+  function uiApprovalHandlerFor(chatId, { turnDeadlineAt = null, mode = 'interactive', triggerId = null, approvalTimeoutMs: overrideTimeoutMs = null } = {}) {
     return makeApprovalHandler({
       chatId,
       mode,
@@ -3172,7 +3172,9 @@ export function startServer({
       // (APPROVAL_INBOX_TTL_MS). Interactive, which for a trigger means
       // someone pressed "run now" and is watching the dialog: the ordinary
       // ten minutes a person gets.
-      approvalTimeoutMs: mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs,
+      // A relay step is interactive AND unattended: its own process waits,
+      // but no person is watching a dialog, so it gets the long window.
+      approvalTimeoutMs: overrideTimeoutMs ?? (mode === 'deferred' ? unattendedApprovalTimeoutMs : approvalTimeoutMs),
       approvalStore: getApprovalStore(),
       describeSource: describeApprovalSource,
     });
@@ -3247,14 +3249,29 @@ export function startServer({
             signal,
             origin: 'relay',
             silent: false,
-            // THE M1 ACCEPTANCE, finally whole: a relay step's approval is
-            // filed in the deferred inbox instead of being auto-denied, so a
-            // batch running overnight parks on the question and waits for a
-            // person — the same inbox, the same answer route, the same
-            // 24-hour window as a trigger's.
+            // A relay step's approval goes in the inbox and the step WAITS for
+            // it — interactive, not deferred, with the unattended window.
+            //
+            // Deferred means "nobody is waiting": the turn ends, and an allow
+            // is replayed later as a fresh turn. That is right for a trigger
+            // and wrong here, twice over. Somebody IS waiting — the step's
+            // own CLI process is blocked on the question — and the replay
+            // runs on the default engine, so the live M2 run answered "yes"
+            // to a codex file write and got three claude turns that failed
+            // (`claude-code/trigger/error` in runs.jsonl). The step stays
+            // parked on its question instead, and the answer reaches the
+            // process that asked it.
+            //
+            // Honest limit: the question lives as long as the relay turn
+            // does. An overnight batch waits for the wall clock, not for
+            // 24 hours.
             ...(tools === 'full'
               ? {
-                  onApprovalRequest: uiApprovalHandlerFor(chatId, { mode: 'deferred' }),
+                  onApprovalRequest: uiApprovalHandlerFor(chatId, {
+                    mode: 'interactive',
+                    approvalTimeoutMs: unattendedApprovalTimeoutMs,
+                    turnDeadlineAt: Date.now() + chatAbsoluteTimeoutMs,
+                  }),
                 }
               : {}),
           });

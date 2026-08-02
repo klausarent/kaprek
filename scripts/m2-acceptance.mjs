@@ -135,7 +135,7 @@ const finished = await waitFor('the run to settle', async () => {
   for (const entry of pending) {
     if (entry.kind === 'relay.gate') continue;
     say('  codex asks:', entry.toolName, '-', (entry.description ?? '').slice(0, 90));
-    await api(`/api/approvals/${encodeURIComponent(entry.requestId)}`, {
+    await api(`/api/approvals/${encodeURIComponent(entry.id)}`, {
       method: 'POST',
       body: JSON.stringify({ chatId: entry.chatId ?? chatId, behavior: 'allow' }),
     });
