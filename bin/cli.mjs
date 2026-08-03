@@ -351,6 +351,13 @@ async function main() {
       console.log('That code lets a phone answer approvals. It cannot start chats,');
       console.log('change settings, or read your transcripts, and it is gone when');
       console.log('kaprek stops. Without --lan, kaprek listens on localhost only.');
+      console.log('');
+      // In LAN mode the page is served without the token (a proxy in front
+      // of loopback would otherwise be handed it), so the browser on THIS
+      // machine gets it here, in the fragment — which never leaves the
+      // browser.
+      console.log('On this computer, open kaprek with full access here:');
+      console.log(`  ${url}/#/?t=${token}`);
     } else {
       console.log('');
       console.log('--lan was given, but this machine has no network address — still listening on localhost only.');
@@ -358,7 +365,10 @@ async function main() {
   }
 
   if (opts.open) {
-    openBrowser(url);
+    // With --lan the page carries no token, so the local browser is opened
+    // with it in the fragment; without --lan the served page still injects
+    // it for loopback, so the bare url is right.
+    openBrowser(lanUrl ? `${url}/#/?t=${token}` : url);
   }
 
   // Best-effort safety net for exit paths that never reach the SIGINT/SIGTERM

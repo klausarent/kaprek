@@ -4233,15 +4233,27 @@ test('lan: a machine with no network address stays on localhost and says so', as
   expect(lanUrl).toBeNull();
 });
 
-test('lan: the token is only handed to loopback, never over the network', async () => {
-  // Serving index.html with the token in it would give it to everyone on the
-  // network who loads the page, and the QR code would be theatre.
+test('lan: the served page never carries the token, not even to loopback', async () => {
+  // A reverse proxy or ssh -L tunnel connects as 127.0.0.1 while forwarding
+  // for someone else; injecting the token for any loopback request would hand
+  // it to them. In LAN mode the local browser gets it from the URL fragment
+  // instead (see bin/cli.mjs). (Codex' review.)
   const webDist = fs.mkdtempSync(path.join(tmpRootDir, 'webdist-'));
   fs.writeFileSync(path.join(webDist, 'index.html'), '<html><head><title>kaprek</title></head><body></body></html>', 'utf8');
   const { url, token } = await boot({ webDist, lan: true, lanAddressOf: () => '127.0.0.1' });
 
   const local = await (await fetch(`${url}/`)).text();
-  expect(local).toContain(token);
+  expect(local).not.toContain(token);
+});
+
+test('non-lan: loopback still gets the token in the page', async () => {
+  // Without --lan the server binds to 127.0.0.1 only, so there is no proxy
+  // path to worry about and the local browser is bootstrapped the usual way.
+  const webDist = fs.mkdtempSync(path.join(tmpRootDir, 'webdist-'));
+  fs.writeFileSync(path.join(webDist, 'index.html'), '<html><head><title>kaprek</title></head><body></body></html>', 'utf8');
+  const { url, token } = await boot({ webDist });
+
+  expect(await (await fetch(`${url}/`)).text()).toContain(token);
 });
 
 test('notify: nothing configured by default, and a shell string is refused', async () => {

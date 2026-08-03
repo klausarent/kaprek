@@ -23,7 +23,24 @@ const SECRET_PATTERNS = [
   /re_[A-Za-z0-9_-]{15,}/g, // Resend
   /ghp_[A-Za-z0-9]{20,}/g, // GitHub personal access token
   /github_pat_[A-Za-z0-9_]{20,}/g, // GitHub fine-grained PAT
+  // Added after both peer reviews independently listed what slipped through.
+  // Only shapes specific enough to never match prose or code: what is
+  // redacted here is PERSISTED redacted, so a false positive does not cost a
+  // warning, it permanently mangles a transcript. The fuzzier lowercase
+  // key=value heuristic deliberately lives in the workflow EXPORT check
+  // instead, where a false positive is a refusal someone can rephrase.
+  /xox[baprs]-[A-Za-z0-9-]{10,}/g, // Slack bot/app/legacy tokens
+  /npm_[A-Za-z0-9]{30,}/g, // npm access tokens (npm_ + 36)
+  /AKIA[0-9A-Z]{16}/g, // AWS access key id (exactly 20 chars)
+  /eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g, // JWT (three base64url segments, both starting {")
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, // PEM block, even when cut off
 ];
+
+// Credentials inside a URL: `https://user:pass@host`. Kept out of
+// SECRET_PATTERNS because the replacement preserves the username — losing
+// WHICH account a transcript talked about would make it useless for the
+// person rereading it, and the password is the secret half.
+const URL_CREDENTIALS_RE = /(\/\/[^\s/:@]+):[^\s/@]+@/g;
 const BEARER_RE = /Bearer\s+[A-Za-z0-9._~+/=-]{16,}/g;
 const KEY_VALUE_RE = /\b([A-Z][A-Z0-9_]*(?:TOKEN|SECRET|API_KEY|APIKEY|PASSWORD|PASSWD)[A-Z0-9_]*)\s*[=:]\s*["']?\S{8,}/g;
 
@@ -62,6 +79,7 @@ export function redactSecrets(str) {
   }
   out = out.replace(BEARER_RE, 'Bearer [REDACTED]');
   out = out.replace(KEY_VALUE_RE, '$1=[REDACTED]');
+  out = out.replace(URL_CREDENTIALS_RE, '$1:[REDACTED]@');
   return out;
 }
 

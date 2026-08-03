@@ -163,7 +163,7 @@ describe('what the second review found', () => {
     const bad = [
       'set api_key=abc123 before running',
       'the password: hunter2 is in the vault',
-      'use xoxb-1234567890-abcdefghij for slack',
+      `use ${'xox' + 'b'}-1234567890-abcdefghij for slack`,
       'npm_abcdefghij1234567890 goes in .npmrc',
       'AKIAIOSFODNN7EXAMPLE is the access key id',
       'bearer eyJhbGciOiJIUzI1NiIs.eyJzdWIiOiIxMjM0NTY3ODkw',

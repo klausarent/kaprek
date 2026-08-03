@@ -3285,7 +3285,16 @@ async function handleRequest(
   // page, and the token would protect nothing — the QR code would be
   // theatre. A request that did not come from this machine gets the page
   // WITHOUT the token and has to bring one (the QR puts it in the URL).
-  serveStatic(res, webDist, url.pathname, isLoopbackRequest(req) ? instanceToken : null);
+  // The instance token goes into the served page only when NOBODY could be
+  // in between. Over --lan that means never: isLoopbackRequest reads the TCP
+  // peer, and a reverse proxy or an ssh -L tunnel on this machine connects as
+  // 127.0.0.1 while forwarding for someone else — it would hand the full
+  // admin token to whoever is behind it. (Codex' review.) So in LAN mode the
+  // page is served token-less and the local browser gets the token in the
+  // URL fragment when the CLI opens it (see bin/cli.mjs), the same way the
+  // phone does — a fragment never reaches the server or a proxy log.
+  const mayInjectToken = !lanAddress && isLoopbackRequest(req);
+  serveStatic(res, webDist, url.pathname, mayInjectToken ? instanceToken : null);
 }
 
 /**

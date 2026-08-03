@@ -325,10 +325,14 @@ What holds either way:
   outright, which matters because that route's job is to run a command. The
   token is generated per run and never written to disk, so it dies when
   kaprek stops.
-- **The instance token is only handed out over loopback.** kaprek normally
-  puts it in the page it serves, which is how the browser on this machine
-  gets it without anyone typing. A request from the network gets the page
-  *without* it and has to bring its own.
+- **In LAN mode the served page never carries the instance token** — not
+  even to loopback. A reverse proxy or an `ssh -L` tunnel on this machine
+  connects as `127.0.0.1` while forwarding for someone else, so trusting the
+  socket would hand it the admin token. The browser on this computer gets the
+  token from the URL fragment when kaprek opens it (a fragment never reaches
+  the server or a proxy log); if you run with `--no-open`, the terminal
+  prints that URL. Without `--lan`, kaprek binds to loopback only and the
+  page is bootstrapped the usual way.
 - **The Host check gains exactly one address**, this machine's own. A
   hostname pointed at that IP is still refused, so DNS rebinding gets no
   further than it did before.

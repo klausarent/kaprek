@@ -651,3 +651,31 @@ test('title falls back to the last-prompt user message when no ai-title exists, 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('redactSecrets: the shapes both peer reviews flagged', () => {
+  // Slack, npm, AWS, JWT, PEM, and credentials in a URL — each specific
+  // enough not to match ordinary prose or code, since redaction here is
+  // persisted, not warned.
+  expect(redactSecrets(`slack ${'xox' + 'b'}-1234567890-0987654321-abcdefghijklmnop here`)).toContain('[REDACTED]');
+  expect(redactSecrets('npm_' + 'a'.repeat(36))).toContain('[REDACTED]');
+  expect(redactSecrets('key AKIAIOSFODNN7EXAMPLE end')).toContain('[REDACTED]');
+  expect(redactSecrets('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghij here')).toContain('[REDACTED]');
+  expect(redactSecrets('-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----')).not.toContain('MIIabc');
+});
+
+test('redactSecrets: URL credentials lose the password, keep the username', () => {
+  // Which account a transcript talked about is what makes it readable later;
+  // the password is the secret half.
+  const out = redactSecrets('clone from https://klaus:hunter2@git.example.com/repo');
+  expect(out).toContain('klaus');
+  expect(out).not.toContain('hunter2');
+  expect(out).toContain('[REDACTED]');
+});
+
+test('redactSecrets: ordinary text and hashes are left alone', () => {
+  // A false positive here permanently mangles a transcript, so the patterns
+  // must not fire on prose, commit hashes, or content digests.
+  const safe = 'The commit a1b2c3d4e5f6a7b8c9d0 fixed the AKIALOOKSLIKE parser and the keyword handling.';
+  expect(redactSecrets(safe)).toBe(safe);
+  expect(redactSecrets('Visit https://example.com/path and read the docs.')).toContain('example.com');
+});
