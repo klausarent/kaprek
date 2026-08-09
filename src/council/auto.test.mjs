@@ -40,6 +40,25 @@ function runner({ level = 'plans', peers = ['codex', 'grok'], answer = async () 
 }
 
 describe('maybeConsult', () => {
+  it('embeds the plan as a snapshot — the peer no longer reads the disk', async () => {
+    const planPath = path.join(dir, 'plan.md');
+    fs.writeFileSync(planPath, '# The plan\n- [ ] rename the store\n', 'utf8');
+    const { runner: r, asked } = runner();
+    const started = r.maybeConsult({ chatId: 'c1', moment: 'plan', question: 'sound?', cwd: dir, planPath });
+    await r.waitFor(started.consultation.id);
+    expect(asked[0].prompt).toContain('rename the store');
+    expect(asked[0].prompt).toContain('NO file access');
+  });
+
+  it('a .env asked for by name arrives as a refusal, never as content', async () => {
+    fs.writeFileSync(path.join(dir, '.env'), 'SOME_TOKEN=super-secret-value-1234567890\n', 'utf8');
+    const { runner: r, asked } = runner();
+    const started = r.maybeConsult({ chatId: 'c1', moment: 'plan', question: 'sound?', cwd: dir, files: ['.env'] });
+    await r.waitFor(started.consultation.id);
+    expect(asked[0].prompt).not.toContain('super-secret-value-1234567890');
+    expect(asked[0].prompt).toContain('Asked for but not included');
+  });
+
   it('asks every peer and records the verdicts', async () => {
     const { runner: r, store, asked } = runner();
     const started = r.maybeConsult({ chatId: 'c1', moment: 'plan', question: 'is this sound?', cwd: dir });

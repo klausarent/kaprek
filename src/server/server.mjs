@@ -51,6 +51,7 @@ import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
 import { consultPeers } from '../council/consult.mjs';
+import { snapshotFiles } from '../council/snapshot.mjs';
 import { makeAskPeer, availablePeerIds } from '../council/ask.mjs';
 import { openConsultations, ConsultationNotFoundError } from '../council/store.mjs';
 import { createCouncilRunner, planQuestion } from '../council/auto.mjs';
@@ -1803,8 +1804,9 @@ async function handleCouncilRoutes(req, res, segments, url, { dataDir, engineReg
       return;
     }
 
-    // The mission's own directory when the caller names one — a peer reads
-    // the files it was pointed at, so it has to stand where they are.
+    // The mission's own directory when the caller names one — not for the
+    // peer to stand in (peers get an empty scratch dir since 0.9.0), but as
+    // the root the requested files must live under and resolve against.
     let cwd = dataDir;
     if (typeof body.data?.missionId === 'string') {
       try {
@@ -1814,11 +1816,21 @@ async function handleCouncilRoutes(req, res, segments, url, { dataDir, engineReg
       }
     }
 
+    // This request body is reachable by anyone holding an instance token, so
+    // `files` used to be a read-any-path-on-disk primitive one hop removed —
+    // the peer did the reading. Snapshotting bounds it to the mission tree,
+    // strips secrets, and refuses the files that hold them outright.
+    const { snapshots, refused } = snapshotFiles(Array.isArray(body.data?.files) ? body.data.files.filter((f) => typeof f === 'string') : [], {
+      cwd,
+      roots: [cwd],
+    });
+
     const consultation = await consultPeers({
       peers: status.peers,
-      askPeer: makeAskPeer({ cwd, timeoutMs: PEER_TURN_TIMEOUT_MS }),
+      askPeer: makeAskPeer({ timeoutMs: PEER_TURN_TIMEOUT_MS }),
       question,
-      files: Array.isArray(body.data?.files) ? body.data.files.filter((f) => typeof f === 'string') : [],
+      snapshots,
+      refused,
       constraints: Array.isArray(body.data?.constraints) ? body.data.constraints.filter((c) => typeof c === 'string') : [],
       tried: Array.isArray(body.data?.tried) ? body.data.tried.filter((t) => typeof t === 'string') : [],
     });

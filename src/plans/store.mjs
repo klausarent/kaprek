@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseSteps, setStep as setStepInMarkdown, planTitle } from './markdown.mjs';
+import { isInside } from '../lib/contain.mjs';
 
 export const PLAN_STATUSES = ['draft', 'active', 'done', 'archived'];
 /** A spec is what brainstorming produces; a plan is what writing-plans produces. */
@@ -63,42 +64,8 @@ export class PlanOutsideRootError extends Error {
   }
 }
 
-/**
- * The real path of `target`, with symlinks resolved as far as they exist.
- * A path that does not exist yet resolves its nearest existing ancestor and
- * appends the rest, so containment can be judged before creation too.
- */
-function realish(target) {
-  let head = path.resolve(target);
-  const tail = [];
-  for (;;) {
-    try {
-      return path.join(fs.realpathSync(head), ...tail.reverse());
-    } catch {
-      const parent = path.dirname(head);
-      if (parent === head) return path.resolve(target);
-      tail.push(path.basename(head));
-      head = parent;
-    }
-  }
-}
-
-/**
- * Whether `target` sits inside `root`, judged AFTER resolving symlinks on
- * both sides.
- *
- * Codex' review: `path.resolve()` is purely lexical, so a junction or
- * symlink in any parent directory makes an "inside" path point anywhere on
- * the disk — and setStep() rewrites whatever it lands on. Resolving first is
- * what turns the containment check from a string comparison into a
- * filesystem one.
- */
-function isInside(root, target) {
-  const a = realish(root);
-  const b = realish(target);
-  const [normA, normB] = process.platform === 'win32' ? [a.toLowerCase(), b.toLowerCase()] : [a, b];
-  return normB === normA || normB.startsWith(normA.endsWith(path.sep) ? normA : `${normA}${path.sep}`);
-}
+// realish() and isInside() moved to src/lib/contain.mjs — the council's file
+// snapshots need the same containment answer this store does.
 
 /**
  * The key two registrations of the same file agree on. Windows paths are

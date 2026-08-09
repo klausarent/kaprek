@@ -24,7 +24,9 @@
 //      file has nothing to review, and asking anyway burns two CLIs on an
 //      empty package.
 import fs from 'node:fs';
+import path from 'node:path';
 import { consultPeers, DEFAULT_PEER_TIMEOUT_MS } from './consult.mjs';
+import { snapshotFiles } from './snapshot.mjs';
 import { shouldConsult, councilStatus, suggestAssignment } from './roles.mjs';
 import { createPeerHealth } from './health.mjs';
 import { sha256Of } from './store.mjs';
@@ -46,12 +48,12 @@ export const SKIP_REASONS = {
   noPlan: 'the turn produced no plan to review',
 };
 
-/** The package a plan review gets. Short on purpose: the plan is the subject, and it is on disk. */
+/** The package a plan review gets. Short on purpose: the plan is the subject, and its snapshot rides along. */
 export function planQuestion({ planPath, goal }) {
   return [
-    `A plan has just been written to ${planPath}.`,
+    `A plan has just been written to ${planPath}; its snapshot is included below.`,
     goal ? `It came out of this conversation: ${goal}` : null,
-    'Read it and say whether it is sound: does it do what it says, is anything load-bearing missing, and is any step going to fail in a way the plan does not anticipate?',
+    'Say whether it is sound: does it do what it says, is anything load-bearing missing, and is any step going to fail in a way the plan does not anticipate?',
   ]
     .filter(Boolean)
     .join(' ');
@@ -122,11 +124,21 @@ export function createCouncilRunner({
     const consultation = store.queue({ chatId, moment, question, peers: status.peers, planPath, planSha256, missionId });
     const controller = new AbortController();
 
+    // Materialize here, at queue time: what the peers see is the file as it
+    // was when the verdict was commissioned — the same moment planSha256
+    // fingerprints. Roots are the asker's cwd plus the plan's own directory
+    // (plans live in the dataDir, not the mission tree).
+    const { snapshots, refused } = snapshotFiles(planPath ? [planPath, ...files] : files, {
+      cwd,
+      roots: [cwd, ...(planPath ? [path.dirname(planPath)] : [])],
+    });
+
     const promise = consultPeers({
       peers: status.peers,
-      askPeer: makeAskPeer({ cwd, timeoutMs }),
+      askPeer: makeAskPeer({ timeoutMs }),
       question,
-      files: planPath ? [planPath, ...files] : files,
+      snapshots,
+      refused,
       constraints,
       tried,
       signal: controller.signal,

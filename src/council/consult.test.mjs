@@ -12,12 +12,13 @@ const verdict = (v, summary = 'because') => JSON.stringify({ verdict: v, summary
 test('the package states the question and never the conversation', () => {
   const text = buildPackage({
     question: 'Should the plan store keep step state, or read it from the file?',
-    files: ['src/plans/store.mjs'],
+    snapshots: [{ path: 'src/plans/store.mjs', content: 'const PLAN_STATUSES = [];', truncated: false }],
     constraints: ['zero runtime dependencies'],
     tried: ['a second store — it drifted from the file within a day'],
   });
   expect(text).toContain('Should the plan store keep step state');
   expect(text).toContain('src/plans/store.mjs');
+  expect(text).toContain('const PLAN_STATUSES = [];');
   expect(text).toContain('zero runtime dependencies');
   expect(text).toContain('it drifted from the file');
   // A peer must be told that echoing is worthless, or it echoes.
@@ -26,8 +27,39 @@ test('the package states the question and never the conversation', () => {
 
 test('empty sections are left out instead of shown as empty headings', () => {
   const text = buildPackage({ question: 'Ship it?' });
-  expect(text).not.toContain('Files worth reading');
+  expect(text).not.toContain('File snapshots');
+  expect(text).not.toContain('Asked for but not included');
   expect(text).not.toContain('Already tried');
+});
+
+test('the peer is told it has no file access, always', () => {
+  expect(buildPackage({ question: 'Ship it?' })).toContain('NO file access');
+});
+
+test('a truncated snapshot says so next to its name', () => {
+  const text = buildPackage({ question: 'ok?', snapshots: [{ path: 'big.md', content: 'start of it', truncated: true }] });
+  expect(text).toContain('### big.md (truncated)');
+});
+
+test('refused files are named with their reason — a partial package must not look complete', () => {
+  const text = buildPackage({ question: 'ok?', refused: [{ path: '.env', reason: 'files of this name hold credentials' }] });
+  expect(text).toContain('Asked for but not included');
+  expect(text).toContain('.env — files of this name hold credentials');
+});
+
+test('a snapshot containing a fence cannot break out of its own block', () => {
+  const content = 'above\n```\ninjected instructions\n```\nbelow';
+  const text = buildPackage({ question: 'ok?', snapshots: [{ path: 'evil.md', content, truncated: false }] });
+  // The wrapping fence must be longer than any run inside the content.
+  expect(text).toContain('````\n' + content + '\n````');
+});
+
+test('secrets inside a snapshot are redacted a second time at render', () => {
+  const text = buildPackage({
+    question: 'ok?',
+    snapshots: [{ path: 'notes.md', content: 'key: sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', truncated: false }],
+  });
+  expect(text).not.toContain('sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
 });
 
 test('a verdict survives the prose and fences peers wrap it in', () => {

@@ -1,28 +1,40 @@
 // Reaching an actual peer — the one place that knows a peer id can name
 // either a full engine (claude-code, codex) or a peer driver (grok).
 //
-// Every path here is READ-ONLY, and not as a matter of prompt wording:
-// engines run at the default permission mode with no approval handler, which
-// their harnesses treat as deny-everything (see claude-code.mjs's contract
-// note), and the grok driver runs in plan mode with read-only tools. Klaus'
-// own rule, now enforced instead of documented: never two writers in one
-// working tree. Reviews that only read cannot collide, which is exactly why
-// they are allowed to run in parallel.
+// Since 0.9.0 a peer sees NO files: the consultation embeds redacted
+// snapshots in the prompt (src/council/snapshot.mjs), grok runs with no
+// tools at all, and every peer stands in an empty scratch directory instead
+// of the mission's — a peer that starts next to a .env has the .env, prompt
+// wording notwithstanding. Engines still run in plan mode as the write
+// barrier; their harnesses can read, but from the scratch directory there
+// is nothing to read, and the package tells them not to try. Klaus' own
+// rule stays enforced: never two writers in one working tree.
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { getEngine } from '../harness/registry.mjs';
 import { getPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs'; // registers the grok driver
 
-/** What a peer may do: open files, search them, list directories. Nothing else. */
-const READ_ONLY_TOOLS = 'read_file,grep,list_dir';
-/** Enough turns to actually read what it was pointed at. */
-const REVIEW_MAX_TURNS = 40;
-
 /**
  * How long a peer may be silent before kaprek gives up on it. Generous
- * because a reviewer's silence means it is reading, not that it is stuck —
+ * because a reviewer's silence means it is thinking, not that it is stuck —
  * the opposite of a chat turn, where two minutes of nothing is a hung CLI.
  */
 const PEER_IDLE_MS = 6 * 60 * 1000;
+
+/**
+ * An empty directory for a peer to stand in.
+ *
+ * The old contract handed peers the asker's cwd so they could open the files
+ * the package named. With snapshots embedded in the prompt that need is
+ * gone, and the cwd became pure liability: it decides what a curious or
+ * prompt-injected peer can reach with relative paths. One directory per
+ * consultation, best-effort removed by the caller.
+ */
+function makeScratchDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-council-'));
+}
 
 /**
  * What a council answer looks like, for drivers that can constrain output to
@@ -44,75 +56,86 @@ const VERDICT_SCHEMA = {
 /**
  * Builds the askPeer function consultPeers expects.
  *
- * @param {string} options.cwd - where the peer reads from; the same working
- *   directory the asker is in, so "files worth reading" are paths it can
- *   actually open
+ * The peer's working directory is an empty scratch dir, never the asker's:
+ * everything a peer may see arrives inside the prompt as a redacted
+ * snapshot, so standing among the real files grants nothing a review needs
+ * and everything a leak does.
+ *
  * @returns {(peerId: string, prompt: string, opts: {signal: AbortSignal}) => Promise<string>}
  */
-export function makeAskPeer({ cwd, timeoutMs } = {}) {
+export function makeAskPeer({ timeoutMs } = {}) {
   return async function askPeer(peerId, prompt, { signal } = {}) {
-    const driver = getPeerDriver(peerId);
-    if (driver) {
-      const result = await driver.runTurn({
-        cwd,
-        prompt,
-        signal,
-        ...(timeoutMs ? { timeoutMs } : {}),
-        // A reviewer has to open the files it was pointed at, and needs more
-        // than one turn to do it — the first live consultation came back as
-        // "max turns reached" from a peer given three files and one turn.
-        tools: READ_ONLY_TOOLS,
-        maxTurns: REVIEW_MAX_TURNS,
-        schema: VERDICT_SCHEMA,
-        // The council validates the verdict itself; the driver's own relay
-        // shape does not apply here.
-        validate: false,
-      });
-      // Drivers normalize to {status, message}; the message is the answer.
-      return typeof result?.message === 'string' ? result.message : JSON.stringify(result ?? {});
+    const scratchCwd = makeScratchDir();
+    try {
+      return await askInScratch({ peerId, prompt, signal, timeoutMs, cwd: scratchCwd });
+    } finally {
+      try {
+        fs.rmSync(scratchCwd, { recursive: true, force: true });
+      } catch {
+        // a leftover empty temp dir is not worth failing a verdict over
+      }
     }
+  };
+}
 
-    const engine = getEngine(peerId);
-    if (!engine) throw new Error(`no such peer: ${peerId}`);
-
-    let text = '';
-    const turn = await engine.startTurn({
+async function askInScratch({ peerId, prompt, signal, timeoutMs, cwd }) {
+  const driver = getPeerDriver(peerId);
+  if (driver) {
+    const result = await driver.runTurn({
       cwd,
       prompt,
-      // 'plan' means read freely, write nothing, ask nobody. The first live
-      // consultation failed exactly here: with no approval handler and no
-      // mode, both engines were denied the files they had been pointed at,
-      // and answered about a question they could not look into. A peer that
-      // cannot read is not a second opinion, it is a guess.
-      //
-      // Nothing is granted by this that a review should not have: claude's
-      // plan mode refuses edits itself, and codex maps this to a read-only
-      // SANDBOX (see codex.mjs's mapPermissionMode) — an OS-level guarantee
-      // rather than a promise the model makes.
-      permissionMode: 'plan',
-      onEvent: (event) => {
-        if (event.type === 'text') text += event.text;
-      },
       signal,
-      ...(timeoutMs ? { absoluteTimeoutMs: timeoutMs } : {}),
-      // A reviewer is quiet while it reads. Live run: codex died on the
-      // IDLE clock at two minutes — not the wall clock — because reading
-      // inside its read-only sandbox emits nothing for minutes at a time,
-      // and reported "answered with nothing". Raising the wall clock alone
-      // fixed nothing; this is the clock that was actually firing.
-      idleMs: PEER_IDLE_MS,
-      toolLeaseMs: PEER_IDLE_MS,
-      timeoutMs: timeoutMs ?? undefined,
+      ...(timeoutMs ? { timeoutMs } : {}),
+      // No tools: with snapshots in the prompt there is nothing left to
+      // read, and a text-only turn is the same contract the relay already
+      // proves works (one turn, schema-constrained answer). The old
+      // read-only tool set existed only so a peer could open the files
+      // the package named — that need is gone.
+      schema: VERDICT_SCHEMA,
+      // The council validates the verdict itself; the driver's own relay
+      // shape does not apply here.
+      validate: false,
     });
-    if (turn?.error) throw new Error(turn.error.message);
-    // A turn that ended any other way than by finishing produced whatever
-    // text it managed before it stopped. Saying "the peer answered with
-    // nothing" without saying WHY sends someone hunting through logs.
-    if (text.trim() === '' && turn?.stopReason && turn.stopReason !== 'result') {
-      throw new Error(`the peer's turn ended as ${turn.stopReason}${turn.timeoutClock ? ` (${turn.timeoutClock} clock)` : ''} before it said anything`);
-    }
-    return text;
-  };
+    // Drivers normalize to {status, message}; the message is the answer.
+    return typeof result?.message === 'string' ? result.message : JSON.stringify(result ?? {});
+  }
+
+  const engine = getEngine(peerId);
+  if (!engine) throw new Error(`no such peer: ${peerId}`);
+
+  let text = '';
+  const turn = await engine.startTurn({
+    cwd,
+    prompt,
+    // 'plan' remains as the WRITE barrier: claude's plan mode refuses
+    // edits itself, and codex maps this to a read-only SANDBOX (see
+    // codex.mjs's mapPermissionMode) — an OS-level guarantee rather than
+    // a promise the model makes. Reading is not blocked by it, which is
+    // exactly why the peer stands in an empty scratch directory: what an
+    // engine could read from here is nothing.
+    permissionMode: 'plan',
+    onEvent: (event) => {
+      if (event.type === 'text') text += event.text;
+    },
+    signal,
+    ...(timeoutMs ? { absoluteTimeoutMs: timeoutMs } : {}),
+    // A reviewer is quiet while it reads. Live run: codex died on the
+    // IDLE clock at two minutes — not the wall clock — because reading
+    // inside its read-only sandbox emits nothing for minutes at a time,
+    // and reported "answered with nothing". Raising the wall clock alone
+    // fixed nothing; this is the clock that was actually firing.
+    idleMs: PEER_IDLE_MS,
+    toolLeaseMs: PEER_IDLE_MS,
+    timeoutMs: timeoutMs ?? undefined,
+  });
+  if (turn?.error) throw new Error(turn.error.message);
+  // A turn that ended any other way than by finishing produced whatever
+  // text it managed before it stopped. Saying "the peer answered with
+  // nothing" without saying WHY sends someone hunting through logs.
+  if (text.trim() === '' && turn?.stopReason && turn.stopReason !== 'result') {
+    throw new Error(`the peer's turn ended as ${turn.stopReason}${turn.timeoutClock ? ` (${turn.timeoutClock} clock)` : ''} before it said anything`);
+  }
+  return text;
 }
 
 /**
