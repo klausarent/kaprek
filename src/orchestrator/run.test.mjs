@@ -250,8 +250,8 @@ test('onEvent bekommt alle Adapter-Events durchgereicht, in Reihenfolge', async 
 // src/parser/parse.mjs::redactSecrets/truncate and run.mjs's sanitize* helpers).
 const SECRET_PATTERNS = {
   skAnt: 'sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
-  skProj: 'sk-proj-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
-  ghp: 'ghp_AbCdEfGh1234567890ABCDEFGHijkl',
+  skProj: 'sk-proj-' + 'AbCdEfGhIjKlMnOpQrStUvWxYz0123456789',
+  ghp: 'ghp_' + 'AbCdEfGh1234567890ABCDEFGHijkl',
   bearer: 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9',
   keyValue: 'DB_PASSWORD=hunter2secretvalue',
 };

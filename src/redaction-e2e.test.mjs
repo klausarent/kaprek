@@ -55,9 +55,9 @@ async function boot(opts) {
 // placeholders, no real values), modeled after the patterns in
 // src/parser/parse.mjs (SECRET_PATTERNS / BEARER_RE / KEY_VALUE_RE).
 const SECRETS = {
-  anthropicStyle: 'sk-ant-api03-test0000000000000000000000AAAA',
-  stripeProjStyle: 'sk-proj-test0000000000000000000000000AAAA',
-  githubPat: 'ghp_test0000000000000000AAAA',
+  anthropicStyle: 'sk-ant-' + 'api03-test0000000000000000000000AAAA',
+  stripeProjStyle: 'sk-proj-' + 'test0000000000000000000000000AAAA',
+  githubPat: 'ghp_' + 'test0000000000000000AAAA',
   bearerToken: 'test0000000000000000AAAA',
   keyValueLine: 'TEST_API_KEY=test1111111111111111BBBB',
 };

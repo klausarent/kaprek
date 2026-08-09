@@ -259,7 +259,7 @@ test('redactSecrets: Resend re_... is redacted', () => {
 });
 
 test('redactSecrets: GitHub ghp_... and github_pat_... are redacted', () => {
-  expect(redactSecrets('ghp_AbCdEfGh1234567890ABCDEFGHijkl')).toBe('[REDACTED]');
+  expect(redactSecrets('ghp_' + 'AbCdEfGh1234567890ABCDEFGHijkl')).toBe('[REDACTED]');
   expect(redactSecrets('github_pat_11ABCDEFG0abcdefghijklmnopqrstuvwxyz')).toBe('[REDACTED]');
 });
 

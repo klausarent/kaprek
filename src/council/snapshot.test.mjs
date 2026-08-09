@@ -13,6 +13,10 @@ afterEach(() => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
+// Concatenated so no complete token pattern sits in the repo — see
+// consult.test.mjs's note (the xoxb- push-protection incident).
+const FAKE_ANT = 'sk-ant-' + 'api03-' + 'a'.repeat(32);
+
 const write = (rel, content) => {
   const full = path.join(root, rel);
   fs.mkdirSync(path.dirname(full), { recursive: true });
@@ -46,7 +50,7 @@ describe('snapshotFiles', () => {
   });
 
   test('a .env inside an allowed root is still refused — the deny list beats containment', () => {
-    write('.env', 'ANTHROPIC_API_KEY=sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n');
+    write('.env', `ANTHROPIC_API_KEY=${FAKE_ANT}\n`);
     const { snapshots, refused } = snapshotFiles(['.env'], { cwd: root, roots: [root] });
     expect(snapshots).toEqual([]);
     expect(refused).toHaveLength(1);
@@ -94,7 +98,7 @@ describe('snapshotFiles', () => {
   });
 
   test('each snapshot carries the sha256 of the raw content it was read from', () => {
-    write('plan.md', '# plan with sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa inside\n');
+    write('plan.md', `# plan with ${FAKE_ANT} inside\n`);
     const raw = fs.readFileSync(path.join(root, 'plan.md'), 'utf8');
     const { snapshots } = snapshotFiles(['plan.md'], { cwd: root, roots: [root] });
     // Hash of the RAW read — redaction changes the content, not the hash.
@@ -113,9 +117,9 @@ describe('snapshotFiles', () => {
   });
 
   test('secrets in file content are redacted before they reach the package', () => {
-    write('notes.md', 'the key is sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa and it works');
+    write('notes.md', `the key is ${FAKE_ANT} and it works`);
     const { snapshots } = snapshotFiles(['notes.md'], { cwd: root, roots: [root] });
-    expect(snapshots[0].content).not.toContain('sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(snapshots[0].content).not.toContain(FAKE_ANT);
     expect(snapshots[0].content).toContain('[REDACTED]');
   });
 

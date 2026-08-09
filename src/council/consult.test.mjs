@@ -9,6 +9,13 @@ const ask = (answers) => vi.fn(async (peerId) => {
 
 const verdict = (v, summary = 'because') => JSON.stringify({ verdict: v, summary, risks: [] });
 
+// Fake secrets are CONCATENATED so no complete token pattern ever sits in
+// the repo — GitHub's push protection has blocked test fakes before (the
+// xoxb- incident), and a literal fake teaches a grep to ignore real hits.
+const FAKE_ANT = 'sk-ant-' + 'api03-' + 'a'.repeat(32);
+const FAKE_PROJ = 'sk-proj-' + 'abcdefghijklmnopqrstuvwxyz123456';
+const FAKE_GHP = 'ghp_' + 'abcdefghijklmnopqrstuvwxyz0123456789';
+
 test('the package states the question and never the conversation', () => {
   const text = buildPackage({
     question: 'Should the plan store keep step state, or read it from the file?',
@@ -74,9 +81,9 @@ test('a newline in a path cannot fake a heading in the package', () => {
 test('secrets inside a snapshot are redacted a second time at render', () => {
   const text = buildPackage({
     question: 'ok?',
-    snapshots: [{ path: 'notes.md', content: 'key: sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', truncated: false }],
+    snapshots: [{ path: 'notes.md', content: `key: ${FAKE_ANT}`, truncated: false }],
   });
-  expect(text).not.toContain('sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+  expect(text).not.toContain(FAKE_ANT);
 });
 
 test('a verdict survives the prose and fences peers wrap it in', () => {
@@ -185,18 +192,18 @@ describe('what leaves the machine', () => {
     // This text goes to another vendor's CLI, which sends it to that
     // vendor's servers. It is the one place where redaction matters more
     // than it does in a log the owner reads.
-    const prompt = buildPackage({ question: 'Is sk-proj-abcdefghijklmnopqrstuvwxyz123456 the right key to use here?' });
-    expect(prompt).not.toContain('sk-proj-abcdefghijklmnopqrstuvwxyz123456');
+    const prompt = buildPackage({ question: `Is ${FAKE_PROJ} the right key to use here?` });
+    expect(prompt).not.toContain(FAKE_PROJ);
   });
 
   test('the constraints and the tried list are cleaned too', () => {
     const prompt = buildPackage({
       question: 'sound?',
-      constraints: ['Use the token ghp_abcdefghijklmnopqrstuvwxyz0123456789'],
-      tried: ['Already tried sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'],
+      constraints: [`Use the token ${FAKE_GHP}`],
+      tried: [`Already tried ${FAKE_ANT}`],
     });
-    expect(prompt).not.toContain('ghp_abcdefghijklmnopqrstuvwxyz0123456789');
-    expect(prompt).not.toContain('sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa');
+    expect(prompt).not.toContain(FAKE_GHP);
+    expect(prompt).not.toContain(FAKE_ANT);
   });
 
   test('ordinary text is left alone', () => {
