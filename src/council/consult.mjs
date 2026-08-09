@@ -83,15 +83,24 @@ function fenceFor(content) {
  * @param {string[]} [options.tried] - what has already been ruled out
  */
 export function buildPackage({ question, snapshots = [], refused = [], constraints = [], tried = [] }) {
+  // A path is one line by definition here: a newline smuggled into a name
+  // would let it fake headings in the package it appears in.
+  const oneLine = (value) => clean(String(value)).replace(/\s+/g, ' ');
   const section = (title, items) => (items.length > 0 ? `\n## ${title}\n${items.map((item) => `- ${clean(item)}`).join('\n')}\n` : '');
   const snapshotBlock = snapshots.length === 0 ? '' : `\n## File snapshots (redacted)\n${snapshots
     .map((snapshot) => {
       const content = clean(snapshot.content);
       const fence = fenceFor(content);
-      return `### ${clean(snapshot.path)}${snapshot.truncated ? ' (truncated)' : ''}\n${fence}\n${content}\n${fence}`;
+      return `### ${oneLine(snapshot.path)}${snapshot.truncated ? ' (truncated)' : ''}\n${fence}\n${content}\n${fence}`;
     })
     .join('\n')}\n`;
-  const refusedBlock = refused.length === 0 ? '' : `\n## Asked for but not included\n${refused.map((entry) => `- ${clean(entry.path)} — ${clean(entry.reason)}`).join('\n')}\n`;
+  // The refusal list is bounded like everything else: a thousand refused
+  // paths rendered one per line would smuggle the size blowup back in
+  // through the block that exists to report it.
+  const MAX_REFUSED_LINES = 20;
+  const refusedShown = refused.slice(0, MAX_REFUSED_LINES);
+  const refusedOmitted = refused.length - refusedShown.length;
+  const refusedBlock = refused.length === 0 ? '' : `\n## Asked for but not included\n${refusedShown.map((entry) => `- ${oneLine(entry.path)} — ${oneLine(entry.reason)}`).join('\n')}${refusedOmitted > 0 ? `\n- …and ${refusedOmitted} more, likewise not included` : ''}\n`;
   return `You are being asked for an independent second opinion. You have not
 seen the conversation this came from, and you do not need it — everything
 that matters is below.

@@ -23,13 +23,11 @@
 //   4. Only after a plan actually appeared. A guided turn that produced no
 //      file has nothing to review, and asking anyway burns two CLIs on an
 //      empty package.
-import fs from 'node:fs';
 import path from 'node:path';
 import { consultPeers, DEFAULT_PEER_TIMEOUT_MS } from './consult.mjs';
 import { snapshotFiles } from './snapshot.mjs';
 import { shouldConsult, councilStatus, suggestAssignment } from './roles.mjs';
 import { createPeerHealth } from './health.mjs';
-import { sha256Of } from './store.mjs';
 
 /**
  * How many consultations may run at once across all chats. Two peers each,
@@ -109,29 +107,23 @@ export function createCouncilRunner({
     if (store.runningFor(chatId)) return { skipped: SKIP_REASONS.inFlight };
     if (active.size >= maxConcurrent) return { skipped: SKIP_REASONS.busy };
 
-    // The plan's fingerprint at the moment it was handed over. What the peers
-    // are about to read is what the verdict will be about — anything typed
-    // into the file afterwards makes the verdict stale, and the store says so.
-    let planSha256 = null;
-    if (planPath) {
-      try {
-        planSha256 = sha256Of(fs.readFileSync(planPath, 'utf8'));
-      } catch {
-        planSha256 = null;
-      }
-    }
-
-    const consultation = store.queue({ chatId, moment, question, peers: status.peers, planPath, planSha256, missionId });
-    const controller = new AbortController();
-
-    // Materialize here, at queue time: what the peers see is the file as it
-    // was when the verdict was commissioned — the same moment planSha256
-    // fingerprints. Roots are the asker's cwd plus the plan's own directory
-    // (plans live in the dataDir, not the mission tree).
+    // Materialize at queue time. Roots are the asker's cwd plus the plan's
+    // own directory (plans live in the dataDir, not the mission tree).
     const { snapshots, refused } = snapshotFiles(planPath ? [planPath, ...files] : files, {
       cwd,
       roots: [cwd, ...(planPath ? [path.dirname(planPath)] : [])],
     });
+
+    // The plan's fingerprint comes from the SAME read that produced the
+    // snapshot (Codex' review: hashing in a second read means a write
+    // between the two makes the stored hash describe a file the peers
+    // never saw). What the peers were shown is what the verdict is about;
+    // anything typed into the file afterwards makes it stale, and the
+    // store says so.
+    const planSha256 = planPath ? (snapshots.find((snapshot) => snapshot.path === planPath)?.sha256 ?? null) : null;
+
+    const consultation = store.queue({ chatId, moment, question, peers: status.peers, planPath, planSha256, missionId });
+    const controller = new AbortController();
 
     const promise = consultPeers({
       peers: status.peers,

@@ -255,3 +255,20 @@ test.skipIf(process.platform !== 'win32')('a resolved shim really spawns node wi
   expect(seen[0].args[0]).toBe(entry);
   expect(seen[0].args).toContain('--tools');
 });
+
+test('a shell shim plus an empty tool list fails loudly before anything runs', async () => {
+  // cmd.exe drops an empty '' argument when it joins the argv, so the
+  // tool-free council turn would silently run with grok's default tools.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-grok-shim-'));
+  const shim = path.join(dir, 'grok.cmd');
+  fs.writeFileSync(shim, '@echo not-a-real-shim\r\n', 'utf8');
+  let spawned = false;
+  try {
+    await expect(
+      runGrokTurn({ cwd: dir, prompt: 'go', logDir: dir, env: { KAPREK_GROK_PATH: shim }, spawnFn: () => { spawned = true; throw new Error('must not spawn'); } }),
+    ).rejects.toThrow(/KAPREK_GROK_PATH/);
+    expect(spawned).toBe(false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

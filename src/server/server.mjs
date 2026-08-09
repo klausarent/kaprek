@@ -1807,12 +1807,16 @@ async function handleCouncilRoutes(req, res, segments, url, { dataDir, engineReg
     // The mission's own directory when the caller names one — not for the
     // peer to stand in (peers get an empty scratch dir since 0.9.0), but as
     // the root the requested files must live under and resolve against.
-    let cwd = dataDir;
+    // No mission, no root: the dataDir holds every chat transcript and the
+    // memory log, and "review this question" must never be the request that
+    // ships those to another vendor (Codex' review of b723bc6). A file
+    // asked for without a mission comes back as a refusal the peer sees.
+    let cwd = null;
     if (typeof body.data?.missionId === 'string') {
       try {
-        cwd = getMissions().get(body.data.missionId).cwd ?? dataDir;
+        cwd = getMissions().get(body.data.missionId).cwd ?? null;
       } catch {
-        // An unknown mission just means the default working directory.
+        // An unknown mission reads as "no mission": no root to read from.
       }
     }
 
@@ -1821,8 +1825,8 @@ async function handleCouncilRoutes(req, res, segments, url, { dataDir, engineReg
     // the peer did the reading. Snapshotting bounds it to the mission tree,
     // strips secrets, and refuses the files that hold them outright.
     const { snapshots, refused } = snapshotFiles(Array.isArray(body.data?.files) ? body.data.files.filter((f) => typeof f === 'string') : [], {
-      cwd,
-      roots: [cwd],
+      cwd: cwd ?? dataDir,
+      roots: cwd ? [cwd] : [],
     });
 
     const consultation = await consultPeers({

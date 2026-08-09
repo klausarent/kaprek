@@ -1,8 +1,9 @@
 import { describe, test, expect, beforeEach, afterEach } from 'vitest';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { snapshotFiles, refusalReason, SNAPSHOT_LIMITS } from './snapshot.mjs';
+import { snapshotFiles, refusalReason, SNAPSHOT_LIMITS, MAX_REQUESTED_PATHS } from './snapshot.mjs';
 
 let root;
 beforeEach(() => {
@@ -69,6 +70,46 @@ describe('snapshotFiles', () => {
     const { snapshots, refused } = snapshotFiles(['a.txt'], { cwd: root, roots: [] });
     expect(snapshots).toEqual([]);
     expect(refused).toHaveLength(1);
+    expect(refused[0].reason).toContain('no readable root');
+  });
+
+  test('a friendly-named symlink to a .env is judged by its target, not its name', () => {
+    write('.env', 'API_KEY=super-secret-value\n');
+    try {
+      fs.symlinkSync(path.join(root, '.env'), path.join(root, 'review.txt'));
+    } catch {
+      return; // creating symlinks needs privileges this runner may not have
+    }
+    const { snapshots, refused } = snapshotFiles(['review.txt'], { cwd: root, roots: [root] });
+    expect(snapshots).toEqual([]);
+    expect(refused[0].reason).toContain('credentials');
+  });
+
+  test('a file above maxRawBytes is refused before it is ever read', () => {
+    write('huge.log', 'x'.repeat(300));
+    const limits = { ...SNAPSHOT_LIMITS, maxRawBytes: 200 };
+    const { snapshots, refused } = snapshotFiles(['huge.log'], { cwd: root, roots: [root], limits });
+    expect(snapshots).toEqual([]);
+    expect(refused[0].reason).toContain('too large');
+  });
+
+  test('each snapshot carries the sha256 of the raw content it was read from', () => {
+    write('plan.md', '# plan with sk-ant-api03-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa inside\n');
+    const raw = fs.readFileSync(path.join(root, 'plan.md'), 'utf8');
+    const { snapshots } = snapshotFiles(['plan.md'], { cwd: root, roots: [root] });
+    // Hash of the RAW read — redaction changes the content, not the hash.
+    expect(snapshots[0].sha256).toBe(crypto.createHash('sha256').update(raw, 'utf8').digest('hex'));
+    expect(snapshots[0].content).toContain('[REDACTED]');
+  });
+
+  test('a request list past MAX_REQUESTED_PATHS is cut with one summary refusal', () => {
+    write('real.txt', 'hi');
+    const flood = Array.from({ length: MAX_REQUESTED_PATHS + 5 }, (_, i) => `missing-${i}.txt`);
+    const { refused } = snapshotFiles([...flood], { cwd: root, roots: [root] });
+    expect(refused[0].reason).toContain(`first ${MAX_REQUESTED_PATHS}`);
+    expect(refused[0].path).toContain('5 further files');
+    // 1 summary line + the capped requests themselves, nothing more.
+    expect(refused).toHaveLength(1 + MAX_REQUESTED_PATHS);
   });
 
   test('secrets in file content are redacted before they reach the package', () => {

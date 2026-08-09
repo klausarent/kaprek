@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createCouncilRunner, SKIP_REASONS, planQuestion } from './auto.mjs';
-import { openConsultations } from './store.mjs';
+import { openConsultations, sha256Of } from './store.mjs';
 
 let dir;
 
@@ -48,6 +48,16 @@ describe('maybeConsult', () => {
     await r.waitFor(started.consultation.id);
     expect(asked[0].prompt).toContain('rename the store');
     expect(asked[0].prompt).toContain('NO file access');
+  });
+
+  it('fingerprints the plan from the same read that fed the snapshot', async () => {
+    const planPath = path.join(dir, 'plan.md');
+    const planText = '# The plan\n- [ ] one\n';
+    fs.writeFileSync(planPath, planText, 'utf8');
+    const { runner: r, store } = runner();
+    const started = r.maybeConsult({ chatId: 'c1', moment: 'plan', question: 'sound?', cwd: dir, planPath });
+    await r.waitFor(started.consultation.id);
+    expect(store.get(started.consultation.id).planSha256).toBe(sha256Of(planText));
   });
 
   it('a .env asked for by name arrives as a refusal, never as content', async () => {

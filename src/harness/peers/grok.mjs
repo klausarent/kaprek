@@ -228,6 +228,17 @@ function killTree(child) {
 export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, signal, logDir = null, spawnFn = spawn, env = process.env, maxTurns, tools, schema, validate = true } = {}) {
   if (typeof prompt !== 'string' || prompt.trim().length === 0) throw new Error('a peer turn needs a prompt');
 
+  const { command, argsPrefix = [], useShell } = resolveGrokCli(env);
+  // The empty --tools '' argument — the default, and what a text-only
+  // council turn relies on — VANISHES when cmd.exe joins the argv (see
+  // resolveCmdShim's note), and grok then runs with its full default tool
+  // set or rejects the flag. Neither is acceptable to discover at answer
+  // time: fail here, before anything touches the disk, on the one path
+  // that still needs a shell.
+  if (useShell && !tools) {
+    throw new Error(`the grok CLI resolved to a shell shim (${command}), which cannot pass an empty --tools list; set KAPREK_GROK_PATH to the grok.exe binary`);
+  }
+
   const startedAt = Date.now();
   const scratchDir = logDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-peer-'));
   fs.mkdirSync(scratchDir, { recursive: true });
@@ -236,7 +247,6 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
   const rawLogPath = path.join(scratchDir, `grok-raw-${stamp}.log`);
   fs.writeFileSync(promptPath, prompt, 'utf8');
 
-  const { command, argsPrefix = [], useShell } = resolveGrokCli(env);
   const args = [...argsPrefix, ...buildGrokArgs({ promptPath, cwd, ...(maxTurns ? { maxTurns } : {}), ...(tools ? { tools } : {}), ...(schema ? { schema } : {}) })];
 
   const result = await new Promise((resolve) => {
