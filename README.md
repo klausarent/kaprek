@@ -122,6 +122,24 @@ A guided turn where the agent answered in prose anyway says so. The mode is
 an instruction to a model, not a guarantee, and a quiet failure would leave
 you with the old wall of text wearing a new label.
 
+### Done is a claim — the convergence check
+
+"Check the work against this plan" on `#/plans` starts a third guided mode,
+`converge`: the agent reads the plan, looks only at the files and places the
+plan itself names, and reports every gap as a fenced ` ```kaprek-findings `
+block — `missing`, `partial`, `contradicts`, or `unrequested` (work nobody
+asked for is reported, never removed), each with a severity, the evidence,
+and the remaining work. kaprek appends the findings to the plan file as new
+unchecked steps under a `## Convergence round N` heading, so they are
+ticked off like any other step. Zero findings marks the plan done; that is
+the only way past the gate without a name on it. Marking a plan done without
+a clean check needs the name of the person who decided, and that override
+is recorded on the plan and in every task receipt whose session the plan's
+chat belongs to — a receipt with `converge` in its payload seals the plan's
+state at signing time, so a later check or override invalidates it, like an
+edited doc does. The gap taxonomy is spec-kit's (`/speckit-converge`); the
+prompt, the fence, and the gate are kaprek's own.
+
 ## Council
 
 Four jobs, and whichever engines you have doing them:

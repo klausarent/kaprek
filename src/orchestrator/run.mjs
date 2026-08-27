@@ -18,6 +18,7 @@ import { writeHarnessSettings, mergeAskList, PROFILE_CLI_MODE } from '../harness
 import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
 import { buildModePrompt, PLAN_MODES } from '../plans/prompt.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
+import { parseFindings } from '../plans/findings.mjs';
 import { openPlans } from '../plans/store.mjs';
 import { openMemory } from '../memory/store.mjs';
 import { buildMemoryPrompt, parseRemember } from '../memory/protocol.mjs';
@@ -127,7 +128,7 @@ function harnessMetaPath(dataDir, chatId) {
  * A parse failure here must not block a turn — it just means we start a
  * fresh CLI session instead of resuming one, same as no sidecar at all.
  */
-function readHarnessMeta(dataDir, chatId) {
+export function readHarnessMeta(dataDir, chatId) {
   const metaPath = harnessMetaPath(dataDir, chatId);
   if (!fs.existsSync(metaPath)) return null;
   try {
@@ -781,6 +782,7 @@ function rememberFromTurn({ dataDir, scopeId, chatId, text }) {
  * guided. The UI shows this rather than hiding it.
  */
 function summarizeGuidedTurn({ dataDir, cwd, chatId, mode, planPath, text }) {
+  if (mode === 'converge') return summarizeConvergeTurn({ dataDir, cwd, chatId, planPath, text });
   const quiz = parseQuiz(text);
   let plan = null;
   let planError = null;
@@ -798,4 +800,31 @@ function summarizeGuidedTurn({ dataDir, cwd, chatId, mode, planPath, text }) {
     }
   }
   return { mode, planPath, quiz, plan, planError, protocolBroken: quiz === null && plan === null };
+}
+
+/**
+ * What a converge turn produced: the findings, written into the plan file
+ * as new steps, and the verdict recorded on the plan. A clean check marks
+ * the plan done (store.mjs::recordConverge) — that is the gate being passed.
+ *
+ * An agent that answered in prose is `protocolBroken`, exactly like a
+ * guided turn without a quiz: nothing is recorded, and the plan's status
+ * does not move, because "the agent said it looked fine" is not a check.
+ */
+function summarizeConvergeTurn({ dataDir, cwd, chatId, planPath, text }) {
+  const findings = parseFindings(text);
+  let plan = null;
+  let planError = null;
+  if (findings && planPath) {
+    try {
+      const plans = openPlans(dataDir, { allowedRoots: () => (cwd ? [dataDir, cwd] : [dataDir]) });
+      plan = plans.register({ path: planPath, chatId });
+      const round = (plan.converge?.round ?? 0) + 1;
+      if (findings.findings.length > 0) plans.appendFindings(plan.id, findings.findings, { round });
+      plan = plans.recordConverge(plan.id, { chatId, findings: findings.findings.length, converged: findings.converged });
+    } catch (err) {
+      planError = err?.message ?? String(err);
+    }
+  }
+  return { mode: 'converge', planPath, quiz: null, plan, planError, findings, protocolBroken: findings === null };
 }

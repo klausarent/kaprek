@@ -15,6 +15,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { parseSteps, setStep as setStepInMarkdown, planTitle } from './markdown.mjs';
+import { renderFindingsSection, appendFindingsSection } from './findings.mjs';
 import { isInside } from '../lib/contain.mjs';
 
 export const PLAN_STATUSES = ['draft', 'active', 'done', 'archived'];
@@ -53,6 +54,22 @@ export class InvalidStatusError extends Error {
     super(`invalid status: ${status} (expected one of ${PLAN_STATUSES.join(', ')})`);
     this.name = 'InvalidStatusError';
     this.status = status;
+  }
+}
+
+/**
+ * The gate: a plan is done when a converge turn found nothing, not when
+ * someone says so. Overriding is allowed — and recorded, on the plan and in
+ * every receipt that points at it — because a gate nobody can pass by hand
+ * gets worked around in silence, which is worse than an override on record.
+ */
+export class PlanNotConvergedError extends Error {
+  constructor(planId, converge) {
+    const state = converge === null ? 'no convergence check has run yet' : `the last check (round ${converge.round}) found ${converge.findings} gap(s)`;
+    super(`plan ${planId} cannot be marked done: ${state}`);
+    this.name = 'PlanNotConvergedError';
+    this.planId = planId;
+    this.converge = converge;
   }
 }
 
@@ -104,6 +121,11 @@ function applyEvent(plans, event) {
         status: 'draft',
         chatId: data.chatId ?? null,
         missionId: data.missionId ?? null,
+        // The last convergence check, and whether 'done' was set past the
+        // gate. Both null until something happens; both survive in the
+        // event log, so a plan's history of checks is replayable.
+        converge: null,
+        override: null,
         createdAt: ts,
         updatedAt: ts,
       });
@@ -113,6 +135,22 @@ function applyEvent(plans, event) {
       const plan = plans.get(planId);
       if (!plan) break;
       plan.status = data.status;
+      // An override is a fact about THIS status. The next status change,
+      // whichever way it goes, starts clean.
+      plan.override = data.override ? { by: data.override.by, at: ts } : null;
+      plan.updatedAt = ts;
+      break;
+    }
+    case 'plan.converged': {
+      const plan = plans.get(planId);
+      if (!plan) break;
+      plan.converge = {
+        round: data.round,
+        chatId: data.chatId ?? null,
+        findings: data.findings,
+        converged: data.converged === true,
+        at: ts,
+      };
       plan.updatedAt = ts;
       break;
     }
@@ -274,11 +312,63 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
       return withExistence(requirePlan(planId));
     },
 
-    setStatus(planId, status) {
+    /**
+     * Changes the status. 'done' is gated: it needs a convergence check that
+     * found nothing (see recordConverge), or an explicit override naming who
+     * decided — which is then part of the plan's record, not a detail lost
+     * in a click.
+     *
+     * @param {{override?: {by: string}}} [options]
+     * @throws {PlanNotConvergedError} for 'done' without a clean check and without an override
+     */
+    setStatus(planId, status, { override } = {}) {
       if (!PLAN_STATUSES.includes(status)) throw new InvalidStatusError(status);
-      requirePlan(planId);
+      const plan = requirePlan(planId);
+      if (status === 'done' && !(plan.converge?.converged === true)) {
+        const by = typeof override?.by === 'string' ? override.by.trim() : '';
+        if (by === '') throw new PlanNotConvergedError(planId, plan.converge ? { round: plan.converge.round, findings: plan.converge.findings } : null);
+        commit('plan.status', planId, { status, override: { by: by.slice(0, 80) } });
+        return withExistence(requirePlan(planId));
+      }
       commit('plan.status', planId, { status });
       return withExistence(requirePlan(planId));
+    },
+
+    /**
+     * Records what a convergence check found. Zero findings with the
+     * agent's claim of convergence marks the plan done — that IS the gate
+     * being passed; findings put it (back) to active, because there is work
+     * again. The findings themselves are appended to the file by
+     * appendFindings(); this only records the verdict.
+     *
+     * @param {{chatId?: string|null, findings: number, converged: boolean}} result
+     */
+    recordConverge(planId, { chatId = null, findings, converged }) {
+      const plan = requirePlan(planId);
+      const count = Number.isInteger(findings) && findings >= 0 ? findings : 0;
+      const clean = converged === true && count === 0;
+      const round = (plan.converge?.round ?? 0) + 1;
+      commit('plan.converged', planId, { round, chatId, findings: count, converged: clean });
+      if (clean && plan.status !== 'done') commit('plan.status', planId, { status: 'done' });
+      if (!clean && plan.status !== 'active') commit('plan.status', planId, { status: 'active' });
+      return withExistence(requirePlan(planId));
+    },
+
+    /**
+     * Appends one round of findings to the plan file as unchecked steps —
+     * append-only, under its own heading, so nothing a person wrote above
+     * is touched. Returns the plan as read() would, from the new content.
+     */
+    appendFindings(planId, findings, { round, ts = new Date().toISOString() } = {}) {
+      const plan = requirePlan(planId);
+      const raw = readFileOf(plan);
+      const nextRound = Number.isInteger(round) && round > 0 ? round : (plan.converge?.round ?? 0) + 1;
+      const next = appendFindingsSection(raw, renderFindingsSection({ round: nextRound, findings, ts }));
+      const tmp = `${plan.path}.kaprek-tmp-${process.pid}-${crypto.randomUUID()}`;
+      fs.writeFileSync(tmp, next, 'utf8');
+      fs.renameSync(tmp, plan.path);
+      commit('plan.touched', planId, {});
+      return { ...withExistence(plan), content: next, steps: parseSteps(next), truncated: false };
     },
 
     /**

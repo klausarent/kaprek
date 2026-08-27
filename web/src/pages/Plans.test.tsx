@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { render, textOf, findAll } from "../test/tree";
-import { PlanList, PlanDetailView, progressOf, subtitleOf } from "./Plans";
+import { PlanList, PlanDetailView, DoneControls, checkLabel, progressOf, subtitleOf } from "./Plans";
 import type { PlanDetail, PlanSummary } from "../lib/api";
 
 const summary = (over: Partial<PlanSummary> = {}): PlanSummary => ({
@@ -14,8 +14,12 @@ const summary = (over: Partial<PlanSummary> = {}): PlanSummary => ({
   createdAt: "2026-08-02T01:00:00.000Z",
   updatedAt: "2026-08-02T01:00:00.000Z",
   exists: true,
+  converge: null,
+  override: null,
   ...over,
 });
+
+const checked = (findings: number, round = 1): PlanSummary["converge"] => ({ round, chatId: "c1", findings, converged: findings === 0, at: "2026-08-27T09:00:00.000Z" });
 
 const detail = (over: Partial<PlanDetail> = {}): PlanDetail => ({
   ...summary(),
@@ -87,5 +91,60 @@ describe("the detail", () => {
   test("boxes are locked while one is being written", () => {
     const tree = render(<PlanDetailView plan={detail()} busyStep={0} onToggleStep={() => {}} onImplement={() => {}} onCopyPath={() => {}} />);
     expect(findAll(tree, (node) => node.props?.type === "checkbox").every((box) => box.props.disabled === true)).toBe(true);
+  });
+
+  test("offers the convergence check whenever the file is there", () => {
+    const tree = render(<PlanDetailView plan={detail()} busyStep={null} onToggleStep={() => {}} onImplement={() => {}} onCopyPath={() => {}} onConverge={() => {}} />);
+    expect(textOf(tree)).toContain("Check the work against this plan");
+    const gone = render(<PlanDetailView plan={detail({ exists: false })} busyStep={null} onToggleStep={() => {}} onImplement={() => {}} onCopyPath={() => {}} onConverge={() => {}} />);
+    expect(textOf(gone)).not.toContain("Check the work against this plan");
+  });
+});
+
+describe("the gate", () => {
+  test("the check label says what the last round found, and who overrode it", () => {
+    expect(checkLabel(summary())).toBe("not checked against the work yet");
+    expect(checkLabel(summary({ converge: checked(3, 2) }))).toBe("checked in round 2: 3 gap(s) open");
+    expect(checkLabel(summary({ converge: checked(0, 3) }))).toBe("checked in round 3: converged");
+    expect(checkLabel(summary({ status: "done", override: { by: "Klaus", at: "2026-08-27T10:00:00.000Z" } }))).toBe("marked done by Klaus without a clean check");
+  });
+
+  test("without a clean check there is no plain Mark done — only the override, and that needs a name", () => {
+    const calls: unknown[] = [];
+    const empty = render(<DoneControls plan={summary({ converge: checked(2) })} overrideBy="" busy={false} onOverrideByChange={() => {}} onMarkDone={(o) => calls.push(o)} />);
+    const buttons = findAll(empty, (node) => node.type === "button");
+    expect(buttons).toHaveLength(1);
+    expect(textOf(buttons[0])).toBe("Mark done without a check");
+    expect(buttons[0].props.disabled).toBe(true);
+
+    const named = render(<DoneControls plan={summary({ converge: checked(2) })} overrideBy=" Klaus " busy={false} onOverrideByChange={() => {}} onMarkDone={(o) => calls.push(o)} />);
+    const button = findAll(named, (node) => node.type === "button")[0];
+    expect(button.props.disabled).toBe(false);
+    (button.props.onClick as () => void)();
+    expect(calls).toEqual([{ by: "Klaus" }]);
+  });
+
+  test("after a clean check, Mark done is plain and carries no override", () => {
+    const calls: unknown[] = [];
+    const tree = render(<DoneControls plan={summary({ converge: checked(0) })} overrideBy="" busy={false} onOverrideByChange={() => {}} onMarkDone={(o) => calls.push(o)} />);
+    const buttons = findAll(tree, (node) => node.type === "button");
+    expect(buttons).toHaveLength(1);
+    expect(textOf(buttons[0])).toBe("Mark done");
+    (buttons[0].props.onClick as () => void)();
+    expect(calls).toEqual([undefined]);
+    expect(findAll(tree, (node) => node.type === "input")).toHaveLength(0);
+  });
+
+  test("a done plan shows its record instead of controls", () => {
+    const tree = render(<DoneControls plan={summary({ status: "done", converge: checked(0) })} overrideBy="" busy={false} onOverrideByChange={() => {}} onMarkDone={() => {}} />);
+    expect(findAll(tree, (node) => node.type === "button")).toHaveLength(0);
+    expect(textOf(tree)).toContain("converged");
+  });
+
+  test("the list marks done plans, overrides, and open gaps", () => {
+    const plans = [summary({ id: "a", status: "done", converge: checked(0) }), summary({ id: "b", status: "done", override: { by: "Klaus", at: "x" } }), summary({ id: "c", status: "active", converge: checked(4) })];
+    const text = textOf(render(<PlanList plans={plans} selectedId={null} onSelect={() => {}} />));
+    expect(text).toContain("done (override)");
+    expect(text).toContain("4 gap(s)");
   });
 });

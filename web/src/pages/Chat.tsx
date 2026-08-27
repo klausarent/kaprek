@@ -207,18 +207,45 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   // moment (see Missions.tsx) — take it once, then clear it so a later visit
   // to the same mission starts empty.
   useEffect(() => {
-    if (initialChatId || !missionId) return;
+    if (initialChatId) return;
     try {
-      const key = `kaprek-first-prompt-${missionId}`;
-      const parked = window.sessionStorage.getItem(key);
-      if (parked) {
-        setDraft(parked);
-        window.sessionStorage.removeItem(key);
+      // The mission's own parked prompt first; the plans page parks under the
+      // plain key (no mission in hand there) — "Start working on this".
+      for (const key of [missionId ? `kaprek-first-prompt-${missionId}` : null, "kaprek-first-prompt"]) {
+        if (!key) continue;
+        const parked = window.sessionStorage.getItem(key);
+        if (parked) {
+          setDraft(parked);
+          window.sessionStorage.removeItem(key);
+          break;
+        }
       }
     } catch {
       // storage blocked — the person types their own opener
     }
   }, [initialChatId, missionId]);
+
+  // A whole turn parked by the plans page ("Check against the plan"): the
+  // click over there was the send, so it starts here without a second one.
+  // Read once and cleared before it runs, so a re-render cannot send twice.
+  const parkedTurnSent = useRef(false);
+  useEffect(() => {
+    if (initialChatId || parkedTurnSent.current) return;
+    let parked: { mode?: PlanMode; planId?: string; text?: string } | null = null;
+    try {
+      const raw = window.sessionStorage.getItem("kaprek-first-turn");
+      if (raw) {
+        window.sessionStorage.removeItem("kaprek-first-turn");
+        parked = JSON.parse(raw);
+      }
+    } catch {
+      parked = null;
+    }
+    if (!parked?.text) return;
+    parkedTurnSent.current = true;
+    void handleSend({ mode: parked.mode, planId: parked.planId, text: parked.text });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialChatId]);
 
   // The picker's options — only a brand-new chat needs them; an existing
   // chat's engine is already settled.
@@ -343,7 +370,7 @@ Is this the right approach?`,
     }
   };
 
-  const handleSend = async ({ mode, text: override }: { mode?: PlanMode; text?: string } = {}) => {
+  const handleSend = async ({ mode, planId, text: override }: { mode?: PlanMode; planId?: string; text?: string } = {}) => {
     const text = (override ?? draft).trim();
     if (!text || streaming) return;
     // A new turn supersedes whatever the last one asked or offered.
@@ -374,6 +401,7 @@ Is this the right approach?`,
         approvalMode,
         effort: effort === "default" ? undefined : effort,
         ...(mode ? { mode } : {}),
+        ...(planId ? { planId } : {}),
         text,
         signal: controller.signal,
         onEvent: (event) => handleStreamEvent(event),
@@ -667,9 +695,48 @@ Is this the right approach?`,
         </div>
       )}
 
+      {guided?.findings && (
+        <div className="plan-written">
+          {guided.findings.converged ? (
+            <span>
+              Converged: the work matches the plan{guided.plan ? <> — <strong>{guided.plan.title}</strong> is done</> : null}.
+            </span>
+          ) : (
+            <span>
+              {guided.findings.findings.length} gap(s) between the plan and the work
+              {guided.plan ? <> — appended to <strong>{guided.plan.title}</strong> as new steps</> : null}.
+            </span>
+          )}
+          {guided.findings.findings.length > 0 && (
+            <ul className="plan-steps">
+              {guided.findings.findings.map((finding) => (
+                <li key={finding.id}>
+                  <strong>
+                    {finding.id} ({finding.severity}, {finding.gapType}
+                    {finding.sourceRef ? `, ${finding.sourceRef}` : ""}):
+                  </strong>{" "}
+                  {finding.remainingWork}
+                  {finding.evidence ? <> — {finding.evidence}</> : null}
+                </li>
+              ))}
+            </ul>
+          )}
+          {guided.plan && (
+            <span className="plan-written-actions">
+              <button type="button" className="btn btn-small" onClick={() => navigateToPlans()}>
+                Open the plan
+              </button>
+            </span>
+          )}
+          {guided.planError && <div className="error-box">{guided.planError}</div>}
+        </div>
+      )}
+
       {guided?.protocolBroken && (
         <div className="chat-turn-line">
-          That turn ran in {guided.mode} mode, but the agent answered in prose instead of using the quiz — the answer above is all there is.
+          {guided.mode === "converge"
+            ? "That turn ran as a convergence check, but the agent answered in prose instead of reporting findings — nothing was recorded, and the plan's status did not move."
+            : `That turn ran in ${guided.mode} mode, but the agent answered in prose instead of using the quiz — the answer above is all there is.`}
         </div>
       )}
 

@@ -2,7 +2,7 @@ import { expect, test } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { openPlans, PLAN_STATUSES, PlanNotFoundError, PlanFileMissingError, InvalidPlanPathError, InvalidStatusError, PlanOutsideRootError } from './store.mjs';
+import { openPlans, PLAN_STATUSES, PlanNotFoundError, PlanFileMissingError, InvalidPlanPathError, InvalidStatusError, PlanOutsideRootError, PlanNotConvergedError } from './store.mjs';
 
 function tmpDataDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-plans-'));
@@ -78,7 +78,8 @@ test('status moves through the known values only', () => {
   const store = openPlans(dataDir);
   const plan = store.register({ path: writePlanFile(dataDir) });
   for (const status of PLAN_STATUSES) {
-    expect(store.setStatus(plan.id, status).status).toBe(status);
+    // 'done' is gated (see the convergence tests below); here it passes with an override on record.
+    expect(store.setStatus(plan.id, status, status === 'done' ? { override: { by: 'test' } } : {}).status).toBe(status);
   }
   expect(() => store.setStatus(plan.id, 'nearly')).toThrow(InvalidStatusError);
   expect(() => store.setStatus('no-such-plan', 'done')).toThrow(PlanNotFoundError);
@@ -195,4 +196,90 @@ test('two instances that both registered the same file collapse to one plan on r
   const store = openPlans(dataDir);
   expect(store.list()).toHaveLength(1);
   expect(store.list()[0].id).toBe('from-instance-a');
+});
+
+// ------------------------------------------------------------- convergence gate
+
+test('done is gated: without a clean convergence check it is refused, with one it goes through', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const plan = store.register({ path: writePlanFile(dataDir) });
+
+  expect(() => store.setStatus(plan.id, 'done')).toThrow(PlanNotConvergedError);
+  expect(store.get(plan.id).status).toBe('draft');
+
+  // A check that found gaps: the plan is active again, still not done.
+  const afterGaps = store.recordConverge(plan.id, { chatId: 'chat-1', findings: 2, converged: false });
+  expect(afterGaps.status).toBe('active');
+  expect(afterGaps.converge).toMatchObject({ round: 1, chatId: 'chat-1', findings: 2, converged: false });
+  expect(() => store.setStatus(plan.id, 'done')).toThrow(/found 2 gap/);
+
+  // A clean check IS the gate being passed: done, round counted, no override on record.
+  const clean = store.recordConverge(plan.id, { chatId: 'chat-2', findings: 0, converged: true });
+  expect(clean.status).toBe('done');
+  expect(clean.converge).toMatchObject({ round: 2, converged: true });
+  expect(clean.override).toBeNull();
+});
+
+test('a converged claim with findings is not clean, and zero findings without the claim is not clean either', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const plan = store.register({ path: writePlanFile(dataDir) });
+  expect(store.recordConverge(plan.id, { findings: 1, converged: true }).converge.converged).toBe(false);
+  expect(store.recordConverge(plan.id, { findings: 0, converged: false }).converge.converged).toBe(false);
+  expect(store.get(plan.id).status).toBe('active');
+});
+
+test('an override passes the gate and is on record — and the record clears on the next status change', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const plan = store.register({ path: writePlanFile(dataDir) });
+
+  expect(() => store.setStatus(plan.id, 'done', { override: { by: '   ' } })).toThrow(PlanNotConvergedError);
+  const done = store.setStatus(plan.id, 'done', { override: { by: 'Klaus' } });
+  expect(done.status).toBe('done');
+  expect(done.override).toMatchObject({ by: 'Klaus' });
+  expect(typeof done.override.at).toBe('string');
+
+  // Replay keeps it.
+  expect(openPlans(dataDir).get(plan.id).override.by).toBe('Klaus');
+
+  const reopened = store.setStatus(plan.id, 'active');
+  expect(reopened.override).toBeNull();
+});
+
+test('other statuses are never gated', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const plan = store.register({ path: writePlanFile(dataDir) });
+  for (const status of ['active', 'archived', 'draft']) expect(store.setStatus(plan.id, status).status).toBe(status);
+});
+
+test('appendFindings adds one unchecked step per finding under its own heading and leaves the text above alone', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const file = writePlanFile(dataDir);
+  const plan = store.register({ path: file });
+
+  const result = store.appendFindings(
+    plan.id,
+    [{ id: 'F1', sourceRef: 'Second step', gapType: 'partial', severity: 'high', evidence: 'no test', remainingWork: 'write the test' }],
+    { round: 1, ts: '2026-08-27T09:00:00.000Z' },
+  );
+  const onDisk = fs.readFileSync(file, 'utf8');
+  expect(onDisk.startsWith(PLAN_MD)).toBe(true);
+  expect(onDisk).toContain('## Convergence round 1 (2026-08-27)');
+  expect(result.steps).toHaveLength(3);
+  expect(result.steps[2]).toMatchObject({ done: false, text: '**F1 (high, partial, Second step):** write the test — no test' });
+  // The new step is a real step: ticking it works like any other.
+  expect(store.setStep(plan.id, 2, true).steps[2].done).toBe(true);
+});
+
+test('appendFindings refuses a plan whose file is gone, like every other write', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const file = writePlanFile(dataDir);
+  const plan = store.register({ path: file });
+  fs.rmSync(file);
+  expect(() => store.appendFindings(plan.id, [{ id: 'F1', severity: 'low', gapType: 'missing', sourceRef: '', evidence: '', remainingWork: 'x' }])).toThrow(PlanFileMissingError);
 });

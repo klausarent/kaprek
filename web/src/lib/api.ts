@@ -662,8 +662,8 @@ export type ChatStreamEvent =
       guided?: GuidedResult | null;
     };
 
-/** A guided mode for one turn: quiz cards, or the plan file. */
-export type PlanMode = "brainstorm" | "plan";
+/** A guided mode for one turn: quiz cards, the plan file, or the check of the work against it. */
+export type PlanMode = "brainstorm" | "plan" | "converge";
 
 export type QuizQuestion = {
   id: string;
@@ -690,11 +690,29 @@ export type PlanSummary = {
   createdAt: string;
   updatedAt: string;
   exists: boolean;
+  /** The last convergence check, or null when none has run. */
+  converge: PlanConverge | null;
+  /** Set when 'done' was reached past the gate, by a person, on record. */
+  override: { by: string; at: string } | null;
 };
+
+export type PlanConverge = { round: number; chatId: string | null; findings: number; converged: boolean; at: string };
 
 export type PlanStep = { index: number; line: number; text: string; done: boolean };
 
 export type PlanDetail = PlanSummary & { content: string; steps: PlanStep[]; truncated: boolean };
+
+/** One gap a convergence check found between the plan and the work. */
+export type Finding = {
+  id: string;
+  sourceRef: string;
+  gapType: "missing" | "partial" | "contradicts" | "unrequested";
+  severity: "critical" | "high" | "medium" | "low";
+  evidence: string;
+  remainingWork: string;
+};
+
+export type Findings = { converged: boolean; findings: Finding[]; checked: { requirements: number | null; files: number | null } };
 
 /**
  * What a guided turn produced. `protocolBroken` is the honest signal that
@@ -707,6 +725,8 @@ export type GuidedResult = {
   quiz: Quiz | null;
   plan: PlanSummary | null;
   planError: string | null;
+  /** Only on a converge turn: what the check found (null = the agent answered in prose). */
+  findings?: Findings | null;
   protocolBroken: boolean;
 };
 
@@ -873,6 +893,7 @@ export async function streamChatTurn({
   approvalMode,
   effort,
   mode,
+  planId,
   text,
   onEvent,
   signal,
@@ -890,6 +911,8 @@ export async function streamChatTurn({
   effort?: Effort;
   /** Guided mode for this turn; omitted runs an ordinary turn. */
   mode?: PlanMode;
+  /** The plan a guided turn is about — a converge turn started from the plans page names the one that was clicked. */
+  planId?: string;
   text: string;
   onEvent: (event: ChatStreamEvent) => void;
   signal?: AbortSignal;
@@ -902,6 +925,7 @@ export async function streamChatTurn({
       ...(approvalMode ? { approvalMode } : {}),
       ...(effort ? { effort } : {}),
       ...(mode ? { mode } : {}),
+      ...(planId ? { planId } : {}),
       text,
     }),
     signal,
@@ -1214,6 +1238,22 @@ export async function fetchPlan(id: string): Promise<PlanDetail> {
   const res = await apiFetch(`/api/plans/${encodeURIComponent(id)}`);
   await throwOnError(res);
   return (await res.json()).plan as PlanDetail;
+}
+
+/**
+ * Changes a plan's status. 'done' is gated server-side on a clean convergence
+ * check; `override` passes the gate and is recorded with the name given. A
+ * refused 'done' comes back as a 409 whose message says why.
+ */
+export async function setPlanStatus(id: string, status: PlanSummary["status"], override?: { by: string }): Promise<PlanDetail> {
+  const res = await apiFetch(`/api/plans/${encodeURIComponent(id)}/status`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ status, ...(override ? { override } : {}) }),
+  });
+  await throwOnError(res);
+  await res.json();
+  return fetchPlan(id);
 }
 
 /** Ticks or unticks one step, rewriting that line in the plan file. */

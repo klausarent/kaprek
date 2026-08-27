@@ -4414,3 +4414,104 @@ test('lan: a made-up token is still a plain 401', async () => {
   const res = await rawFetch(`${url}/api/approvals`, { headers: { [TOKEN_HEADER]: 'not-a-real-token', 'x-app-request': '1' } });
   expect(res.status).toBe(401);
 });
+
+test('plans: done is gated on a clean convergence check; an override passes it on record', async () => {
+  const { url } = await boot();
+  const planFile = path.join(dataDir, 'workspace', 'plans', 'gated.md');
+  fs.mkdirSync(path.dirname(planFile), { recursive: true });
+  fs.writeFileSync(planFile, '# Gated\n\n- [x] step\n', 'utf8');
+  const { openPlans } = await import('../plans/store.mjs');
+  const store = openPlans(dataDir);
+  const registered = store.register({ path: planFile });
+
+  const refused = await postJson(`${url}/api/plans/${registered.id}/status`, { status: 'done' });
+  expect(refused.status).toBe(409);
+  const refusedBody = await refused.json();
+  expect(refusedBody.notConverged).toBe(true);
+  expect(refusedBody.error).toContain('no convergence check');
+
+  const badOverride = await postJson(`${url}/api/plans/${registered.id}/status`, { status: 'done', override: { by: '' } });
+  expect(badOverride.status).toBe(400);
+  const badStatus = await postJson(`${url}/api/plans/${registered.id}/status`, { status: 'finished' });
+  expect(badStatus.status).toBe(400);
+
+  const overridden = await postJson(`${url}/api/plans/${registered.id}/status`, { status: 'done', override: { by: 'Klaus' } });
+  expect(overridden.status).toBe(200);
+  const { plan } = await overridden.json();
+  expect(plan.status).toBe('done');
+  expect(plan.override.by).toBe('Klaus');
+
+  // After a clean check, done needs no override.
+  store.setStatus(registered.id, 'active');
+  store.recordConverge(registered.id, { findings: 0, converged: true });
+  expect((await (await fetch(`${url}/api/plans/${registered.id}`)).json()).plan.status).toBe('done');
+});
+
+test('chat turn: a converge turn names its plan by id, appends the findings to that file and reports them', async () => {
+  const planFile = path.join(dataDir, 'workspace', 'plans', 'to-check.md');
+  fs.mkdirSync(path.dirname(planFile), { recursive: true });
+  fs.writeFileSync(planFile, '# To check\n\n- [x] Build it\n', 'utf8');
+  let seenPrompt = null;
+  const harness = {
+    startTurn: async (options) => {
+      seenPrompt = options.appendSystemPrompt ?? '';
+      options.onEvent({
+        type: 'text',
+        text: ['Checked.', '', '```kaprek-findings', JSON.stringify({ converged: false, findings: [{ id: 'F1', sourceRef: 'Build it', gapType: 'partial', severity: 'medium', evidence: 'no README', remainingWork: 'write the README' }] }), '```'].join('\n'),
+      });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+  const { openPlans } = await import('../plans/store.mjs');
+  const registered = openPlans(dataDir).register({ path: planFile });
+
+  const unknown = await postJson(`${url}/api/chat/turn`, { text: 'check', mode: 'converge', planId: 'nope' });
+  expect(unknown.status).toBe(404);
+
+  const res = await postJson(`${url}/api/chat/turn`, { text: 'check the work against the plan', mode: 'converge', planId: registered.id });
+  const frames = await readSse(res);
+  const complete = frames.find((f) => f.type === 'turn-complete');
+  expect(seenPrompt).toContain(path.resolve(planFile));
+  expect(complete.guided.mode).toBe('converge');
+  expect(complete.guided.findings.findings).toHaveLength(1);
+  expect(complete.guided.plan.id).toBe(registered.id);
+  expect(complete.guided.plan.status).toBe('active');
+  expect(fs.readFileSync(planFile, 'utf8')).toContain('- [ ] **F1 (medium, partial, Build it):** write the README — no README');
+
+  // Still one plan: the converge turn checked the named one, it did not register a rival.
+  expect((await (await fetch(`${url}/api/plans`)).json()).plans).toHaveLength(1);
+});
+
+test('board receipt: the payload carries the convergence record of every plan whose chat is one of the task sessions', async () => {
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'init', sessionId: 'cli-session-7', tools: [], model: 'm', permissionMode: 'default' });
+      options.onEvent({ type: 'text', text: ['```kaprek-findings', '{"converged": true, "findings": []}', '```'].join('\n') });
+      return { sessionId: 'cli-session-7', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+  const planFile = path.join(dataDir, 'workspace', 'plans', 'receipted.md');
+  fs.mkdirSync(path.dirname(planFile), { recursive: true });
+  fs.writeFileSync(planFile, '# Receipted\n\n- [x] step\n', 'utf8');
+  const { openPlans } = await import('../plans/store.mjs');
+  const registered = openPlans(dataDir).register({ path: planFile });
+  const frames = await readSse(await postJson(`${url}/api/chat/turn`, { text: 'check', mode: 'converge', planId: registered.id }));
+  const chatId = frames.find((f) => f.type === 'turn-complete').chatId;
+
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Receipt with proof' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'linkSession', session: { machine: 'pc', projectSlug: 'p', sessionId: 'cli-session-7' } });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+
+  const { receipt } = await (await postJson(`${url}/api/board/tasks/${task.id}/receipt`, { agentName: 'fable' })).json();
+  expect(receipt.alg).toBe('ed25519');
+  expect(await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).toEqual({ valid: true });
+
+  // The receipt sealed the plan's state: a later override or check changes the payload, so verification fails.
+  openPlans(dataDir).setStatus(registered.id, 'active');
+  expect((await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).valid).toBe(false);
+  expect(chatId).toBeTruthy();
+});

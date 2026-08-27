@@ -46,7 +46,7 @@ import { HOME_MISSIONS, buildHomePrompt, homeMission } from '../missions/home.mj
 import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
-import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError } from '../plans/store.mjs';
+import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError, PlanNotConvergedError, PLAN_STATUSES } from '../plans/store.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
@@ -64,7 +64,7 @@ import { createCouncilRunner, planQuestion } from '../council/auto.mjs';
  */
 const PEER_TURN_TIMEOUT_MS = 9 * 60 * 1000;
 import { planPathFor, PLAN_MODES } from '../plans/prompt.mjs';
-import { runTurn } from '../orchestrator/run.mjs';
+import { runTurn, readHarnessMeta } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
 import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
@@ -476,7 +476,8 @@ function handleArtifactsManifest(res, dataDir, slug, sessionId) {
  * placeholders so the payload shape is stable for future receipts that do
  * set them.
  */
-function receiptPayloadFor(task) {
+function receiptPayloadFor(task, { dataDir = null, getPlans = null } = {}) {
+  const converge = convergeEvidenceFor(task, { dataDir, getPlans });
   return {
     taskId: task.id,
     title: task.title,
@@ -486,7 +487,35 @@ function receiptPayloadFor(task) {
     sessionIds: task.sessions.map((s) => s.sessionId),
     gitCommit: null,
     policyVersion: null,
+    // Only present when there is something to seal: a task with no linked
+    // plan keeps the payload shape every receipt before this field had, so
+    // those receipts still verify.
+    ...(converge === null ? {} : { converge }),
   };
+}
+
+/**
+ * The convergence record of every plan whose chat is one of the task's
+ * sessions — the link runs plan.chatId → that chat's CLI session id →
+ * task.sessions. This is what turns "done" in a receipt from a claim into
+ * a claim with a check behind it (or, on record, an override without one).
+ * Rebuilt from the plan store at sign AND verify time, like the rest of the
+ * payload: a check or override after signing invalidates the receipt.
+ */
+function convergeEvidenceFor(task, { dataDir, getPlans }) {
+  if (typeof getPlans !== 'function' || !dataDir) return null;
+  const sessionIds = new Set((task.sessions ?? []).map((s) => s.sessionId));
+  if (sessionIds.size === 0) return null;
+  let plans;
+  try {
+    plans = getPlans().list();
+  } catch {
+    return null;
+  }
+  const linked = plans
+    .filter((plan) => plan.chatId && sessionIds.has(readHarnessMeta(dataDir, plan.chatId)?.cliSessionId))
+    .map((plan) => ({ planId: plan.id, title: plan.title, path: plan.path, status: plan.status, converge: plan.converge ?? null, override: plan.override ?? null }));
+  return linked.length === 0 ? null : linked;
 }
 
 /**
@@ -494,7 +523,7 @@ function receiptPayloadFor(task) {
  * already-open) board for the server's configured dataDir — see
  * startServer()'s lazy board getter below.
  */
-async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
+async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir, { getPlans = null } = {}) {
   if (segments[2] !== 'tasks') {
     sendJson(res, 404, { error: 'not found' });
     return;
@@ -670,7 +699,7 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
         : 'local';
     let receipt;
     try {
-      receipt = signReceipt({ dataDir, agentName, payload: receiptPayloadFor(task) });
+      receipt = signReceipt({ dataDir, agentName, payload: receiptPayloadFor(task, { dataDir, getPlans }) });
     } catch (err) {
       if (err instanceof InvalidAgentNameError) {
         sendJson(res, 400, { error: err.message });
@@ -710,7 +739,7 @@ async function handleBoardRoutes(req, res, getBoard, segments, url, dataDir) {
     }
     // Reconstructed from the task's CURRENT state, not a stored snapshot —
     // see receiptPayloadFor()'s comment.
-    const result = verifyReceipt({ payload: receiptPayloadFor(task), receipt: task.receipt });
+    const result = verifyReceipt({ payload: receiptPayloadFor(task, { dataDir, getPlans }), receipt: task.receipt });
     sendJson(res, 200, result);
     return;
   }
@@ -1939,6 +1968,41 @@ async function handlePlanRoutes(req, res, segments, { getPlans }) {
     return;
   }
 
+  // /api/plans/<id>/status — 'done' is gated on a clean convergence check.
+  // An override passes the gate and is recorded with the name given; the
+  // answer to a refused 'done' is 409 with the reason, so the page can offer
+  // the check (or the override) instead of a generic error.
+  if (segments.length === 4 && segments[3] === 'status') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const body = await readJsonBody(req);
+    if (!body.ok) {
+      sendJson(res, body.status, { error: body.error });
+      return;
+    }
+    const { status, override } = body.data ?? {};
+    if (!PLAN_STATUSES.includes(status)) {
+      sendJson(res, 400, { error: `invalid status (${PLAN_STATUSES.join(' | ')})` });
+      return;
+    }
+    if (override !== undefined && (typeof override !== 'object' || override === null || typeof override.by !== 'string' || override.by.trim() === '')) {
+      sendJson(res, 400, { error: 'override must be {by: <who decided>}' });
+      return;
+    }
+    try {
+      sendJson(res, 200, { plan: plans.setStatus(segments[2], status, override ? { override } : {}) });
+    } catch (err) {
+      if (err instanceof PlanNotConvergedError) {
+        sendJson(res, 409, { error: err.message, notConverged: true, converge: err.converge });
+        return;
+      }
+      fail(err);
+    }
+    return;
+  }
+
   sendJson(res, 404, { error: 'not found' });
 }
 
@@ -2167,6 +2231,27 @@ async function handleChatTurn(
     sendJson(res, 400, { error: `invalid mode (${PLAN_MODES.join(' | ')})` });
     return;
   }
+  // A guided turn may name the plan it is about — a converge turn started
+  // from the plans page runs in a fresh chat, and the plan it checks is
+  // the one that was clicked, not a new file named after the prompt.
+  // 'converge' without a plan is refused: there is nothing to check against.
+  let namedPlanPath = null;
+  const planId = body.data?.planId ?? null;
+  if (planId !== null) {
+    if (typeof planId !== 'string' || planId.trim() === '') {
+      sendJson(res, 400, { error: 'invalid planId' });
+      return;
+    }
+    try {
+      namedPlanPath = getPlans().get(planId).path;
+    } catch (err) {
+      if (err instanceof PlanNotFoundError) {
+        sendJson(res, 404, { error: 'plan not found' });
+        return;
+      }
+      throw err;
+    }
+  }
 
   let chatId = body.data?.chatId;
   let chatEngine;
@@ -2330,7 +2415,7 @@ async function handleChatTurn(
       // to the agent as an instruction — never asked for afterwards. That
       // inversion is the fix for the original complaint: a path nobody has
       // to reconstruct from a sentence.
-      ...(mode ? { mode, planPath: guidedPlanPath({ getPlans, chats, chatId, cwd: turnCwd ?? null, dataDir, text }) } : {}),
+      ...(mode ? { mode, planPath: namedPlanPath ?? guidedPlanPath({ getPlans, chats, chatId, cwd: turnCwd ?? null, dataDir, text }) } : {}),
       // Memory belongs to a body of work, so only a mission chat has a scope
       // — see memoryScopeForChat().
       memoryScopeId: memoryScopeForChat ? memoryScopeForChat(chatId, mission) : null,
@@ -2971,7 +3056,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'board') {
-      await handleBoardRoutes(req, res, getBoard, segments, url, dataDir);
+      await handleBoardRoutes(req, res, getBoard, segments, url, dataDir, { getPlans });
       return;
     }
     if (segments[1] === 'missions') {

@@ -65,3 +65,14 @@ test('no working directory means the plan lands in kaprek own workspace', () => 
   const planPath = planPathFor({ cwd: null, dataDir: path.join('C:', 'Users', 'k', '.kaprek'), topic: 'idea', ts: '2026-08-02T01:00:00.000Z' });
   expect(planPath.startsWith(path.join('C:', 'Users', 'k', '.kaprek', 'workspace'))).toBe(true);
 });
+
+test('the converge prompt names the findings fence, the gap taxonomy, and forbids fixing anything', () => {
+  const prompt = buildModePrompt({ mode: 'converge', cwd: CWD, planPath: 'C:/x/docs/plans/p.md' });
+  expect(prompt).toContain('kaprek-findings');
+  expect(prompt).toContain('"converged"');
+  for (const gap of ['missing', 'partial', 'contradicts', 'unrequested']) expect(prompt).toContain(gap);
+  expect(prompt).toContain('Do not modify any file');
+  expect(prompt.toLowerCase()).toContain('end your turn');
+  // Scope is the plan's, not the agent's.
+  expect(prompt).toContain('ONLY at the files and places the plan itself names');
+});

@@ -1091,3 +1091,57 @@ test('a prompt that carries an <external> block gets the rule that explains it a
   expect(seen[0].appendSystemPrompt).toContain('not orders');
   expect(seen[1].appendSystemPrompt).toBeUndefined();
 });
+
+test('a converge turn appends the findings to the plan as steps and records the verdict; a clean one marks the plan done', async () => {
+  const planPath = path.join(tmpDir, 'docs', 'plans', '2026-08-27-thing.md');
+  fs.mkdirSync(path.dirname(planPath), { recursive: true });
+  fs.writeFileSync(planPath, '# The thing\n\n- [x] Step 1\n- [x] Step 2\n', 'utf8');
+  const answer = (json) => ['Checked it.', '', '```kaprek-findings', JSON.stringify(json), '```'].join('\n');
+  let reply = answer({ converged: false, checked: { requirements: 2, files: 1 }, findings: [{ id: 'F1', sourceRef: 'Step 2', gapType: 'partial', severity: 'high', evidence: 'no test for it', remainingWork: 'write the test' }] });
+  let seenArgs = null;
+  const harness = {
+    startTurn: async (options) => {
+      seenArgs = options;
+      options.onEvent({ type: 'text', text: reply });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+
+  const first = await runTurn({ dataDir: tmpDir, text: 'check it', harness, mode: 'converge', planPath });
+  expect(seenArgs.appendSystemPrompt).toContain('kaprek convergence check');
+  expect(seenArgs.appendSystemPrompt).toContain(planPath);
+  expect(first.guided.mode).toBe('converge');
+  expect(first.guided.protocolBroken).toBe(false);
+  expect(first.guided.findings.converged).toBe(false);
+  expect(first.guided.findings.findings).toHaveLength(1);
+  expect(first.guided.plan.status).toBe('active');
+  expect(first.guided.plan.converge).toMatchObject({ round: 1, findings: 1, converged: false });
+  const onDisk = fs.readFileSync(planPath, 'utf8');
+  expect(onDisk).toContain('## Convergence round 1');
+  expect(onDisk).toContain('- [ ] **F1 (high, partial, Step 2):** write the test — no test for it');
+
+  reply = answer({ converged: true, checked: { requirements: 3, files: 1 }, findings: [] });
+  const second = await runTurn({ dataDir: tmpDir, chatId: first.chatId, text: 'check again', harness, mode: 'converge', planPath });
+  expect(second.guided.findings.converged).toBe(true);
+  expect(second.guided.plan.status).toBe('done');
+  expect(second.guided.plan.converge).toMatchObject({ round: 2, findings: 0, converged: true });
+  // A clean round appends nothing.
+  expect(fs.readFileSync(planPath, 'utf8')).toBe(onDisk);
+});
+
+test('a converge turn answered in prose records nothing and says so', async () => {
+  const planPath = path.join(tmpDir, 'docs', 'plans', 'p.md');
+  fs.mkdirSync(path.dirname(planPath), { recursive: true });
+  fs.writeFileSync(planPath, '# P\n\n- [x] Step\n', 'utf8');
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'text', text: 'Looks fine to me, all done.' });
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const result = await runTurn({ dataDir: tmpDir, text: 'check', harness, mode: 'converge', planPath });
+  expect(result.guided.protocolBroken).toBe(true);
+  expect(result.guided.findings).toBeNull();
+  expect(result.guided.plan).toBeNull();
+  expect(fs.readFileSync(planPath, 'utf8')).toBe('# P\n\n- [x] Step\n');
+});

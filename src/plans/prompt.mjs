@@ -10,9 +10,10 @@
 // and where the file goes.
 import path from 'node:path';
 import { QUIZ_FENCE } from './quiz.mjs';
+import { FINDINGS_FENCE, GAP_TYPES, SEVERITIES } from './findings.mjs';
 
-/** brainstorm: ask through the quiz. plan: write the plan file. */
-export const PLAN_MODES = ['brainstorm', 'plan'];
+/** brainstorm: ask through the quiz. plan: write the plan file. converge: check the work against the plan file. */
+export const PLAN_MODES = ['brainstorm', 'plan', 'converge'];
 
 export class InvalidModeError extends Error {
   constructor(mode) {
@@ -146,6 +147,41 @@ be able to follow it.
 If you need a decision from the person before you can write the plan, ask it
 as a quiz block (see the brainstorming mode) rather than guessing.`;
 
+const CONVERGE = (planPath) => `# kaprek convergence check
+
+"Done" is a claim. Your job this turn is to check it against the plan at:
+
+  ${planPath}
+
+Read the plan. Then look ONLY at the files and places the plan itself names
+— do not widen the scope to things the plan never mentions, and do not
+guess at intent the plan does not state. For every step, requirement or
+decision in it, compare what the plan says with what is actually there.
+
+Report only gaps. A step that is fully done gets no line. Gap types:
+${GAP_TYPES.map((g) => `  ${g}`).join('\n')}
+(unrequested = work that exists but no step asked for; report it, never
+remove it). Severity: ${SEVERITIES.join(' | ')}.
+
+Do not modify any file. Do not fix anything you find. Do not tick steps.
+
+End your turn with exactly one block, and put nothing after it:
+
+\`\`\`${FINDINGS_FENCE}
+{"converged": false,
+ "checked": {"requirements": 7, "files": 3},
+ "findings": [
+   {"id": "F1", "sourceRef": "Step 3", "gapType": "missing", "severity": "high",
+    "evidence": "src/a.mjs has no parse() export", "remainingWork": "add parse() to src/a.mjs as Step 3 describes"}
+ ]}
+\`\`\`
+
+If there is no gap at all, say so with \`{"converged": true, "checked": {...}, "findings": []}\`.
+Prose above the block is welcome: say what you checked and what you could
+not check. kaprek appends every finding to the plan file as a new step, and
+only a plan with zero findings can be marked done — so a gap you leave out
+is a gap the person will never see.`;
+
 /**
  * The system-prompt appendix for one guided turn.
  *
@@ -154,5 +190,7 @@ as a quiz block (see the brainstorming mode) rather than guessing.`;
  */
 export function buildModePrompt({ mode, planPath }) {
   if (!PLAN_MODES.includes(mode)) throw new InvalidModeError(mode);
-  return mode === 'brainstorm' ? BRAINSTORM(planPath) : PLAN(planPath);
+  if (mode === 'brainstorm') return BRAINSTORM(planPath);
+  if (mode === 'converge') return CONVERGE(planPath);
+  return PLAN(planPath);
 }
