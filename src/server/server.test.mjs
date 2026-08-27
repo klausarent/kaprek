@@ -4515,3 +4515,53 @@ test('board receipt: the payload carries the convergence record of every plan wh
   expect((await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).valid).toBe(false);
   expect(chatId).toBeTruthy();
 });
+
+test('posture: a turn asked for past the ceiling is a 400 naming the ceiling and its source; the mission only ever tightens', async () => {
+  const harness = { startTurn: async () => ({ sessionId: 's', costUsd: null, usage: null, stopReason: 'result', error: null }) };
+  const { url } = await boot({ harness });
+  fs.writeFileSync(path.join(dataDir, 'policy.json'), JSON.stringify({ posture: 'edits' }), 'utf8');
+
+  const past = await postJson(`${url}/api/chat/turn`, { text: 'go', approvalMode: 'auto' });
+  expect(past.status).toBe(400);
+  const pastBody = await past.json();
+  expect(pastBody.error).toContain('above the posture ceiling "edits" set by policy.json');
+  expect(pastBody.posture).toBe('edits');
+
+  const within = await postJson(`${url}/api/chat/turn`, { text: 'go', approvalMode: 'edits' });
+  expect(within.status).toBe(200);
+  await readSse(within);
+
+  // A mission that tries to loosen (auto under a global edits) changes nothing; one that tightens does.
+  const loose = await (await postJson(`${url}/api/missions`, { title: 'loose', posture: 'auto' })).json();
+  const stillEdits = await postJson(`${url}/api/chat/turn`, { text: 'go', approvalMode: 'auto', missionId: loose.mission.id });
+  expect(stillEdits.status).toBe(400);
+  expect((await stillEdits.json()).error).toContain('set by policy.json');
+
+  const tight = await (await postJson(`${url}/api/missions`, { title: 'tight' })).json();
+  const set = await postJson(`${url}/api/missions/${tight.mission.id}/posture`, { posture: 'ask' });
+  expect(set.status).toBe(200);
+  expect((await set.json()).mission.posture).toBe('ask');
+  const refused = await postJson(`${url}/api/chat/turn`, { text: 'go', approvalMode: 'edits', missionId: tight.mission.id });
+  expect(refused.status).toBe(400);
+  expect((await refused.json()).error).toContain('set by the mission "tight"');
+
+  const bad = await postJson(`${url}/api/missions/${tight.mission.id}/posture`, { posture: 'yolo' });
+  expect(bad.status).toBe(400);
+  const cleared = await postJson(`${url}/api/missions/${tight.mission.id}/posture`, { posture: null });
+  expect((await cleared.json()).mission.posture).toBeNull();
+});
+
+test('board receipt: policyVersion is null under the default policy and a fingerprint once policy.json owns a posture or a denial', async () => {
+  const { url } = await boot({});
+  const task = await (await postJson(`${url}/api/board/tasks`, { title: 'Policy me' })).json();
+  await patchJson(`${url}/api/board/tasks/${task.id}`, { op: 'setDoc', doc: fullDoc() });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'in_progress' });
+  await postJson(`${url}/api/board/tasks/${task.id}/status`, { status: 'done' });
+  const first = await (await postJson(`${url}/api/board/tasks/${task.id}/receipt`, {})).json();
+  expect(first.receipt.alg).toBe('ed25519');
+  expect(await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).toEqual({ valid: true });
+
+  // A policy that says something of its own changes the payload the receipt sealed.
+  fs.writeFileSync(path.join(dataDir, 'policy.json'), JSON.stringify({ posture: 'ask' }), 'utf8');
+  expect((await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).valid).toBe(false);
+});

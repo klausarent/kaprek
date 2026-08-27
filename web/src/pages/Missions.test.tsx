@@ -2,7 +2,7 @@ import { test, expect, vi } from "vitest";
 import { MissionListItem } from "./Missions";
 import { MissionHeader, MISSION_STATUS_OPTIONS } from "./MissionDetail";
 import type { Mission } from "../lib/api";
-import { render, textOf, click, findByType } from "../test/tree";
+import { render, textOf, click, findByType, findAll } from "../test/tree";
 
 function mission(overrides: Partial<Mission> = {}): Mission {
   return {
@@ -10,6 +10,7 @@ function mission(overrides: Partial<Mission> = {}): Mission {
     title: "Ship the widget",
     goal: "A working widget with tests",
     cwd: "C:\\projects\\widget",
+    posture: null,
     preset: null,
     status: "active",
     createdAt: "2026-08-01T10:00:00.000Z",
@@ -50,4 +51,17 @@ test("the mission header offers the full status lifecycle and names the working 
 test("a mission without a cwd says it runs in the workspace default", () => {
   const tree = render(<MissionHeader mission={mission({ cwd: null })} onStatusChange={() => {}} />);
   expect(textOf(tree)).toContain("kaprek workspace (default)");
+});
+
+test("posture: the header offers the select only when it can change it, defaulting to the global one", () => {
+    const withoutHandler = render(<MissionHeader mission={mission()} onStatusChange={() => {}} />);
+    expect(findAll(withoutHandler, (node) => node.props?.["aria-label"] === "Mission posture ceiling")).toHaveLength(0);
+    const picked: (string | null)[] = [];
+    const tree = render(<MissionHeader mission={mission({ posture: "edits" })} onStatusChange={() => {}} onPostureChange={(p) => picked.push(p)} />);
+    const select = findAll(tree, (node) => node.props?.["aria-label"] === "Mission posture ceiling")[0];
+    expect(select.props.value).toBe("edits");
+    expect(textOf(tree)).toContain("only ever tightens");
+    (select.props.onChange as (e: { target: { value: string } }) => void)({ target: { value: "" } });
+    (select.props.onChange as (e: { target: { value: string } }) => void)({ target: { value: "ask" } });
+    expect(picked).toEqual([null, "ask"]);
 });

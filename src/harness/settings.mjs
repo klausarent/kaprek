@@ -185,15 +185,19 @@ function writeAtomically(dir, settingsPath, content) {
  * @param {string[]} [learnedTools] - see mergeAskList() above; merged on top
  *   of `profile`'s static ask list, additive only, never touches `allow`.
  */
-export function writeHarnessSettings({ dataDir, profile, learnedTools = [] }) {
+export function writeHarnessSettings({ dataDir, profile, learnedTools = [], denyRules = [] }) {
   if (!dataDir) throw new Error('writeHarnessSettings requires dataDir');
   const ask = mergeAskList(profile, learnedTools);
+  // Hard denials in the CLI's own vocabulary (see policy/guards.mjs::
+  // cliDenyRules): the one layer that still holds in 'chat-auto', where the
+  // CLI never asks kaprek's handler anything.
+  const deny = [...new Set(denyRules.filter((rule) => typeof rule === 'string' && rule !== ''))];
 
   const dir = path.join(dataDir, 'harness');
   const settingsPath = path.join(dir, `settings-${profile}.json`);
   const settings = {
     hooks: {},
-    permissions: { defaultMode: PROFILE_CLI_MODE[profile] ?? 'default', allow: [], deny: [], ask },
+    permissions: { defaultMode: PROFILE_CLI_MODE[profile] ?? 'default', allow: [], deny, ask },
   };
   const content = `${JSON.stringify(settings, null, 2)}\n`;
 

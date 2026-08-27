@@ -24,6 +24,8 @@ import { openMemory } from '../memory/store.mjs';
 import { buildMemoryPrompt, parseRemember } from '../memory/protocol.mjs';
 import { buildCheckpoint, buildRehydrationPrompt, readCheckpoint, shouldCheckpoint, wasCompacted, writeCheckpoint } from '../memory/checkpoint.mjs';
 import { buildRulesPrompt, openPolicy } from '../memory/policy.mjs';
+import { loadPolicyFailOpen } from '../policy/policy.mjs';
+import { evaluateHardDenials, hardDenialsOf, cliDenyRules } from '../policy/guards.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -426,6 +428,12 @@ export async function runTurn({
   // an always-present-but-no-op wrapper would make claude-code.mjs think a
   // handler exists (it decides `--permission-prompt-tool stdio` from
   // presence alone) and start a control-channel nobody answers.
+  // The policy this turn runs under — its hard denials answer approval
+  // requests below and become the CLI's own deny rules in the settings file
+  // (writeHarnessSettings further down). Fail-open load: a broken
+  // policy.json means the built-in denials, never no denials.
+  const hardDenials = hardDenialsOf(loadPolicyFailOpen(dataDir));
+
   const wrappedOnApprovalRequest = onApprovalRequest
     ? async (request) => {
         const sanitizedInput = sanitizeToolInput(request.input, maxToolLen, redact);
@@ -471,6 +479,17 @@ export async function runTurn({
           reason: sanitizedReason,
           suggestions: sanitizedSuggestions,
         };
+
+        // Hard denials first: what no turn may do on this machine is not a
+        // question for anyone, and it is answered the same way in a chat, a
+        // trigger, a relay step and a deferred inbox. Recorded like any
+        // other decision, so the transcript shows what was refused and why.
+        const denial = evaluateHardDenials(request, hardDenials);
+        if (denial.denied) {
+          const message = `kaprek hard denial (${denial.rule.id}): ${denial.rule.why}`;
+          chats.appendEvent(effectiveChatId, { kind: 'approval', phase: 'resolved', requestId: request.id, toolName: request.toolName, behavior: 'deny', message });
+          return { behavior: 'deny', message };
+        }
 
         let decision;
         try {
@@ -560,7 +579,7 @@ export async function runTurn({
       serverScriptPath: MCP_SERVER_SCRIPT_PATH,
       tmpDir: mcpConfigDir,
     });
-    settingsPath = writeHarnessSettings({ dataDir, profile: settingsProfile, learnedTools });
+    settingsPath = writeHarnessSettings({ dataDir, profile: settingsProfile, learnedTools, denyRules: cliDenyRules(hardDenials) });
   } catch (err) {
     const message = `failed to prepare harness config (mcp-config/settings): ${err?.message ?? String(err)}`;
     if (mcpConfigPath) cleanupMcpConfig(mcpConfigPath); // best-effort — writeMcpConfig() itself may have succeeded before writeHarnessSettings() threw

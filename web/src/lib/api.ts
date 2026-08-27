@@ -508,6 +508,8 @@ export type Mission = {
   /** Absolute project directory this mission's turns run in; null means the workspace default. */
   cwd: string | null;
   preset: string | null;
+  /** The mission's own posture ceiling; null = the global one from policy.json. In effect only ever stricter than global. */
+  posture: Posture | null;
   status: MissionStatus;
   createdAt: string;
   updatedAt: string;
@@ -532,6 +534,15 @@ export type MissionDetail = {
   tasks: Task[];
   pendingApprovals: InboxApproval[];
 };
+
+/** The posture ceiling vocabulary — the same words as the chat picker's approval stance. */
+export type Posture = "ask" | "edits" | "auto";
+export const POSTURES: Posture[] = ["ask", "edits", "auto"];
+
+/** Sets (or clears, with null) a mission's own posture ceiling. */
+export function setMissionPosture(id: string, posture: Posture | null): Promise<Mission> {
+  return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/posture`, { posture }).then((r) => r.mission);
+}
 
 export function fetchMissions(): Promise<Mission[]> {
   return getJson<{ missions: Mission[] }>("/api/missions").then((r) => r.missions);

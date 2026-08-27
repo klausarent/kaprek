@@ -39,6 +39,7 @@ import {
   InvalidCwdError,
   InvalidGoalError,
   InvalidLinkError,
+  InvalidPostureError,
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
 import { InvalidWorkflowError, buildWorkflow, importSummary, loadWorkflows, saveWorkflow, validateWorkflow } from '../missions/workflow.mjs';
@@ -47,6 +48,8 @@ import { getEngine, listEngines } from '../harness/registry.mjs';
 import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError, PlanNotConvergedError, PLAN_STATUSES } from '../plans/store.mjs';
+import { loadPolicyFailOpen, policyVersion } from '../policy/policy.mjs';
+import { effectivePosture, postureAllows, POSTURES } from '../policy/guards.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
@@ -478,6 +481,7 @@ function handleArtifactsManifest(res, dataDir, slug, sessionId) {
  */
 function receiptPayloadFor(task, { dataDir = null, getPlans = null } = {}) {
   const converge = convergeEvidenceFor(task, { dataDir, getPlans });
+  const policyFingerprint = policyFingerprintFor(dataDir);
   return {
     taskId: task.id,
     title: task.title,
@@ -486,12 +490,27 @@ function receiptPayloadFor(task, { dataDir = null, getPlans = null } = {}) {
     doc: task.doc,
     sessionIds: task.sessions.map((s) => s.sessionId),
     gitCommit: null,
-    policyVersion: null,
+    // The rules this was done under — only once a policy.json says
+    // something of its own (a posture, a hard denial). A default policy
+    // leaves this null, which is what every receipt before it carried.
+    policyVersion: policyFingerprint,
     // Only present when there is something to seal: a task with no linked
     // plan keeps the payload shape every receipt before this field had, so
     // those receipts still verify.
     ...(converge === null ? {} : { converge }),
   };
+}
+
+/** The policy fingerprint for receipts, or null while the policy is the default one. */
+function policyFingerprintFor(dataDir) {
+  if (!dataDir) return null;
+  try {
+    const policy = loadPolicyFailOpen(dataDir);
+    const ownsGuards = policy.posture !== 'auto' || (Array.isArray(policy.hardDenials) && policy.hardDenials.length > 0);
+    return ownsGuards ? policyVersion(policy) : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -1487,6 +1506,7 @@ function missionErrorStatus(err) {
     err instanceof MissionInvalidStatusError ||
     err instanceof InvalidCwdError ||
     err instanceof InvalidGoalError ||
+    err instanceof InvalidPostureError ||
     err instanceof InvalidLinkError
   ) {
     return 400;
@@ -2026,7 +2046,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         sendJson(res, body.status, { error: body.error });
         return;
       }
-      const { title, goal = null, cwd = null, preset = null } = body.data ?? {};
+      const { title, goal = null, cwd = null, preset = null, posture = null } = body.data ?? {};
       // Existence is a route concern, shape is a store concern: the store
       // validates "absolute path", but only this process can ask the disk.
       // Checked BEFORE create() so a mission with a dead cwd never enters
@@ -2048,7 +2068,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         }
       }
       try {
-        const mission = missions.create({ title, goal, cwd, preset });
+        const mission = missions.create({ title, goal, cwd, preset, posture });
         sendJson(res, 201, { mission });
       } catch (err) {
         const status = missionErrorStatus(err);
@@ -2092,7 +2112,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
   }
 
   // /api/missions/<id>/status | /api/missions/<id>/link
-  if (segments.length === 4 && (segments[3] === 'status' || segments[3] === 'link')) {
+  if (segments.length === 4 && (segments[3] === 'status' || segments[3] === 'link' || segments[3] === 'posture')) {
     if (req.method !== 'POST') {
       sendJson(res, 405, { error: 'method not allowed' });
       return;
@@ -2105,6 +2125,17 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     try {
       if (segments[3] === 'status') {
         sendJson(res, 200, { mission: missions.setStatus(segments[2], body.data?.status) });
+        return;
+      }
+      // The mission's own posture ceiling (null clears it). Only ever
+      // tightens the global one in effect — see policy/guards.mjs.
+      if (segments[3] === 'posture') {
+        const posture = body.data?.posture ?? null;
+        if (posture !== null && !POSTURES.includes(posture)) {
+          sendJson(res, 400, { error: `invalid posture (${POSTURES.join(' | ')} | null)` });
+          return;
+        }
+        sendJson(res, 200, { mission: missions.update(segments[2], { posture }) });
         return;
       }
       const { chatId, taskId } = body.data ?? {};
@@ -2385,6 +2416,18 @@ async function handleChatTurn(
   // ever going through abort (e.g. it resolves on its own right as the turn
   // is wrapping up for some other reason).
   controller.signal.addEventListener('abort', () => cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore));
+
+  // The posture ceiling: the global dial, tightened by the mission's own.
+  // A stance past it is refused with the reason — never clamped, because a
+  // picker that says "auto" while the turn runs "edits" would be lying.
+  {
+    const ceiling = effectivePosture({ global: loadPolicyFailOpen(dataDir).posture, mission: mission?.posture ?? null });
+    if (!postureAllows(ceiling, approvalMode)) {
+      const setBy = mission?.posture && postureAllows(loadPolicyFailOpen(dataDir).posture, approvalMode) ? `the mission "${mission.title}"` : 'policy.json';
+      sendJson(res, 400, { error: `approvalMode "${approvalMode}" is above the posture ceiling "${ceiling}" set by ${setBy}`, posture: ceiling });
+      return;
+    }
+  }
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',

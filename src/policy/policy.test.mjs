@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { openBoard } from '../board/store.mjs';
-import { loadPolicy, evaluateStop, DEFAULT_POLICY, PolicyValidationError } from './policy.mjs';
+import { loadPolicy, loadPolicyFailOpen, policyVersion, evaluateStop, DEFAULT_POLICY, PolicyValidationError } from './policy.mjs';
 
 let dataDir;
 
@@ -61,6 +61,8 @@ test('loadPolicy returns the parsed policy for a well-formed file', () => {
     version: 1,
     mode: 'block',
     rules: { requireTaskDoc: false, requireCommitTask: true },
+    posture: 'auto',
+    hardDenials: [],
   });
 });
 
@@ -70,13 +72,15 @@ test('loadPolicy fills in missing fields with DEFAULT_POLICY values', () => {
     version: 1,
     mode: 'warn',
     rules: DEFAULT_POLICY.rules,
+    posture: 'auto',
+    hardDenials: [],
   });
 });
 
 test('loadPolicy strips a leading BOM before parsing', () => {
   const bom = '﻿';
   fs.writeFileSync(path.join(dataDir, 'policy.json'), `${bom}${JSON.stringify({ mode: 'warn' })}`, 'utf8');
-  expect(loadPolicy(dataDir)).toEqual({ version: 1, mode: 'warn', rules: DEFAULT_POLICY.rules });
+  expect(loadPolicy(dataDir)).toEqual({ version: 1, mode: 'warn', rules: DEFAULT_POLICY.rules, posture: 'auto', hardDenials: [] });
 });
 
 test('loadPolicy falls back to observe (with a reason) for corrupt JSON, without throwing', () => {
@@ -265,4 +269,41 @@ test('evaluateStop writes a JSONL entry to policy.log', async () => {
   expect(entry.decision).toBe('block');
   expect(Array.isArray(entry.reasons)).toBe(true);
   expect(typeof entry.ts).toBe('string');
+});
+
+// -------------------------------------------------------- posture + hard denials
+
+test('loadPolicy defaults posture to auto and hardDenials to none, and reads both when set', () => {
+  expect(loadPolicy(dataDir)).toMatchObject({ posture: 'auto', hardDenials: [] });
+  writePolicy({ posture: 'edits', hardDenials: [{ id: 'no-prod', tools: ['Bash'], command: 'prod' }] });
+  const policy = loadPolicy(dataDir);
+  expect(policy.posture).toBe('edits');
+  expect(policy.hardDenials).toEqual([{ id: 'no-prod', why: 'denied by policy.json', tools: ['Bash'], command: 'prod' }]);
+});
+
+test('loadPolicy refuses an unknown posture and a malformed hard denial, as schema errors', () => {
+  writePolicy({ posture: 'yolo' });
+  expect(() => loadPolicy(dataDir)).toThrow(PolicyValidationError);
+  writePolicy({ hardDenials: [{ id: 'x', tools: ['Bash'] }] });
+  expect(() => loadPolicy(dataDir)).toThrow(PolicyValidationError);
+  writePolicy({ hardDenials: 'nope' });
+  expect(() => loadPolicy(dataDir)).toThrow(PolicyValidationError);
+});
+
+test('policyVersion is stable for the same policy and changes with a posture or a denial', () => {
+  const base = policyVersion(loadPolicy(dataDir));
+  expect(base).toMatch(/^[0-9a-f]{16}$/);
+  expect(policyVersion(loadPolicy(dataDir))).toBe(base);
+  writePolicy({ posture: 'ask' });
+  const withPosture = policyVersion(loadPolicy(dataDir));
+  expect(withPosture).not.toBe(base);
+  writePolicy({ posture: 'ask', hardDenials: [{ id: 'x', tools: ['Bash'], command: 'y' }] });
+  expect(policyVersion(loadPolicy(dataDir))).not.toBe(withPosture);
+});
+
+test('loadPolicyFailOpen keeps the built-in guards reachable even when policy.json is broken', () => {
+  writePolicy({ posture: 'yolo' });
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy.posture).toBe('auto');
+  expect(policy.reason).toContain('invalid policy.json');
 });

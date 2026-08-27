@@ -11,15 +11,22 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import readline from 'node:readline';
 import { openBoard } from '../board/store.mjs';
+import { POSTURES, validateHardDenials, HardDenialValidationError } from './guards.mjs';
 
 const VALID_MODES = ['observe', 'warn', 'block'];
-const KNOWN_TOP_FIELDS = ['version', 'mode', 'rules'];
+const KNOWN_TOP_FIELDS = ['version', 'mode', 'rules', 'posture', 'hardDenials'];
 const KNOWN_RULE_FIELDS = ['requireTaskDoc', 'requireCommitTask'];
 
 export const DEFAULT_POLICY = Object.freeze({
   version: 1,
   mode: 'observe',
   rules: Object.freeze({ requireTaskDoc: true, requireCommitTask: true }),
+  // The global posture ceiling (see guards.mjs): 'auto' means no ceiling,
+  // which is what every install before this field had.
+  posture: 'auto',
+  // Rules a person added on top of guards.mjs's built-ins. The built-ins
+  // are not listed here because they cannot be switched off from here.
+  hardDenials: Object.freeze([]),
 });
 
 export class PolicyValidationError extends Error {
@@ -52,6 +59,17 @@ function validatePolicyShape(raw) {
   }
   if (raw.mode !== undefined && !VALID_MODES.includes(raw.mode)) {
     throw new PolicyValidationError(`invalid mode: ${JSON.stringify(raw.mode)} (expected one of ${VALID_MODES.join(', ')})`);
+  }
+  if (raw.posture !== undefined && !POSTURES.includes(raw.posture)) {
+    throw new PolicyValidationError(`invalid posture: ${JSON.stringify(raw.posture)} (expected one of ${POSTURES.join(', ')})`);
+  }
+  if (raw.hardDenials !== undefined) {
+    try {
+      validateHardDenials(raw.hardDenials);
+    } catch (err) {
+      if (err instanceof HardDenialValidationError) throw new PolicyValidationError(err.message);
+      throw err;
+    }
   }
   if (raw.rules !== undefined) {
     if (raw.rules === null || typeof raw.rules !== 'object' || Array.isArray(raw.rules)) {
@@ -106,11 +124,28 @@ export function loadPolicy(dataDir) {
       requireTaskDoc: parsed.rules?.requireTaskDoc ?? DEFAULT_POLICY.rules.requireTaskDoc,
       requireCommitTask: parsed.rules?.requireCommitTask ?? DEFAULT_POLICY.rules.requireCommitTask,
     },
+    posture: parsed.posture ?? DEFAULT_POLICY.posture,
+    hardDenials: validateHardDenials(parsed.hardDenials),
   };
 }
 
+/**
+ * A short, stable fingerprint of the loaded policy — what a receipt can
+ * name as "the rules this was done under". Same input, same string.
+ */
+export function policyVersion(policy) {
+  const canonical = JSON.stringify({
+    version: policy?.version ?? null,
+    mode: policy?.mode ?? null,
+    rules: policy?.rules ?? null,
+    posture: policy?.posture ?? null,
+    hardDenials: policy?.hardDenials ?? [],
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+}
+
 /** Same as loadPolicy(), but never throws — a schema error also falls back to observe. */
-function loadPolicyFailOpen(dataDir) {
+export function loadPolicyFailOpen(dataDir) {
   try {
     return loadPolicy(dataDir);
   } catch (err) {

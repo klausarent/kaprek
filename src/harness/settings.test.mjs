@@ -220,3 +220,11 @@ test('the chat-auto profile asks for NOTHING and runs the CLI in bypassPermissio
   // Learned tools must not sneak questions back into full auto.
   expect(mergeAskList('chat-auto', ['BrandNewTool'])).toEqual([]);
 });
+
+test('writeHarnessSettings carries the hard-denial rules as permissions.deny, deduplicated, and never touches allow', () => {
+  const settingsPath = writeHarnessSettings({ dataDir: tmpDir, profile: 'chat-auto', denyRules: ['Edit(~/.claude/**)', 'Edit(~/.claude/**)', '', 'Edit(**/.mcp.json)'] });
+  const parsed = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  expect(parsed.permissions.deny).toEqual(['Edit(~/.claude/**)', 'Edit(**/.mcp.json)']);
+  expect(parsed.permissions.allow).toEqual([]);
+  expect(parsed.permissions.defaultMode).toBe('bypassPermissions');
+});

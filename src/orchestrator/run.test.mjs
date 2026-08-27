@@ -7,6 +7,7 @@ import { readRuns } from './runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { createFakeHarness } from '../harness/fake.mjs';
 import { ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
+import { cliDenyRules } from '../policy/guards.mjs';
 import { readKnownTools } from '../harness/knownTools.mjs';
 
 let tmpDir;
@@ -541,7 +542,8 @@ test('runTurn wires mcpConfigPath (kaprek apps MCP server) and settingsPath (neu
   const result = await runTurn({ dataDir: tmpDir, text: 'wire it up', harness });
 
   expect(result.stopReason).toBe('result');
-  expect(capturedSettings).toEqual({ hooks: {}, permissions: { defaultMode: 'default', allow: [], deny: [], ask: ASK_TOOLS_CHAT } });
+  // deny carries the built-in hard denials in the CLI's own words (see policy/guards.mjs)
+  expect(capturedSettings).toEqual({ hooks: {}, permissions: { defaultMode: 'default', allow: [], deny: cliDenyRules(), ask: ASK_TOOLS_CHAT } });
   expect(capturedMcpConfig.mcpServers['kaprek-apps'].command).toBe(process.execPath);
   expect(capturedMcpConfig.mcpServers['kaprek-apps'].env.KAPREK_DATA_DIR).toBe(tmpDir);
 
@@ -1144,4 +1146,35 @@ test('a converge turn answered in prose records nothing and says so', async () =
   expect(result.guided.findings).toBeNull();
   expect(result.guided.plan).toBeNull();
   expect(fs.readFileSync(planPath, 'utf8')).toBe('# P\n\n- [x] Step\n');
+});
+
+test('a hard denial answers the approval request itself — the caller is never asked, the refusal is on record, and the settings file carries the CLI deny rules', async () => {
+  const configPath = path.join(os.homedir(), '.claude', 'settings.json');
+  const fakeHarness = createFakeHarness({
+    script: [
+      { type: 'init', sessionId: 's1', tools: ['Edit'], model: 'm', permissionMode: 'default' },
+      { approval: { toolName: 'Edit', displayName: 'Edit', input: { file_path: configPath, old_string: 'a', new_string: 'b' }, description: 'edit settings', agentId: null, toolUseId: 't1', reasonType: 'rule', reason: 'ask' } },
+      { approval: { toolName: 'Bash', displayName: 'Bash', input: { command: 'rm -rf ./dist' }, description: 'clean', agentId: null, toolUseId: 't2', reasonType: 'rule', reason: 'ask' } },
+      { type: 'result', sessionId: 's1', costUsd: 0.001, usage: {}, isError: false },
+    ],
+  });
+  const seen = [];
+  const onApprovalRequest = vi.fn(async (request) => {
+    seen.push(request.toolName);
+    return { behavior: 'allow' };
+  });
+  let settingsFile = null;
+  const harness = { startTurn: async (options) => { settingsFile = options.settingsPath; return fakeHarness.startTurn(options); } };
+  const result = await runTurn({ dataDir: tmpDir, text: 'touch the config', harness, onApprovalRequest });
+
+  // Only the ordinary request reached the caller; the config write was refused before anyone was asked.
+  expect(seen).toEqual(['Bash']);
+  const approvals = openChats(tmpDir).events(result.chatId).filter((e) => e.kind === 'approval');
+  expect(approvals.map((e) => `${e.phase}:${e.toolName}:${e.behavior ?? ''}`)).toEqual(['requested:Edit:', 'resolved:Edit:deny', 'requested:Bash:', 'resolved:Bash:allow']);
+  expect(approvals[1].message).toContain('kaprek hard denial (agent-config-write)');
+  expect(fakeHarness.approvalLog[0].decision).toMatchObject({ behavior: 'deny' });
+
+  const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf8'));
+  expect(settings.permissions.deny).toContain('Edit(~/.claude/**)');
+  expect(settings.permissions.deny).toContain('Edit(**/.mcp.json)');
 });

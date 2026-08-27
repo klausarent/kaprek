@@ -8,12 +8,13 @@
 // to the chats and board tasks that carry the work. Chats and tasks remain
 // authoritative for their own content; a mission only holds the links.
 import fs from 'node:fs';
+import { POSTURES, isPosture } from '../policy/guards.mjs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
 export const MISSION_STATUSES = ['active', 'waiting', 'done', 'archived'];
 
-const UPDATABLE_FIELDS = ['title', 'goal'];
+const UPDATABLE_FIELDS = ['title', 'goal', 'posture'];
 
 export class MissionNotFoundError extends Error {
   constructor(missionId) {
@@ -43,6 +44,14 @@ export class InvalidCwdError extends Error {
     super(`cwd must be null or an absolute path, got: ${cwd}`);
     this.name = 'InvalidCwdError';
     this.cwd = cwd;
+  }
+}
+
+export class InvalidPostureError extends Error {
+  constructor(posture) {
+    super(`posture must be null or one of ${POSTURES.join(', ')}, got: ${JSON.stringify(posture)}`);
+    this.name = 'InvalidPostureError';
+    this.posture = posture;
   }
 }
 
@@ -81,6 +90,9 @@ function applyEvent(missions, event) {
         goal: data.goal ?? null,
         cwd: data.cwd ?? null,
         preset: data.preset ?? null,
+        // The mission's own posture ceiling, or null for "the global one".
+        // Only ever stricter than global in effect — see policy/guards.mjs.
+        posture: data.posture ?? null,
         status: 'active',
         createdAt: ts,
         updatedAt: ts,
@@ -195,6 +207,10 @@ export function openMissions(dataDir) {
     if (typeof title !== 'string' || title.trim().length === 0) throw new InvalidTitleError();
   }
 
+  function assertPosture(posture) {
+    if (posture !== null && !isPosture(posture)) throw new InvalidPostureError(posture);
+  }
+
   function assertCwd(cwd) {
     if (cwd === null) return;
     if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw new InvalidCwdError(cwd);
@@ -213,7 +229,7 @@ export function openMissions(dataDir) {
       return clone(requireMission(missionId));
     },
 
-    create({ title, goal = null, cwd = null, preset = null } = {}) {
+    create({ title, goal = null, cwd = null, preset = null, posture = null } = {}) {
       assertTitle(title);
       if (goal !== null && typeof goal !== 'string') throw new InvalidGoalError();
       assertCwd(cwd);
@@ -221,7 +237,8 @@ export function openMissions(dataDir) {
         throw new InvalidLinkError('preset');
       }
       const missionId = crypto.randomUUID();
-      commit('mission.created', missionId, { title, goal, cwd, preset });
+      assertPosture(posture);
+      commit('mission.created', missionId, { title, goal, cwd, preset, posture });
       return clone(requireMission(missionId));
     },
 
@@ -235,6 +252,7 @@ export function openMissions(dataDir) {
       if ('goal' in fields && fields.goal !== null && typeof fields.goal !== 'string') {
         throw new InvalidGoalError();
       }
+      if ('posture' in fields) assertPosture(fields.posture);
       commit('mission.updated', missionId, fields);
       return clone(requireMission(missionId));
     },

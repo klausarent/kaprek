@@ -5,9 +5,12 @@ import { useEffect, useState } from "react";
 import {
   fetchMission,
   setMissionStatus,
+  setMissionPosture,
+  POSTURES,
   type Mission,
   type MissionDetail as MissionDetailData,
   type MissionStatus,
+  type Posture,
 } from "../lib/api";
 import { navigateToApprovals, navigateToBoard, navigateToChat, navigateToMissionChat, navigateToMissions } from "../App";
 
@@ -18,13 +21,22 @@ export const MISSION_STATUS_OPTIONS: { value: MissionStatus; label: string }[] =
   { value: "archived", label: "Archived" },
 ];
 
-/** Header block: title, goal, cwd, and the status select. Pure — testable without fetch. */
+/** What each posture means, in the picker's own words. */
+export const POSTURE_LABELS: Record<Posture, string> = {
+  ask: "ask — everything write-shaped asks",
+  edits: "edits — edits run free, the rest asks",
+  auto: "auto — nothing asks",
+};
+
+/** Header block: title, goal, cwd, the status select and the posture ceiling. Pure — testable without fetch. */
 export function MissionHeader({
   mission,
   onStatusChange,
+  onPostureChange,
 }: {
   mission: Mission;
   onStatusChange: (status: MissionStatus) => void;
+  onPostureChange?: (posture: Posture | null) => void;
 }) {
   return (
     <div className="mission-header">
@@ -45,6 +57,27 @@ export function MissionHeader({
       <p className="mission-cwd">
         Runs in: <code>{mission.cwd ?? "kaprek workspace (default)"}</code>
       </p>
+      {onPostureChange && (
+        <p className="mission-posture">
+          <label>
+            Posture ceiling:{" "}
+            <select
+              className="mission-posture-select"
+              value={mission.posture ?? ""}
+              onChange={(e) => onPostureChange(e.target.value === "" ? null : (e.target.value as Posture))}
+              aria-label="Mission posture ceiling"
+            >
+              <option value="">global (policy.json)</option>
+              {POSTURES.map((p) => (
+                <option key={p} value={p}>
+                  {POSTURE_LABELS[p]}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className="plan-note"> a mission only ever tightens the global ceiling; a turn asked for past it is refused, not clamped</span>
+        </p>
+      )}
     </div>
   );
 }
@@ -93,7 +126,15 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
 
   return (
     <div className="mission-detail">
-      <MissionHeader mission={mission} onStatusChange={handleStatusChange} />
+      <MissionHeader
+        mission={mission}
+        onStatusChange={handleStatusChange}
+        onPostureChange={(posture) => {
+          setMissionPosture(missionId, posture)
+            .then(() => setReloads((n) => n + 1))
+            .catch((e) => setError((e as Error).message));
+        }}
+      />
 
       {pendingApprovals.length > 0 && (
         <section className="mission-section mission-pending">

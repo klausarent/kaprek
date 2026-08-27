@@ -14,6 +14,7 @@ import {
   InvalidStatusError,
   InvalidCwdError,
   InvalidLinkError,
+  InvalidPostureError,
 } from './store.mjs';
 
 function tmpDataDir() {
@@ -146,4 +147,16 @@ test('list filters by status', () => {
   store.setStatus(a.id, 'done');
   expect(store.list({ status: 'done' }).map((m) => m.title)).toEqual(['a']);
   expect(store.list({ status: 'active' }).map((m) => m.title)).toEqual(['b']);
+});
+
+test('a mission may carry its own posture ceiling, cleared with null, and refuses anything else', () => {
+  const store = openMissions(tmpDataDir());
+  const plain = store.create({ title: 'plain' });
+  expect(plain.posture).toBeNull();
+  const strict = store.create({ title: 'strict', posture: 'ask' });
+  expect(strict.posture).toBe('ask');
+  expect(store.update(strict.id, { posture: 'edits' }).posture).toBe('edits');
+  expect(store.update(strict.id, { posture: null }).posture).toBeNull();
+  expect(() => store.create({ title: 'x', posture: 'yolo' })).toThrow(InvalidPostureError);
+  expect(() => store.update(plain.id, { posture: 'auto-ish' })).toThrow(InvalidPostureError);
 });
