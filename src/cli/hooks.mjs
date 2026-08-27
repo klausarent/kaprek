@@ -1,4 +1,8 @@
-// Manages kaprek's Claude Code Stop hook entry in ~/.claude/settings.json.
+// Manages kaprek's Claude Code hook entries in ~/.claude/settings.json:
+// the Stop hook (policy engine, artifact sweep) and the SessionStart hook
+// (mission, open questions, rules and memory for the directory a session
+// opens in — see src/policy/hook-session-start.mjs). One install, one
+// uninstall, one marker for both.
 //
 // Pure fs work, no console output — bin/cli.mjs owns printing, this module
 // only returns plain result objects so it stays easy to test against a
@@ -13,6 +17,10 @@ import { getAppDir, getPackageName } from '../lib/appdir.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const HOOK_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-stop.mjs');
+export const SESSION_START_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-session-start.mjs');
+
+/** The events kaprek hooks into, and which script answers each. */
+export const HOOK_EVENTS = Object.freeze({ Stop: 'hookScriptPath', SessionStart: 'sessionStartScriptPath' });
 
 const MANAGED_BY_PREFIX = '--managed-by=';
 
@@ -96,10 +104,11 @@ function extractCommandPath(command) {
   return match ? match[1] : undefined;
 }
 
-function findOurHookEntry(settings, packageName) {
-  const stopMatchers = settings?.hooks?.Stop;
-  if (!Array.isArray(stopMatchers)) return null;
-  for (const matcher of stopMatchers) {
+/** Our entry under one event's matcher list, or null. */
+function findOurHookEntry(settings, packageName, event = 'Stop') {
+  const matchers = settings?.hooks?.[event];
+  if (!Array.isArray(matchers)) return null;
+  for (const matcher of matchers) {
     if (!Array.isArray(matcher?.hooks)) continue;
     const hook = matcher.hooks.find((h) => isOurHookEntry(h, packageName));
     if (hook) return hook;
@@ -108,40 +117,62 @@ function findOurHookEntry(settings, packageName) {
 }
 
 function hasOurHookInstalled(settings, packageName) {
-  return findOurHookEntry(settings, packageName) !== null;
+  return Object.keys(HOOK_EVENTS).some((event) => findOurHookEntry(settings, packageName, event) !== null);
 }
 
-/**
- * Idempotently adds kaprek's Stop hook to `settingsPath` (default
- * `~/.claude/settings.json`). Backs up the file first (if it exists),
- * leaves any other hooks byte-for-byte untouched. If an entry with our
- * `--managed-by` marker already exists (even at a different path), its
- * command is updated in place rather than adding a duplicate.
- */
-export function install({ settingsPath = defaultSettingsPath(), hookScriptPath = HOOK_SCRIPT_PATH, packageName = getPackageName() } = {}) {
-  const settings = readSettings(settingsPath);
-  const backupPath = backupSettings(settingsPath);
-  const command = buildCommand(hookScriptPath, packageName);
-
-  const existingHook = findOurHookEntry(settings, packageName);
-  const alreadyInstalled = existingHook !== null;
-
+/** Adds or refreshes our entry under one event. Returns whether it was already there. */
+function upsertEntry(settings, event, command, packageName) {
+  const existingHook = findOurHookEntry(settings, packageName, event);
   if (existingHook) {
     existingHook.command = command; // path may have shifted (e.g. npx cache) — replace, don't duplicate
-  } else {
-    settings.hooks = settings.hooks ?? {};
-    settings.hooks.Stop = Array.isArray(settings.hooks.Stop) ? settings.hooks.Stop : [];
-    settings.hooks.Stop.push({ hooks: [{ type: 'command', command }] });
+    return true;
   }
-
-  writeSettings(settingsPath, settings);
-  return { installed: true, alreadyInstalled, settingsPath, backupPath, hookScriptPath };
+  settings.hooks = settings.hooks ?? {};
+  settings.hooks[event] = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : [];
+  settings.hooks[event].push({ hooks: [{ type: 'command', command }] });
+  return false;
 }
 
 /**
- * Removes only kaprek's own Stop hook entry (matched by its
- * `--managed-by` marker, regardless of the path recorded in it) from
- * `settingsPath`. Other hooks (Stop or otherwise) are left untouched.
+ * Idempotently adds kaprek's hooks — Stop and SessionStart — to
+ * `settingsPath` (default `~/.claude/settings.json`). Backs up the file
+ * first (if it exists), leaves any other hooks byte-for-byte untouched. If
+ * an entry with our `--managed-by` marker already exists under an event
+ * (even at a different path), its command is updated in place rather than
+ * adding a duplicate; an install from before the SessionStart hook existed
+ * gains that entry and keeps the other.
+ */
+export function install({
+  settingsPath = defaultSettingsPath(),
+  hookScriptPath = HOOK_SCRIPT_PATH,
+  sessionStartScriptPath = SESSION_START_SCRIPT_PATH,
+  packageName = getPackageName(),
+} = {}) {
+  const settings = readSettings(settingsPath);
+  const backupPath = backupSettings(settingsPath);
+
+  const scripts = { hookScriptPath, sessionStartScriptPath };
+  const already = {};
+  for (const [event, key] of Object.entries(HOOK_EVENTS)) {
+    already[event] = upsertEntry(settings, event, buildCommand(scripts[key], packageName), packageName);
+  }
+  // `alreadyInstalled` keeps its old meaning — the Stop hook was there —
+  // and `added` names what this run actually put in, so an install from
+  // before the SessionStart hook existed reads as "already installed,
+  // SessionStart added" rather than as either extreme.
+  const alreadyInstalled = already.Stop === true;
+  const added = Object.entries(already)
+    .filter(([, wasThere]) => !wasThere)
+    .map(([event]) => event);
+
+  writeSettings(settingsPath, settings);
+  return { installed: true, alreadyInstalled, added, settingsPath, backupPath, hookScriptPath, sessionStartScriptPath, events: Object.keys(HOOK_EVENTS) };
+}
+
+/**
+ * Removes only kaprek's own hook entries (matched by the `--managed-by`
+ * marker, regardless of the path recorded in them) from `settingsPath`,
+ * under every event kaprek hooks into. Other hooks are left untouched.
  * Cleans up now-empty matcher entries (`{hooks: []}`) it leaves behind.
  */
 export function uninstall({ settingsPath = defaultSettingsPath(), hookScriptPath = HOOK_SCRIPT_PATH, packageName = getPackageName() } = {}) {
@@ -156,40 +187,49 @@ export function uninstall({ settingsPath = defaultSettingsPath(), hookScriptPath
 
   const backupPath = backupSettings(settingsPath);
 
-  settings.hooks.Stop = settings.hooks.Stop
-    .map((matcher) => {
-      if (!Array.isArray(matcher?.hooks)) return matcher;
-      return { ...matcher, hooks: matcher.hooks.filter((h) => !isOurHookEntry(h, packageName)) };
-    })
-    .filter((matcher) => !Array.isArray(matcher?.hooks) || matcher.hooks.length > 0);
-
-  if (settings.hooks.Stop.length === 0) delete settings.hooks.Stop;
-  if (Object.keys(settings.hooks).length === 0) delete settings.hooks;
+  for (const event of Object.keys(HOOK_EVENTS)) {
+    if (!Array.isArray(settings.hooks?.[event])) continue;
+    settings.hooks[event] = settings.hooks[event]
+      .map((matcher) => {
+        if (!Array.isArray(matcher?.hooks)) return matcher;
+        return { ...matcher, hooks: matcher.hooks.filter((h) => !isOurHookEntry(h, packageName)) };
+      })
+      .filter((matcher) => !Array.isArray(matcher?.hooks) || matcher.hooks.length > 0);
+    if (settings.hooks[event].length === 0) delete settings.hooks[event];
+  }
+  if (settings.hooks && Object.keys(settings.hooks).length === 0) delete settings.hooks;
 
   writeSettings(settingsPath, settings);
   return { uninstalled: true, settingsPath, backupPath, hookScriptPath };
 }
 
 /**
- * Read-only report: is the hook installed (by marker), what path is
- * currently recorded for it (and whether that path still exists on disk —
- * a missing file means a dead/stale entry), and what policy mode is
- * currently active for dataDir.
+ * Read-only report: which of our hooks are installed (by marker), what
+ * path is currently recorded for each (and whether that path still exists
+ * on disk — a missing file means a dead/stale entry), and what policy mode
+ * is currently active for dataDir. `installed`/`recordedPath`/
+ * `recordedPathMissing` describe the Stop hook, as they always did;
+ * `events` carries the same per event.
  */
 export function status({ settingsPath = defaultSettingsPath(), hookScriptPath = HOOK_SCRIPT_PATH, dataDir = getAppDir(), packageName = getPackageName() } = {}) {
-  let installed = false;
-  let recordedPath;
-  let recordedPathMissing = false;
+  const events = {};
+  let settings = {};
   try {
-    const hook = findOurHookEntry(readSettings(settingsPath), packageName);
-    if (hook) {
-      installed = true;
-      recordedPath = extractCommandPath(hook.command);
-      if (recordedPath) recordedPathMissing = !fs.existsSync(recordedPath);
-    }
+    settings = readSettings(settingsPath);
   } catch {
-    installed = false;
+    settings = null;
   }
+  for (const event of Object.keys(HOOK_EVENTS)) {
+    const report = { installed: false, recordedPath: undefined, recordedPathMissing: false };
+    const hook = settings ? findOurHookEntry(settings, packageName, event) : null;
+    if (hook) {
+      report.installed = true;
+      report.recordedPath = extractCommandPath(hook.command);
+      if (report.recordedPath) report.recordedPathMissing = !fs.existsSync(report.recordedPath);
+    }
+    events[event] = report;
+  }
+  const { installed, recordedPath, recordedPathMissing } = events.Stop;
 
   let mode = 'observe';
   let policyError;
@@ -199,5 +239,5 @@ export function status({ settingsPath = defaultSettingsPath(), hookScriptPath = 
     policyError = err.message;
   }
 
-  return { installed, settingsPath, hookScriptPath, dataDir, mode, policyError, recordedPath, recordedPathMissing };
+  return { installed, settingsPath, hookScriptPath, dataDir, mode, policyError, recordedPath, recordedPathMissing, events };
 }

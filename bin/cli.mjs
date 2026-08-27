@@ -44,20 +44,23 @@ Autostart (start kaprek when you log in — off unless you ask):
   autostart status     Show whether it is there, and print its path
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
-  hooks install    Add the kaprek Stop hook to ~/.claude/settings.json
-  hooks uninstall  Remove only the kaprek Stop hook entry
-  hooks status     Show whether the hook is installed and the active policy mode
+  hooks install    Add the kaprek Stop + SessionStart hooks to ~/.claude/settings.json
+  hooks uninstall  Remove only the kaprek hook entries
+  hooks status     Show whether the hooks are installed and the active policy mode
 `;
 
 const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
 
-Manages the Claude Code Stop hook kaprek's policy engine uses to gently
-enforce workflow rules (e.g. requiring a linked board task for commits).
+Manages kaprek's Claude Code hooks: the Stop hook the policy engine uses to
+gently enforce workflow rules (e.g. requiring a linked board task for
+commits), and the SessionStart hook that tells a session opening in a
+mission directory about the mission, its open questions, the rules a person
+accepted, and what earlier sessions wrote down.
 
-  install    Adds the kaprek Stop hook to ~/.claude/settings.json
+  install    Adds both kaprek hooks to ~/.claude/settings.json
              (backs up the existing file first; leaves other hooks intact)
-  uninstall  Removes only the kaprek Stop hook entry
-  status     Shows whether the hook is installed and the active policy mode
+  uninstall  Removes only the kaprek hook entries
+  status     Shows whether the hooks are installed and the active policy mode
 `;
 
 const MAX_PORT_ATTEMPTS = 10;
@@ -120,20 +123,20 @@ function runHooksCommand(args) {
   try {
     if (sub === 'install') {
       const result = installHook();
-      console.log(`Installed Stop hook -> ${result.settingsPath}`);
+      console.log(`Installed Stop + SessionStart hooks -> ${result.settingsPath}`);
       if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
-      if (result.alreadyInstalled) console.log('(already installed, left unchanged)');
+      if (result.alreadyInstalled) console.log(result.added?.length ? `(Stop hook was already installed; added: ${result.added.join(', ')})` : '(already installed, left unchanged)');
     } else if (sub === 'uninstall') {
       const result = uninstallHook();
       if (result.uninstalled) {
-        console.log(`Removed Stop hook from ${result.settingsPath}`);
+        console.log(`Removed kaprek hooks from ${result.settingsPath}`);
         if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       } else {
-        console.log(`No kaprek Stop hook found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
+        console.log(`No kaprek hooks found in ${result.settingsPath} (${result.reason ?? 'nothing to remove'})`);
       }
     } else if (sub === 'status') {
       const result = hookStatus();
-      console.log(`Installed: ${result.installed ? 'yes' : 'no'}`);
+      console.log(`Installed: ${result.installed ? 'yes' : 'no'} (Stop)${result.events?.SessionStart ? `, ${result.events.SessionStart.installed ? 'yes' : 'no'} (SessionStart)` : ''}`);
       console.log(`Settings file: ${result.settingsPath}`);
       if (result.installed) {
         const staleNote = result.recordedPathMissing ? ' (WARNING: no file exists at this recorded path)' : '';

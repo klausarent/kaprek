@@ -464,9 +464,13 @@ kaprek can install a Claude Code **Stop** hook that gently enforces the policy e
 
 Important: a Stop hook fires *after* the turn already ended — after any tool call in it, including a `git commit`, already ran. It cannot prevent a commit or require a task link "before" one happens; it can only look back at the transcript once the turn is over and react (log, warn, or refuse to end that particular Stop event) to what already occurred. Think of it as a nag, not a gate.
 
-- `kaprek hooks install` adds one entry to `~/.claude/settings.json` (backs up the file first, leaves any other hooks untouched).
-- `kaprek hooks uninstall` removes only that entry, at any time, identified by a stable `--managed-by` marker so a later reinstall never creates a duplicate.
-- `kaprek hooks status` shows whether it's installed and which policy mode is active.
+- `kaprek hooks install` adds two entries to `~/.claude/settings.json` — the Stop hook and the SessionStart hook below (backs up the file first, leaves any other hooks untouched).
+- `kaprek hooks uninstall` removes only those entries, at any time, identified by a stable `--managed-by` marker so a later reinstall never creates a duplicate.
+- `kaprek hooks status` shows whether each is installed and which policy mode is active.
+
+### SessionStart: what kaprek knows about this directory
+
+The same install adds a **SessionStart** hook. When a Claude Code session opens in a directory that is a kaprek mission's working directory, the session starts with what kaprek knows about that work, as context it can see: the mission's title and goal, how many questions are waiting in the kaprek inbox for it (with the address to answer them), the rules a person accepted from failure-to-policy proposals, and what earlier sessions wrote down for that project — the same rules and memory kaprek's own turns get, so a terminal session is no longer the one place they do not reach. Outside a mission directory the hook adds only the accepted rules, if any; with nothing to say it says nothing. The whole block is capped at 1,500 characters, the hook reads kaprek's data and never writes it, fails open on every error, and exits on its own after three seconds — it must never slow a session down. Same shape as the Stop hook: one script, no daemon, uninstalled with the same command.
 
 Policy mode lives in `<dataDir>/policy.json`: `observe` (default) fully evaluates both rules and logs any violation to `policy.log`, but always resolves to allow — it's for seeing what would happen before switching modes. `warn` writes its reasons to stderr (Claude Code hooks reference exit 0 as no objection either way, so this is best-effort visibility, not a blocking signal). `block` is the only mode that can actually end a turn abnormally, and even then at most once per session. The hook fails open on any internal error — a bug here must never stop you from ending a turn. This is the single exception to kaprek's read-only promise; every other feature only reads `~/.claude/projects`.
 

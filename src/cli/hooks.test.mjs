@@ -5,7 +5,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { install, uninstall, status, HOOK_SCRIPT_PATH } from './hooks.mjs';
+import { install, uninstall, status, HOOK_SCRIPT_PATH, SESSION_START_SCRIPT_PATH } from './hooks.mjs';
 
 let tmpDir;
 let settingsPath;
@@ -228,4 +228,55 @@ test('a settings.json with a leading BOM is read and modified correctly', () => 
   const settings = readJson(settingsPath);
   expect(settings.someOtherSetting).toBe(true);
   expect(settings.hooks.Stop).toHaveLength(1);
+});
+
+// ------------------------------------------------------------ SessionStart
+
+test('install adds the SessionStart hook next to the Stop hook, both under one marker', () => {
+  install({ settingsPath });
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.SessionStart).toHaveLength(1);
+  expect(settings.hooks.SessionStart[0].hooks[0].command).toContain(SESSION_START_SCRIPT_PATH);
+  expect(settings.hooks.SessionStart[0].hooks[0].command).toContain('--managed-by=');
+  expect(settings.hooks.Stop[0].hooks[0].command).toContain(HOOK_SCRIPT_PATH);
+});
+
+test('an install from before the SessionStart hook existed gains it, and says which entry was added', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }] } }), 'utf8');
+  const result = install({ settingsPath, packageName: 'kaprek' });
+  expect(result.alreadyInstalled).toBe(true);
+  expect(result.added).toEqual(['SessionStart']);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.Stop).toHaveLength(1);
+  expect(settings.hooks.SessionStart).toHaveLength(1);
+  // The second run changes nothing and says so.
+  const again = install({ settingsPath, packageName: 'kaprek' });
+  expect(again.alreadyInstalled).toBe(true);
+  expect(again.added).toEqual([]);
+  expect(readJson(settingsPath).hooks.SessionStart).toHaveLength(1);
+  // A fresh install adds both.
+  fs.rmSync(settingsPath);
+  expect(install({ settingsPath, packageName: 'kaprek' }).added).toEqual(['Stop', 'SessionStart']);
+});
+
+test('uninstall removes both entries and leaves a foreign SessionStart hook alone', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo theirs' }] }] } }), 'utf8');
+  install({ settingsPath, packageName: 'kaprek' });
+  expect(readJson(settingsPath).hooks.SessionStart).toHaveLength(2);
+  const result = uninstall({ settingsPath, packageName: 'kaprek' });
+  expect(result.uninstalled).toBe(true);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.Stop).toBeUndefined();
+  expect(settings.hooks.SessionStart).toEqual([{ matcher: 'startup', hooks: [{ type: 'command', command: 'echo theirs' }] }]);
+});
+
+test('status reports each event, and a Stop-only install shows SessionStart as missing', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }] } }), 'utf8');
+  const before = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(before.installed).toBe(true);
+  expect(before.events.Stop.installed).toBe(true);
+  expect(before.events.SessionStart.installed).toBe(false);
+  install({ settingsPath, packageName: 'kaprek' });
+  const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(after.events.SessionStart).toMatchObject({ installed: true, recordedPath: SESSION_START_SCRIPT_PATH, recordedPathMissing: false });
 });
