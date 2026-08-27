@@ -283,3 +283,37 @@ test('appendFindings refuses a plan whose file is gone, like every other write',
   fs.rmSync(file);
   expect(() => store.appendFindings(plan.id, [{ id: 'F1', severity: 'low', gapType: 'missing', sourceRef: '', evidence: '', remainingWork: 'x' }])).toThrow(PlanFileMissingError);
 });
+
+// ------------------------------------------------------ edited outside kaprek
+
+test('a plan remembers the file as kaprek last saw it, and says when it changed outside', () => {
+  const dataDir = tmpDataDir();
+  const store = openPlans(dataDir);
+  const file = writePlanFile(dataDir);
+  const plan = store.register({ path: file });
+  expect(plan.seenAt).toBeTruthy();
+  expect(plan.changedOutside).toBe(false);
+
+  // An edit by hand (or by an agent in a terminal): the next read says so.
+  fs.appendFileSync(file, '- [ ] Added by hand\n', 'utf8');
+  expect(store.get(plan.id).changedOutside).toBe(true);
+  expect(store.list()[0].changedOutside).toBe(true);
+
+  // A tick through kaprek writes the file and brings the view up to date.
+  const ticked = store.setStep(plan.id, 0, true);
+  expect(ticked.changedOutside).toBe(false);
+  expect(store.get(plan.id).seenAt >= plan.seenAt).toBe(true);
+
+  // So does a converge round: it read the file to check it.
+  fs.appendFileSync(file, '- [ ] Another one\n', 'utf8');
+  expect(store.get(plan.id).changedOutside).toBe(true);
+  expect(store.recordConverge(plan.id, { findings: 0, converged: true }).changedOutside).toBe(false);
+
+  // Gone is gone, not "changed".
+  fs.rmSync(file);
+  expect(store.get(plan.id)).toMatchObject({ exists: false, changedOutside: null });
+
+  // Replay keeps the fingerprint.
+  fs.writeFileSync(file, 'something else', 'utf8');
+  expect(openPlans(dataDir).get(plan.id).changedOutside).toBe(true);
+});

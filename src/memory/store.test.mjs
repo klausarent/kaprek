@@ -168,3 +168,39 @@ describe('replay', () => {
     expect(openMemory(dataDir, { now }).recall({ scopeId: 'person:klaus' }).map((entry) => entry.text)).toEqual(['second', 'first']);
   });
 });
+
+// ------------------------------------------------------------- confirmations
+
+test('learning the same fact again confirms it instead of duplicating it — count, sources and clock move', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-memory-confirm-'));
+  let clock = Date.parse('2026-05-01T10:00:00.000Z');
+  const memory = openMemory(dataDir, { now: () => clock });
+  memory.addScope({ id: 'person:local' });
+  memory.addScope({ id: 'project:p', parent: 'person:local' });
+  const first = memory.remember({ scopeId: 'project:p', text: 'Deploys go through wrangler.', kind: 'fact', origin: 'chat:a', confidence: 0.6 });
+  expect(first).toMatchObject({ confirmations: 1, origins: ['chat:a'] });
+
+  // 100 days later, another agent learns it — differently capitalised, no full stop.
+  clock += 100 * 24 * 60 * 60 * 1000;
+  expect(memory.list({ scopeId: 'project:p' })[0].stale).toBe(true);
+  const again = memory.remember({ scopeId: 'project:p', text: 'deploys go through  wrangler', kind: 'fact', origin: 'chat:b', confidence: 0.9 });
+  expect(again.id).toBe(first.id);
+  expect(again.confirmed).toBe(true);
+  expect(again).toMatchObject({ confirmations: 2, origins: ['chat:a', 'chat:b'], confidence: 0.9, stale: false });
+  expect(memory.list({ scopeId: 'project:p' })).toHaveLength(1);
+
+  // The same origin confirming again counts, but is listed once.
+  expect(memory.remember({ scopeId: 'project:p', text: 'Deploys go through wrangler.', kind: 'fact', origin: 'chat:b' })).toMatchObject({ confirmations: 3, origins: ['chat:a', 'chat:b'] });
+
+  // A different kind, a different scope, or a withdrawn fact is a new entry.
+  memory.addScope({ id: 'project:q', parent: 'person:local' });
+  expect(memory.remember({ scopeId: 'project:q', text: 'Deploys go through wrangler.', kind: 'fact', origin: 'chat:c' }).id).not.toBe(first.id);
+  expect(memory.remember({ scopeId: 'project:p', text: 'Deploys go through wrangler.', kind: 'profile', origin: 'chat:c' }).id).not.toBe(first.id);
+  memory.forget(first.id, 'wrong');
+  expect(memory.remember({ scopeId: 'project:p', text: 'Deploys go through wrangler.', kind: 'fact', origin: 'chat:d' }).id).not.toBe(first.id);
+
+  // Replay keeps the count.
+  const reopened = openMemory(dataDir, { now: () => clock });
+  expect(reopened.list({ scopeId: 'project:p' }).find((f) => f.id === first.id)).toMatchObject({ confirmations: 3, forgotten: true });
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});

@@ -25,6 +25,22 @@ export const PLAN_KINDS = ['spec', 'plan'];
 /** Content above this is capped on read — a plan is a document, not a dataset. */
 const MAX_READ_BYTES = 512 * 1024;
 
+/** sha256 of a string, the fingerprint a plan carries of the file as kaprek last saw it. */
+function hashOf(content) {
+  return crypto.createHash('sha256').update(content, 'utf8').digest('hex');
+}
+
+/** The file's fingerprint now, or null when it cannot be read or is too large to be a plan. */
+function hashFile(filePath) {
+  try {
+    const stat = fs.statSync(filePath);
+    if (!stat.isFile() || stat.size > MAX_READ_BYTES * 4) return null;
+    return hashOf(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
 export class PlanNotFoundError extends Error {
   constructor(planId) {
     super(`plan not found: ${planId}`);
@@ -109,6 +125,10 @@ function applyEvent(plans, event) {
           if (dedupeKey(existing.path) !== key) continue;
           existing.chatId = existing.chatId ?? data.chatId ?? null;
           existing.missionId = existing.missionId ?? data.missionId ?? null;
+          if (data.contentHash) {
+            existing.seenHash = data.contentHash;
+            existing.seenAt = ts;
+          }
           existing.updatedAt = ts;
           return;
         }
@@ -126,6 +146,12 @@ function applyEvent(plans, event) {
         // event log, so a plan's history of checks is replayable.
         converge: null,
         override: null,
+        // The file as kaprek last saw it (a registration, a tick, a converge
+        // round): the fingerprint, and when. Against it a read can say
+        // "edited outside kaprek since" — the Graft idea of a source hash,
+        // applied to the one file a plan IS.
+        seenHash: data.contentHash ?? null,
+        seenAt: data.contentHash ? ts : null,
         createdAt: ts,
         updatedAt: ts,
       });
@@ -144,6 +170,10 @@ function applyEvent(plans, event) {
     case 'plan.converged': {
       const plan = plans.get(planId);
       if (!plan) break;
+      if (data.contentHash) {
+        plan.seenHash = data.contentHash;
+        plan.seenAt = ts;
+      }
       plan.converge = {
         round: data.round,
         chatId: data.chatId ?? null,
@@ -157,6 +187,10 @@ function applyEvent(plans, event) {
     case 'plan.touched': {
       const plan = plans.get(planId);
       if (!plan) break;
+      if (data?.contentHash) {
+        plan.seenHash = data.contentHash;
+        plan.seenAt = ts;
+      }
       plan.updatedAt = ts;
       break;
     }
@@ -224,9 +258,15 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
     return plan;
   }
 
-  /** The plan plus whether its file is still there — a deleted file is worth showing, not hiding. */
+  /**
+   * The plan plus whether its file is still there — a deleted file is worth
+   * showing, not hiding — and whether it changed outside kaprek since kaprek
+   * last saw it (null when nothing has been seen yet or the file is gone).
+   */
   function withExistence(plan) {
-    return { ...clone(plan), exists: fs.existsSync(plan.path) };
+    const exists = fs.existsSync(plan.path);
+    const changedOutside = exists && plan.seenHash ? hashFile(plan.path) !== plan.seenHash : null;
+    return { ...clone(plan), exists, changedOutside };
   }
 
   /** Reads a registered plan's file, re-checking containment first. */
@@ -291,7 +331,7 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
             ...(plan.chatId === null && chatId !== null ? { chatId } : {}),
             ...(plan.missionId === null && missionId !== null ? { missionId } : {}),
           };
-          commit('plan.created', plan.id, { path: plan.path, title: plan.title, kind: plan.kind, ...fill });
+          commit('plan.created', plan.id, { path: plan.path, title: plan.title, kind: plan.kind, ...fill, contentHash: hashFile(resolved) });
           return withExistence(plans.get(plan.id));
         }
       }
@@ -308,6 +348,7 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
         kind: PLAN_KINDS.includes(kind) ? kind : 'plan',
         chatId,
         missionId,
+        contentHash: hashFile(resolved),
       });
       return withExistence(requirePlan(planId));
     },
@@ -348,7 +389,7 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
       const count = Number.isInteger(findings) && findings >= 0 ? findings : 0;
       const clean = converged === true && count === 0;
       const round = (plan.converge?.round ?? 0) + 1;
-      commit('plan.converged', planId, { round, chatId, findings: count, converged: clean });
+      commit('plan.converged', planId, { round, chatId, findings: count, converged: clean, contentHash: hashFile(plan.path) });
       if (clean && plan.status !== 'done') commit('plan.status', planId, { status: 'done' });
       if (!clean && plan.status !== 'active') commit('plan.status', planId, { status: 'active' });
       return withExistence(requirePlan(planId));
@@ -367,7 +408,7 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
       const tmp = `${plan.path}.kaprek-tmp-${process.pid}-${crypto.randomUUID()}`;
       fs.writeFileSync(tmp, next, 'utf8');
       fs.renameSync(tmp, plan.path);
-      commit('plan.touched', planId, {});
+      commit('plan.touched', planId, { contentHash: hashOf(next) });
       return { ...withExistence(plan), content: next, steps: parseSteps(next), truncated: false };
     },
 
@@ -399,7 +440,7 @@ export function openPlans(dataDir, { allowedRoots } = {}) {
       const tmp = `${plan.path}.kaprek-tmp-${process.pid}-${crypto.randomUUID()}`;
       fs.writeFileSync(tmp, next, 'utf8');
       fs.renameSync(tmp, plan.path);
-      commit('plan.touched', planId, {});
+      commit('plan.touched', planId, { contentHash: hashOf(next) });
       return { ...withExistence(plan), content: next, steps: parseSteps(next), truncated: false };
     },
   };

@@ -99,6 +99,7 @@ export function PlanList({ plans, selectedId, onSelect }: { plans: PlanSummary[]
               {subtitleOf(plan)}
               {!plan.exists && <span className="badge badge-muted">missing</span>}
               {plan.status === "done" && <span className="badge badge-muted">{plan.override ? "done (override)" : "done"}</span>}
+              {plan.changedOutside === true && <span className="badge badge-muted">edited outside</span>}
               {plan.status !== "done" && plan.converge && !plan.converge.converged && <span className="badge badge-muted">{plan.converge.findings} gap(s)</span>}
             </span>
           </button>
@@ -142,6 +143,12 @@ export function PlanDetailView({
         </button>
       </div>
       <div className="plan-status">status: {plan.status}</div>
+      {plan.changedOutside === true && (
+        <div className="plan-note">
+          Edited outside kaprek since {plan.seenAt ? new Date(plan.seenAt).toLocaleString() : "kaprek last saw it"} — the steps below are read from the file as it is now; a
+          convergence check or a tick brings kaprek's view up to date.
+        </div>
+      )}
 
       {plan.steps.length > 0 && (
         <>

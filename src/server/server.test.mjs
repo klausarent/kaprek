@@ -4565,3 +4565,20 @@ test('board receipt: policyVersion is null under the default policy and a finger
   fs.writeFileSync(path.join(dataDir, 'policy.json'), JSON.stringify({ posture: 'ask' }), 'utf8');
   expect((await (await fetch(`${url}/api/board/tasks/${task.id}/receipt/verify`)).json()).valid).toBe(false);
 });
+
+test('GET /api/usage reads the latest subscription-window signal per harness back from runs.jsonl', async () => {
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'init', sessionId: 's', tools: [], model: 'm', permissionMode: 'default' });
+      options.onEvent({ type: 'rate-limit', info: { status: 'allowed_warning', utilization: 0.8, rateLimitType: 'five_hour', resetsAt: 1756310400 } });
+      return { sessionId: 's', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  const { url } = await boot({ harness });
+  expect((await (await fetch(`${url}/api/usage`)).json()).usage).toEqual([]);
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'hi' }));
+  const { usage } = await (await fetch(`${url}/api/usage`)).json();
+  expect(usage).toHaveLength(1);
+  expect(usage[0].summary).toMatchObject({ usedPercent: 80, window: 'five_hour', status: 'allowed_warning' });
+  expect(usage[0].info).toMatchObject({ utilization: 0.8 });
+});

@@ -49,6 +49,7 @@ import { EFFORT_LEVELS } from '../harness/claude-code.mjs';
 import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError, PlanNotConvergedError, PLAN_STATUSES } from '../plans/store.mjs';
 import { loadPolicyFailOpen, policyVersion } from '../policy/policy.mjs';
+import { latestRateLimits } from '../orchestrator/usage.mjs';
 import { effectivePosture, postureAllows, POSTURES } from '../policy/guards.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
@@ -3141,6 +3142,18 @@ async function handleRequest(
       sendJson(res, 200, { repeats: findRepeats(events) });
       return;
     }
+    // /api/usage — the subscription windows as the CLIs last reported them
+    // (see src/orchestrator/usage.mjs). Read back from runs.jsonl, never
+    // asked of a vendor.
+    if (segments.length === 2 && segments[1] === 'usage') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendJson(res, 200, { usage: latestRateLimits(dataDir) });
+      return;
+    }
+
     if (segments.length === 2 && segments[1] === 'engines') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: 'method not allowed' });

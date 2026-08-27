@@ -40,6 +40,11 @@ export function MemoryRow({ entry, onVerify, onForget }: { entry: MemoryEntry; o
         <span className="badge badge-muted">{entry.kind}</span>
         <span className="memory-age">{ageLabel(entry)}</span>
         <span className="memory-origin">from {entry.origin}</span>
+        {(entry.confirmations ?? 1) > 1 && (
+          <span className="badge badge-muted" title={(entry.origins ?? []).join(", ")}>
+            confirmed {entry.confirmations}× by {(entry.origins ?? [entry.origin]).length} source{(entry.origins ?? [entry.origin]).length === 1 ? "" : "s"}
+          </span>
+        )}
       </div>
       <p className="memory-text">{entry.text}</p>
       <div className="memory-actions">

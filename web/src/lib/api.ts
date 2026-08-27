@@ -591,6 +591,19 @@ export function fetchRepeats(): Promise<RepeatSuggestion[]> {
   return getJson<{ repeats: RepeatSuggestion[] }>("/api/repeats").then((r) => r.repeats);
 }
 
+/** The latest subscription-window signal per harness, as read back from runs.jsonl. */
+export type UsageEntry = {
+  harness: string;
+  seenAt: string | null;
+  chatId: string | null;
+  summary: { usedPercent: number | null; resetsAt: string | null; window: string | null; status: string | null; plan: string | null };
+  info: unknown;
+};
+
+export function fetchUsage(): Promise<UsageEntry[]> {
+  return getJson<{ usage: UsageEntry[] }>("/api/usage").then((r) => r.usage);
+}
+
 export function fetchEngines(): Promise<Engine[]> {
   return getJson<{ engines: Engine[] }>("/api/engines").then((r) => r.engines);
 }
@@ -716,6 +729,10 @@ export type PlanSummary = {
   converge: PlanConverge | null;
   /** Set when 'done' was reached past the gate, by a person, on record. */
   override: { by: string; at: string } | null;
+  /** When kaprek last saw the file's content (a registration, a tick, a converge round); null before any. */
+  seenAt: string | null;
+  /** Whether the file differs from what kaprek last saw — edited outside kaprek. null when nothing was seen yet or the file is gone. */
+  changedOutside: boolean | null;
 };
 
 export type PlanConverge = { round: number; chatId: string | null; findings: number; converged: boolean; at: string };
@@ -1442,6 +1459,10 @@ export type MemoryEntry = {
   /** Older than 90 days without a verify. Shown, never hidden. */
   stale: boolean;
   ageMs: number;
+  /** How many times this was learned (the first time counts as one); a second learner confirms rather than duplicates. */
+  confirmations?: number;
+  /** Every distinct origin that learned it, oldest first (bounded). */
+  origins?: string[];
 };
 
 export async function fetchMemoryScopes(): Promise<MemoryScope[]> {

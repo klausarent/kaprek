@@ -140,6 +140,8 @@ state at signing time, so a later check or override invalidates it, like an
 edited doc does. The gap taxonomy is spec-kit's (`/speckit-converge`); the
 prompt, the fence, and the gate are kaprek's own.
 
+**Edited outside kaprek.** Every plan carries a fingerprint of the file as kaprek last saw it — at registration, at a tick, at a converge round. A read that finds the file different says so: a badge in the list, a line in the detail with the time of that last sighting. Nothing is blocked by it; it is the one thing a reader needs to know before trusting the checkboxes, and the next tick or check brings kaprek's view up to date.
+
 ## Council
 
 Four jobs, and whichever engines you have doing them:
@@ -315,6 +317,8 @@ instructions; a rejected one is not proposed again.
 Not built, deliberately: vector search, embeddings, automatic summarizing of
 raw transcripts, syncing between machines.
 
+
+**Confirmed, not duplicated.** An agent that learns something another agent already wrote down in the same scope confirms it: the entry's count goes up, its sources grow, and its stale clock resets — a fact that three sessions learned carries that on its face (`confirmed 3× by 2 sources`), and the 90-day clock stops nagging about what work keeps re-learning. Same text, same scope, same kind; a withdrawn fact is a new entry again.
 ## Answering from a phone (`--lan`)
 
 kaprek listens on `127.0.0.1`. `kaprek --lan` also listens on this machine's
@@ -442,6 +446,8 @@ Full-text search across every indexed session, backed by SQLite FTS5. Requires N
 
 The index only covers a session's title plus its user/assistant text, truncated to the first 4,000 characters per event — tool output, thinking blocks, and subagent transcripts are not indexed at all. A search miss doesn't mean the term isn't in the session; it may just be outside what's indexed.
 
+
+**Subscription windows.** Both CLIs say during a turn where their window stands (Claude Code's `rate_limit_event`, codex's `account/rateLimits/updated`); kaprek has logged that signal per turn since M1 and now shows the latest per engine on `#/setup` — how full, when it resets, which window, and as of when it was seen. Read back from `runs.jsonl`, never asked of a vendor: a window kaprek has not seen since the last turn is shown with that time, which is the honest form of "as of". `GET /api/usage` returns the same, raw signal included.
 ## Task board
 
 A local task board (`#/board`) for tracking work against these sessions.

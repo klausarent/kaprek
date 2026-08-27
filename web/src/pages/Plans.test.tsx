@@ -16,6 +16,8 @@ const summary = (over: Partial<PlanSummary> = {}): PlanSummary => ({
   exists: true,
   converge: null,
   override: null,
+  seenAt: "2026-08-02T01:00:00.000Z",
+  changedOutside: false,
   ...over,
 });
 
@@ -139,6 +141,15 @@ describe("the gate", () => {
     const tree = render(<DoneControls plan={summary({ status: "done", converge: checked(0) })} overrideBy="" busy={false} onOverrideByChange={() => {}} onMarkDone={() => {}} />);
     expect(findAll(tree, (node) => node.type === "button")).toHaveLength(0);
     expect(textOf(tree)).toContain("converged");
+  });
+
+  test("a plan edited outside kaprek is marked in the list and explained in the detail", () => {
+    const text = textOf(render(<PlanList plans={[summary({ changedOutside: true })]} selectedId={null} onSelect={() => {}} />));
+    expect(text).toContain("edited outside");
+    const detailText = textOf(render(<PlanDetailView plan={detail({ changedOutside: true })} busyStep={null} onToggleStep={() => {}} onImplement={() => {}} onCopyPath={() => {}} />));
+    expect(detailText).toContain("Edited outside kaprek since");
+    const clean = textOf(render(<PlanList plans={[summary({ changedOutside: null })]} selectedId={null} onSelect={() => {}} />));
+    expect(clean).not.toContain("edited outside");
   });
 
   test("the list marks done plans, overrides, and open gaps", () => {

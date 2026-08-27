@@ -38,6 +38,14 @@ export const MEMORY_KINDS = ['profile', 'fact', 'evidence'];
 
 /** After this long without a verify, a fact comes back marked stale. */
 export const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+/** How many distinct sources a confirmed fact lists. Past this the count still climbs; the list does not. */
+const MAX_ORIGINS = 20;
+
+/** Two texts that say the same thing, for the purpose of confirming rather than duplicating. */
+function sameText(a, b) {
+  const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').replace(/[.!]+$/, '').trim();
+  return norm(a) === norm(b);
+}
 
 export class MemoryNotFoundError extends Error {
   constructor(id) {
@@ -86,12 +94,27 @@ function applyEvent(state, event) {
     return;
   }
   if (event.type === 'memory.remembered') {
-    if (!facts.has(event.memoryId)) facts.set(event.memoryId, { id: event.memoryId, seq: state.seq, forgotten: false, ...event.data });
+    if (!facts.has(event.memoryId)) facts.set(event.memoryId, { id: event.memoryId, seq: state.seq, forgotten: false, confirmations: 1, origins: [event.data.origin], ...event.data });
     return;
   }
   const existing = facts.get(event.memoryId);
   if (!existing) return;
   if (event.type === 'memory.verified') facts.set(event.memoryId, { ...existing, lastVerifiedAt: event.ts, confidence: event.data.confidence ?? existing.confidence });
+  // A second agent (or a later turn) learning the same thing: not a second
+  // entry, a confirmation — the count, the sources and the clock move. That
+  // is what makes a fact carry its own weight: "3 sessions, last week"
+  // rather than one line that could be anyone's guess.
+  else if (event.type === 'memory.confirmed') {
+    const origins = existing.origins ?? [existing.origin];
+    const origin = typeof event.data?.origin === 'string' ? event.data.origin : null;
+    facts.set(event.memoryId, {
+      ...existing,
+      confirmations: (existing.confirmations ?? 1) + 1,
+      lastVerifiedAt: event.ts,
+      confidence: Math.max(existing.confidence ?? 0, typeof event.data?.confidence === 'number' ? event.data.confidence : 0),
+      origins: origin && !origins.includes(origin) ? [...origins, origin].slice(-MAX_ORIGINS) : origins,
+    });
+  }
   // A forget is an event, not a deleted line: the log stays replayable, and
   // "this was believed and then withdrawn" is worth as much as the belief.
   else if (event.type === 'memory.forgotten') facts.set(event.memoryId, { ...existing, forgotten: true, forgottenReason: event.data.reason ?? null, forgottenAt: event.ts });
@@ -122,7 +145,7 @@ export function openMemory(dataDir, { now = Date.now } = {}) {
   /** A fact plus the two things a reader has to know about it before using it. */
   function decorate(fact) {
     const age = now() - Date.parse(fact.lastVerifiedAt ?? fact.createdAt);
-    return { ...JSON.parse(JSON.stringify(fact)), stale: age > MAX_AGE_MS, ageMs: age };
+    return { confirmations: 1, origins: [fact.origin], ...JSON.parse(JSON.stringify(fact)), stale: age > MAX_AGE_MS, ageMs: age };
   }
 
   return {
@@ -153,6 +176,15 @@ export function openMemory(dataDir, { now = Date.now } = {}) {
       if (!MEMORY_KINDS.includes(kind)) throw new InvalidMemoryError('kind', `kind must be one of ${MEMORY_KINDS.join(', ')}`);
       if (typeof origin !== 'string' || origin.trim() === '') throw new InvalidMemoryError('origin', 'a memory needs an origin — a fact nobody can trace is a rumour');
       if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) throw new InvalidMemoryError('confidence', 'confidence must be between 0 and 1');
+
+      // The same thing, already known in this scope and not withdrawn: a
+      // confirmation, not a twin. The stale clock resets on its own when
+      // work re-learns a fact — which is the honest way to keep it fresh.
+      const twin = [...state.facts.values()].find((fact) => fact.scopeId === scopeId && fact.kind === kind && !fact.forgotten && sameText(fact.text, text));
+      if (twin) {
+        commit('memory.confirmed', twin.id, { origin, confidence });
+        return { ...decorate(state.facts.get(twin.id)), confirmed: true };
+      }
 
       const id = crypto.randomUUID();
       const ts = new Date(now()).toISOString();
