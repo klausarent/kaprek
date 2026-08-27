@@ -23,6 +23,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { appendRun } from '../orchestrator/runs.mjs';
+import { EXTERNAL_RULE, wrapExternal } from '../parser/external.mjs';
 import { routeFromLegacy, stepsOf, validateRecipe } from './recipes.mjs';
 
 /** Full rounds (every peer on the route once) before the run must ask a human. Conservative on purpose: two rounds is enough to see whether the pair is converging, and short enough that a bad run costs little. */
@@ -183,7 +184,11 @@ export function buildPeerPrompt({ goal, role, round, maxRounds, previous, previo
       : 'You have no tools, no file access and no web search. Work from the text below alone.',
   ];
   if (previous) {
-    lines.push('', `--- what ${previousFrom} produced ---`, previous, '--- end ---');
+    // What the other agent wrote is material, not a second operator. A peer
+    // has no system prompt kaprek controls (a codex or grok driver gets only
+    // this text), so the rule that explains the label rides in the prompt
+    // itself, right before the block it is about.
+    lines.push('', EXTERNAL_RULE, '', `--- what ${previousFrom} produced ---`, wrapExternal(`peer:${previousFrom ?? 'unknown'}`, previous), '--- end ---');
   } else {
     lines.push('', 'You are first: there is nothing from the other agent yet.');
   }

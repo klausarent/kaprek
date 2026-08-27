@@ -12,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { openChats } from '../chats/store.mjs';
 import { appendRun } from './runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
+import { EXTERNAL_RULE, hasExternal } from '../parser/external.mjs';
 import { writeMcpConfig, cleanupMcpConfig } from '../apps/mcp-config.mjs';
 import { writeHarnessSettings, mergeAskList, PROFILE_CLI_MODE } from '../harness/settings.mjs';
 import { readKnownTools, learnTools } from '../harness/knownTools.mjs';
@@ -603,7 +604,12 @@ export async function runTurn({
   // the memory block, which is explicitly what previous turns wrote down. A
   // proposal nobody has answered reaches no prompt at all.
   const rulesPrompt = buildRulesPrompt(activeRules(dataDir));
-  const combined = [rulesPrompt, guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
+  // Foreign text in THIS prompt (a clipboard trigger, a relay handoff)
+  // arrives as a labelled <external> block; the rule that says what the
+  // label means travels with it and only with it, so a turn without such a
+  // block keeps its prompt exactly as before.
+  const externalPrompt = hasExternal(text) ? EXTERNAL_RULE : '';
+  const combined = [rulesPrompt, externalPrompt, guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
   const appendSystemPrompt = combined === '' ? undefined : combined;
 
   let turnResult;

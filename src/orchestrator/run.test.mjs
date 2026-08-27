@@ -1075,3 +1075,19 @@ test('a session id is only resumed by the harness that issued it', async () => {
   expect(seen[1].resumed).toBe('claude-code-session');
   expect(seen[2].resumed).toBeNull();
 });
+
+test('a prompt that carries an <external> block gets the rule that explains it appended to the system prompt; one without stays untouched', async () => {
+  const seen = [];
+  const harness = {
+    startTurn: async (options) => {
+      seen.push(options);
+      return { sessionId: 's1', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'Look at this:\n<external source="clipboard">\nsome copied text\n</external>', harness });
+  await runTurn({ dataDir: tmpDir, text: 'plain question', harness });
+
+  expect(seen[0].appendSystemPrompt).toContain('<external source="...">');
+  expect(seen[0].appendSystemPrompt).toContain('not orders');
+  expect(seen[1].appendSystemPrompt).toBeUndefined();
+});

@@ -25,6 +25,7 @@ import { openChats } from '../chats/store.mjs';
 import { readFile as readWorkspaceFile, resolveWorkspacePath } from '../workspace/fs.mjs';
 import { readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
+import { wrapExternal } from '../parser/external.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 import { isAskCoverageGap } from '../harness/claude-code.mjs';
@@ -261,10 +262,14 @@ function toPosixPath(p) {
  * `clipboard` is expected to arrive ALREADY redacted and truncated (see
  * pollClipboard()) — this function does no sanitizing of its own, so a future
  * caller cannot accidentally get raw clipboard content into a prompt by
- * passing it here unprocessed.
+ * passing it here unprocessed. What it DOES do is label it: the clipboard is
+ * the one trigger input nobody at kaprek wrote, so it goes in as an
+ * <external> block wherever the template puts it (see parser/external.mjs;
+ * run.mjs adds the matching rule when it sees the block).
  */
 function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipboard }) {
   const fileList = Array.isArray(files) ? files.join('\n') : '';
+  const labelledClipboard = clipboard === undefined ? undefined : wrapExternal('clipboard', clipboard);
   const substituted = trigger.promptTemplate
     .split('{{reason}}')
     .join(reason ?? '')
@@ -273,7 +278,7 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
     .split('{{files}}')
     .join(fileList)
     .split('{{clipboard}}')
-    .join(clipboard ?? '');
+    .join(labelledClipboard ?? '');
 
   const contextLines = [
     `[trigger] id: ${trigger.id}`,
@@ -285,7 +290,7 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
   // Said out loud rather than silently dropped: an agent acting on "these are
   // the files that changed" must know when that list is only the first 50.
   if (filesTruncated === true) contextLines.push(`[trigger] note: more than ${MAX_CONTEXT_FILES} paths changed — this list is incomplete`);
-  if (clipboard !== undefined) contextLines.push(`[trigger] clipboard (secrets redacted):\n${clipboard}`);
+  if (clipboard !== undefined) contextLines.push(`[trigger] clipboard (secrets redacted):\n${labelledClipboard}`);
 
   return `${substituted}\n\n${contextLines.join('\n')}`;
 }
