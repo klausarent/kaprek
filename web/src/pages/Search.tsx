@@ -2,7 +2,7 @@
 // via GET /api/search; offers a "Build index" action (POST /api/search/reindex)
 // when the index hasn't been built yet or the query has no hits.
 import { useEffect, useState } from "react";
-import { fetchSearch, reindexSearch, type SearchHit } from "../lib/api";
+import { fetchSearch, reindexSearch, type SearchHit, type SearchVerdict } from "../lib/api";
 import { navigateToProjects, navigateToThread } from "../App";
 
 /**
@@ -18,6 +18,23 @@ function renderSnippet(snippet: string) {
     if (match) return <mark key={i}>{match[1]}</mark>;
     return <span key={i}>{part}</span>;
   });
+}
+
+/**
+ * One line per hit on whether it still points at anything: how many files
+ * the session named, how many are where it left them, how many moved on,
+ * how many are gone. The worst example rides along, because "1 gone" is a
+ * number and "src/old/parser.mjs gone" is something to act on.
+ */
+export function verdictLine(files: SearchVerdict): string {
+  const parts = [`${files.mentioned} file${files.mentioned === 1 ? "" : "s"} named`];
+  if (files.present > 0) parts.push(`${files.present} still there`);
+  if (files.changed > 0) parts.push(`${files.changed} changed since`);
+  if (files.gone > 0) parts.push(`${files.gone} gone`);
+  if (files.checked < files.mentioned) parts.push(`first ${files.checked} checked`);
+  const worst = files.sample.find((s) => s.verdict !== "present");
+  const line = parts.join(" · ");
+  return worst ? `${line} — ${worst.path} (${worst.verdict})` : line;
 }
 
 type State =
@@ -135,6 +152,7 @@ export default function Search({ query }: { query: string }) {
                 </div>
               </div>
               <div className="session-row-meta search-snippet">{renderSnippet(r.snippet)}</div>
+              {r.files && <div className="session-row-meta search-verdict">{verdictLine(r.files)}</div>}
             </a>
           ))}
         </div>

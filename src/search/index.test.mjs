@@ -354,3 +354,87 @@ test('buildSearchIndex issues the WAL + busy_timeout pragmas on open', async () 
   expect(joined).toMatch(/PRAGMA journal_mode\s*=\s*WAL/i);
   expect(joined).toMatch(/PRAGMA busy_timeout\s*=\s*5000/i);
 });
+
+// ------------------------------------------------------------------ verdicts
+
+/** A one-turn session whose assistant text names `mentions`, with `cwd` as the session's working directory. */
+function seedMentioningSession(projectSlug, sessionId, { cwd, mentions }) {
+  const projectDir = path.join(rootDir, projectSlug);
+  fs.mkdirSync(projectDir, { recursive: true });
+  const dest = path.join(projectDir, `${sessionId}.jsonl`);
+  const line = {
+    parentUuid: null,
+    isSidechain: false,
+    type: 'assistant',
+    message: { model: 'm', id: 'msg_1', type: 'message', role: 'assistant', content: [{ type: 'text', text: `I edited ${mentions.join(' and ')} for the verdict test.` }], stop_reason: null, usage: { input_tokens: 1, output_tokens: 1 } },
+    uuid: 'a1',
+    timestamp: '2026-08-27T10:00:00.000Z',
+    cwd,
+    sessionId,
+    version: '2.1.212',
+  };
+  fs.writeFileSync(dest, `${JSON.stringify(line)}\n`, 'utf8');
+  return dest;
+}
+
+test('a hit says whether the files the session named are still there, changed since, or gone', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'search-cwd-'));
+  const kept = path.join(cwd, 'src', 'kept.mjs');
+  const moved = path.join(cwd, 'src', 'moved.mjs');
+  fs.mkdirSync(path.dirname(kept), { recursive: true });
+  fs.writeFileSync(kept, 'x');
+  fs.writeFileSync(moved, 'y');
+  const gone = path.join(cwd, 'src', 'gone.mjs');
+  const sessionFile = seedMentioningSession('proj-v', 'verdict-session', { cwd, mentions: ['src/kept.mjs', moved, 'src/gone.mjs'] });
+  // The session "ended" now; `moved` is touched afterwards, `kept` was written before.
+  const old = new Date(Date.now() - 3_600_000);
+  fs.utimesSync(kept, old, old);
+  fs.utimesSync(sessionFile, new Date(), new Date());
+
+  await buildSearchIndex({ rootDir, dataDir });
+  fs.utimesSync(moved, new Date(Date.now() + 3_600_000), new Date(Date.now() + 3_600_000));
+
+  const results = await searchSessions({ dataDir, query: 'verdict' });
+  expect(results).toHaveLength(1);
+  const { files } = results[0];
+  expect(files).toMatchObject({ mentioned: 3, checked: 3, present: 1, changed: 1, gone: 1 });
+  expect(files.sample[0]).toEqual({ path: gone, verdict: 'gone' });
+  expect(files.sample[1]).toEqual({ path: moved, verdict: 'changed' });
+  fs.rmSync(cwd, { recursive: true, force: true });
+});
+
+test('a session that names no file has no verdict, not a clean one', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  await buildSearchIndex({ rootDir, dataDir });
+  const results = await searchSessions({ dataDir, query: 'fixture' });
+  expect(results.length).toBeGreaterThan(0);
+  for (const hit of results) expect(hit.files === null || typeof hit.files.mentioned === 'number').toBe(true);
+});
+
+test('an index from before the mentioned table is dropped whole rather than served with a gap', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  await buildSearchIndex({ rootDir, dataDir });
+  // Pretend this index predates verdicts.
+  const { db } = await openSearchDb({ dataDir });
+  db.exec('PRAGMA user_version = 1');
+  db.close();
+  expect(await searchSessions({ dataDir, query: 'fixture' })).toEqual([]);
+  // A rebuild fills it again, at the current version.
+  await buildSearchIndex({ rootDir, dataDir });
+  expect((await searchSessions({ dataDir, query: 'fixture' })).length).toBeGreaterThan(0);
+  const reopened = await openSearchDb({ dataDir });
+  expect(reopened.db.prepare('PRAGMA user_version').get().user_version).toBe(2);
+  reopened.db.close();
+});
+
+test('the reindex removes the mentioned paths of a session whose file is gone', async () => {
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'search-cwd-'));
+  const file = seedMentioningSession('proj-v', 'doomed', { cwd, mentions: ['src/a.mjs'] });
+  await buildSearchIndex({ rootDir, dataDir });
+  fs.rmSync(file);
+  await buildSearchIndex({ rootDir, dataDir });
+  const { db } = await openSearchDb({ dataDir });
+  expect(db.prepare('SELECT COUNT(*) AS n FROM mentioned').get().n).toBe(0);
+  db.close();
+  fs.rmSync(cwd, { recursive: true, force: true });
+});

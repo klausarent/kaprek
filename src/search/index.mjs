@@ -9,7 +9,11 @@ import path from 'node:path';
 import { getSqlite } from '../lib/sqlite.mjs';
 import { scanProjects } from '../scan/scan.mjs';
 import { digestSession } from '../parser/parse.mjs';
+import { extractPaths, verdictFor } from './verdict.mjs';
 
+// `mentioned` holds the absolute paths a session's text named (see
+// verdict.mjs) — extracted at index time, checked against the disk at
+// search time, so a hit can say whether it still points at anything.
 const SCHEMA_SQL = `
 CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
   sessionId UNINDEXED,
@@ -22,12 +26,31 @@ CREATE TABLE IF NOT EXISTS indexed (
   mtime REAL,
   size INTEGER
 );
+CREATE TABLE IF NOT EXISTS mentioned (
+  sessionId TEXT NOT NULL,
+  path TEXT NOT NULL,
+  PRIMARY KEY (sessionId, path)
+);
 `;
+
+/**
+ * Bumped when the index needs a full rebuild to be right. Version 2 added
+ * `mentioned`: a session indexed before it has an FTS document but no
+ * paths, and "no paths" would read as "mentions nothing" — so an older
+ * index is dropped whole rather than served with a silent gap, and the
+ * search view offers its reindex button as it does for an empty index.
+ */
+const SCHEMA_VERSION = 2;
 
 /** Opens (creating if needed) the search DB at `<dataDir>/search.db`, pragmas + schema applied. */
 function openDbSync(dataDir, DatabaseSync) {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  const version = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
+  if (version < SCHEMA_VERSION) {
+    db.exec('DROP TABLE IF EXISTS sessions_fts; DROP TABLE IF EXISTS indexed; DROP TABLE IF EXISTS mentioned;');
+    db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+  }
   // WAL lets a concurrent reader (search) and the writer (build) coexist
   // without blocking each other on every statement; busy_timeout makes lock
   // contention wait and retry for up to 5s instead of failing immediately
@@ -89,6 +112,8 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
       'INSERT INTO sessions_fts (sessionId, projectSlug, title, content) VALUES (?, ?, ?, ?)',
     );
     const insertMetaStmt = db.prepare('INSERT INTO indexed (sessionId, mtime, size) VALUES (?, ?, ?)');
+    const deleteMentionedStmt = db.prepare('DELETE FROM mentioned WHERE sessionId = ?');
+    const insertMentionedStmt = db.prepare('INSERT OR IGNORE INTO mentioned (sessionId, path) VALUES (?, ?)');
 
     let indexed = 0;
     let skipped = 0;
@@ -111,8 +136,11 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
         .map((event) => event.text)
         .join('\n');
       const title = digest.meta.title ?? '';
+      // Same redacted text the FTS document holds — a path inside a
+      // redacted secret is gone before it can be recorded here.
+      const mentioned = extractPaths(content, { cwd: digest.meta.cwd ?? null });
 
-      // Wrapped so the four writes commit atomically: a failure between the
+      // Wrapped so the writes commit atomically: a failure between the
       // FTS delete and the meta update (crash, disk full, ...) rolls back
       // to the PRE-attempt state, so the meta row's old (non-matching) mtime
       // is what next build's skip check sees — not a half-written state
@@ -121,8 +149,10 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
       try {
         deleteFtsStmt.run(session.sessionId);
         deleteMetaStmt.run(session.sessionId);
+        deleteMentionedStmt.run(session.sessionId);
         insertFtsStmt.run(session.sessionId, session.projectSlug, title, content);
         insertMetaStmt.run(session.sessionId, mtimeMs, session.sizeBytes);
+        for (const mentionedPath of mentioned) insertMentionedStmt.run(session.sessionId, mentionedPath);
         db.exec('COMMIT');
       } catch (err) {
         db.exec('ROLLBACK');
@@ -151,6 +181,7 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
       try {
         db.prepare(`DELETE FROM sessions_fts WHERE sessionId IN (${placeholders})`).run(...chunk);
         db.prepare(`DELETE FROM indexed WHERE sessionId IN (${placeholders})`).run(...chunk);
+        db.prepare(`DELETE FROM mentioned WHERE sessionId IN (${placeholders})`).run(...chunk);
         db.exec('COMMIT');
       } catch (err) {
         db.exec('ROLLBACK');
@@ -170,8 +201,12 @@ export async function buildSearchIndex({ rootDir, dataDir, onProgress, importSql
  * safe FTS5 phrase tokens (see `toMatchQuery`) before being bound as a MATCH
  * parameter, so it can never throw on FTS5 query-syntax errors or reach the
  * outer SQL as anything but a plain bound value.
+ *
+ * Every hit carries `files`: the verdict on the paths the session mentioned,
+ * checked against the disk NOW (see verdict.mjs) — or null when it mentioned
+ * none. `stat` is injectable so a test can decide what the disk says.
  */
-export async function searchSessions({ dataDir, query, limit = 50, importSqlite } = {}) {
+export async function searchSessions({ dataDir, query, limit = 50, importSqlite, stat } = {}) {
   const matchQuery = toMatchQuery(query);
   if (!matchQuery) return [];
 
@@ -187,12 +222,19 @@ export async function searchSessions({ dataDir, query, limit = 50, importSqlite 
       ORDER BY rank
       LIMIT ?
     `);
-    return stmt.all(matchQuery, limit).map((row) => ({
-      sessionId: row.sessionId,
-      projectSlug: row.projectSlug,
-      title: row.title,
-      snippet: row.snippet,
-    }));
+    const mentionedStmt = db.prepare('SELECT path FROM mentioned WHERE sessionId = ? ORDER BY rowid');
+    const mtimeStmt = db.prepare('SELECT mtime FROM indexed WHERE sessionId = ?');
+    return stmt.all(matchQuery, limit).map((row) => {
+      const paths = mentionedStmt.all(row.sessionId).map((entry) => entry.path);
+      const sessionMtimeMs = mtimeStmt.get(row.sessionId)?.mtime ?? NaN;
+      return {
+        sessionId: row.sessionId,
+        projectSlug: row.projectSlug,
+        title: row.title,
+        snippet: row.snippet,
+        files: verdictFor(paths, { sessionMtimeMs, ...(stat ? { stat } : {}) }),
+      };
+    });
   } finally {
     db.close();
   }

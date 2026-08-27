@@ -345,6 +345,17 @@ export type SearchHit = {
   // Contains literal <b>…</b> markers from FTS5's snippet() — never render
   // this as HTML; callers must parse the markers themselves.
   snippet: string;
+  /** Whether the files this session named are still there — checked against the disk at search time; null when it named none. */
+  files: SearchVerdict | null;
+};
+
+export type SearchVerdict = {
+  mentioned: number;
+  checked: number;
+  present: number;
+  changed: number;
+  gone: number;
+  sample: { path: string; verdict: "present" | "changed" | "gone" }[];
 };
 
 export type SearchResponse = { available: true; results: SearchHit[] } | { available: false; reason: string };
