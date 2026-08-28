@@ -11,18 +11,30 @@ import { encodeQr, qrToText } from '../src/server/qr.mjs';
 import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
 import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
-import { ensureAppDir } from '../src/lib/appdir.mjs';
+import { ensureAppDir, getAppDir } from '../src/lib/appdir.mjs';
 import {
   acquireInstanceLock,
   InstanceLockHeldError,
   LOCK_PORT_BASE,
   LOCK_PORT_RANGE,
 } from '../src/lib/instance-lock.mjs';
+import { runCouncilCommand, COUNCIL_USAGE } from '../src/cli/council.mjs';
+import { readCouncil } from '../src/council/config.mjs';
+import { suggestAssignment, councilStatus } from '../src/council/roles.mjs';
+import { availablePeerIds, makeAskPeer } from '../src/council/ask.mjs';
+import { snapshotFiles } from '../src/council/snapshot.mjs';
+import { consultPeers } from '../src/council/consult.mjs';
+import { listEngines } from '../src/harness/registry.mjs';
+
+// Same value as server.mjs's PEER_TURN_TIMEOUT_MS (not exported there — kept
+// in sync by hand; see src/server/server.mjs around the council imports).
+const PEER_TURN_TIMEOUT_MS = 9 * 60 * 1000;
 
 const USAGE = `Usage: kaprek [options]
        kaprek update [--check]
        kaprek autostart <install|uninstall|status>
        kaprek hooks <install|uninstall|status>
+       kaprek council "<q>"
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -47,6 +59,8 @@ Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop + SessionStart hooks to ~/.claude/settings.json
   hooks uninstall  Remove only the kaprek hook entries
   hooks status     Show whether the hooks are installed and the active policy mode
+
+  council "<q>"      Ask the peers (codex, grok) blind and in parallel from the terminal
 `;
 
 const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
@@ -245,6 +259,27 @@ async function main() {
 
   if (argv[0] === 'update') {
     await runUpdateCommand(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'council') {
+    if (argv[1] === '-h' || argv[1] === '--help' || argv.length === 1) {
+      console.log(COUNCIL_USAGE);
+      return;
+    }
+    const dataDir = getAppDir();
+    const peersFor = () => {
+      const installed = availablePeerIds({ engineIds: listEngines().map((e) => e.id) });
+      const saved = readCouncil(dataDir);
+      const assignment = saved.configured ? saved.assignment : suggestAssignment(installed);
+      return councilStatus(assignment);
+    };
+    process.exitCode = await runCouncilCommand(argv.slice(1), {
+      dataDir,
+      peersFor,
+      snapshotFiles,
+      consultPeers: (args) => consultPeers({ ...args, askPeer: makeAskPeer({ timeoutMs: PEER_TURN_TIMEOUT_MS }), timeoutMs: PEER_TURN_TIMEOUT_MS }),
+    });
     return;
   }
 
