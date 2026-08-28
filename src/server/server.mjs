@@ -84,6 +84,9 @@ import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/drive
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
+import { createResumeHandler } from './resume-routes.mjs';
+import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir, setStoreRoots as setResumeStoreRoots } from '../resume/scan.mjs';
+import { resumeSession as launchResumeSession } from '../resume/launch.mjs';
 import {
   createApprovalStore,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
@@ -2993,6 +2996,7 @@ async function handleRequest(
     getPlans,
     getCouncil,
     getConsultations,
+    handleResumeRoutes,
     memoryScopeForChat,
     lanAddress,
     approvalToken,
@@ -3113,6 +3117,10 @@ async function handleRequest(
     }
     if (segments[1] === 'council') {
       await handleCouncilRoutes(req, res, segments, url, { dataDir, engineRegistry, getMissions, getConsultations });
+      return;
+    }
+    if (segments[1] === 'resume') {
+      await handleResumeRoutes(req, res, segments, url);
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {
@@ -3530,6 +3538,12 @@ export function startServer({
   lan = false,
   // Injected so a test can pretend to be on a network without having one.
   lanAddressOf = firstLanAddress,
+  // Repoints all four /api/resume/* session stores at this home directory
+  // instead of the real one. Used by tests, which must never scan the
+  // machine's actual ~/.claude, ~/.codex, ~/.grok, ~/.kimi-code. Applied
+  // before --dir below, so --dir's claudeProjects override still wins for
+  // that one store.
+  resumeHome = null,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -3543,6 +3557,22 @@ export function startServer({
   // that ever ends up in a prompt, a tool input or a CLI reply is stored as
   // [REDACTED] instead of verbatim in a transcript on disk.
   const instanceToken = ensureInstanceToken(dataDir);
+
+  // /api/resume/* reads all four agent CLIs' session stores and can open a
+  // terminal tab for one of them (see src/resume/scan.mjs, src/resume/launch.mjs).
+  // Wired once here, where dataDir is fixed, same as the getX() closures below.
+  // resumeHome (tests) repoints all four stores; --dir/rootDir then overrides
+  // claudeProjects on top of that, so the viewer and Claude-resume always
+  // agree on which projects directory is "the" one — setStoreRoots() applies
+  // home first and the named override second, in that order internally.
+  setResumeStoreRoots({ home: resumeHome, claudeProjects: rootDir });
+  setResumeCacheDir(path.join(dataDir, 'resume-cache'));
+  const handleResumeRoutes = createResumeHandler({
+    scanAll: scanResumeSessions,
+    resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
+    readJsonBody,
+    sendJson,
+  });
 
   // A SECOND token, for the phone, that may do exactly one thing.
   //
@@ -4050,6 +4080,7 @@ export function startServer({
       getPlans,
       getCouncil,
       getConsultations,
+      handleResumeRoutes,
       memoryScopeForChat,
       lanAddress,
       approvalToken,

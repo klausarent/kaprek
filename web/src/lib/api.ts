@@ -256,7 +256,7 @@ function tokenHeader(): Record<string, string> {
  * unreachable — a 401/404/500 is still a server that answered. An aborted
  * request (user pressed Stop, component unmounted) is neither.
  */
-async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
+export async function apiFetch(url: string, init: RequestInit = {}): Promise<Response> {
   const headers = { ...(init.headers as Record<string, string> | undefined), ...tokenHeader() };
   try {
     const res = await fetch(url, { ...init, headers });
@@ -290,7 +290,7 @@ async function getJson<T>(url: string): Promise<T> {
 // without it (see server.mjs's CSRF hardening comment). It forces the
 // browser into a CORS preflight, which fails silently for any cross-origin
 // caller since this server never sends CORS headers back.
-const APP_HEADERS = { "x-app-request": "1" } as const;
+export const APP_HEADERS = { "x-app-request": "1" } as const;
 
 async function writeJson<T>(url: string, method: string, body?: unknown): Promise<T> {
   const res = await apiFetch(url, {
