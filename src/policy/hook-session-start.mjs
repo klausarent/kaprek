@@ -39,12 +39,13 @@ async function main() {
   const cwd = typeof input?.cwd === 'string' ? input.cwd : null;
   if (!cwd) return;
 
+  const dataDir = getAppDir();
   try {
-    if (typeof input?.session_id === 'string') appendSessionEvent(getAppDir(), { type: 'start', sessionId: input.session_id, cwd, transcriptPath: input?.transcript_path ?? null });
+    if (typeof input?.session_id === 'string') appendSessionEvent(dataDir, { type: 'start', sessionId: input.session_id, cwd, transcriptPath: input?.transcript_path ?? null });
   } catch {
   }
 
-  const context = buildSessionStartContext({ dataDir: getAppDir(), cwd });
+  const context = buildSessionStartContext({ dataDir, cwd });
   if (context === '') return;
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } }));
 }

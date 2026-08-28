@@ -178,6 +178,10 @@ export function harvestRemember({
     const { texts, endOffset } = readAssistantTexts(transcriptPath, state.offset, isOverdue, maxChunkBytes, maxLineBytes);
     let written = 0;
     let skipped = 0;
+    // The deadline covers the write path too: openMemory() replays the whole
+    // memory log synchronously. If reading already used up the budget, leave
+    // the offset where it is — the same texts are read again next Stop.
+    if (texts.length > 0 && isOverdue()) return { written: 0, skipped: 0, scopeId, deferred: true };
     if (texts.length > 0) {
       const memory = openMemory(dataDir);
       memory.addScope({ id: 'person:local' });
