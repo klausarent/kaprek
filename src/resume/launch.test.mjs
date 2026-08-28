@@ -1,5 +1,11 @@
-import { describe, it, expect } from 'vitest';
-import { buildResumeArgs, buildClaudeCommand, buildCodexCommand, buildGrokCommand, buildKimiCommand } from './launch.mjs';
+import { describe, it, expect, vi } from 'vitest';
+import { spawn } from 'node:child_process';
+import { buildResumeArgs, buildClaudeCommand, buildCodexCommand, buildGrokCommand, buildKimiCommand, resumeSession, PATHS } from './launch.mjs';
+
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, spawn: vi.fn() };
+});
 
 describe('buildResumeArgs', () => {
   it('matches the launcher command strings for every engine', () => {
@@ -18,5 +24,25 @@ describe('buildResumeArgs', () => {
 
   it('rejects unknown engines', () => {
     expect(() => buildResumeArgs({ engine: 'nope', id: 'x' })).toThrow(/unknown engine/);
+  });
+});
+
+describe('resumeSession', () => {
+  it('reports a missing CLI instead of opening an empty tab', async () => {
+    const original = PATHS.claude;
+    PATHS.claude = '';
+    try {
+      const r = await resumeSession({ engine: 'claude', id: 'x', cwd: 'C:\\p', title: 't' });
+      expect(r).toEqual({ ok: false, error: expect.stringMatching(/claude CLI not found/) });
+      expect(spawn).not.toHaveBeenCalled();
+    } finally {
+      PATHS.claude = original;
+    }
+  });
+
+  it('rejects unknown engines without opening a tab', async () => {
+    const r = await resumeSession({ engine: 'nope', id: 'x' });
+    expect(r).toEqual({ ok: false, error: expect.stringMatching(/unknown engine/) });
+    expect(spawn).not.toHaveBeenCalled();
   });
 });

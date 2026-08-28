@@ -97,17 +97,13 @@ export async function openTab({ cwd, title, exe, args = [], launchDir = DEFAULT_
 }
 
 export function openClaudeSession(s, { skipPermissions = true, launchDir } = {}) {
-  const args = [];
-  if (skipPermissions) args.push('--dangerously-skip-permissions');
-  args.push('--resume', s.id);
-  return openTab({ cwd: s.cwd, title: `CC · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(0, 8)}`, exe: PATHS.claude, args, launchDir });
+  const { exe, args } = buildResumeArgs({ engine: 'claude', id: s.id }, { skip: skipPermissions });
+  return openTab({ cwd: s.cwd, title: `CC · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(0, 8)}`, exe, args, launchDir });
 }
 
 export function openKimiSession(s, { yolo = true, launchDir } = {}) {
-  const args = [];
-  if (yolo) args.push('--yolo');
-  args.push('-S', s.id);
-  return openTab({ cwd: s.cwd, title: `Kimi · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe: PATHS.kimi, args, launchDir });
+  const { exe, args } = buildResumeArgs({ engine: 'kimi', id: s.id }, { skip: yolo });
+  return openTab({ cwd: s.cwd, title: `Kimi · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe, args, launchDir });
 }
 
 export function buildCodexCommand(id) {
@@ -118,15 +114,13 @@ export function buildGrokCommand(id) {
 }
 
 export function openCodexSession(s, { bypass = true, launchDir } = {}) {
-  const args = ['resume', s.id];
-  if (bypass) args.push('--dangerously-bypass-approvals-and-sandbox');
-  return openTab({ cwd: s.cwd, title: `Codex · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe: PATHS.codex, args, launchDir });
+  const { exe, args } = buildResumeArgs({ engine: 'codex', id: s.id }, { skip: bypass });
+  return openTab({ cwd: s.cwd, title: `Codex · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe, args, launchDir });
 }
 
 export function openGrokSession(s, { bypass = true, launchDir } = {}) {
-  const args = ['--resume', s.id];
-  if (bypass) args.push('--permission-mode', 'bypassPermissions');
-  return openTab({ cwd: s.cwd, title: `Grok · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe: PATHS.grok, args, launchDir });
+  const { exe, args } = buildResumeArgs({ engine: 'grok', id: s.id }, { skip: bypass });
+  return openTab({ cwd: s.cwd, title: `Grok · ${path.basename(s.cwd || '') || 'home'} · ${s.id.slice(-8)}`, exe, args, launchDir });
 }
 
 export function openShell(cwd) {
@@ -158,6 +152,8 @@ export function buildResumeArgs(session, { skip = true } = {}) {
 /** Opens the session as a new Windows Terminal tab. Mirrors the launcher's launchOne(). */
 export async function resumeSession(session, { skip = true, launchDir = DEFAULT_LAUNCH_DIR } = {}) {
   try {
+    const { exe } = buildResumeArgs(session, { skip });
+    if (!exe) return { ok: false, error: `${session.engine} CLI not found on this machine` };
     const r = session.engine === 'claude' ? await openClaudeSession(session, { skipPermissions: skip, launchDir })
       : session.engine === 'kimi' ? await openKimiSession(session, { yolo: skip, launchDir })
       : session.engine === 'codex' ? await openCodexSession(session, { bypass: skip, launchDir })
