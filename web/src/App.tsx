@@ -29,6 +29,7 @@ import CouncilPage from "./pages/Council";
 import Setup from "./pages/Setup";
 import Memory from "./pages/Memory";
 import Home from "./pages/Home";
+import { Experiments } from "./pages/Experiments";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
 
@@ -48,9 +49,10 @@ export type Route =
   | { name: "council" }
   | { name: "setup" }
   | { name: "memory" }
-  | { name: "home" };
+  | { name: "home" }
+  | { name: "experiments" };
 
-function parseHash(hash: string): Route {
+export function parseRoute(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
   // The query string (if any) lives after '?' and is parsed separately from
   // the path segments — a raw '/' inside a query value must not be mistaken
@@ -115,6 +117,9 @@ function parseHash(hash: string): Route {
   }
   if (parts[0] === "project" && parts[1]) {
     return { name: "list", project: parts[1] };
+  }
+  if (parts[0] === "experiments") {
+    return { name: "experiments" };
   }
   if (parts[0] === "list") {
     return { name: "list", project: null };
@@ -200,15 +205,19 @@ export function navigateToSetup() {
   window.location.hash = "#/setup";
 }
 
+export function navigateToExperiments() {
+  window.location.hash = "#/experiments";
+}
+
 /**
  * The current route plus how many hash changes have happened. The counter
  * exists for chatInstanceKey() below — see its doc comment.
  */
 function useHashRoute(): { route: Route; navCount: number } {
-  const [state, setState] = useState(() => ({ route: parseHash(window.location.hash), navCount: 0 }));
+  const [state, setState] = useState(() => ({ route: parseRoute(window.location.hash), navCount: 0 }));
   useEffect(() => {
     const onChange = () =>
-      setState((prev) => ({ route: parseHash(window.location.hash), navCount: prev.navCount + 1 }));
+      setState((prev) => ({ route: parseRoute(window.location.hash), navCount: prev.navCount + 1 }));
     window.addEventListener("hashchange", onChange);
     return () => window.removeEventListener("hashchange", onChange);
   }, []);
@@ -294,149 +303,61 @@ function MissingTokenScreen() {
   );
 }
 
+/**
+ * The main nav, cut down to the reading surface (see #/experiments for
+ * everything else). Kept as data — not inline JSX — so the order and labels
+ * are directly assertable in a test without a DOM (this repo has none, see
+ * vitest.config.ts): App.test.tsx checks `NAV_ITEMS.map(i => i.label)`.
+ */
+export const NAV_ITEMS: { href: string; label: string; navigate: () => void; isActive: (route: Route) => boolean }[] = [
+  { href: "#/list", label: "Sessions", navigate: navigateToProjects, isActive: (r) => r.name === "list" || r.name === "thread" },
+  {
+    href: "#/search",
+    label: "Suche",
+    navigate: () => {
+      window.location.hash = "#/search";
+    },
+    isActive: (r) => r.name === "search",
+  },
+  { href: "#/approvals", label: "Inbox", navigate: navigateToApprovals, isActive: (r) => r.name === "approvals" },
+  { href: "#/board", label: "Board", navigate: navigateToBoard, isActive: (r) => r.name === "board" },
+  { href: "#/memory", label: "Memory", navigate: navigateToMemory, isActive: (r) => r.name === "memory" },
+  { href: "#/setup", label: "Setup", navigate: navigateToSetup, isActive: (r) => r.name === "setup" },
+  { href: "#/experiments", label: "Experimente", navigate: navigateToExperiments, isActive: (r) => r.name === "experiments" },
+];
+
 export default function App() {
   const { route, navCount } = useHashRoute();
 
   if (!hasInstanceToken()) return <MissingTokenScreen />;
 
-  const advancedActive = route.name === "list" || route.name === "thread" || route.name === "search" || route.name === "board";
-
   return (
     <div className="app-shell">
       <header className="app-header">
         <a
-          href="#/"
+          href="#/list"
           className="app-title"
           onClick={(e) => {
             e.preventDefault();
-            navigateToChat();
+            navigateToProjects();
           }}
         >
           kaprek
         </a>
         <nav className="app-nav">
-          <a
-            href="#/chat"
-            className={route.name === "chat" || route.name === "chats" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToChat();
-            }}
-          >
-            Chat
-          </a>
-          <a
-            href="#/missions"
-            className={route.name === "missions" || route.name === "mission" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToMissions();
-            }}
-          >
-            Missions
-          </a>
-          <a
-            href="#/triggers"
-            className={route.name === "triggers" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToTriggers();
-            }}
-          >
-            Triggers
-          </a>
-          <a
-            href="#/plans"
-            className={route.name === "plans" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToPlans();
-            }}
-          >
-            Plans
-          </a>
-          <a
-            href="#/council"
-            className={route.name === "council" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToCouncil();
-            }}
-          >
-            Council
-          </a>
-          <a
-            href="#/home"
-            className={route.name === "home" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToHome();
-            }}
-          >
-            Make something
-          </a>
-          <a
-            href="#/memory"
-            className={route.name === "memory" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToMemory();
-            }}
-          >
-            Memory
-          </a>
-          <a
-            href="#/setup"
-            className={route.name === "setup" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToSetup();
-            }}
-          >
-            Setup
-          </a>
-          <a
-            href="#/approvals"
-            className={route.name === "approvals" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToApprovals();
-            }}
-          >
-            Approvals
-          </a>
-          <a
-            href="#/apps"
-            className={route.name === "apps" ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToApps();
-            }}
-          >
-            Apps
-          </a>
-          <a
-            href="#/list"
-            className={advancedActive ? "active" : ""}
-            onClick={(e) => {
-              e.preventDefault();
-              navigateToProjects();
-            }}
-          >
-            Advanced
-          </a>
-          {advancedActive && (
+          {NAV_ITEMS.map((item) => (
             <a
-              href="#/board"
-              className={route.name === "board" ? "active" : ""}
+              key={item.href}
+              href={item.href}
+              className={item.isActive(route) ? "active" : ""}
               onClick={(e) => {
                 e.preventDefault();
-                navigateToBoard();
+                item.navigate();
               }}
             >
-              Board
+              {item.label}
             </a>
-          )}
+          ))}
         </nav>
         <StatusDot />
         <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
@@ -464,6 +385,8 @@ export default function App() {
           <Plans />
         ) : route.name === "apps" ? (
           <Apps />
+        ) : route.name === "experiments" ? (
+          <Experiments />
         ) : route.name === "chats" ? (
           <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
         ) : route.name === "missions" ? (
