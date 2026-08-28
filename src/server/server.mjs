@@ -85,7 +85,7 @@ import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
 import { createResumeHandler } from './resume-routes.mjs';
-import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir } from '../resume/scan.mjs';
+import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir, setStoreRoots as setResumeStoreRoots } from '../resume/scan.mjs';
 import { resumeSession as launchResumeSession } from '../resume/launch.mjs';
 import {
   createApprovalStore,
@@ -3538,6 +3538,12 @@ export function startServer({
   lan = false,
   // Injected so a test can pretend to be on a network without having one.
   lanAddressOf = firstLanAddress,
+  // Repoints all four /api/resume/* session stores at this home directory
+  // instead of the real one. Used by tests, which must never scan the
+  // machine's actual ~/.claude, ~/.codex, ~/.grok, ~/.kimi-code. Applied
+  // before --dir below, so --dir's claudeProjects override still wins for
+  // that one store.
+  resumeHome = null,
 } = {}) {
   const cache = createLruCache(DIGEST_CACHE_SIZE);
   // Set for real once listen() resolves below (port:0 means an OS-assigned
@@ -3555,6 +3561,11 @@ export function startServer({
   // /api/resume/* reads all four agent CLIs' session stores and can open a
   // terminal tab for one of them (see src/resume/scan.mjs, src/resume/launch.mjs).
   // Wired once here, where dataDir is fixed, same as the getX() closures below.
+  // resumeHome (tests) repoints all four stores; --dir/rootDir then overrides
+  // claudeProjects on top of that, so the viewer and Claude-resume always
+  // agree on which projects directory is "the" one — setStoreRoots() applies
+  // home first and the named override second, in that order internally.
+  setResumeStoreRoots({ home: resumeHome, claudeProjects: rootDir });
   setResumeCacheDir(path.join(dataDir, 'resume-cache'));
   const handleResumeRoutes = createResumeHandler({
     scanAll: scanResumeSessions,

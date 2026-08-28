@@ -6,10 +6,34 @@ import os from 'node:os';
 import readline from 'node:readline';
 
 export const HOME = os.homedir();
-export const CLAUDE_PROJECTS = path.join(HOME, '.claude', 'projects');
-export const KIMI_HOME = path.join(HOME, '.kimi-code');
-export const CODEX_SESSIONS = path.join(HOME, '.codex', 'sessions');
-export const GROK_SESSIONS = path.join(HOME, '.grok', 'sessions');
+// The four engines' session stores, read at call time (never captured once
+// at import time) so a test — or --dir / a resume-home option — can point
+// them elsewhere before the first scan. setStoreRoots() is the only writer.
+export const STORES = {
+  claudeProjects: path.join(HOME, '.claude', 'projects'),
+  kimiHome: path.join(HOME, '.kimi-code'),
+  codexSessions: path.join(HOME, '.codex', 'sessions'),
+  grokSessions: path.join(HOME, '.grok', 'sessions'),
+};
+
+/**
+ * Repoints one or more store roots. `home` sets all four relative to that
+ * home directory; a named field overrides `home` for that one store. Used
+ * by the server (--dir, a resume-home option) and by tests that must never
+ * scan the real machine's session history.
+ */
+export function setStoreRoots({ home, claudeProjects, kimiHome, codexSessions, grokSessions } = {}) {
+  if (home) {
+    STORES.claudeProjects = path.join(home, '.claude', 'projects');
+    STORES.kimiHome = path.join(home, '.kimi-code');
+    STORES.codexSessions = path.join(home, '.codex', 'sessions');
+    STORES.grokSessions = path.join(home, '.grok', 'sessions');
+  }
+  if (claudeProjects) STORES.claudeProjects = claudeProjects;
+  if (kimiHome) STORES.kimiHome = kimiHome;
+  if (codexSessions) STORES.codexSessions = codexSessions;
+  if (grokSessions) STORES.grokSessions = grokSessions;
+}
 // Where scan results are cached between runs. The server sets this to
 // <dataDir>/resume-cache; tests point it at a temp dir. Never the repo.
 let CACHE_DIR = path.join(os.tmpdir(), 'kaprek-resume-cache');
@@ -150,11 +174,11 @@ export async function scanClaude({ force = false, onProgress } = {}) {
   const next = {};
   const out = [];
   let dirs = [];
-  try { dirs = await fsp.readdir(CLAUDE_PROJECTS, { withFileTypes: true }); } catch { return []; }
+  try { dirs = await fsp.readdir(STORES.claudeProjects, { withFileTypes: true }); } catch { return []; }
   const files = [];
   for (const d of dirs) {
     if (!d.isDirectory()) continue;
-    const full = path.join(CLAUDE_PROJECTS, d.name);
+    const full = path.join(STORES.claudeProjects, d.name);
     let ents = [];
     try { ents = await fsp.readdir(full, { withFileTypes: true }); } catch { continue; }
     for (const e of ents) {
@@ -224,9 +248,9 @@ async function kimiFirstPrompt(sessionDir) {
 }
 
 export async function scanKimi() {
-  const sessionsRoot = path.join(KIMI_HOME, 'sessions');
+  const sessionsRoot = path.join(STORES.kimiHome, 'sessions');
   let workspaces = {};
-  try { workspaces = JSON.parse(await fsp.readFile(path.join(KIMI_HOME, 'workspaces.json'), 'utf8')).workspaces || {}; } catch {}
+  try { workspaces = JSON.parse(await fsp.readFile(path.join(STORES.kimiHome, 'workspaces.json'), 'utf8')).workspaces || {}; } catch {}
   let wds = [];
   try { wds = await fsp.readdir(sessionsRoot, { withFileTypes: true }); } catch { return []; }
   const out = [];
@@ -331,7 +355,7 @@ export async function scanCodex({ force = false, onProgress } = {}) {
       else if (e.isFile() && e.name.endsWith('.jsonl')) files.push(p);
     }
   };
-  await walk(CODEX_SESSIONS);
+  await walk(STORES.codexSessions);
   let done = 0;
   for (const file of files) {
     let st;
@@ -374,13 +398,13 @@ export function classifyGrok(meta) {
 
 export async function scanGrok() {
   let cwdDirs = [];
-  try { cwdDirs = await fsp.readdir(GROK_SESSIONS, { withFileTypes: true }); } catch { return []; }
+  try { cwdDirs = await fsp.readdir(STORES.grokSessions, { withFileTypes: true }); } catch { return []; }
   const out = [];
   for (const cd of cwdDirs) {
     if (!cd.isDirectory()) continue;
     let cwdFromDir = '';
     try { cwdFromDir = decodeURIComponent(cd.name); } catch {}
-    const base = path.join(GROK_SESSIONS, cd.name);
+    const base = path.join(STORES.grokSessions, cd.name);
     let ents = [];
     try { ents = await fsp.readdir(base, { withFileTypes: true }); } catch { continue; }
     for (const e of ents) {

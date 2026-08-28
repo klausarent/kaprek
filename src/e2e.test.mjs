@@ -21,6 +21,7 @@ const APP_JSON_HEADERS = { ...APP_HEADERS, 'Content-Type': 'application/json' };
 
 let rootDir;
 let dataDir;
+let resumeHomeDir;
 let servers = [];
 // Set by boot(); every /api/* request must carry it (see src/server/token.mjs).
 let currentToken = null;
@@ -34,6 +35,11 @@ function fetch(input, init = {}) {
 beforeEach(() => {
   rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-root-'));
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-data-'));
+  // A fresh, empty home for /api/resume/* — see resumeHome in startServer()
+  // (src/server/server.mjs). Never the real machine's ~/.claude, ~/.codex,
+  // ~/.grok, ~/.kimi-code: those hold thousands of real sessions and a cold
+  // scan against them takes tens of seconds (see the resume test below).
+  resumeHomeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'e2e-resume-home-'));
   servers = [];
 });
 
@@ -43,6 +49,7 @@ afterEach(async () => {
   }
   fs.rmSync(rootDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(resumeHomeDir, { recursive: true, force: true });
 });
 
 async function boot(opts) {
@@ -134,15 +141,12 @@ test('session -> task -> link -> doc -> done -> receipt -> verify (valid)', asyn
   expect(verifyResult).toEqual({ valid: true });
 });
 
-// HOME is not redirected here (see resume/scan.mjs), so on a machine with a
-// real, uncached session history this hits every engine's real store cold —
-// measured ~44s against ~1850 real sessions on this machine. The default
-// 5000ms test timeout is nowhere near enough; 60s leaves headroom.
 test('GET /api/resume/sessions answers with a list even when no CLI store exists', async () => {
-  const { url } = await boot({});
+  const { url } = await boot({ resumeHome: resumeHomeDir });
   const res = await fetch(`${url}/api/resume/sessions?days=1`);
   expect(res.status).toBe(200);
   const body = await res.json();
   expect(Array.isArray(body.sessions)).toBe(true);
+  expect(body.sessions).toEqual([]);
   expect(typeof body.scannedAt).toBe('string');
-}, 60000);
+});

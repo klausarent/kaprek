@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir } from './scan.mjs';
+import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir, setStoreRoots, scanAll, STORES } from './scan.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, 'fixtures', 'claude', '-C--Users-demo-proj', '11111111-1111-4111-8111-111111111111.jsonl');
@@ -58,5 +58,33 @@ describe('resume scanner', () => {
     const s = publicSession({ engine: 'grok', id: 'x1', cwd: 'C:\\p', title: 'Hallo', lastTs: '2026-08-28T06:00:00.000Z' });
     expect(s).toMatchObject({ key: 'grok:x1', engine: 'grok', id: 'x1', cwd: 'C:\\p', title: 'Hallo', userMsgs: 0, hidden: false, crash: false });
     expect(s.firstTs).toBe(s.lastTs);
+  });
+
+  it('setStoreRoots({ home }) points all four store roots at that home', () => {
+    const home = path.join('C:', 'fake-home');
+    setStoreRoots({ home });
+    expect(STORES).toEqual({
+      claudeProjects: path.join(home, '.claude', 'projects'),
+      kimiHome: path.join(home, '.kimi-code'),
+      codexSessions: path.join(home, '.codex', 'sessions'),
+      grokSessions: path.join(home, '.grok', 'sessions'),
+    });
+  });
+
+  it('setStoreRoots({ home, claudeProjects }) lets a named override win over home — the --dir + resumeHome order in startServer()', () => {
+    const home = path.join('C:', 'fake-home-2');
+    const override = path.join('C:', 'explicit-claude-projects');
+    setStoreRoots({ home, claudeProjects: override });
+    expect(STORES.claudeProjects).toBe(override);
+    expect(STORES.kimiHome).toBe(path.join(home, '.kimi-code'));
+  });
+
+  it('setStoreRoots points every engine at an empty home — scanAll finds nothing, fast', async () => {
+    setStoreRoots({ home: fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-empty-home-')) });
+    const start = Date.now();
+    const { sessions } = await scanAll();
+    const elapsed = Date.now() - start;
+    expect(sessions).toEqual([]);
+    expect(elapsed).toBeLessThan(1000);
   });
 });
