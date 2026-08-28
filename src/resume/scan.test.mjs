@@ -37,6 +37,23 @@ describe('resume scanner', () => {
     expect(pub.find((s) => s.id === 'c').crash).toBe(false);
   });
 
+  it('marks sessions whose file mtime lags well behind their last message and cluster together', () => {
+    const t = (min) => new Date(Date.UTC(2026, 7, 28, 6, min)).toISOString();
+    const ms = (min) => Date.UTC(2026, 7, 28, 6, min);
+    const sessions = [
+      // mtime 10 min after lastTs (> gapMs of 5 min) → crash candidate
+      { engine: 'claude', id: 'a', lastTs: t(0), mtimeMs: ms(10) },
+      // mtime also 10 min after lastTs, and within windowMs of a's mtime → same crash group
+      { engine: 'claude', id: 'b', lastTs: t(1), mtimeMs: ms(11) },
+      // mtime only 1 min after lastTs (< gapMs) → not a candidate, no crash
+      { engine: 'codex', id: 'c', lastTs: t(2), mtimeMs: ms(3) },
+    ];
+    markCrashGroups(sessions, { windowMs: 120_000, minMembers: 2, gapMs: 5 * 60_000 });
+    const pub = sessions.map(publicSession);
+    expect(pub.filter((s) => s.crash).map((s) => s.id).sort()).toEqual(['a', 'b']);
+    expect(pub.find((s) => s.id === 'c').crash).toBe(false);
+  });
+
   it('publicSession exposes one shape and a stable key', () => {
     const s = publicSession({ engine: 'grok', id: 'x1', cwd: 'C:\\p', title: 'Hallo', lastTs: '2026-08-28T06:00:00.000Z' });
     expect(s).toMatchObject({ key: 'grok:x1', engine: 'grok', id: 'x1', cwd: 'C:\\p', title: 'Hallo', userMsgs: 0, hidden: false, crash: false });
