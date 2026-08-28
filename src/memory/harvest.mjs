@@ -7,6 +7,11 @@
 // the last call (offset per session), stops at its own deadline, and
 // remembers which blocks it already wrote (hash per scope+text) so a turn
 // that is re-read never writes twice. Never throws.
+//
+// Every call reads at most one chunk (MAX_CHUNK_BYTES), never the whole
+// unread tail: a first run against a transcript that has grown large while
+// nobody harvested it must still finish inside the deadline and make
+// progress, not fail the same way on every subsequent hook forever.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -14,6 +19,7 @@ import { openMemory } from './store.mjs';
 import { parseRemember } from './protocol.mjs';
 
 const MAX_LINE_BYTES = 4 * 1024 * 1024;
+export const MAX_CHUNK_BYTES = 2 * 1024 * 1024;
 
 function statePath(dataDir, sessionId) {
   return path.join(dataDir, 'memory', 'harvest', `${sessionId.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`);
@@ -22,10 +28,34 @@ function statePath(dataDir, sessionId) {
 function readState(file) {
   try {
     const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    return { offset: Number.isFinite(parsed.offset) ? parsed.offset : 0, hashes: Array.isArray(parsed.hashes) ? parsed.hashes : [] };
+    return { offset: Number.isFinite(parsed.offset) ? parsed.offset : 0, hashes: Array.isArray(parsed.hashes) ? parsed.hashes : [], isNew: false };
   } catch {
-    return { offset: 0, hashes: [] };
+    return { offset: 0, hashes: [], isNew: true };
   }
+}
+
+/**
+ * Where a session with no saved offset should start: the last chunk of the
+ * transcript, not byte 0. By the time the Stop hook first runs against a
+ * given transcript it can already be tens of megabytes — the turn that
+ * triggered the hook is always in the tail, and reading from the start would
+ * mean re-decoding the whole history before ever getting there, over and
+ * over, one bounded chunk at a time. Older history is deliberately never
+ * back-harvested.
+ */
+function seedOffset(transcriptPath, size) {
+  if (size <= MAX_CHUNK_BYTES) return 0;
+  let seed = size - MAX_CHUNK_BYTES;
+  const fd = fs.openSync(transcriptPath, 'r');
+  try {
+    const probe = Buffer.alloc(Math.min(MAX_CHUNK_BYTES, size - seed));
+    fs.readSync(fd, probe, 0, probe.length, seed);
+    const nl = probe.indexOf(0x0a); // '\n' — land on the next full line, not mid-line
+    if (nl >= 0) seed += nl + 1;
+  } finally {
+    fs.closeSync(fd);
+  }
+  return seed;
 }
 
 function writeState(file, state) {
@@ -37,9 +67,10 @@ function writeState(file, state) {
 function readAssistantTexts(transcriptPath, offset, isOverdue) {
   const size = fs.statSync(transcriptPath).size;
   if (size <= offset) return { texts: [], endOffset: offset };
+  const readSize = Math.min(size - offset, MAX_CHUNK_BYTES);
   const fd = fs.openSync(transcriptPath, 'r');
   try {
-    const buf = Buffer.alloc(size - offset);
+    const buf = Buffer.alloc(readSize);
     fs.readSync(fd, buf, 0, buf.length, offset);
     const chunk = buf.toString('utf8');
     const lastNewline = chunk.lastIndexOf('\n');
@@ -76,11 +107,13 @@ export function harvestRemember({ dataDir, transcriptPath, sessionId, cwd, deadl
     if (typeof dataDir !== 'string' || typeof transcriptPath !== 'string' || typeof sessionId !== 'string' || sessionId === '') return empty;
     if (typeof cwd !== 'string' || cwd.trim() === '') return empty;
     if (!fs.existsSync(transcriptPath)) return empty;
+    if (!fs.statSync(transcriptPath).isFile()) return empty; // a directory (or a socket, a pipe...) is not a transcript
     const started = now();
     const isOverdue = () => now() - started > deadlineMs;
     const scopeId = `project:${path.basename(cwd)}`;
     const file = statePath(dataDir, sessionId);
     const state = readState(file);
+    if (state.isNew) state.offset = seedOffset(transcriptPath, fs.statSync(transcriptPath).size);
     const { texts, endOffset } = readAssistantTexts(transcriptPath, state.offset, isOverdue);
     let written = 0;
     let skipped = 0;
