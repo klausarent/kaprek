@@ -84,6 +84,9 @@ import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/drive
 import '../harness/peers/grok.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
+import { createResumeHandler } from './resume-routes.mjs';
+import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir } from '../resume/scan.mjs';
+import { resumeSession as launchResumeSession } from '../resume/launch.mjs';
 import {
   createApprovalStore,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
@@ -2993,6 +2996,7 @@ async function handleRequest(
     getPlans,
     getCouncil,
     getConsultations,
+    handleResumeRoutes,
     memoryScopeForChat,
     lanAddress,
     approvalToken,
@@ -3113,6 +3117,10 @@ async function handleRequest(
     }
     if (segments[1] === 'council') {
       await handleCouncilRoutes(req, res, segments, url, { dataDir, engineRegistry, getMissions, getConsultations });
+      return;
+    }
+    if (segments[1] === 'resume') {
+      await handleResumeRoutes(req, res, segments, url);
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {
@@ -3543,6 +3551,17 @@ export function startServer({
   // that ever ends up in a prompt, a tool input or a CLI reply is stored as
   // [REDACTED] instead of verbatim in a transcript on disk.
   const instanceToken = ensureInstanceToken(dataDir);
+
+  // /api/resume/* reads all four agent CLIs' session stores and can open a
+  // terminal tab for one of them (see src/resume/scan.mjs, src/resume/launch.mjs).
+  // Wired once here, where dataDir is fixed, same as the getX() closures below.
+  setResumeCacheDir(path.join(dataDir, 'resume-cache'));
+  const handleResumeRoutes = createResumeHandler({
+    scanAll: scanResumeSessions,
+    resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
+    readJsonBody,
+    sendJson,
+  });
 
   // A SECOND token, for the phone, that may do exactly one thing.
   //
@@ -4050,6 +4069,7 @@ export function startServer({
       getPlans,
       getCouncil,
       getConsultations,
+      handleResumeRoutes,
       memoryScopeForChat,
       lanAddress,
       approvalToken,

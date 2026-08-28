@@ -133,3 +133,16 @@ test('session -> task -> link -> doc -> done -> receipt -> verify (valid)', asyn
   const verifyResult = await verifyRes.json();
   expect(verifyResult).toEqual({ valid: true });
 });
+
+// HOME is not redirected here (see resume/scan.mjs), so on a machine with a
+// real, uncached session history this hits every engine's real store cold —
+// measured ~44s against ~1850 real sessions on this machine. The default
+// 5000ms test timeout is nowhere near enough; 60s leaves headroom.
+test('GET /api/resume/sessions answers with a list even when no CLI store exists', async () => {
+  const { url } = await boot({});
+  const res = await fetch(`${url}/api/resume/sessions?days=1`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(Array.isArray(body.sessions)).toBe(true);
+  expect(typeof body.scannedAt).toBe('string');
+}, 60000);
