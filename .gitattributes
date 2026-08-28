@@ -1,0 +1,2 @@
+# Node parses LF everywhere; a CRLF checkout of src/apps/mcp-server.mjs breaks vitest's transform (28.08.2026).
+* text=auto eol=lf
