@@ -57,3 +57,17 @@ test('a directory kaprek knows nothing about, no cwd, and malformed input all pr
     expect(stdout).toBe('');
   }
 });
+
+test('SessionStart writes a start event to the session ledger', async () => {
+  const { code } = await runHook(JSON.stringify({ session_id: 'ledger-1', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }));
+  expect(code).toBe(0);
+  const ledger = fs.readFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'), 'utf8');
+  expect(ledger).toContain('"type":"start"');
+  expect(ledger).toContain('"sessionId":"ledger-1"');
+});
+
+test('no cwd: no ledger event is written either (nothing to scope it to)', async () => {
+  const { code } = await runHook(JSON.stringify({ session_id: 'ledger-2' }));
+  expect(code).toBe(0);
+  expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
+});

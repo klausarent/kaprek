@@ -14,6 +14,8 @@ import os from 'node:os';
 import { evaluateStop } from './policy.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { sweepSessionArtifacts } from '../artifacts/preserve.mjs';
+import { harvestRemember } from '../memory/harvest.mjs';
+import { appendSessionEvent } from '../ledger/sessions.mjs';
 
 const SELF_TIMEOUT_MS = 3000;
 
@@ -59,6 +61,19 @@ async function main() {
     transcriptPath: input?.transcript_path,
     sessionId: input?.session_id,
   });
+
+  // The terminal learns: remember-blocks from this session's transcript go
+  // into the project's memory scope, and the ledger notes the turn. Both
+  // fail open — a hook that cannot write must still let the turn end.
+  const cwd = typeof input?.cwd === 'string' ? input.cwd : null;
+  try {
+    harvestRemember({ dataDir, transcriptPath: input?.transcript_path, sessionId: input?.session_id, cwd, deadlineMs: 1500 });
+  } catch {
+  }
+  try {
+    if (typeof input?.session_id === 'string') appendSessionEvent(dataDir, { type: 'stop', sessionId: input.session_id, cwd, transcriptPath: input?.transcript_path ?? null });
+  } catch {
+  }
 
   // Best-effort scratchpad preservation for the ending session. The Stop
   // hook is the one moment kaprek knows a session just ended, making it the
