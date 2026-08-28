@@ -34,6 +34,19 @@ describe('resume routes', () => {
     expect(out.body.sessions.map((s) => s.key)).toEqual(['claude:a']);
   });
 
+  it('GET sessions?days=0 clamps to 1 day instead of falling back to the default 7', async () => {
+    // A session 3 days old: outside a 1-day window, but inside the wrong
+    // (unclamped-to-default) 7-day window — the one fixture that tells the
+    // two behaviors apart (the shared `sessions` fixture above cannot: its
+    // sessions are either <1 day or >7 days old).
+    const threeDaysOld = { key: 'claude:mid', engine: 'claude', id: 'mid', cwd: 'C:\\p', title: 'Mid', firstTs: '2026-08-25T07:00:00.000Z', lastTs: '2026-08-25T07:00:00.000Z', userMsgs: 1, hidden: false, crash: false };
+    const { h } = handler({ scanAll: async () => ({ sessions: [threeDaysOld], scannedAt: '2026-08-28T07:00:00.000Z' }) });
+    const { out, res } = fakeRes();
+    await h({ method: 'GET' }, res, ['api', 'resume', 'sessions'], new URL('http://x/api/resume/sessions?days=0'));
+    expect(out.status).toBe(200);
+    expect(out.body.sessions).toEqual([]);
+  });
+
   it('GET sessions?all=1 includes hidden', async () => {
     const { h } = handler();
     const { out, res } = fakeRes();
@@ -59,6 +72,21 @@ describe('resume routes', () => {
     expect(out.body.ok).toBe(true);
     expect(out.body.results.map((r) => r.id)).toEqual(['a', 'old']);
     expect(launched).toEqual(['claude:a', 'codex:old']);
+  });
+
+  it('POST batch reports a partial failure for an unknown item and flips the top-level ok to false', async () => {
+    const { h, launched } = handler();
+    const { out, res } = fakeRes();
+    await h(
+      { method: 'POST', body: { items: [{ engine: 'claude', id: 'a' }, { engine: 'codex', id: 'zzz' }] } },
+      res,
+      ['api', 'resume', 'batch'],
+      new URL('http://x/api/resume/batch'),
+    );
+    expect(out.body.ok).toBe(false);
+    expect(out.body.results).toContainEqual({ ok: true, method: 'wt-tab', engine: 'claude', id: 'a' });
+    expect(out.body.results).toContainEqual({ ok: false, error: 'no such session', engine: 'codex', id: 'zzz' });
+    expect(launched).toEqual(['claude:a']);
   });
 
   it('answers 405 for wrong methods', async () => {

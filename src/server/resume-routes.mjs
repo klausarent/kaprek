@@ -25,7 +25,9 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      const days = Math.min(Math.max(Number(url.searchParams.get('days')) || 7, 1), 90);
+      const rawDays = url.searchParams.get('days');
+      const parsedDays = rawDays === null ? NaN : Number(rawDays);
+      const days = Math.min(Math.max(Number.isNaN(parsedDays) ? 7 : parsedDays, 1), 90);
       const includeHidden = url.searchParams.get('all') === '1';
       const since = now() - days * DAY_MS;
       const { sessions, scannedAt } = await scanAll({ force: url.searchParams.get('force') === '1' });
