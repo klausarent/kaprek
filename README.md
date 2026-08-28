@@ -193,6 +193,10 @@ One consultation per chat at a time, two in total. A verdict about a plan you
 edited afterwards is marked as stale rather than shown as review, and one
 interrupted by a restart says so instead of being quietly asked again.
 
+### From the terminal (`kaprek council`)
+
+`kaprek council "<question>" [--file <path>]... [--cwd <dir>] [--constraint <text>]... [--json]` asks the configured peers blind and in parallel, from any terminal — no browser turn needed. Files go out as the same redacted snapshots the web council uses; a secrets file is refused. The verdicts are printed and saved under `<dataDir>/council/cli/<timestamp>.json`. Exit 0 with answers, 1 when a peer or snapshot failed, 2 on bad arguments.
+
 ## Engines
 
 A new chat picks which already-installed, already-authenticated CLI runs its
@@ -464,6 +468,17 @@ Claude Code writes scratchpad work products (scripts, data files, images) under 
 
 kaprek sweeps every session's scratchpad into `<dataDir>/artifacts/<projectSlug>/<sessionId>/` in two ways: automatically (best-effort, small byte budget) when the Stop hook fires for that session, and fully (no budget beyond the caps below) whenever the search index is rebuilt (`POST /api/search/reindex`, including the button in `#/search`). A per-session `manifest.json` makes repeat sweeps idempotent — unchanged files are neither re-hashed nor re-copied. Two caps bound disk usage: a single file over 25 MB is skipped (recorded in the manifest as `too-large`), and once a session's preserved total crosses 100 MB (20 MB for the hook's own smaller sweep) further files are skipped as `session-budget`. A session's preserved artifacts, if any, show up under an "Artifacts" section on its thread view.
 
+## Resume after a crash (`kaprek resume`)
+
+Windows Terminal dies, twenty sessions with it. kaprek reads the session stores of all four engines — `~/.claude/projects`, `~/.codex/sessions`, `~/.grok/sessions`, `~/.kimi-code/sessions` — and reopens them as terminal tabs, one `wt` tab per session, with the engine's own resume command (`claude --resume <id>`, `codex resume <id>`, and so on).
+
+- `kaprek resume` lists the sessions of the last 7 days (`--days N`), all engines, newest first. Sessions that ended within the same short window are marked as a crash group. Titles are shown through the same redaction as everywhere else.
+- `kaprek resume --all` reopens everything from the last 24 hours (`--hours N`), one tab after another with a short pause so Windows Terminal keeps up. Exit 0 when every tab opened, 1 when any failed.
+- `kaprek resume <engine>:<id>` (a unique prefix is enough) reopens one session. Unknown or ambiguous → exit 2 with the candidates.
+- `--no-skip` starts Claude without `--dangerously-skip-permissions`.
+
+The same list and buttons sit at the top of `#/list` (`GET /api/resume/sessions`, `POST /api/resume`, `POST /api/resume/batch`). Scan results are cached under `<dataDir>/resume-cache/`; a session is never opened by a test.
+
 ## Claude Code hook (optional)
 
 kaprek can install a Claude Code **Stop** hook that gently enforces the policy engine's rules (e.g. flagging a session that made a commit without a linked board task). It is opt-in only — nothing is installed by default.
@@ -477,6 +492,14 @@ Important: a Stop hook fires *after* the turn already ended — after any tool c
 ### SessionStart: what kaprek knows about this directory
 
 The same install adds a **SessionStart** hook. When a Claude Code session opens in a directory that is a kaprek mission's working directory, the session starts with what kaprek knows about that work, as context it can see: the mission's title and goal, how many questions are waiting in the kaprek inbox for it (with the address to answer them), the rules a person accepted from failure-to-policy proposals, and what earlier sessions wrote down for that project — the same rules and memory kaprek's own turns get, so a terminal session is no longer the one place they do not reach. Outside a mission directory the hook adds only the accepted rules, if any; with nothing to say it says nothing. The whole block is capped at 1,500 characters, the hook reads kaprek's data and never writes it, fails open on every error, and exits on its own after three seconds — it must never slow a session down. Same shape as the Stop hook: one script, no daemon, uninstalled with the same command.
+
+### Stop: what the hook writes
+
+Since the terminal is where the work happens, the Stop hook also makes the terminal count:
+
+- **Session ledger.** Every Stop and every SessionStart appends one line to `<dataDir>/ledger/sessions.jsonl`: type, session id, working directory, transcript path, timestamp. Nothing from the transcript itself.
+- **Remember blocks.** When the assistant's turn contains a fenced ```kaprek-remember block (same protocol as kaprek's own turns), its lines become memory facts in the scope `project:<basename(cwd)>` (created under `person:local` if missing), origin `terminal:<sessionId>`. Nothing else is harvested — no auto-summaries, no transcript excerpts. The hook reads the transcript in bounded chunks from the tail, remembers where it stopped (`<dataDir>/memory/harvest/`), and never re-writes a fact it already wrote.
+- Budget: 1.5 s for the harvest, exit 0 always; anything unfinished waits for the next Stop.
 
 Policy mode lives in `<dataDir>/policy.json`: `observe` (default) fully evaluates both rules and logs any violation to `policy.log`, but always resolves to allow — it's for seeing what would happen before switching modes. `warn` writes its reasons to stderr (Claude Code hooks reference exit 0 as no objection either way, so this is best-effort visibility, not a blocking signal). `block` is the only mode that can actually end a turn abnormally, and even then at most once per session. The hook fails open on any internal error — a bug here must never stop you from ending a turn. This is the single exception to kaprek's read-only promise; every other feature only reads `~/.claude/projects`.
 
