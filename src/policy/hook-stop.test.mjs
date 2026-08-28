@@ -104,6 +104,9 @@ test('malformed stdin: exits 0 with no stdout output (fail-open)', async () => {
   expect(code).toBe(0);
   expect(stdout).toBe('');
   expect(stderr).toBe('');
+  // Malformed JSON never even reaches the harvest/ledger code — no ledger
+  // file gets created for a turn kaprek could not parse at all.
+  expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
 }, 10000);
 
 test('observe mode (default, no policy.json): exits 0 with no stdout output', async () => {
@@ -202,4 +205,69 @@ test('block mode allows silently when the session is linked to a board task', as
   );
   expect(code).toBe(0);
   expect(stdout).toBe('');
+}, 10000);
+
+test('harvests a kaprek-remember block from the transcript and writes a stop event to the ledger', async () => {
+  const sessionId = 'e2e-harvest';
+  const transcriptPath = path.join(dataDir, `${sessionId}.jsonl`);
+  const text = 'Notiert.\n```kaprek-remember\n{"text":"Build läuft über build.ps1","kind":"fact"}\n```';
+  fs.writeFileSync(
+    transcriptPath,
+    `${JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } })}\n`,
+    'utf8',
+  );
+
+  const { code } = await runHook(
+    JSON.stringify({ transcript_path: transcriptPath, session_id: sessionId, cwd: 'C:\\Users\\demo\\alpha' }),
+  );
+  expect(code).toBe(0);
+
+  const events = fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8');
+  expect(events).toContain('Build läuft über build.ps1');
+  expect(events).toContain('project:alpha');
+
+  const ledger = fs.readFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'), 'utf8');
+  expect(ledger).toContain('"type":"stop"');
+  expect(ledger).toContain(`"sessionId":"${sessionId}"`);
+}, 10000);
+
+test('missing transcript_path still exits 0, harvests nothing, and still writes a stop event to the ledger', async () => {
+  const sessionId = 'e2e-no-transcript';
+  const { code, stdout } = await runHook(
+    JSON.stringify({ session_id: sessionId, cwd: 'C:\\Users\\demo\\beta' }),
+  );
+  expect(code).toBe(0);
+  expect(stdout).toBe('');
+
+  const ledger = fs.readFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'), 'utf8');
+  expect(ledger).toContain('"type":"stop"');
+  expect(ledger).toContain(`"sessionId":"${sessionId}"`);
+  // No transcript to read from — nothing was harvested, and no memory store
+  // was even created.
+  expect(fs.existsSync(path.join(dataDir, 'memory', 'events.jsonl'))).toBe(false);
+}, 10000);
+
+test('a 5 MB transcript is harvested well inside the hook\'s 3 s self-timeout', async () => {
+  const sessionId = 'e2e-perf';
+  const transcriptPath = path.join(dataDir, `${sessionId}.jsonl`);
+  const fillerLine = JSON.stringify({ type: 'user', message: { role: 'user', content: 'x'.repeat(970) } });
+  const lineBytes = Buffer.byteLength(fillerLine, 'utf8') + 1;
+  const targetBytes = 5 * 1024 * 1024;
+  const lineCount = Math.ceil(targetBytes / lineBytes);
+  const lines = new Array(lineCount).fill(fillerLine);
+  const rememberText = 'Notiert.\n```kaprek-remember\n{"text":"Perf-Test-Fakt","kind":"fact"}\n```';
+  lines.push(JSON.stringify({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: rememberText }] } }));
+  fs.writeFileSync(transcriptPath, `${lines.join('\n')}\n`, 'utf8');
+  expect(fs.statSync(transcriptPath).size).toBeGreaterThan(targetBytes);
+
+  const started = Date.now();
+  const { code } = await runHook(
+    JSON.stringify({ transcript_path: transcriptPath, session_id: sessionId, cwd: 'C:\\Users\\demo\\perfproj' }),
+  );
+  const elapsed = Date.now() - started;
+  expect(code).toBe(0);
+  expect(elapsed).toBeLessThan(2500);
+
+  const events = fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8');
+  expect(events).toContain('Perf-Test-Fakt');
 }, 10000);
