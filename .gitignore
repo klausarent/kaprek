@@ -7,3 +7,6 @@ web/node_modules/
 .DS_Store
 *.local.md
 dist-zip/
+
+# git worktrees for parallel implementers (superpowers:using-git-worktrees)
+.worktrees/
