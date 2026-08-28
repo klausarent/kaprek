@@ -26,6 +26,7 @@ function parse(argv) {
   }
   if (typeof opts.question !== 'string' || opts.question.trim() === '') throw new Error('a question is required');
   if (opts.files.some((f) => typeof f !== 'string')) throw new Error('--file needs a path');
+  if (typeof opts.cwd !== 'string' || opts.cwd === '') throw new Error('--cwd needs a directory');
   return opts;
 }
 
@@ -49,15 +50,21 @@ export async function runCouncilCommand(argv, { dataDir, peersFor, snapshotFiles
     stderr(COUNCIL_USAGE);
     return 1;
   }
-  const status = peersFor();
-  if (!status.possible) {
-    stderr(`no council possible: ${status.reason ?? 'no second engine'}`);
-    return 2;
+  let status, cwd, snapshots, refused, result;
+  try {
+    status = peersFor();
+    if (!status.possible) {
+      stderr(`no council possible: ${status.reason ?? 'no second engine'}`);
+      return 2;
+    }
+    cwd = path.resolve(opts.cwd);
+    const files = opts.files.map((f) => path.resolve(cwd, f));
+    ({ snapshots, refused } = snapshotFiles(files, { cwd, roots: [cwd] }));
+    result = await consultPeers({ peers: status.peers, question: opts.question, snapshots, refused, constraints: opts.constraints, tried: [] });
+  } catch (err) {
+    stderr(`council failed: ${err.message}`);
+    return 1;
   }
-  const cwd = path.resolve(opts.cwd);
-  const files = opts.files.map((f) => path.resolve(cwd, f));
-  const { snapshots, refused } = snapshotFiles(files, { cwd, roots: [cwd] });
-  const result = await consultPeers({ peers: status.peers, question: opts.question, snapshots, refused, constraints: opts.constraints, tried: [] });
   const record = { ts: new Date().toISOString(), question: opts.question, files: opts.files, cwd, peers: status.peers, refused, result };
   try {
     const dir = path.join(dataDir, 'council', 'cli');

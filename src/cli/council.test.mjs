@@ -63,4 +63,18 @@ describe('kaprek council', () => {
     const d = deps();
     expect(await runCouncilCommand([], d.deps)).toBe(1);
   });
+
+  it('fails closed with exit 1 when a peer call rejects, and writes no result file', async () => {
+    const d = deps({ consultPeers: async () => { throw new Error('peer timeout'); } });
+    const code = await runCouncilCommand(['Frage'], d.deps);
+    expect(code).toBe(1);
+    expect(d.lines.join('\n')).toMatch(/ERR council failed: peer timeout/);
+    const dir = path.join(d.dataDir, 'council', 'cli');
+    expect(fs.existsSync(dir)).toBe(false);
+  });
+
+  it('exits 1 when --cwd is given without a value', async () => {
+    const d = deps();
+    expect(await runCouncilCommand(['Frage', '--cwd'], d.deps)).toBe(1);
+  });
 });
