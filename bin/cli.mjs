@@ -11,6 +11,9 @@ import { encodeQr, qrToText } from '../src/server/qr.mjs';
 import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
 import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
+import { runResumeCommand, RESUME_USAGE } from '../src/cli/resume.mjs';
+import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir } from '../src/resume/scan.mjs';
+import { resumeSession as launchResumeSession } from '../src/resume/launch.mjs';
 import { ensureAppDir } from '../src/lib/appdir.mjs';
 import {
   acquireInstanceLock,
@@ -23,6 +26,7 @@ const USAGE = `Usage: kaprek [options]
        kaprek update [--check]
        kaprek autostart <install|uninstall|status>
        kaprek hooks <install|uninstall|status>
+       kaprek resume [key|--all]
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -47,6 +51,10 @@ Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop + SessionStart hooks to ~/.claude/settings.json
   hooks uninstall  Remove only the kaprek hook entries
   hooks status     Show whether the hooks are installed and the active policy mode
+
+Resume (bring a session of claude/codex/grok/kimi back as a terminal tab):
+  resume [key|--all]  List or reopen sessions of claude/codex/grok/kimi as
+                       terminal tabs. Run \`kaprek resume --help\` for details.
 `;
 
 const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
@@ -250,6 +258,20 @@ async function main() {
 
   if (argv[0] === 'hooks') {
     runHooksCommand(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'resume') {
+    if (argv[1] === '-h' || argv[1] === '--help') {
+      console.log(RESUME_USAGE);
+      return;
+    }
+    const dataDir = ensureAppDir();
+    setResumeCacheDir(path.join(dataDir, 'resume-cache'));
+    process.exitCode = await runResumeCommand(argv.slice(1), {
+      scanAll: scanResumeSessions,
+      resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
+    });
     return;
   }
 

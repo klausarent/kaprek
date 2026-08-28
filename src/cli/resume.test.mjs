@@ -1,0 +1,104 @@
+import { describe, it, expect } from 'vitest';
+import { runResumeCommand } from './resume.mjs';
+
+const sessions = [
+  { key: 'claude:a', engine: 'claude', id: 'a', cwd: 'C:\\p', title: 'Aufgabe A', lastTs: '2026-08-28T06:30:00.000Z', userMsgs: 2, hidden: false, crash: true },
+  { key: 'codex:b', engine: 'codex', id: 'b', cwd: 'C:\\q', title: 'Aufgabe B', lastTs: '2026-08-27T06:30:00.000Z', userMsgs: 1, hidden: false, crash: false },
+  { key: 'grok:abc111', engine: 'grok', id: 'abc111', cwd: 'C:\\r', title: 'Aufgabe C', lastTs: '2026-08-28T05:00:00.000Z', userMsgs: 1, hidden: false, crash: false },
+  { key: 'grok:abc222', engine: 'grok', id: 'abc222', cwd: 'C:\\r', title: 'Aufgabe D', lastTs: '2026-08-28T04:00:00.000Z', userMsgs: 1, hidden: false, crash: false },
+];
+
+function deps() {
+  const launched = [];
+  const lines = [];
+  return {
+    launched,
+    lines,
+    deps: {
+      scanAll: async () => ({ sessions, scannedAt: 'x' }),
+      resumeSession: async (s, opts) => { launched.push([s.key, opts.skip]); return { ok: true, method: 'wt-tab' }; },
+      now: () => Date.parse('2026-08-28T07:00:00.000Z'),
+      stdout: (line) => lines.push(line),
+      stderr: (line) => lines.push(`ERR ${line}`),
+      sleep: async () => {},
+    },
+  };
+}
+
+describe('kaprek resume', () => {
+  it('lists sessions newest first with engine:id keys', async () => {
+    const d = deps();
+    const code = await runResumeCommand([], d.deps);
+    expect(code).toBe(0);
+    expect(d.lines.join('\n')).toMatch(/claude:a[\s\S]*grok:abc111[\s\S]*grok:abc222/);
+    expect(d.lines.join('\n')).toMatch(/Aufgabe A/);
+    expect(d.launched).toEqual([]);
+  });
+
+  it('resumes one session by exact key', async () => {
+    const d = deps();
+    expect(await runResumeCommand(['codex:b'], d.deps)).toBe(0);
+    expect(d.launched).toEqual([['codex:b', true]]);
+  });
+
+  it('resumes one session by a unique prefix of its key', async () => {
+    const d = deps();
+    expect(await runResumeCommand(['grok:abc1'], d.deps)).toBe(0);
+    expect(d.launched).toEqual([['grok:abc111', true]]);
+  });
+
+  it('--all resumes only the last 24 hours, newest first, with a pause between calls, --no-skip drops the permission flags', async () => {
+    const d = deps();
+    const sleeps = [];
+    d.deps.sleep = async (ms) => { sleeps.push(ms); };
+    const code = await runResumeCommand(['--all', '--no-skip'], d.deps);
+    expect(code).toBe(0);
+    // codex:b is ~24.5h old at `now` and falls outside the default 24h window.
+    expect(d.launched).toEqual([
+      ['claude:a', false],
+      ['grok:abc111', false],
+      ['grok:abc222', false],
+    ]);
+    expect(sleeps.length).toBe(3);
+  });
+
+  it('--all reports a partial failure as exit 1 and names the failed session', async () => {
+    const d = deps();
+    d.deps.resumeSession = async (s) => (s.key === 'grok:abc222' ? { ok: false, error: 'boom' } : { ok: true, method: 'wt-tab' });
+    const code = await runResumeCommand(['--all'], d.deps);
+    expect(code).toBe(1);
+    expect(d.lines.join('\n')).toMatch(/ERR .*grok:abc222.*boom/);
+  });
+
+  it('unknown key exits 2 with a message and launches nothing', async () => {
+    const d = deps();
+    expect(await runResumeCommand(['grok:nope'], d.deps)).toBe(2);
+    expect(d.lines.join('\n')).toMatch(/ERR .*grok:nope/);
+    expect(d.launched).toEqual([]);
+  });
+
+  it('an ambiguous prefix exits 2 and lists the candidates', async () => {
+    const d = deps();
+    const code = await runResumeCommand(['grok:abc'], d.deps);
+    expect(code).toBe(2);
+    expect(d.lines.join('\n')).toMatch(/ERR .*ambiguous.*grok:abc/);
+    expect(d.lines.join('\n')).toMatch(/grok:abc111/);
+    expect(d.lines.join('\n')).toMatch(/grok:abc222/);
+    expect(d.launched).toEqual([]);
+  });
+
+  it('a launch failure for a single key exits 1', async () => {
+    const d = deps();
+    d.deps.resumeSession = async () => ({ ok: false, error: 'no such CLI' });
+    const code = await runResumeCommand(['codex:b'], d.deps);
+    expect(code).toBe(1);
+    expect(d.lines.join('\n')).toMatch(/ERR .*codex:b.*no such CLI/);
+  });
+
+  it('an unknown flag is rejected with exit 1 and the usage text', async () => {
+    const d = deps();
+    const code = await runResumeCommand(['--nope'], d.deps);
+    expect(code).toBe(1);
+    expect(d.lines.join('\n')).toMatch(/ERR unknown argument: --nope/);
+  });
+});
