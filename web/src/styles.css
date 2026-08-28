@@ -2408,3 +2408,85 @@ pre,
   align-items: center;
   margin-top: 1.25rem;
 }
+
+/* Resume panel (#/list — kaprek resume) */
+
+.resume-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.resume-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.resume-panel-title {
+  margin: 0;
+  font-size: 15px;
+  flex: 1;
+}
+
+.resume-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.resume-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.resume-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.resume-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.resume-row-crash {
+  border-color: var(--danger-text);
+}
+
+.resume-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.resume-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.resume-row-crash .resume-title::before {
+  content: "⚠ ";
+}
+
+.resume-meta {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

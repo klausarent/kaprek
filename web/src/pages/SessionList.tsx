@@ -4,6 +4,8 @@
 import { useEffect, useMemo, useState } from "react";
 import { fetchProjects, fetchSessions, type ProjectSummary, type SessionMeta } from "../lib/api";
 import { navigateToProjects, navigateToSessions, navigateToThread } from "../App";
+import { ResumePanel } from "../components/ResumePanel";
+import { fetchResumeSessions, recentSessions, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -84,6 +86,10 @@ function ProjectGrid() {
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
 
+  const [resumeList, setResumeList] = useState<ResumeSession[]>([]);
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const [resumeStatus, setResumeStatus] = useState("");
+
   useEffect(() => {
     let cancelled = false;
     fetchProjects()
@@ -98,6 +104,43 @@ function ProjectGrid() {
     };
   }, []);
 
+  useEffect(() => {
+    let cancelled = false;
+    fetchResumeSessions(7)
+      .then((sessions) => {
+        if (!cancelled) setResumeList(sessions);
+      })
+      .catch((e) => {
+        if (!cancelled) setResumeStatus((e as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleResume(engine: string, id: string) {
+    setResumeBusy(true);
+    setResumeStatus("");
+    try {
+      const r = await resumeOne(engine, id);
+      setResumeStatus(r.ok ? `Tab geöffnet (${r.method})` : `Fehler: ${r.error}`);
+    } finally {
+      setResumeBusy(false);
+    }
+  }
+
+  async function handleResumeAll() {
+    setResumeBusy(true);
+    setResumeStatus("");
+    try {
+      const items = recentSessions(resumeList, 24).map((s) => ({ engine: s.engine, id: s.id }));
+      const r = await resumeMany(items);
+      setResumeStatus(`${r.results.filter((x) => x.ok).length}/${r.results.length} Tabs geöffnet`);
+    } finally {
+      setResumeBusy(false);
+    }
+  }
+
   const filtered = useMemo(() => {
     if (!projects) return [];
     const q = search.trim().toLowerCase();
@@ -107,6 +150,14 @@ function ProjectGrid() {
 
   return (
     <div className="page">
+      <ResumePanel
+        sessions={resumeList}
+        onResume={(engine, id) => void handleResume(engine, id)}
+        onResumeAll={() => void handleResumeAll()}
+        busy={resumeBusy}
+        statusText={resumeStatus}
+      />
+
       <header className="page-header">
         <h1>Projects</h1>
         <p className="page-subtitle">
