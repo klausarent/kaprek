@@ -17,7 +17,11 @@ export type ResumeSession = {
   crash: boolean;
 };
 
-export type ResumeResult = { engine?: string; id?: string; ok: boolean; method?: string; error?: string };
+// `ok` is optional: the server's 404 branch (unknown engine:id) answers with
+// just `{ error }`, no `ok` field at all — falsy-checking `r.ok` still treats
+// that as a failure, but the type must not claim a field that is sometimes
+// absent (see src/server/resume-routes.mjs's `if (!session)` branch).
+export type ResumeResult = { engine?: string; id?: string; ok?: boolean; method?: string; error?: string };
 
 export async function fetchResumeSessions(days = 7): Promise<ResumeSession[]> {
   const res = await apiFetch(`/api/resume/sessions?days=${days}`);
@@ -48,4 +52,15 @@ export async function resumeMany(items: { engine: string; id: string }[]): Promi
 export function recentSessions(sessions: ResumeSession[], hours: number, nowMs = Date.now()): ResumeSession[] {
   const since = nowMs - hours * 60 * 60 * 1000;
   return sessions.filter((s) => Date.parse(s.lastTs) >= since);
+}
+
+/**
+ * Turns a thrown fetch error — a real network failure, or MissingTokenError
+ * when the page was not served with an instance token (see api.ts's
+ * apiFetch/tokenHeader) — into the "Fehler: …" status text SessionList shows.
+ * Always "Fehler: "-prefixed so the panel can tell an error status apart from
+ * a success one by the text alone (see ResumePanel.tsx's status styling).
+ */
+export function resumeErrorText(err: unknown): string {
+  return `Fehler: ${err instanceof Error ? err.message : String(err)}`;
 }

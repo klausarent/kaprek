@@ -7,7 +7,7 @@
 // src/test/tree.tsx). The state and the fetch/resume calls live in
 // SessionList.tsx, which owns this panel — same split as
 // Approvals.tsx/ApprovalInboxItem.
-import type { ResumeSession } from "../lib/resume";
+import { recentSessions, type ResumeSession } from "../lib/resume";
 
 const ENGINE_ORDER = ["claude", "codex", "grok", "kimi"] as const;
 
@@ -41,10 +41,14 @@ export function ResumePanel({
     <section className="resume-panel" aria-label="Sessions fortsetzen">
       <div className="resume-panel-header">
         <h2 className="resume-panel-title">Fortsetzen</h2>
-        <button type="button" className="btn" disabled={busy || sessions.length === 0} onClick={onResumeAll}>
+        <button type="button" className="btn" disabled={busy || recentSessions(sessions, 24).length === 0} onClick={onResumeAll}>
           Alle der letzten 24 h fortsetzen
         </button>
-        {statusText && <span className="resume-status">{statusText}</span>}
+        {statusText && (
+          <span className={statusText.startsWith("Fehler:") ? "resume-status resume-status-error" : "resume-status"}>
+            {statusText}
+          </span>
+        )}
       </div>
 
       {groups.length === 0 && <div className="empty-box">Keine Sessions in den letzten Tagen.</div>}

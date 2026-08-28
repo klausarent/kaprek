@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchProjects, fetchSessions, type ProjectSummary, type SessionMeta } from "../lib/api";
 import { navigateToProjects, navigateToSessions, navigateToThread } from "../App";
 import { ResumePanel } from "../components/ResumePanel";
-import { fetchResumeSessions, recentSessions, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
+import { fetchResumeSessions, recentSessions, resumeErrorText, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -111,7 +111,7 @@ function ProjectGrid() {
         if (!cancelled) setResumeList(sessions);
       })
       .catch((e) => {
-        if (!cancelled) setResumeStatus((e as Error).message);
+        if (!cancelled) setResumeStatus(resumeErrorText(e));
       });
     return () => {
       cancelled = true;
@@ -124,6 +124,11 @@ function ProjectGrid() {
     try {
       const r = await resumeOne(engine, id);
       setResumeStatus(r.ok ? `Tab geöffnet (${r.method})` : `Fehler: ${r.error}`);
+    } catch (err) {
+      // apiFetch throws on a real network failure or a missing instance
+      // token (see api.ts) — resumeOne/resumeMany never see a Response to
+      // check .ok on in that case, so the status would otherwise stay blank.
+      setResumeStatus(resumeErrorText(err));
     } finally {
       setResumeBusy(false);
     }
@@ -136,6 +141,8 @@ function ProjectGrid() {
       const items = recentSessions(resumeList, 24).map((s) => ({ engine: s.engine, id: s.id }));
       const r = await resumeMany(items);
       setResumeStatus(`${r.results.filter((x) => x.ok).length}/${r.results.length} Tabs geöffnet`);
+    } catch (err) {
+      setResumeStatus(resumeErrorText(err));
     } finally {
       setResumeBusy(false);
     }
