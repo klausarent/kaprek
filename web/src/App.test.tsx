@@ -2,7 +2,7 @@
 // next one. The component itself needs a DOM; the key that decides whether React
 // keeps or discards its instance does not.
 import { test, expect } from "vitest";
-import { chatInstanceKey, type Route } from "./App";
+import { chatInstanceKey, parseRoute, NAV_ITEMS, type Route } from "./App";
 
 const CHAT_A = "11111111-1111-4111-8111-111111111111";
 const CHAT_B = "22222222-2222-4222-8222-222222222222";
@@ -40,4 +40,32 @@ test("every further click on 'Chat' starts yet another fresh instance", () => {
 test("a non-chat route has one stable key, so the counter cannot churn other pages", () => {
   expect(chatInstanceKey({ name: "triggers" }, 1)).toBe(chatInstanceKey({ name: "triggers" }, 9));
   expect(chatInstanceKey({ name: "apps" }, 1)).toBe(chatInstanceKey({ name: "list", project: null }, 9));
+});
+
+test("parses #/experiments", () => {
+  expect(parseRoute("#/experiments")).toEqual({ name: "experiments" });
+});
+
+test("#/chat still parses to the chat route — freezing the nav does not remove the route", () => {
+  expect(parseRoute("#/chat")).toEqual({ name: "chat", chatId: undefined, missionId: undefined });
+  // An empty hash still falls back to chat too — it is the app's landing page.
+  expect(parseRoute("#/")).toEqual({ name: "chat", chatId: undefined, missionId: undefined });
+});
+
+// The nav is data (App.tsx's NAV_ITEMS), not inline JSX, precisely so this
+// assertion does not need a DOM: this repo has none (see vitest.config.ts —
+// environment 'node', no jsdom/happy-dom/@testing-library dependency).
+test("the nav shows only the reading surface plus Experimente, in that order", () => {
+  expect(NAV_ITEMS.map((item) => item.label)).toEqual(["Sessions", "Suche", "Inbox", "Board", "Memory", "Setup", "Experimente"]);
+});
+
+test("Sessions is active for both the list and the thread route; every other item is single-route", () => {
+  const sessions = NAV_ITEMS.find((item) => item.label === "Sessions")!;
+  expect(sessions.isActive({ name: "list", project: null })).toBe(true);
+  expect(sessions.isActive({ name: "thread", project: "p", sessionId: "s" })).toBe(true);
+  expect(sessions.isActive({ name: "board" })).toBe(false);
+
+  const experiments = NAV_ITEMS.find((item) => item.label === "Experimente")!;
+  expect(experiments.isActive({ name: "experiments" })).toBe(true);
+  expect(experiments.isActive({ name: "list", project: null })).toBe(false);
 });

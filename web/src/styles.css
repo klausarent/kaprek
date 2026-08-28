@@ -2408,3 +2408,17 @@ pre,
   align-items: center;
   margin-top: 1.25rem;
 }
+
+/* experiments */
+.muted {
+  color: var(--muted);
+}
+
+.experiments ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
