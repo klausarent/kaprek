@@ -31,23 +31,31 @@ const DEFAULT_ROOT_SCOPE = 'person:local';
 // redactSecrets(), and running this check afterward would find nothing but
 // the literal string "[REDACTED]".
 const SECRET_LINE_PATTERNS = [
-  /Bearer\s+\S{8,}/i,
+  // "Bearer <value>" — but not "Bearer $TOKEN", "Bearer <token>", "Bearer MARKY_API_KEY":
+  // a placeholder or an env-variable NAME is exactly what a note should say.
+  /\bBearer\s+(?![$<[{]|[A-Z0-9_]+(?=[\s,;.)]|$))\S{8,}/,
   /\bsk-[A-Za-z0-9_-]{10,}/,
   /\bAKIA[0-9A-Z]{16}\b/,
   /\bghp_[A-Za-z0-9]{20,}/,
   /\bxox[baprs]-[A-Za-z0-9-]{10,}/,
   /\b[A-Z]{2}\d{2}[A-Z0-9]{10,30}\b/, // IBAN shape: country + check digits + BBAN
   /-----BEGIN [A-Z ]*(?:PRIVATE KEY|CERTIFICATE)-----/,
-  // A credential named as such, whatever its shape: "token: abc…", "Passwort=…".
-  /\b(?:token|secret|passw(?:or[dt]|d)|api[_ -]?key|client[_ -]?secret)\s*[:=]\s*(?!\[)\S{8,}/i,
+  // A credential named as such with a value that could be one: "token: x9f…",
+  // "Passwort=Sup3r…". Not a placeholder ($VAR, <value>, [REDACTED]), not an
+  // env-variable NAME, not a Windows path, and not a plain word without a
+  // digit ("Instance-Token = Vollzugriff" is prose, not a leak).
+  /\b(?:[Tt]oken|TOKEN|[Ss]ecret|SECRET|[Pp]assw(?:or[dt]|d)|PASSW(?:OR[DT]|D)|[Aa]pi[_ -]?[Kk]ey|API[_ -]?KEY|[Cc]lient[_ -]?[Ss]ecret)\s*[:=]\s*(?![$<[{~]|[A-Za-z]:\\|[A-Z0-9_]+(?=[\s,;.)]|$))(?=\S*\d)\S{8,}/,
   // A raw hex token of SHA-256 length or longer. 32- and 40-char hex are
   // deliberately NOT matched: memory notes are full of commit hashes and
-  // Convex/UUID-style ids, and losing a fact over a git hash is the wrong trade.
+  // Convex/UUID/Cloudflare-account ids, and losing a fact over one of those
+  // is the wrong trade.
   /(?<![A-Za-z0-9])[A-Fa-f0-9]{64,}(?![A-Za-z0-9])/,
-  // A raw base64/JWT-looking token: long, mixed case, digits, and at least
-  // one base64 symbol or a dot-separated JWT shape. Plain lowercase ids
-  // (Convex, ULID-like) and words never have all of these.
-  /(?<![A-Za-z0-9+/=_-])(?=[^\s]*[a-z])(?=[^\s]*[A-Z])(?=[^\s]*\d)(?=[^\s]*[+/=]|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.)[A-Za-z0-9+/=_.-]{40,}(?![A-Za-z0-9+/=_-])/,
+  // A JWT: three base64url segments, the first one always decodes to '{"'.
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/,
+  // A base64 blob within reach of a credential word. German notes are full of
+  // "Converge/FTS5-Verdikte/SessionStart-Hook"-style runs, so a bare blob
+  // is not enough: it needs a '+' or '/', a digit, length 40+, and the word.
+  /\b(?:[Tt]oken|TOKEN|[Ss]ecret|SECRET|[Kk]ey|KEY|[Bb]earer|[Pp]assw(?:or[dt]|d)|[Aa]uthorization)\b[^\n]{0,40}?(?<![A-Za-z0-9+/])(?=[A-Za-z0-9+/]*[+/])(?=[A-Za-z0-9+/]*\d)[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/])/,
 ];
 
 /** Whether `text` looks enough like a bare credential that the whole line should be dropped rather than redacted in place. */
