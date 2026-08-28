@@ -7,8 +7,9 @@ import { redactSecrets } from '../parser/parse.mjs';
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 const ALL_GAP_MS = 700; // wt needs a breath between tabs, or they land in new windows
+const DEFAULT_LIMIT = 40; // the list can run into the hundreds; showing all of them defeats the point of a list
 
-export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hours N] [--days N] [--no-skip]
+export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hours N] [--days N] [--limit N] [--no-skip]
 
   kaprek resume              list sessions of the last 7 days (claude, codex, grok, kimi)
   kaprek resume claude:<id>  open that session as a new Windows Terminal tab
@@ -16,19 +17,34 @@ export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hou
   kaprek resume --all        open every session active in the last 24 hours
   --hours N                  window for --all (default 24)
   --days N                   window for the list (default 7)
+  --limit N                  show at most N sessions in the list, newest first
+                              (default 40; 0 shows all of them)
   --no-skip                  do not pass the permission-skipping flags to the CLIs
 `;
 
 function parse(argv) {
-  const opts = { key: null, all: false, hours: 24, days: 7, skip: true };
+  const opts = { key: null, all: false, hours: 24, days: 7, limit: DEFAULT_LIMIT, skip: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') opts.all = true;
     else if (a === '--no-skip') opts.skip = false;
-    else if (a === '--hours') opts.hours = Math.max(1, Number(argv[++i]) || 24);
-    else if (a === '--days') opts.days = Math.max(1, Number(argv[++i]) || 7);
-    else if (/^[a-z]+:.+$/.test(a)) opts.key = a;
-    else throw new Error(`unknown argument: ${a}`);
+    else if (a === '--hours') {
+      const n = Number(argv[++i]);
+      opts.hours = Math.max(1, Number.isFinite(n) ? n : 24);
+    } else if (a === '--days') {
+      const n = Number(argv[++i]);
+      opts.days = Math.max(1, Number.isFinite(n) ? n : 7);
+    } else if (a === '--limit') {
+      const n = Number(argv[++i]);
+      opts.limit = Number.isFinite(n) ? Math.max(0, Math.trunc(n)) : DEFAULT_LIMIT;
+    } else if (/^[a-z]+:.+$/.test(a)) {
+      if (opts.key !== null) {
+        const err = new Error(`only one session key is allowed (got "${opts.key}" and "${a}")`);
+        err.exitCode = 2;
+        throw err;
+      }
+      opts.key = a;
+    } else throw new Error(`unknown argument: ${a}`);
   }
   return opts;
 }
@@ -61,7 +77,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   } catch (err) {
     stderr(err.message);
     stderr(RESUME_USAGE);
-    return 1;
+    return err.exitCode ?? 1;
   }
   const { sessions } = await scanAll();
   const nowMs = now();
@@ -91,14 +107,15 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
       .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS)
       .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
     let failed = 0;
-    for (const s of picked) {
+    for (let i = 0; i < picked.length; i++) {
+      const s = picked[i];
       const r = await resumeSession(s, { skip: opts.skip });
       if (r.ok) stdout(`opened ${s.key} — ${redactSecrets(s.title)}`);
       else {
         failed++;
         stderr(`failed ${s.key}: ${r.error}`);
       }
-      await sleep(ALL_GAP_MS);
+      if (i < picked.length - 1) await sleep(ALL_GAP_MS);
     }
     stdout(`${picked.length - failed}/${picked.length} sessions of the last ${opts.hours} h reopened`);
     return failed === 0 ? 0 : 1;
@@ -111,9 +128,14 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
     stdout(`no sessions in the last ${opts.days} days`);
     return 0;
   }
-  for (const s of listed) {
+  const cap = opts.limit === 0 ? listed.length : opts.limit;
+  const shown = listed.slice(0, cap);
+  for (const s of shown) {
     const flag = s.crash ? ' [crash]' : '';
     stdout(`${s.key.padEnd(48)} ${ago(s.lastTs, nowMs).padStart(6)}  ${path.basename(s.cwd || '') || '-'}  ${redactSecrets(s.title)}${flag}`);
+  }
+  if (shown.length < listed.length) {
+    stdout(`… and ${listed.length - shown.length} more (--limit 0 for all of them, or narrow --days)`);
   }
   stdout(`\n${listed.length} sessions. Resume one: kaprek resume <engine>:<id>   All of last 24 h: kaprek resume --all`);
   return 0;
