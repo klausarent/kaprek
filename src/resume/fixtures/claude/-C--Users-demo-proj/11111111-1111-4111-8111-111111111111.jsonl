@@ -1,0 +1,2 @@
+{"type":"user","cwd":"C:\\Users\\demo\\proj","sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-28T06:00:00.000Z","message":{"role":"user","content":"Bitte README kürzen"}}
+{"type":"assistant","cwd":"C:\\Users\\demo\\proj","sessionId":"11111111-1111-4111-8111-111111111111","timestamp":"2026-08-28T06:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Mache ich."}]}}
