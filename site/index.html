@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kaprek · supervision layer for Claude Code and Codex</title>
+<meta name="description" content="kaprek is the local supervision layer for the Claude Code and Codex CLIs you already have: a searchable flight recorder, scheduled triggers, and an approval inbox that survives a restart. No API key, no account, no server of its own.">
+<meta property="og:title" content="kaprek · supervision layer for Claude Code and Codex">
+<meta property="og:description" content="Your Claude Code sessions never die. You just can't see them. kaprek keeps the tape, files the questions, and stays on your machine.">
+<meta property="og:type" content="website">
+<link rel="icon" href='data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="%230a7d4f"/><text x="16" y="23" font-family="monospace" font-size="20" font-weight="bold" fill="white" text-anchor="middle">k</text></svg>'>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="wrap hero">
+  <div class="topline">
+    <p class="brand">kaprek</p>
+    <a class="ghlink" href="https://github.com/klausarent/kaprek">GitHub</a>
+  </div>
+  <h1>Your Claude Code sessions never die.<br>You just can&rsquo;t see them.</h1>
+  <p class="lede">kaprek keeps the tape, files the questions,<br>and stays on your machine.</p>
+  <p class="sub">Claude Code deletes transcripts after 30 days.
+  A night job either stalls or acts without you.
+  kaprek is the local supervision layer for the
+  Claude Code and Codex CLIs you already have:
+  a searchable flight recorder, scheduled triggers,
+  and an approval inbox that survives a restart.</p>
+  <p class="sub"><strong>No API key. No account. No server of its own.<br>
+  The human stays in the gate.</strong></p>
+  <div class="install">
+    <code id="cmd">npx kaprek</code>
+    <button id="copy" type="button" aria-label="Copy install command">copy</button>
+  </div>
+  <p class="hint">Opens http://127.0.0.1:4900 &middot; Needs Node 22+ &middot; Ctrl+C stops it<br>
+  Early preview &middot; Windows first, macOS/Linux welcome &middot;
+  <a href="https://github.com/klausarent/kaprek">GitHub</a></p>
+</header>
+
+<figure class="wrap shot">
+  <div class="frame" role="img" aria-label="kaprek thread view: a session as a conversation with user turns, tool calls, and a collapsed subagent transcript">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="title">kaprek &middot; thread &mdash; mission: Patch the auth timeout in checkout &middot; ~/work/shop-api</span></div>
+    <div class="body">
+      <div class="row">
+        <span class="who">you &middot; 22:41</span>
+        <div class="bubble">Reproduce the 30s timeout on POST /checkout, then patch only the client retry.</div>
+      </div>
+      <div class="row">
+        <span class="who">claude &middot; 22:41</span>
+        <div class="bubble">Plan: reproduce against a slowed stub, find the client retry path, patch only that path, run the checkout tests.</div>
+      </div>
+      <div class="row">
+        <span class="who">tool &middot; bash</span>
+        <div class="bubble tool">$ sed -n '1,120p' src/routes/checkout.ts &amp;&amp; sed -n '1,80p' src/routes/checkout.test.ts</div>
+      </div>
+      <div class="row">
+        <span class="who">tool &middot; bash &middot; log</span>
+        <div class="bubble tool">resp 401 www-authenticate &middot; Authorization: Bearer <span class="redact">sk-ant-&hellip; [redacted]</span></div>
+      </div>
+      <details class="bubble">
+        <summary>subagent: trace the timeout &middot; 14 turns &middot; collapsed</summary>
+        <p class="dim">Full subagent transcript stays on the tape: every turn, every tool call.</p>
+      </details>
+    </div>
+    <div class="statusline"><span>claude-sonnet</span><span>23 turns</span><span>9 tool calls</span><span>4.1 MB on tape</span></div>
+  </div>
+  <figcaption>The flight recorder. Every past session as a thread:
+your turns, tool calls, subagent transcripts.
+Synthetic demo data &mdash; not a live session.</figcaption>
+</figure>
+
+<main class="wrap">
+
+<section>
+  <p class="kicker">01</p>
+  <h2>The flight recorder</h2>
+  <p>Claude Code deletes transcripts after 30 days.<br>
+  kaprek reads <code>~/.claude/projects</code> and keeps the black box.</p>
+  <p>Every session becomes a searchable thread: user turns,
+  tool calls, subagent transcripts. The parser streams
+  multi-hundred-megabyte JSONL files. Search runs on
+  SQLite FTS5, over redacted content only.</p>
+  <p>Viewing the tape needs nothing but Node.<br>
+  Chat and triggers need the CLI you already signed into.</p>
+</section>
+
+<section>
+  <p class="kicker">02</p>
+  <h2>The approval inbox</h2>
+  <p>A trigger starts a turn at 03:00.
+  The agent wants a command you marked as &ldquo;ask first.&rdquo;
+  Nobody is at the desk. Nothing waits.</p>
+  <p>The question is filed. The agent continues with
+  everything else. The turn ends.</p>
+  <p>The question survives the turn.
+  It survives restarting kaprek.
+  When you answer in the morning, exactly the approved
+  action runs: byte-for-byte, exactly once.
+  A second call, or a call one byte different,
+  goes back into the inbox.
+  Unanswered questions lapse after 24 hours.</p>
+  <p>Strict modes block the work.
+  Auto modes let the agent decide alone.
+  kaprek parks the question, then honors the answer.</p>
+</section>
+
+<figure class="shot" style="max-width:none">
+  <div class="frame" role="img" aria-label="kaprek approval inbox: a question filed at 03:14 by a trigger, with approve, deny, and later actions">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="title">kaprek &middot; approval inbox</span></div>
+    <div class="body">
+      <div class="row">
+        <span class="who">filed 03:14 &middot; trigger nightly.checkout &middot; <span class="badge">survives restart</span></span>
+        <div class="bubble">marked ask-first: <code>$ git push origin fix/checkout-timeout</code></div>
+      </div>
+      <div class="actions">
+        <span class="primary">Approve exactly</span><span>Deny</span><span>Later</span>
+      </div>
+      <p class="dim" style="margin:0">A different command goes back to the inbox.</p>
+    </div>
+  </div>
+  <figcaption>Filed while you slept. Still there after restart.
+Approve once &mdash; the exact command, not a cousin of it.</figcaption>
+</figure>
+
+<section>
+  <p class="kicker">03</p>
+  <h2>Triggers and missions</h2>
+  <p>Point a trigger at a schedule, a file change,
+  or a clipboard match. kaprek runs the prompt
+  through your CLI and writes a local run and cost log.</p>
+  <p>A trigger every 30 minutes is 48 requests a day
+  you did not individually click. Know that before
+  you point one at anything sensitive.</p>
+  <p>Missions keep the work together.
+  Name a goal. Point it at a real project directory.
+  Every chat, task, and pending question of that work
+  hangs on the mission.</p>
+  <p>By default agents run jailed in kaprek&rsquo;s workspace.
+  A mission directory is the one deliberate door out &mdash;
+  typed by you, checked on every turn.</p>
+</section>
+
+<figure class="shot" style="max-width:none">
+  <div class="frame" role="img" aria-label="kaprek mission view: goal, directory, two chats, one open question, and a nightly trigger with its cost line">
+    <div class="bar"><span class="dot"></span><span class="dot"></span><span class="dot"></span>
+      <span class="title">kaprek &middot; mission</span></div>
+    <div class="body">
+      <div class="row">
+        <span class="who">mission</span>
+        <div class="bubble">Patch the auth timeout in checkout<br>
+        <span class="dim">~/work/shop-api &middot; 2 chats &middot; 1 open question</span></div>
+      </div>
+      <div class="row">
+        <span class="who">trigger</span>
+        <div class="bubble tool">nightly.checkout &middot; 0 3 * * * &middot; last run 03:00 &middot; next 03:00 &middot; $0.42 this week</div>
+      </div>
+      <p class="dim" style="margin:0">jail: working dir = mission dir &middot; checked this turn</p>
+    </div>
+  </div>
+  <figcaption>03:00 trigger &rarr; parked question &rarr; mission still holds the thread.</figcaption>
+</figure>
+
+<section>
+  <p class="kicker">04</p>
+  <h2>What leaves your machine</h2>
+  <p>kaprek binds to 127.0.0.1, has zero runtime
+  dependencies, and operates no server of its own.
+  No account. No telemetry.</p>
+  <div class="egress">
+    <div>
+      <h3>Stays here</h3>
+      <p>Chat logs, trigger config, run and cost log,
+      missions, search index, preserved artifacts,
+      the approval inbox.
+      A static guard test fails the build if a
+      network call is added to the Node code.</p>
+    </div>
+    <div>
+      <h3>Goes to Anthropic or OpenAI</h3>
+      <p>Everything the agent actually processes &mdash;
+      because your installed CLI sends it under
+      your account. Every chat message. Every
+      trigger prompt. kaprek adds no destination
+      of its own and never asks for an API key.</p>
+    </div>
+  </div>
+  <p>Secret redaction is on by default:
+  ten patterns for keys and tokens, replaced
+  before anything is digested or indexed.</p>
+  <p>Read the tests in the repo instead of
+  trusting this page.</p>
+</section>
+
+<section>
+  <h3>Why not the built-in permission prompts?</h3>
+  <div class="faq">
+    <p>Claude Code&rsquo;s own questions die with the process, and the transcript
+    is gone after 30 days. kaprek keeps the tape past the delete, keeps the
+    question in an inbox that survives a restart, and keeps parallel missions
+    tracked while you sleep.</p>
+  </div>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>Early preview. Built and used hardest on Windows.<br>
+  macOS and Linux should work; they have seen fewer
+  real hours. <a href="https://github.com/klausarent/kaprek/issues">Issues welcome.</a></p>
+  <p><a href="https://github.com/klausarent/kaprek">GitHub</a> &middot; <code>npx kaprek</code></p>
+  <p class="founder">Built because the only record of what the agent
+  did kept vanishing &mdash; and because an unattended
+  turn is either blocked or unsupervised.</p>
+</footer>
+
+<script>
+const btn = document.getElementById('copy');
+btn.addEventListener('click', async () => {
+  try {
+    await navigator.clipboard.writeText('npx kaprek');
+    btn.textContent = 'copied';
+  } catch {
+    const range = document.createRange();
+    range.selectNodeContents(document.getElementById('cmd'));
+    const sel = getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    btn.textContent = 'select';
+  }
+  setTimeout(() => { btn.textContent = 'copy'; }, 1500);
+});
+</script>
+
+</body>
+</html>

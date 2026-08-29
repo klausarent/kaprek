@@ -1,12 +1,16 @@
 # kaprek
 
-> Your Claude Code sessions never die — you just can't see them.
+Your Claude Code sessions never die — you just can't see them.
 
-kaprek is a local agent workspace built around the Claude Code CLI you already have. It runs chat turns and scheduled triggers through that CLI, shows you what the agents are doing, and asks before they do anything you said should need asking. It also reads `~/.claude/projects` and serves your existing session transcripts as a searchable list of threads.
+kaprek is a local supervision layer around the Claude Code
+and Codex CLIs you already have. It keeps every session as a
+searchable thread, runs scheduled triggers through that CLI,
+and files approval questions to an inbox that survives a restart.
 
-kaprek itself has no server and no account. Your prompts still go to Anthropic, because the `claude` CLI sends them — see [What leaves your machine](#what-leaves-your-machine).
+No API key. No account. No server of its own.
 
-**Status: early preview.** Built and tested on Windows first; macOS/Linux should work but have seen less real use — [issues](https://github.com/klausarent/kaprek/issues) welcome.
+Status: early preview. Windows has the most real use.
+macOS/Linux should work; issues welcome. Node 22+.
 
 ![kaprek's thread view — a session rendered as a conversation, with tool calls](docs/screenshot.png)
 
@@ -116,7 +120,13 @@ Presets pre-fill a new mission: two generic ones ship built in (`blank` and
 A user preset with a builtin's id replaces it; an invalid file is skipped with
 a warning, never a crash.
 
-## Plans
+## Advanced
+
+The systems in this section are the advanced layer. They are in the app and they are not going away —
+they are just not the headline: guided plans, the council, second engines, relays and recipes,
+hierarchical memory, phone access on the LAN, the task board, and signed receipts.
+
+### Plans
 
 Say something like "let's build a small line counter" and kaprek offers to
 work through it as a quiz: a few questions, each with two to four options and
@@ -154,7 +164,7 @@ prompt, the fence, and the gate are kaprek's own.
 
 **Edited outside kaprek.** Every plan carries a fingerprint of the file as kaprek last saw it — at registration, at a tick, at a converge round. A read that finds the file different says so: a badge in the list, a line in the detail with the time of that last sighting. Nothing is blocked by it; it is the one thing a reader needs to know before trusting the checkboxes, and the next tick or check brings kaprek's view up to date.
 
-## Council
+### Council
 
 Four jobs, and whichever engines you have doing them:
 
@@ -211,7 +221,7 @@ interrupted by a restart says so instead of being quietly asked again.
 
 `--diff [<ref>]` adds the working tree's changes against `<ref>` (default `HEAD`) as one more snapshot — `git diff --stat`, `git diff`, and the untracked files, combined into a virtual `git-diff.patch` and put through the same redaction as `--file`, at hunk granularity: a secrets file's own hunk is removed and named as `[redacted: <path>]` rather than the whole diff being refused. Capped at 200,000 characters; past that the snapshot is cut with a note. `--diff` and `--file` combine freely. Outside a git repo, or with nothing to diff, it prints why and exits 1.
 
-## Engines
+### Engines
 
 A new chat picks which already-installed, already-authenticated CLI runs its
 turns: `claude` (the default) or `codex`. The choice is fixed at chat
@@ -233,7 +243,7 @@ apply.
 A chat's own engine is still fixed at creation. A **relay recipe** is the one
 place where several engines work inside one chat on purpose — see below.
 
-## Relays and recipes
+### Relays and recipes
 
 A relay is a controlled handoff between agents: each step is an event in the
 chat log, under a budget, with a human gate. A **recipe** says who takes part
@@ -286,7 +296,7 @@ an unknown recipe id, a duplicate step id, or a step no edge leads to.
 Starting a relay from a trigger stays deliberately closed — an unattended
 loop that starts itself is the one thing on the kill list.
 
-## Memory
+### Memory
 
 What was learned while working, kept per scope, so the next agent starts
 with it instead of rediscovering it.
@@ -337,7 +347,7 @@ raw transcripts, syncing between machines.
 
 
 **Confirmed, not duplicated.** An agent that learns something another agent already wrote down in the same scope confirms it: the entry's count goes up, its sources grow, and its stale clock resets — a fact that three sessions learned carries that on its face (`confirmed 3× by 2 sources`), and the 90-day clock stops nagging about what work keeps re-learning. Same text, same scope, same kind; a withdrawn fact is a new entry again.
-## Answering from a phone (`--lan`)
+### Answering from a phone (`--lan`)
 
 kaprek listens on `127.0.0.1`. `kaprek --lan` also listens on this machine's
 network address and prints a QR code:
@@ -380,6 +390,15 @@ What holds either way:
   not be something you can switch on once and forget.
 - On a machine with no network address, `--lan` stays on loopback and says
   so rather than printing a QR for an address that does not exist.
+### Task board
+
+A local task board (`#/board`) for tracking work against these sessions.
+
+The core rule: a task can only be marked done once it carries a complete 7-field completion record — what triggered it, the outcome, the approach taken, the course including any detours or failures, how it was verified, the effort spent, and what's still open. All seven fields are required and enforced server-side, not just suggested by the UI. It's the discipline your future self wants but never keeps on its own.
+
+### Receipts
+
+A receipt is an ed25519-signed snapshot of a completed task: its doc plus its linked sessions, signed at the moment you ask for one. It proves that a given key signed this exact state at this time — it does not prove the work is good, and the agent name is self-declared, not a verified identity. The verify view shows valid/invalid; editing the doc after signing invalidates the receipt, because verification always re-checks against the task's current state, not a stored snapshot.
 
 ## Make something (`#/home`)
 
@@ -466,16 +485,6 @@ The index only covers a session's title plus its user/assistant text, truncated 
 
 
 **Subscription windows.** Both CLIs say during a turn where their window stands (Claude Code's `rate_limit_event`, codex's `account/rateLimits/updated`); kaprek has logged that signal per turn since M1 and now shows the latest per engine on `#/setup` — how full, when it resets, which window, and as of when it was seen. Read back from `runs.jsonl`, never asked of a vendor: a window kaprek has not seen since the last turn is shown with that time, which is the honest form of "as of". `GET /api/usage` returns the same, raw signal included.
-## Task board
-
-A local task board (`#/board`) for tracking work against these sessions.
-
-The core rule: a task can only be marked done once it carries a complete 7-field completion record — what triggered it, the outcome, the approach taken, the course including any detours or failures, how it was verified, the effort spent, and what's still open. All seven fields are required and enforced server-side, not just suggested by the UI. It's the discipline your future self wants but never keeps on its own.
-
-## Receipts
-
-A receipt is an ed25519-signed snapshot of a completed task: its doc plus its linked sessions, signed at the moment you ask for one. It proves that a given key signed this exact state at this time — it does not prove the work is good, and the agent name is self-declared, not a verified identity. The verify view shows valid/invalid; editing the doc after signing invalidates the receipt, because verification always re-checks against the task's current state, not a stored snapshot.
-
 ## Artifact preservation
 
 Claude Code writes scratchpad work products (scripts, data files, images) under `<OS temp dir>/claude/<projectSlug>/<sessionId>/scratchpad/`, alongside the transcript it also writes to `~/.claude/projects`. The transcript survives — that's kaprek's whole reason to exist — but the OS temp directory does not; it gets wiped routinely, and a scratchpad disappears with it while the transcript that references it lives on.
