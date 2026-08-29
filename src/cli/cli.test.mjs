@@ -117,7 +117,7 @@ test('starts a real server against an empty --dir and serves /api/projects', asy
   child.kill();
 });
 
-test('a second start on the same dataDir refuses instead of silently falling back to basePort+1', async () => {
+test('a second start on the same dataDir reports the running instance and exits 0 instead of silently falling back to basePort+1', async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-test-'));
   const port = 20000 + Math.floor(Math.random() * 20000);
 
@@ -126,11 +126,15 @@ test('a second start on the same dataDir refuses instead of silently falling bac
   const first = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
   const firstUrl = await waitForUrl(first);
 
+  // --no-open on the second call too: this only checks the message and exit
+  // code, not that a browser actually opened (see bin/cli.mjs's own
+  // best-effort openBrowser(), which logs rather than throws on failure).
   const second = runCli(['--no-open', '--port', String(port), '--dir', tmpDir]);
-  const { code, stderr } = await collectRun(second);
+  const { code, stdout } = await collectRun(second);
 
-  expect(code).not.toBe(0);
-  expect(stderr).toContain(firstUrl);
+  expect(code).toBe(0);
+  expect(stdout).toContain(firstUrl);
+  expect(stdout).toContain('already running');
 
   // The pre-lock behavior (startWithPortRetry silently trying basePort+1 on
   // EADDRINUSE) must not have kicked in: nothing should be listening there.

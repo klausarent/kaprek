@@ -13,6 +13,8 @@ import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir, getAppDir } from '../src/lib/appdir.mjs';
 import { runResumeCommand, RESUME_USAGE } from '../src/cli/resume.mjs';
+import { runStopCommand, STOP_USAGE } from '../src/cli/stop.mjs';
+import { readInstanceLock, defaultIsAlive } from '../src/server/ensure.mjs';
 import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir } from '../src/resume/scan.mjs';
 import { resumeSession as launchResumeSession } from '../src/resume/launch.mjs';
 import {
@@ -34,6 +36,7 @@ import { listEngines } from '../src/harness/registry.mjs';
 const PEER_TURN_TIMEOUT_MS = 9 * 60 * 1000;
 
 const USAGE = `Usage: kaprek [options]
+       kaprek stop
        kaprek update [--check]
        kaprek autostart <install|uninstall|status>
        kaprek hooks <install|uninstall|status>
@@ -49,6 +52,9 @@ Options:
                 code for answering approvals from a phone. Off by default;
                 the instance token stays required either way.
   -h, --help    Show this help message
+
+Stop:
+  stop           Stop the kaprek server running for this data directory, if any
 
 Update:
   update         Check npm for a newer kaprek and install it if there is one
@@ -295,6 +301,22 @@ async function main() {
     return;
   }
 
+  if (argv[0] === 'stop') {
+    if (argv[1] === '-h' || argv[1] === '--help') {
+      console.log(STOP_USAGE);
+      return;
+    }
+    const dataDir = ensureAppDir();
+    const lockPath = path.join(dataDir, 'instance.lock');
+    process.exitCode = await runStopCommand(argv.slice(1), {
+      readLock: () => readInstanceLock(dataDir),
+      kill: (pid, signal) => process.kill(pid, signal),
+      isAlive: (url) => defaultIsAlive(url),
+      unlink: () => fs.unlinkSync(lockPath),
+    });
+    return;
+  }
+
   if (argv[0] === 'resume') {
     if (argv[1] === '-h' || argv[1] === '--help') {
       console.log(RESUME_USAGE);
@@ -359,15 +381,22 @@ async function main() {
     lock = await acquireInstanceLock({ dataDir, port: undefined });
   } catch (err) {
     if (err instanceof InstanceLockHeldError) {
+      if (err.url) {
+        // Already running is not an error a person needs to act on — it is
+        // exactly what a second launch of an already-autostarted kaprek
+        // should do: get the page in front of them. The served page injects
+        // the instance token itself on a loopback request (see
+        // src/server/token.mjs), so the bare url is enough here too.
+        console.log(`kaprek is already running at ${err.url} (pid ${err.pid}) — opened it`);
+        if (opts.open) openBrowser(err.url);
+        process.exitCode = 0;
+        return;
+      }
       // err.url is null while the holder is between acquiring the lock and
       // calling updatePort() below — exactly the narrow double-click window
       // this whole module exists to close, so it needs its own honest
-      // message rather than printing "at null".
-      console.error(
-        err.url
-          ? `kaprek is already running at ${err.url} (pid ${err.pid})`
-          : `kaprek is already starting (pid ${err.pid}), no port yet`,
-      );
+      // message rather than printing "at null", and nothing to open yet.
+      console.error(`kaprek is already starting (pid ${err.pid}), no port yet`);
     } else {
       console.error(`Failed to acquire instance lock: ${err.message}`);
     }

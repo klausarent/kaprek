@@ -23,9 +23,16 @@ afterEach(() => {
   fs.rmSync(cwd, { recursive: true, force: true });
 });
 
-function runHook(stdinPayload) {
+function runHook(stdinPayload, envOverrides = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [HOOK_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, [DATA_DIR_ENV]: dataDir } });
+    // KAPREK_NO_AUTOSTART=1 always: without it a 'startup'/'resume' payload
+    // below would make the hook actually spawn a detached kaprek server (see
+    // src/server/ensure.mjs) — real processes have no place in this suite.
+    // The call is still exercised (see the 'startup'/'resume' tests below),
+    // just short-circuited before it can spawn anything; ensure.test.mjs
+    // covers the spawn-or-not decision itself with a fake spawn.
+    const env = { ...process.env, [DATA_DIR_ENV]: dataDir, KAPREK_NO_AUTOSTART: '1', ...envOverrides };
+    const child = spawn(process.execPath, [HOOK_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => {
@@ -70,4 +77,11 @@ test('no cwd: no ledger event is written either (nothing to scope it to)', async
   const { code } = await runHook(JSON.stringify({ session_id: 'ledger-2' }));
   expect(code).toBe(0);
   expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
+});
+
+test('source startup/resume both exercise the autostart call (opted out here) without throwing or hanging; compact/clear/fork/missing all run fine too', async () => {
+  for (const source of ['startup', 'resume', 'compact', 'clear', 'fork', undefined]) {
+    const { code } = await runHook(JSON.stringify({ session_id: `s-${source}`, transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source }));
+    expect(code).toBe(0);
+  }
 });

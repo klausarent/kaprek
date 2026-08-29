@@ -10,11 +10,21 @@
 // no output at all. Like hook-stop.mjs this script must NEVER exit non-zero
 // and must NEVER hang — a session start is not allowed to wait on kaprek —
 // so every path is wrapped, and a self-timeout forces a clean exit.
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { buildSessionStartContext } from './session-start.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
+import { ensureServerRunning } from '../server/ensure.mjs';
 
 const SELF_TIMEOUT_MS = 3000;
+// A fresh terminal opening (startup) or reattaching to one (resume) is a
+// person about to work — that is worth an autostart. compact/clear/fork
+// reopen a session that was already running kaprek or wasn't; they get no
+// say here, since a mid-session context reset is not "someone just sat
+// down".
+const AUTOSTART_SOURCES = new Set(['startup', 'resume']);
+const CLI_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'bin', 'cli.mjs');
 
 function readStdin() {
   return new Promise((resolve) => {
@@ -43,6 +53,18 @@ async function main() {
   try {
     if (typeof input?.session_id === 'string') appendSessionEvent(dataDir, { type: 'start', sessionId: input.session_id, cwd, transcriptPath: input?.transcript_path ?? null });
   } catch {
+  }
+
+  // Makes kaprek run without a `kaprek` command anyone has to remember — see
+  // src/server/ensure.mjs. Its own aliveness check is capped at 300 ms and it
+  // never awaits the spawned server coming up, so this cannot be the reason
+  // a session start is slow; the try/catch is only for the unexpected.
+  if (AUTOSTART_SOURCES.has(input?.source)) {
+    try {
+      await ensureServerRunning({ dataDir, cliPath: CLI_PATH });
+    } catch {
+      // best-effort: a session opening must never wait on kaprek starting
+    }
   }
 
   const context = buildSessionStartContext({ dataDir, cwd });
