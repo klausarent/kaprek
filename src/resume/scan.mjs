@@ -4,6 +4,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
+import { readLedgerIndex } from '../ledger/sessions.mjs';
 
 export const HOME = os.homedir();
 // The four engines' session stores, read at call time (never captured once
@@ -448,18 +449,83 @@ export function publicSession(s) {
     // markCrashGroups() stamps the group's timestamp onto `crashGroup`
     // (not a boolean) — a real value there means "part of a crash group".
     crash: Boolean(s.crashGroup),
+    // Set by attachLedgerInfo() below for claude sessions the ledger knows
+    // about; null for every other engine, and for a claude session the
+    // ledger has never heard from (a headless/cron run, or one that ran
+    // before the SessionStart hook was installed).
+    ledger: s.ledger ?? null,
   };
 }
 
-/** Every engine's sessions, newest first. An engine whose store is missing contributes nothing, not an error. */
-export async function scanAll({ force = false } = {}) {
+/**
+ * Attaches `{ open, lastType, endReason }` (see src/ledger/sessions.mjs::
+ * readLedgerIndex) to every `claude` session whose id the ledger has an
+ * entry for, matching on `s.id` — the same id scanClaude() derives from the
+ * transcript's filename, which is also the `sessionId` every kaprek hook
+ * writes to the ledger. Sessions of other engines, and claude sessions
+ * absent from the index, pass through unchanged. Works on either the raw
+ * per-engine session shape or the public one — both carry `.engine`/`.id`.
+ */
+export function attachLedgerInfo(sessions, ledgerIndex) {
+  if (!ledgerIndex) return sessions;
+  return sessions.map((s) => {
+    if (s.engine !== 'claude') return s;
+    const entry = ledgerIndex.get(s.id);
+    if (!entry) return s;
+    return { ...s, ledger: { open: entry.lastType !== 'end', lastType: entry.lastType, endReason: entry.endReason ?? null } };
+  });
+}
+
+/**
+ * Drops `claude` sessions the terminal-session ledger has never heard of —
+ * scanClaude() alone cannot tell an interactive session someone is
+ * mid-conversation with apart from a headless/cron run that shares the same
+ * `~/.claude/projects` store. Other engines are untouched, and `unfiltered`
+ * (`kaprek resume --unfiltered` / `?unfiltered=1`) turns this off entirely,
+ * exactly reproducing behavior from before this filter existed — including
+ * for a claude session whose ledger entry says it already ended; that
+ * distinction is `ledger.open`, handled by the caller, not by this filter.
+ */
+export function filterToLedgerSessions(sessions, ledgerIndex, { unfiltered = false } = {}) {
+  if (unfiltered || !ledgerIndex) return sessions;
+  return sessions.filter((s) => s.engine !== 'claude' || s.ledger != null);
+}
+
+/**
+ * Every engine's sessions, newest first. An engine whose store is missing
+ * contributes nothing, not an error.
+ *
+ * `dataDir`, if given, turns on the terminal-session ledger filter for the
+ * `claude` engine (see filterToLedgerSessions() above) and attaches
+ * `ledger: { open, lastType, endReason }` to every claude session the
+ * ledger knows about; omit it (existing callers, most tests) and this
+ * behaves exactly as it always did — nothing filtered, `ledger` always
+ * null. `unfiltered: true` keeps the `ledger` field but turns the filter
+ * off, same as `dataDir` being absent, for exactly the sessions a headless
+ * run would otherwise hide.
+ *
+ * Filtering happens BEFORE markCrashGroups() runs, not after: a headless
+ * probe closing near the same time as one real terminal session must not
+ * make that session look like part of a multi-session crash group once the
+ * probe itself is filtered out of the list.
+ */
+export async function scanAll({ force = false, dataDir, unfiltered = false } = {}) {
   const parts = await Promise.all([
     scanClaude({ force }).catch(() => []),
     scanCodex({ force }).catch(() => []),
     scanGrok().catch(() => []),
     scanKimi().catch(() => []),
   ]);
-  const all = parts.flat();
+  let all = parts.flat();
+  if (dataDir) {
+    let ledgerIndex = null;
+    try {
+      ledgerIndex = readLedgerIndex(dataDir);
+    } catch {
+      ledgerIndex = null;
+    }
+    all = filterToLedgerSessions(attachLedgerInfo(all, ledgerIndex), ledgerIndex, { unfiltered });
+  }
   markCrashGroups(all);
   const sessions = all.map(publicSession).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));
   return { sessions, scannedAt: new Date().toISOString() };

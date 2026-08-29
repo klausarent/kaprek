@@ -60,7 +60,7 @@ Autostart (start kaprek when you log in — off unless you ask):
   autostart status     Show whether it is there, and print its path
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
-  hooks install    Add the kaprek Stop + SessionStart hooks to ~/.claude/settings.json
+  hooks install    Add the kaprek Stop + SessionStart + SessionEnd hooks to ~/.claude/settings.json
   hooks uninstall  Remove only the kaprek hook entries
   hooks status     Show whether the hooks are installed and the active policy mode
 
@@ -74,11 +74,13 @@ const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
 
 Manages kaprek's Claude Code hooks: the Stop hook the policy engine uses to
 gently enforce workflow rules (e.g. requiring a linked board task for
-commits), and the SessionStart hook that tells a session opening in a
-mission directory about the mission, its open questions, the rules a person
-accepted, and what earlier sessions wrote down.
+commits), the SessionStart hook that tells a session opening in a mission
+directory about the mission, its open questions, the rules a person
+accepted, and what earlier sessions wrote down, and the SessionEnd hook
+that marks a session's ledger entry as ended so \`kaprek resume\` can tell
+it apart from one still open.
 
-  install    Adds both kaprek hooks to ~/.claude/settings.json
+  install    Adds all three kaprek hooks to ~/.claude/settings.json
              (backs up the existing file first; leaves other hooks intact)
   uninstall  Removes only the kaprek hook entries
   status     Shows whether the hooks are installed and the active policy mode
@@ -144,7 +146,7 @@ function runHooksCommand(args) {
   try {
     if (sub === 'install') {
       const result = installHook();
-      console.log(`Installed Stop + SessionStart hooks -> ${result.settingsPath}`);
+      console.log(`Installed Stop + SessionStart + SessionEnd hooks -> ${result.settingsPath}`);
       if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       if (result.alreadyInstalled) console.log(result.added?.length ? `(Stop hook was already installed; added: ${result.added.join(', ')})` : '(already installed, left unchanged)');
     } else if (sub === 'uninstall') {
@@ -157,7 +159,10 @@ function runHooksCommand(args) {
       }
     } else if (sub === 'status') {
       const result = hookStatus();
-      console.log(`Installed: ${result.installed ? 'yes' : 'no'} (Stop)${result.events?.SessionStart ? `, ${result.events.SessionStart.installed ? 'yes' : 'no'} (SessionStart)` : ''}`);
+      for (const event of ['Stop', 'SessionStart', 'SessionEnd']) {
+        const report = result.events?.[event];
+        console.log(`${event}: ${report?.installed ? 'installed' : 'not installed'}`);
+      }
       console.log(`Settings file: ${result.settingsPath}`);
       if (result.installed) {
         const staleNote = result.recordedPathMissing ? ' (WARNING: no file exists at this recorded path)' : '';
@@ -303,7 +308,7 @@ async function main() {
     const dataDir = ensureAppDir();
     setResumeCacheDir(path.join(dataDir, 'resume-cache'));
     process.exitCode = await runResumeCommand(argv.slice(1), {
-      scanAll: scanResumeSessions,
+      scanAll: (opts) => scanResumeSessions({ ...opts, dataDir }),
       resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
     });
     return;

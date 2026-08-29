@@ -472,12 +472,15 @@ kaprek sweeps every session's scratchpad into `<dataDir>/artifacts/<projectSlug>
 
 Windows Terminal dies, twenty sessions with it. kaprek reads the session stores of all four engines — `~/.claude/projects`, `~/.codex/sessions`, `~/.grok/sessions`, `~/.kimi-code/sessions` — and reopens them as terminal tabs, one `wt` tab per session, with the engine's own resume command (`claude --resume <id>`, `codex resume <id>`, and so on).
 
-- `kaprek resume` lists the sessions of the last 7 days (`--days N`), all engines, newest first. Sessions that ended within the same short window are marked as a crash group. Titles are shown through the same redaction as everywhere else.
-- `kaprek resume --all` reopens everything from the last 24 hours (`--hours N`), one tab after another with a short pause so Windows Terminal keeps up. Exit 0 when every tab opened, 1 when any failed.
+`~/.claude/projects` holds more than terminal sessions — every headless/cron run through kaprek's own engines lands there too, and looks like a session someone could resume even though nobody ever will. By default, `kaprek resume` only lists claude sessions that showed up in the terminal-session ledger (`<dataDir>/ledger/sessions.jsonl`, written by the SessionStart/SessionEnd hooks — see [SessionEnd](#sessionend-closing-the-ledger-entry) below); a headless run that never touched those hooks stays hidden. `--unfiltered` (`?unfiltered=1` on the route) turns that off and shows everything, exactly as before this filter existed. Other engines (codex, grok, kimi) have no ledger concept and are never filtered.
+
+- `kaprek resume` lists the sessions of the last 7 days (`--days N`), all engines, newest first. Each claude session the ledger knows about shows "open" or "ended (\<reason\>)"; sessions that ended within the same short window are marked as a crash group (computed only over the sessions actually shown — a filtered-out headless run cannot make a real terminal session look like part of a crash). Titles are shown through the same redaction as everywhere else.
+- `kaprek resume --all` reopens every **open** session from the last 24 hours (`--hours N`), one tab after another with a short pause so Windows Terminal keeps up. A claude session the ledger already marked ended is never opened this way, even inside the window. Exit 0 when every tab opened, 1 when any failed.
 - `kaprek resume <engine>:<id>` (a unique prefix is enough) reopens one session. Unknown or ambiguous → exit 2 with the candidates.
 - `--no-skip` starts Claude without `--dangerously-skip-permissions`.
+- `--unfiltered` also lists/resumes claude sessions the ledger has never heard of.
 
-The same list and buttons sit at the top of `#/list` (`GET /api/resume/sessions`, `POST /api/resume`, `POST /api/resume/batch`). Scan results are cached under `<dataDir>/resume-cache/`; a session is never opened by a test.
+The same list and buttons sit at the top of `#/list` (`GET /api/resume/sessions`, `POST /api/resume`, `POST /api/resume/batch`) — each row shows the same open/ended badge, and "Alle der letzten 24 h fortsetzen" only ever reopens open ones. Resuming a specific session by `engine:id` (the two `POST` routes) always works regardless of the ledger filter — it is the *list* that is filtered, not the ability to jump straight to a session you already know the id of. Scan results are cached under `<dataDir>/resume-cache/`; a session is never opened by a test.
 
 ## Claude Code hook (optional)
 
@@ -485,19 +488,23 @@ kaprek can install a Claude Code **Stop** hook that gently enforces the policy e
 
 Important: a Stop hook fires *after* the turn already ended — after any tool call in it, including a `git commit`, already ran. It cannot prevent a commit or require a task link "before" one happens; it can only look back at the transcript once the turn is over and react (log, warn, or refuse to end that particular Stop event) to what already occurred. Think of it as a nag, not a gate.
 
-- `kaprek hooks install` adds two entries to `~/.claude/settings.json` — the Stop hook and the SessionStart hook below (backs up the file first, leaves any other hooks untouched).
+- `kaprek hooks install` adds three entries to `~/.claude/settings.json` — the Stop hook, the SessionStart hook below, and the SessionEnd hook (backs up the file first, leaves any other hooks untouched).
 - `kaprek hooks uninstall` removes only those entries, at any time, identified by a stable `--managed-by` marker so a later reinstall never creates a duplicate.
-- `kaprek hooks status` shows whether each is installed and which policy mode is active.
+- `kaprek hooks status` shows whether each of the three is installed (one line per hook) and which policy mode is active.
 
 ### SessionStart: what kaprek knows about this directory
 
 The same install adds a **SessionStart** hook. When a Claude Code session opens in a directory that is a kaprek mission's working directory, the session starts with what kaprek knows about that work, as context it can see: the mission's title and goal, how many questions are waiting in the kaprek inbox for it (with the address to answer them), the rules a person accepted from failure-to-policy proposals, and what earlier sessions wrote down for that project — the same rules and memory kaprek's own turns get, so a terminal session is no longer the one place they do not reach. Outside a mission directory the hook adds only the accepted rules, if any; with nothing to say it says nothing. The whole block is capped at 1,500 characters, the hook reads kaprek's data and never writes it, fails open on every error, and exits on its own after three seconds — it must never slow a session down. Same shape as the Stop hook: one script, no daemon, uninstalled with the same command.
 
+### SessionEnd: closing the ledger entry
+
+The same install adds a **SessionEnd** hook. It does exactly one thing: appends an `end` event (with Claude Code's session-end reason) to the session ledger described below, so `kaprek resume` can tell an open session from one that already ended. It reads nothing, writes nothing back to Claude Code (there is no output shape for this event), never blocks, and exits within one second on its own — this hook shares Claude Code's 1.5 s SessionEnd budget with whatever else has hooked into it.
+
 ### Stop: what the hook writes
 
 Since the terminal is where the work happens, the Stop hook also makes the terminal count:
 
-- **Session ledger.** Every Stop and every SessionStart appends one line to `<dataDir>/ledger/sessions.jsonl`: type, session id, working directory, transcript path, timestamp. Nothing from the transcript itself.
+- **Session ledger.** Every Stop, SessionStart and SessionEnd appends one line to `<dataDir>/ledger/sessions.jsonl`: type (`start`/`stop`/`end`), session id, working directory, transcript path, timestamp, and — for `end` only — the session-end reason Claude Code reports (`clear`, `resume`, `logout`, `prompt_input_exit`, `other`). Nothing from the transcript itself. This is what tells `kaprek resume` a session apart from a headless/cron run that never touched a hook — see [Resume after a crash](#resume-after-a-crash-kaprek-resume) — and whether it ended (`lastType: "end"`) or is still open.
 - **Remember blocks.** When the assistant's turn contains a fenced ```kaprek-remember block (same protocol as kaprek's own turns), its lines become memory facts in the scope `project:<basename(cwd)>` (created under `person:local` if missing), origin `terminal:<sessionId>`. Nothing else is harvested — no auto-summaries, no transcript excerpts. The hook reads the transcript in bounded chunks from the tail, remembers where it stopped (`<dataDir>/memory/harvest/`), and never re-writes a fact it already wrote.
 - Budget: 1.5 s for the harvest, exit 0 always; anything unfinished waits for the next Stop.
 

@@ -9,25 +9,31 @@ const DAY_MS = 24 * HOUR_MS;
 const ALL_GAP_MS = 700; // wt needs a breath between tabs, or they land in new windows
 const DEFAULT_LIMIT = 40; // the list can run into the hundreds; showing all of them defeats the point of a list
 
-export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hours N] [--days N] [--limit N] [--no-skip]
+export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hours N] [--days N] [--limit N] [--no-skip] [--unfiltered]
 
   kaprek resume              list sessions of the last 7 days (claude, codex, grok, kimi)
   kaprek resume claude:<id>  open that session as a new Windows Terminal tab
                              (a unique prefix of <engine>:<id> also works)
-  kaprek resume --all        open every session active in the last 24 hours
+  kaprek resume --all        open every OPEN session active in the last 24 hours
+                             (a claude session the ledger already marked "end" is
+                             never opened by --all, even inside the window)
   --hours N                  window for --all (default 24)
   --days N                   window for the list (default 7)
   --limit N                  show at most N sessions in the list, newest first
                               (default 40; 0 shows all of them)
   --no-skip                  do not pass the permission-skipping flags to the CLIs
+  --unfiltered               also list/resume claude sessions that never showed up
+                             in the terminal-session ledger (headless/cron runs) —
+                             hidden by default; see \`kaprek hooks status\`
 `;
 
 function parse(argv) {
-  const opts = { key: null, all: false, hours: 24, days: 7, limit: DEFAULT_LIMIT, skip: true };
+  const opts = { key: null, all: false, hours: 24, days: 7, limit: DEFAULT_LIMIT, skip: true, unfiltered: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--all') opts.all = true;
     else if (a === '--no-skip') opts.skip = false;
+    else if (a === '--unfiltered') opts.unfiltered = true;
     else if (a === '--hours') {
       const n = Number(argv[++i]);
       opts.hours = Math.max(1, Number.isFinite(n) ? n : 24);
@@ -56,6 +62,12 @@ function ago(iso, nowMs) {
   return `${Math.round(min / (24 * 60))} d`;
 }
 
+/** "open" / "ended (<reason>)" for a claude session the ledger knows; '' for everything else (other engines, or --unfiltered's whole point: a claude session it knows nothing about). */
+function ledgerStatus(s) {
+  if (!s.ledger) return '';
+  return s.ledger.open ? 'open' : `ended (${s.ledger.endReason ?? '?'})`;
+}
+
 /**
  * Finds the session `key` names — an exact `engine:id` match first, then (so
  * a long UUID never has to be typed in full) a unique prefix of the key. More
@@ -79,7 +91,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
     stderr(RESUME_USAGE);
     return err.exitCode ?? 1;
   }
-  const { sessions } = await scanAll();
+  const { sessions } = await scanAll({ unfiltered: opts.unfiltered });
   const nowMs = now();
 
   if (opts.key) {
@@ -103,8 +115,12 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   }
 
   if (opts.all) {
+    // A claude session the ledger already marked "end" is never opened here,
+    // even inside the window — beendete Sessions nie automatisch. Other
+    // engines, and a claude session with no ledger info at all (unfiltered
+    // mode's whole point), carry no `ledger` and stay eligible.
     const picked = sessions
-      .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS)
+      .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS && (!s.ledger || s.ledger.open))
       .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
     let failed = 0;
     for (let i = 0; i < picked.length; i++) {
@@ -132,7 +148,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   const shown = listed.slice(0, cap);
   for (const s of shown) {
     const flag = s.crash ? ' [crash]' : '';
-    stdout(`${s.key.padEnd(48)} ${ago(s.lastTs, nowMs).padStart(6)}  ${path.basename(s.cwd || '') || '-'}  ${redactSecrets(s.title)}${flag}`);
+    stdout(`${s.key.padEnd(48)} ${ago(s.lastTs, nowMs).padStart(6)}  ${ledgerStatus(s).padEnd(18)}${path.basename(s.cwd || '') || '-'}  ${redactSecrets(s.title)}${flag}`);
   }
   if (shown.length < listed.length) {
     stdout(`… and ${listed.length - shown.length} more (--limit 0 for all of them, or narrow --days)`);

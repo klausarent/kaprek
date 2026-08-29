@@ -2490,15 +2490,29 @@ pre,
   min-width: 0;
 }
 
+.resume-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
 .resume-title {
   font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 1;
 }
 
 .resume-row-crash .resume-title::before {
   content: "⚠ ";
+}
+
+.resume-badge-ended {
+  color: var(--danger-text);
+  flex-shrink: 0;
 }
 
 .resume-meta {

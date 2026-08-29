@@ -9,8 +9,12 @@ const MAX_BATCH = 30;
 const BATCH_GAP_MS = 700; // wt needs a breath between tabs, or they land in new windows
 
 export function createResumeHandler({ scanAll, resumeSession, readJsonBody, sendJson, now = Date.now, sleep = (ms) => new Promise((r) => setTimeout(r, ms)) }) {
+  // Resuming a specific, already-known engine:id must always work — including
+  // one surfaced through an unfiltered GET /api/resume/sessions — so both
+  // findSession() and the batch loop below always scan unfiltered themselves,
+  // independent of whichever listing produced the id being resumed.
   async function findSession(engine, id) {
-    const { sessions } = await scanAll();
+    const { sessions } = await scanAll({ unfiltered: true });
     return sessions.find((s) => s.engine === engine && s.id === id) ?? null;
   }
 
@@ -19,7 +23,7 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
   }
 
   return async function handleResumeRoutes(req, res, segments, url) {
-    // GET /api/resume/sessions?days=7&all=0
+    // GET /api/resume/sessions?days=7&all=0&unfiltered=0
     if (segments.length === 3 && segments[2] === 'sessions') {
       if (req.method !== 'GET') {
         sendJson(res, 405, { error: 'method not allowed' });
@@ -29,8 +33,12 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
       const parsedDays = rawDays === null ? NaN : Number(rawDays);
       const days = Math.min(Math.max(Number.isNaN(parsedDays) ? 7 : parsedDays, 1), 90);
       const includeHidden = url.searchParams.get('all') === '1';
+      // Off by default: a claude session the terminal-session ledger has
+      // never heard of (headless/cron run) is hidden here, same as
+      // `kaprek resume` without --unfiltered — see src/resume/scan.mjs.
+      const unfiltered = url.searchParams.get('unfiltered') === '1';
       const since = now() - days * DAY_MS;
-      const { sessions, scannedAt } = await scanAll({ force: url.searchParams.get('force') === '1' });
+      const { sessions, scannedAt } = await scanAll({ force: url.searchParams.get('force') === '1', unfiltered });
       const picked = sessions.filter((s) => Date.parse(s.lastTs) >= since && (includeHidden || !s.hidden));
       sendJson(res, 200, { sessions: publicList(picked), scannedAt });
       return;
@@ -74,7 +82,7 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
         return;
       }
       const items = Array.isArray(body.data?.items) ? body.data.items.slice(0, MAX_BATCH) : [];
-      const { sessions } = await scanAll();
+      const { sessions } = await scanAll({ unfiltered: true });
       const results = [];
       for (const item of items) {
         const session = sessions.find((s) => s.engine === item?.engine && s.id === item?.id);

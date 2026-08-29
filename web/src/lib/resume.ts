@@ -4,6 +4,13 @@
 // active in the last N hours after a crash.
 import { apiFetch, APP_HEADERS } from "./api";
 
+// Set for a `claude` session the terminal-session ledger knows about (see
+// src/ledger/sessions.mjs::readLedgerIndex / src/resume/scan.mjs); null for
+// every other engine, and for a claude session the ledger has never heard
+// from — a headless/cron run, or one from before the SessionEnd hook was
+// installed. `open` is `lastType !== "end"`.
+export type SessionLedgerInfo = { open: boolean; lastType: string; endReason: string | null };
+
 export type ResumeSession = {
   key: string;
   engine: "claude" | "codex" | "grok" | "kimi";
@@ -15,6 +22,7 @@ export type ResumeSession = {
   userMsgs: number;
   hidden: boolean;
   crash: boolean;
+  ledger: SessionLedgerInfo | null;
 };
 
 // `ok` is optional: the server's 404 branch (unknown engine:id) answers with
@@ -52,6 +60,18 @@ export async function resumeMany(items: { engine: string; id: string }[]): Promi
 export function recentSessions(sessions: ResumeSession[], hours: number, nowMs = Date.now()): ResumeSession[] {
   const since = nowMs - hours * 60 * 60 * 1000;
   return sessions.filter((s) => Date.parse(s.lastTs) >= since);
+}
+
+/**
+ * `recentSessions()` narrowed to ones "Alle N h fortsetzen" is actually
+ * allowed to reopen: a claude session the ledger already marked ended never
+ * gets swept up in a batch reopen, even if its last activity falls inside
+ * the window. Other engines, and a claude session the ledger has no entry
+ * for at all, carry no `ledger` and stay eligible — same as the CLI's
+ * `kaprek resume --all` (see src/cli/resume.mjs).
+ */
+export function resumableSessions(sessions: ResumeSession[], hours: number, nowMs = Date.now()): ResumeSession[] {
+  return recentSessions(sessions, hours, nowMs).filter((s) => !s.ledger || s.ledger.open);
 }
 
 /**

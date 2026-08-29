@@ -185,4 +185,46 @@ describe('kaprek resume', () => {
     expect(rows.length).toBe(3);
     expect(d.lines.join('\n')).toMatch(/and 7 more/);
   });
+
+  it('forwards --unfiltered to scanAll, and defaults it to false', async () => {
+    const d = deps();
+    const calls = [];
+    d.deps.scanAll = async (opts) => {
+      calls.push(opts);
+      return { sessions, scannedAt: 'x' };
+    };
+    await runResumeCommand([], d.deps);
+    expect(calls).toEqual([{ unfiltered: false }]);
+    await runResumeCommand(['--unfiltered'], d.deps);
+    expect(calls).toEqual([{ unfiltered: false }, { unfiltered: true }]);
+  });
+
+  it('the list shows "open"/"ended (reason)" for a claude session the ledger knows, and nothing for one it does not', async () => {
+    const withLedger = [
+      { key: 'claude:open1', engine: 'claude', id: 'open1', cwd: 'C:\\p', title: 'Offen', lastTs: '2026-08-28T06:30:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: true, lastType: 'stop', endReason: null } },
+      { key: 'claude:ended1', engine: 'claude', id: 'ended1', cwd: 'C:\\p', title: 'Zu Ende', lastTs: '2026-08-28T06:20:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: false, lastType: 'end', endReason: 'clear' } },
+      { key: 'codex:c', engine: 'codex', id: 'c', cwd: 'C:\\p', title: 'Codex', lastTs: '2026-08-28T06:10:00.000Z', userMsgs: 1, hidden: false, crash: false },
+    ];
+    const d = deps();
+    d.deps.scanAll = async () => ({ sessions: withLedger, scannedAt: 'x' });
+    const code = await runResumeCommand([], d.deps);
+    expect(code).toBe(0);
+    const text = d.lines.join('\n');
+    expect(text).toMatch(/claude:open1\s+\d+\s+min\s+open\s/);
+    expect(text).toMatch(/claude:ended1\s+\d+\s+min\s+ended \(clear\)\s/);
+    expect(text).toMatch(/codex:c(?!.*open)(?!.*ended)/);
+  });
+
+  it('--all skips a claude session the ledger already marked ended, even inside the window, but still opens one with no ledger info', async () => {
+    const withLedger = [
+      { key: 'claude:open1', engine: 'claude', id: 'open1', cwd: 'C:\\p', title: 'Offen', lastTs: '2026-08-28T06:50:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: true, lastType: 'stop', endReason: null } },
+      { key: 'claude:ended1', engine: 'claude', id: 'ended1', cwd: 'C:\\p', title: 'Zu Ende', lastTs: '2026-08-28T06:55:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: false, lastType: 'end', endReason: 'clear' } },
+      { key: 'codex:c', engine: 'codex', id: 'c', cwd: 'C:\\p', title: 'Codex', lastTs: '2026-08-28T06:59:00.000Z', userMsgs: 1, hidden: false, crash: false },
+    ];
+    const d = deps();
+    d.deps.scanAll = async () => ({ sessions: withLedger, scannedAt: 'x' });
+    const code = await runResumeCommand(['--all'], d.deps);
+    expect(code).toBe(0);
+    expect(d.launched.map(([k]) => k).sort()).toEqual(['claude:open1', 'codex:c']);
+  });
 });
