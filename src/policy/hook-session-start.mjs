@@ -16,6 +16,10 @@ import { buildSessionStartContext } from './session-start.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
 import { ensureServerRunning } from '../server/ensure.mjs';
+import { syncMemoryDir } from '../memory/sync.mjs';
+
+/** Sources where the session actually starts fresh context for a person to read — not a compaction or a fork mid-conversation, where re-syncing buys nothing. */
+const SYNC_SOURCES = ['startup', 'resume', 'clear'];
 
 const SELF_TIMEOUT_MS = 3000;
 // A fresh terminal opening (startup) or reattaching to one (resume) is a
@@ -64,6 +68,15 @@ async function main() {
       await ensureServerRunning({ dataDir, cliPath: CLI_PATH });
     } catch {
       // best-effort: a session opening must never wait on kaprek starting
+    }
+  }
+
+  // Before building the context, not after: a fact synced this run should
+  // already be there for this same session's own memory block.
+  if (SYNC_SOURCES.includes(input?.source)) {
+    try {
+      syncMemoryDir({ dataDir, deadlineMs: 700 });
+    } catch {
     }
   }
 

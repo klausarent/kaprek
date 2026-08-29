@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openMissions } from '../missions/store.mjs';
+import { openMemory } from '../memory/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_PATH = path.join(__dirname, 'hook-session-start.mjs');
@@ -12,15 +13,18 @@ const DATA_DIR_ENV = 'KAPREK_DATA_DIR';
 
 let dataDir;
 let cwd;
+let memoryDir;
 
 beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-'));
   cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-cwd-'));
+  memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-mem-'));
 });
 
 afterEach(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.rmSync(cwd, { recursive: true, force: true });
+  fs.rmSync(memoryDir, { recursive: true, force: true });
 });
 
 function runHook(stdinPayload, envOverrides = {}) {
@@ -84,4 +88,34 @@ test('source startup/resume both exercise the autostart call (opted out here) wi
     const { code } = await runHook(JSON.stringify({ session_id: `s-${source}`, transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source }));
     expect(code).toBe(0);
   }
+});
+
+function writeMemoryFile(name, description) {
+  fs.writeFileSync(
+    path.join(memoryDir, name),
+    `---\nname: ${name.replace(/\.md$/, '')}\ndescription: ${description}\nmetadata: \n  type: feedback\n---\n\nbody\n`,
+    'utf8',
+  );
+}
+
+test('source=startup runs the memory sync before building context — a memory file becomes a fact', async () => {
+  openMemory(dataDir).addScope({ id: 'person:local' });
+  writeMemoryFile('feedback_hooked.md', 'Learned through the SessionStart hook');
+
+  const { code } = await runHook(JSON.stringify({ session_id: 's-sync', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }), {
+    KAPREK_MEMORY_DIR: memoryDir,
+  });
+  expect(code).toBe(0);
+  expect(fs.existsSync(path.join(dataDir, 'memory', 'sync-state.json'))).toBe(true);
+  const facts = openMemory(dataDir).list({ scopeId: 'person:local' });
+  expect(facts.some((fact) => fact.text === 'Learned through the SessionStart hook')).toBe(true);
+});
+
+test('source=compact does not run the memory sync', async () => {
+  writeMemoryFile('feedback_skipped.md', 'Must not be synced on compact');
+  const { code } = await runHook(JSON.stringify({ session_id: 's-compact', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'compact' }), {
+    KAPREK_MEMORY_DIR: memoryDir,
+  });
+  expect(code).toBe(0);
+  expect(fs.existsSync(path.join(dataDir, 'memory', 'sync-state.json'))).toBe(false);
 });

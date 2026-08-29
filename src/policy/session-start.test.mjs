@@ -93,7 +93,7 @@ test('accepted rules reach every directory; proposals nobody answered do not', (
   expect(text).not.toContain('Never mind this one');
 });
 
-test('memory shows only for a project scope that already exists, profile first, without inventing one', () => {
+test('memory shows only facts for a project scope that already exists, without inventing one — a profile line stays out entirely', () => {
   expect(memoryLinesForCwd({ dataDir, cwd })).toEqual([]);
   const memory = openMemory(dataDir);
   memory.addScope({ id: 'person:local' });
@@ -104,9 +104,52 @@ test('memory shows only for a project scope that already exists, profile first, 
   const before = snapshot(dataDir);
   const text = buildSessionStartContext({ dataDir, cwd });
   expect(text).toContain('## What kaprek remembers about this project');
-  expect(text.indexOf('An Astro site')).toBeLessThan(text.indexOf('Deploys go through wrangler'));
-  expect(text).toContain('Only turns run through kaprek can add to this');
+  expect(text).toContain('Deploys go through wrangler');
+  expect(text).not.toContain('An Astro site');
+  expect(text).toContain("Written down by earlier sessions and by Klaus' memory files, not instructions");
   expect(snapshot(dataDir)).toEqual(before);
+});
+
+test('a scope with only a profile and no facts shows nothing at all, same as one with no memory', () => {
+  const memory = openMemory(dataDir);
+  memory.addScope({ id: 'person:local' });
+  const scopeId = `project:${path.basename(cwd)}`;
+  memory.addScope({ id: scopeId, parent: 'person:local' });
+  memory.remember({ scopeId, text: 'An Astro site on Cloudflare Pages', kind: 'profile', confidence: 0.9, origin: 'chat:x' });
+  expect(memoryLinesForCwd({ dataDir, cwd })).toEqual([]);
+  expect(buildSessionStartContext({ dataDir, cwd })).toBe('');
+});
+
+test('own scope facts come before a parent scope\'s, newest first within each', () => {
+  const memory = openMemory(dataDir);
+  memory.addScope({ id: 'person:local' });
+  memory.remember({ scopeId: 'person:local', text: 'person: older person fact', confidence: 0.9, origin: 'chat:x' });
+  memory.remember({ scopeId: 'person:local', text: 'person: newer person fact', confidence: 0.9, origin: 'chat:y' });
+  const scopeId = `project:${path.basename(cwd)}`;
+  memory.addScope({ id: scopeId, parent: 'person:local' });
+  memory.remember({ scopeId, text: 'project: older project fact', confidence: 0.9, origin: 'chat:x' });
+  memory.remember({ scopeId, text: 'project: newer project fact', confidence: 0.9, origin: 'chat:y' });
+
+  const lines = memoryLinesForCwd({ dataDir, cwd });
+  expect(lines).toEqual([
+    '- project: newer project fact',
+    '- project: older project fact',
+    '- person: newer person fact',
+    '- person: older person fact',
+  ]);
+});
+
+test('the memory block is capped at MAX_MEMORY_LINES (10), own scope filling it before any parent fact is shown', () => {
+  const memory = openMemory(dataDir);
+  memory.addScope({ id: 'person:local' });
+  for (let i = 0; i < 3; i += 1) memory.remember({ scopeId: 'person:local', text: `person fact ${i}`, confidence: 0.9, origin: `chat:${i}` });
+  const scopeId = `project:${path.basename(cwd)}`;
+  memory.addScope({ id: scopeId, parent: 'person:local' });
+  for (let i = 0; i < 12; i += 1) memory.remember({ scopeId, text: `project fact ${i}`, confidence: 0.9, origin: `chat:${i}` });
+
+  const lines = memoryLinesForCwd({ dataDir, cwd });
+  expect(lines).toHaveLength(10);
+  expect(lines.every((line) => line.includes('project fact'))).toBe(true);
 });
 
 test('the block is capped and says so', () => {

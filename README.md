@@ -506,6 +506,10 @@ The same install adds a **SessionStart** hook. When a Claude Code session opens 
 
 The same install adds a **SessionEnd** hook. It does exactly one thing: appends an `end` event (with Claude Code's session-end reason) to the session ledger described below, so `kaprek resume` can tell an open session from one that already ended. It reads nothing, writes nothing back to Claude Code (there is no output shape for this event), never blocks, and exits within one second on its own — this hook shares Claude Code's 1.5 s SessionEnd budget with whatever else has hooked into it.
 
+### Memory follows your memory files
+
+On startup, resume and clear, the SessionStart hook also reads your own Claude Code memory files (`~/.claude/projects/<slug>/memory/*.md`, override with `KAPREK_MEMORY_DIR`) and remembers each file's `description` as a fact in its project scope, so a fresh kaprek starts already knowing what you have written down elsewhere. It only reads files that changed since the last sync, skips anything that looks like a bare secret, and gives up after 700 ms — a directory of hundreds of files catches up over a few session starts, not all at once.
+
 ### Stop: what the hook writes
 
 Since the terminal is where the work happens, the Stop hook also makes the terminal count:
