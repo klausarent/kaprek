@@ -5,7 +5,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { install, uninstall, status, HOOK_SCRIPT_PATH, SESSION_START_SCRIPT_PATH } from './hooks.mjs';
+import { install, uninstall, status, HOOK_SCRIPT_PATH, SESSION_START_SCRIPT_PATH, SESSION_END_SCRIPT_PATH } from './hooks.mjs';
 
 let tmpDir;
 let settingsPath;
@@ -245,7 +245,7 @@ test('an install from before the SessionStart hook existed gains it, and says wh
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }] } }), 'utf8');
   const result = install({ settingsPath, packageName: 'kaprek' });
   expect(result.alreadyInstalled).toBe(true);
-  expect(result.added).toEqual(['SessionStart']);
+  expect(result.added).toEqual(['SessionStart', 'SessionEnd']);
   const settings = readJson(settingsPath);
   expect(settings.hooks.Stop).toHaveLength(1);
   expect(settings.hooks.SessionStart).toHaveLength(1);
@@ -254,9 +254,9 @@ test('an install from before the SessionStart hook existed gains it, and says wh
   expect(again.alreadyInstalled).toBe(true);
   expect(again.added).toEqual([]);
   expect(readJson(settingsPath).hooks.SessionStart).toHaveLength(1);
-  // A fresh install adds both.
+  // A fresh install adds all three.
   fs.rmSync(settingsPath);
-  expect(install({ settingsPath, packageName: 'kaprek' }).added).toEqual(['Stop', 'SessionStart']);
+  expect(install({ settingsPath, packageName: 'kaprek' }).added).toEqual(['Stop', 'SessionStart', 'SessionEnd']);
 });
 
 test('uninstall removes both entries and leaves a foreign SessionStart hook alone', () => {
@@ -279,4 +279,52 @@ test('status reports each event, and a Stop-only install shows SessionStart as m
   install({ settingsPath, packageName: 'kaprek' });
   const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
   expect(after.events.SessionStart).toMatchObject({ installed: true, recordedPath: SESSION_START_SCRIPT_PATH, recordedPathMissing: false });
+});
+
+// -------------------------------------------------------------- SessionEnd
+
+test('install adds the SessionEnd hook alongside Stop and SessionStart, all under one marker', () => {
+  install({ settingsPath });
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.SessionEnd).toHaveLength(1);
+  expect(settings.hooks.SessionEnd[0].hooks[0].command).toContain(SESSION_END_SCRIPT_PATH);
+  expect(settings.hooks.SessionEnd[0].hooks[0].command).toContain('--managed-by=');
+});
+
+test('an install from before the SessionEnd hook existed gains it, keeping Stop and SessionStart untouched', () => {
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }],
+        SessionStart: [{ hooks: [{ type: 'command', command: `node "${SESSION_START_SCRIPT_PATH}" --managed-by=kaprek` }] }],
+      },
+    }),
+    'utf8',
+  );
+  const result = install({ settingsPath, packageName: 'kaprek' });
+  expect(result.alreadyInstalled).toBe(true);
+  expect(result.added).toEqual(['SessionEnd']);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.Stop).toHaveLength(1);
+  expect(settings.hooks.SessionStart).toHaveLength(1);
+  expect(settings.hooks.SessionEnd).toHaveLength(1);
+});
+
+test('uninstall removes the SessionEnd entry and leaves a foreign SessionEnd hook alone', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { SessionEnd: [{ hooks: [{ type: 'command', command: 'echo theirs' }] }] } }), 'utf8');
+  install({ settingsPath, packageName: 'kaprek' });
+  expect(readJson(settingsPath).hooks.SessionEnd).toHaveLength(2);
+  const result = uninstall({ settingsPath, packageName: 'kaprek' });
+  expect(result.uninstalled).toBe(true);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.SessionEnd).toEqual([{ hooks: [{ type: 'command', command: 'echo theirs' }] }]);
+});
+
+test('status reports SessionEnd as missing before install and installed after', () => {
+  const before = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(before.events.SessionEnd.installed).toBe(false);
+  install({ settingsPath, packageName: 'kaprek' });
+  const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(after.events.SessionEnd).toMatchObject({ installed: true, recordedPath: SESSION_END_SCRIPT_PATH, recordedPathMissing: false });
 });

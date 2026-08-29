@@ -3,7 +3,7 @@
 // the element-tree walker every other component test here uses.
 import { describe, it, expect, vi } from "vitest";
 import { ResumePanel } from "./ResumePanel";
-import { recentSessions, type ResumeSession } from "../lib/resume";
+import { recentSessions, resumableSessions, type ResumeSession } from "../lib/resume";
 import { click, findByType, render, textOf } from "../test/tree";
 
 const s = (over: Partial<ResumeSession>): ResumeSession => ({
@@ -17,6 +17,7 @@ const s = (over: Partial<ResumeSession>): ResumeSession => ({
   userMsgs: 2,
   hidden: false,
   crash: false,
+  ledger: null,
   ...over,
 });
 
@@ -73,6 +74,41 @@ describe("ResumePanel", () => {
       <ResumePanel sessions={[old, recent]} onResume={() => {}} onResumeAll={() => {}} busy={false} statusText="" />,
     );
     expect(findByType(mixedTree, "button")[0].props.disabled).toBe(false);
+  });
+
+  it("shows an open/ended badge for a claude session the ledger knows, and none for one it doesn't", () => {
+    const tree = render(
+      <ResumePanel
+        sessions={[
+          s({ key: "claude:open1", id: "open1", ledger: { open: true, lastType: "stop", endReason: null } }),
+          s({ key: "claude:ended1", id: "ended1", ledger: { open: false, lastType: "end", endReason: "clear" } }),
+          s({ key: "codex:b", engine: "codex", id: "b" }),
+        ]}
+        onResume={() => {}}
+        onResumeAll={() => {}}
+        busy={false}
+        statusText=""
+      />,
+    );
+    const text = textOf(tree);
+    expect(text).toContain("open");
+    expect(text).toMatch(/ended \(clear\)/);
+  });
+
+  it("resumableSessions excludes a claude session the ledger already marked ended, even within the window", () => {
+    const now = Date.parse("2026-08-28T08:00:00.000Z");
+    const list = [
+      s({ key: "claude:open1", id: "open1", ledger: { open: true, lastType: "stop", endReason: null } }),
+      s({ key: "claude:ended1", id: "ended1", ledger: { open: false, lastType: "end", endReason: "clear" } }),
+      s({ key: "codex:b", engine: "codex", id: "b" }),
+    ];
+    expect(resumableSessions(list, 24, now).map((x) => x.id).sort()).toEqual(["b", "open1"]);
+  });
+
+  it('disables "resume all" when every claude session in the window already ended, even though recentSessions() would find them', () => {
+    const ended = s({ ledger: { open: false, lastType: "end", endReason: "clear" } });
+    const tree = render(<ResumePanel sessions={[ended]} onResume={() => {}} onResumeAll={() => {}} busy={false} statusText="" />);
+    expect(findByType(tree, "button")[0].props.disabled).toBe(true);
   });
 
   it("marks a status starting with 'Fehler:' as an error, leaves a success status muted", () => {

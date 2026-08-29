@@ -5,7 +5,7 @@ import { useEffect, useMemo, useState } from "react";
 import { fetchProjects, fetchSessions, type ProjectSummary, type SessionMeta } from "../lib/api";
 import { navigateToProjects, navigateToSessions, navigateToThread } from "../App";
 import { ResumePanel } from "../components/ResumePanel";
-import { fetchResumeSessions, recentSessions, resumeErrorText, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
+import { fetchResumeSessions, resumableSessions, resumeErrorText, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -138,7 +138,7 @@ function ProjectGrid() {
     setResumeBusy(true);
     setResumeStatus("");
     try {
-      const items = recentSessions(resumeList, 24).map((s) => ({ engine: s.engine, id: s.id }));
+      const items = resumableSessions(resumeList, 24).map((s) => ({ engine: s.engine, id: s.id }));
       const r = await resumeMany(items);
       setResumeStatus(`${r.results.filter((x) => x.ok).length}/${r.results.length} Tabs geöffnet`);
     } catch (err) {

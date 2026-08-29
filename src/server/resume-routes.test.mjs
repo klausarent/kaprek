@@ -89,6 +89,40 @@ describe('resume routes', () => {
     expect(launched).toEqual(['claude:a']);
   });
 
+  it('GET sessions forwards ?unfiltered=1 to scanAll, defaulting to false', async () => {
+    const calls = [];
+    const { h } = handler({
+      scanAll: async (opts) => {
+        calls.push(opts);
+        return { sessions, scannedAt: 'x' };
+      },
+    });
+    let r = fakeRes();
+    await h({ method: 'GET' }, r.res, ['api', 'resume', 'sessions'], new URL('http://x/api/resume/sessions?days=7'));
+    r = fakeRes();
+    await h({ method: 'GET' }, r.res, ['api', 'resume', 'sessions'], new URL('http://x/api/resume/sessions?days=7&unfiltered=1'));
+    expect(calls).toEqual([
+      { force: false, unfiltered: false },
+      { force: false, unfiltered: true },
+    ]);
+  });
+
+  it('POST resume and POST batch scan unfiltered themselves, independent of the GET query', async () => {
+    const calls = [];
+    const { h, launched } = handler({
+      scanAll: async (opts) => {
+        calls.push(opts);
+        return { sessions, scannedAt: 'x' };
+      },
+    });
+    let r = fakeRes();
+    await h({ method: 'POST', body: { engine: 'claude', id: 'a' } }, r.res, ['api', 'resume'], new URL('http://x/api/resume'));
+    r = fakeRes();
+    await h({ method: 'POST', body: { items: [{ engine: 'claude', id: 'a' }] } }, r.res, ['api', 'resume', 'batch'], new URL('http://x/api/resume/batch'));
+    expect(calls.every((c) => c.unfiltered === true)).toBe(true);
+    expect(launched).toEqual(['claude:a', 'claude:a']);
+  });
+
   it('answers 405 for wrong methods', async () => {
     const { h } = handler();
     const { out, res } = fakeRes();

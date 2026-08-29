@@ -3568,7 +3568,7 @@ export function startServer({
   setResumeStoreRoots({ home: resumeHome, claudeProjects: rootDir });
   setResumeCacheDir(path.join(dataDir, 'resume-cache'));
   const handleResumeRoutes = createResumeHandler({
-    scanAll: scanResumeSessions,
+    scanAll: (opts) => scanResumeSessions({ ...opts, dataDir }),
     resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
     readJsonBody,
     sendJson,
