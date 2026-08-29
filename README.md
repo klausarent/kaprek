@@ -23,6 +23,17 @@ No install and no config for kaprek itself, and it has no account of its own. Ct
 
 Viewing transcripts needs nothing else. Chat and triggers need the `claude` CLI installed and signed in — kaprek runs your CLI and never asks for an API key.
 
+## How you work with it: zero steps
+
+With the hooks installed (`kaprek hooks install`, once), the daily loop needs no kaprek command at all. You work in your terminal as before; kaprek runs underneath:
+
+- Your first Claude Code session of the day **starts the server itself** — no command, no browser tab ([Starting and stopping](#starting-and-stopping)).
+- Every session start **injects what kaprek knows** about that directory — mission, project memory — and **syncs your memory files** into the store ([SessionStart](#sessionstart-what-kaprek-knows-about-this-directory)).
+- Every session end **updates the ledger** and **harvests remember blocks** ([Stop](#stop-what-the-hook-writes), [SessionEnd](#sessionend-closing-the-ledger-entry)).
+- A big change that ends without a peer review **gets one automatic council nudge** ([Council as a gate](#council-as-a-gate)).
+
+The only two commands worth remembering are for the exceptional moments: `kaprek resume` after a terminal crash, and `kaprek council "<question>" --diff` for a second opinion on demand. The browser at `http://127.0.0.1:4900` is for looking things up, not for operating anything.
+
 ## Updating
 
 ```
