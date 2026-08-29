@@ -54,8 +54,12 @@ export const MAX_REQUESTED_PATHS = 64;
 const REFUSED_NAMES = new Set(['.env', '.netrc', '.npmrc', '.git-credentials', '.htpasswd', '.pgpass', 'credentials', 'credentials.json', 'secrets.json', 'secrets.yaml', 'secrets.yml']);
 /** A `.env.production` is still a .env; an `id_rsa.pub` is still key material. */
 const REFUSED_PREFIXES = ['.env.', 'id_rsa', 'id_ed25519', 'id_ecdsa', 'id_dsa', 'service-account'];
-/** Extensions whose files exist to hold key or credential material. */
-const REFUSED_EXTENSIONS = ['.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.tfstate', '.kdbx'];
+// `.env` itself is a suffix check (not just REFUSED_NAMES' exact ".env"):
+// a file named "produktion.env" or "Überschrift.env" is exactly as much a
+// dotenv file as ".env" is, and over-blocking is the safe direction here —
+// someone who genuinely wants to share such a file can rename it.
+/** Extensions whose files exist to hold key, credential, or secret material. */
+const REFUSED_EXTENSIONS = ['.pem', '.key', '.p12', '.pfx', '.jks', '.keystore', '.tfstate', '.kdbx', '.env'];
 
 /**
  * Why `filePath` must not be embedded in a peer package, or null if it may.

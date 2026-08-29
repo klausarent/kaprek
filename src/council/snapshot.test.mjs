@@ -37,6 +37,13 @@ describe('refusalReason', () => {
     // "envelope.mjs" starts with env but is not a .env
     expect(refusalReason('src/envelope.mjs')).toBeNull();
   });
+
+  test.each(['produktion.env', 'Überschrift.env', 'app.ENV'])(
+    '%s is refused too — any basename ending in .env, not just the exact dotfile',
+    (name) => {
+      expect(refusalReason(path.join('C:', 'anywhere', name))).toBeTruthy();
+    },
+  );
 });
 
 describe('snapshotFiles', () => {
@@ -55,6 +62,14 @@ describe('snapshotFiles', () => {
     expect(snapshots).toEqual([]);
     expect(refused).toHaveLength(1);
     expect(refused[0].reason).toContain('credentials');
+  });
+
+  test('a *.env file without a leading dot is refused the same way via --file', () => {
+    write('produktion.env', `DB_PASSWORD=${FAKE_ANT}\n`);
+    const { snapshots, refused } = snapshotFiles(['produktion.env'], { cwd: root, roots: [root] });
+    expect(snapshots).toEqual([]);
+    expect(refused).toHaveLength(1);
+    expect(refused[0].reason).toContain('credential');
   });
 
   test('a path outside every root is refused, and the refusal names the rule', () => {

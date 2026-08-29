@@ -93,6 +93,24 @@ describe('buildDiffSnapshot against a real git repo (non-ASCII paths)', () => {
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  test('a top-level *.env file with a non-ASCII name is redacted too (refusalReason now matches any .env suffix)', () => {
+    const { dir, git } = initGitRepo();
+    try {
+      const secretFile = path.join(dir, 'Überschrift.env');
+      fs.writeFileSync(secretFile, 'A=before\n', 'utf8');
+      git(['add', '.']);
+      git(['commit', '-q', '-m', 'init']);
+      fs.writeFileSync(secretFile, 'A=SECRET123\n', 'utf8');
+
+      const result = buildDiffSnapshot({ cwd: dir, exec: gitExec });
+      expect(result.error).toBeUndefined();
+      expect(result.snapshot.content).not.toContain('SECRET123');
+      expect(result.snapshot.content).toContain('[redacted: Überschrift.env]');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('parseDiffStat', () => {
