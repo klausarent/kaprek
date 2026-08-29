@@ -1,5 +1,20 @@
 import { describe, test, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { redactSecretHunks, parseDiffStat, buildDiffSnapshot, DIFF_MAX_CHARS } from './diff.mjs';
+import { gitExec } from '../lib/git-exec.mjs';
+
+/** A real git repo (temp dir), for the tests that need real `git diff` output rather than a fake exec. */
+function initGitRepo() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-diff-git-'));
+  const git = (args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', encoding: 'utf8' });
+  git(['init', '-q']);
+  git(['config', 'user.email', 'kaprek-test@example.com']);
+  git(['config', 'user.name', 'kaprek test']);
+  return { dir, git };
+}
 
 describe('redactSecretHunks', () => {
   test('replaces a secrets file hunk with a marker, leaves ordinary hunks intact', () => {
@@ -39,6 +54,44 @@ describe('redactSecretHunks', () => {
   test('non-string / empty input is returned unchanged', () => {
     expect(redactSecretHunks('')).toBe('');
     expect(redactSecretHunks(undefined)).toBe(undefined);
+  });
+
+  test('does NOT redact a git-quoted (octal-escaped) header — this is exactly why gitExec always disables core.quotePath', () => {
+    // What real git emits for a non-ASCII path when core.quotePath is left
+    // at its default (true): the whole path in double quotes, each
+    // non-ASCII byte as a C-style octal escape (here, \303\234 = UTF-8 for
+    // 'Ü'). DIFF_HEADER_RE only matches the plain `diff --git a/... b/...`
+    // form, so a hunk in this shape is never attributed to a file at all —
+    // this test documents that failure mode rather than fixing it here; the
+    // actual fix (src/lib/git-exec.mjs's `-c core.quotePath=false`) makes
+    // sure this shape never reaches this function in the first place. See
+    // the real-git regression test below for the end-to-end behavior.
+    const diff = 'diff --git "a/\\303\\234bersicht/.env" "b/\\303\\234bersicht/.env"\n@@ -1 +1 @@\n-A=before\n+A=SECRET123';
+    const out = redactSecretHunks(diff);
+    expect(out).toContain('SECRET123');
+  });
+});
+
+describe('buildDiffSnapshot against a real git repo (non-ASCII paths)', () => {
+  test('a secrets file behind a non-ASCII directory is redacted, not leaked, via the real gitExec', () => {
+    const { dir, git } = initGitRepo();
+    try {
+      const secretDir = path.join(dir, 'Übersicht');
+      fs.mkdirSync(secretDir);
+      const secretFile = path.join(secretDir, '.env');
+      fs.writeFileSync(secretFile, 'A=before\n', 'utf8');
+      git(['add', '.']);
+      git(['commit', '-q', '-m', 'init']);
+      fs.writeFileSync(secretFile, 'A=SECRET123\n', 'utf8');
+
+      const result = buildDiffSnapshot({ cwd: dir, exec: gitExec });
+      expect(result.error).toBeUndefined();
+      expect(result.snapshot.content).not.toContain('SECRET123');
+      // git always uses '/' inside diff headers, even on Windows.
+      expect(result.snapshot.content).toContain('[redacted: Übersicht/.env]');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

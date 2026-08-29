@@ -173,10 +173,16 @@ it('src/resume/launch.mjs spawns only wt.exe / powershell.exe / where.exe / net.
   expect(src).toMatch(/spawn\(PATHS\.powershell,/);
 });
 
-test('src/lib/git-exec.mjs only ever runs the local git binary, never through a shell', () => {
+test('src/lib/git-exec.mjs only ever runs the local git binary, never through a shell, and always disables path quoting', () => {
   const src = fs.readFileSync(path.join(ROOT, 'src', 'lib', 'git-exec.mjs'), 'utf8');
   expect(src).toMatch(/execFileSync\('git',/);
   expect(src).not.toMatch(/shell:\s*true/);
+  // Without this, git renders a non-ASCII path as a quoted octal escape
+  // (`"a/\303\234bersicht/.env"`) instead of plain UTF-8, and
+  // src/council/diff.mjs's diff-header parser silently fails to attribute
+  // the hunk to its file — a secrets file with such a name would then never
+  // reach refusalReason() at all. See git-exec.mjs's own comment on this.
+  expect(src).toMatch(/execFileSync\('git',\s*\['-c',\s*'core\.quotePath=false',/);
 });
 
 test('the update command talks to the npm registry and to nothing else', () => {

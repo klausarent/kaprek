@@ -34,8 +34,11 @@ const hookStart = Date.now();
 // deadlineMs (600ms default, see council-gate.mjs) bounds how long the gate
 // spends overall, but a single hung `git` process could still burn through
 // that budget on its own without this — and this hook's SELF_TIMEOUT_MS is
-// what stands between that and hanging the user's turn.
-const gateExec = (args, options) => gitExec(args, { ...options, timeoutMs: 400 });
+// what stands between that and hanging the user's turn. 250ms, not 400: the
+// gate makes up to two git calls (`diff --stat` then `ls-files`), and
+// 2*400ms could already exceed the 600ms overall deadline on its own before
+// isOverdue() ever gets a chance to catch it; 2*250ms stays under it.
+const gateExec = (args, options) => gitExec(args, { ...options, timeoutMs: 250 });
 
 // Test-only override, mirroring KAPREK_DATA_DIR (see appdir.mjs): hook-stop.mjs
 // runs as a spawned child process (see hook-stop.test.mjs), so its tests need
