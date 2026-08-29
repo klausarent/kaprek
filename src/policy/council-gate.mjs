@@ -15,9 +15,35 @@ import { parseDiffStat } from '../council/diff.mjs';
 
 export const MIN_FILES = 5;
 export const MIN_LINES = 150;
-export const DEFAULT_GATE_DEADLINE_MS = 600;
+export const DEFAULT_GATE_DEADLINE_MS = 1000;
+
+const MIN_GATE_DEADLINE_MS = 100;
+const MAX_GATE_DEADLINE_MS = 5000;
 
 const NO_BLOCK = Object.freeze({ block: false });
+
+/**
+ * DEFAULT_GATE_DEADLINE_MS, overridable via KAPREK_COUNCIL_GATE_DEADLINE_MS
+ * for a machine (or a parallel test run) where git under load routinely
+ * takes longer than the default budget — measured: 611-644ms wall-clock
+ * against the previous 600ms deadline under the full suite's parallel load,
+ * which made the gate silently fail open far more often than intended. Only
+ * a plain integer within [MIN_GATE_DEADLINE_MS, MAX_GATE_DEADLINE_MS] is
+ * accepted; anything else (unset, non-numeric, fractional, negative, out of
+ * range) falls back to the default rather than either disabling the
+ * overrun protection or accepting a value that could itself stall the Stop
+ * hook. Read fresh on every call, not cached, so a test can set the env var
+ * per case; a caller's own explicit `deadlineMs` argument to
+ * evaluateCouncilGate() below still overrides this outright — an env
+ * override only ever changes what "no explicit deadlineMs" defaults to.
+ */
+export function resolveGateDeadlineMs(env = process.env) {
+  const raw = typeof env.KAPREK_COUNCIL_GATE_DEADLINE_MS === 'string' ? env.KAPREK_COUNCIL_GATE_DEADLINE_MS.trim() : '';
+  if (!/^\d+$/.test(raw)) return DEFAULT_GATE_DEADLINE_MS;
+  const parsed = Number(raw);
+  if (parsed < MIN_GATE_DEADLINE_MS || parsed > MAX_GATE_DEADLINE_MS) return DEFAULT_GATE_DEADLINE_MS;
+  return parsed;
+}
 
 /** The reason handed to Claude on stderr — precise about what fired and what to do about it. */
 export function councilGateReason(files, lines) {
@@ -115,7 +141,10 @@ function hasRecentCouncilResult(dataDir, sinceTs) {
  * @param {() => number} [options.now]
  * @param {number} [options.deadlineMs] - overall time budget for this
  *   evaluation; exceeding it at any checkpoint fails open, same idea as
- *   harvestRemember()'s deadline
+ *   harvestRemember()'s deadline. Defaults to resolveGateDeadlineMs() (see
+ *   above), not the bare DEFAULT_GATE_DEADLINE_MS constant, so
+ *   KAPREK_COUNCIL_GATE_DEADLINE_MS can raise it without callers changing
+ *   anything; passing this explicitly overrides the env var entirely.
  * @param {(args: string[], opts: {cwd: string}) => string} options.exec -
  *   runs `git <args>` in cwd and returns stdout, or throws. Injected so
  *   this module never imports child_process itself — see
@@ -126,7 +155,7 @@ function hasRecentCouncilResult(dataDir, sinceTs) {
 // sites do not read as an invocation of something literally named "exec" —
 // see the identical note in src/council/diff.mjs. The external contract
 // (the options key is `exec`) is unchanged.
-export function evaluateCouncilGate({ dataDir, cwd, sessionId, stopHookActive, now = Date.now, deadlineMs = DEFAULT_GATE_DEADLINE_MS, exec: runGit }) {
+export function evaluateCouncilGate({ dataDir, cwd, sessionId, stopHookActive, now = Date.now, deadlineMs = resolveGateDeadlineMs(), exec: runGit }) {
   try {
     if (process.env.KAPREK_COUNCIL_GATE === '0') return NO_BLOCK; // (a)
     if (stopHookActive === true) return NO_BLOCK; // (b)

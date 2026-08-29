@@ -294,10 +294,19 @@ test('a 5 MB transcript is harvested well inside the hook\'s 3 s self-timeout', 
   expect(events).toContain('Perf-Test-Fakt');
 }, 10000);
 
+// These two tests need the gate to actually fire (exit 2), which depends on
+// evaluateCouncilGate()'s internal git calls finishing inside its own
+// deadlineMs budget — real git, real subprocess, real wall-clock timing.
+// KAPREK_COUNCIL_GATE_DEADLINE_MS widens that budget for just these two
+// runs so a slow CI/parallel-suite machine doesn't make the gate silently
+// fail open (see council-gate.mjs); the hook's own SELF_TIMEOUT_MS (3000ms)
+// remains the real backstop regardless of this env var.
+const GENEROUS_GATE_DEADLINE_ENV = { KAPREK_COUNCIL_GATE_DEADLINE_MS: '3000' };
+
 test('council gate: 6 changed files with no review yet exits 2, writes the reason to stderr, and no policy JSON to stdout', async () => {
   const repoDir = initGitRepoWithChanges(6);
   try {
-    const { code, stdout, stderr } = await runHook(JSON.stringify({ session_id: 'e2e-gate-block', cwd: repoDir }));
+    const { code, stdout, stderr } = await runHook(JSON.stringify({ session_id: 'e2e-gate-block', cwd: repoDir }), GENEROUS_GATE_DEADLINE_ENV);
     expect(code).toBe(2);
     expect(stdout).toBe('');
     expect(stderr).toMatch(/kaprek council gate/);
@@ -312,10 +321,10 @@ test('council gate: a second Stop for the same session does not fire again (once
   const repoDir = initGitRepoWithChanges(6);
   try {
     const stdinPayload = JSON.stringify({ session_id: 'e2e-gate-once', cwd: repoDir });
-    const first = await runHook(stdinPayload);
+    const first = await runHook(stdinPayload, GENEROUS_GATE_DEADLINE_ENV);
     expect(first.code).toBe(2);
 
-    const second = await runHook(stdinPayload);
+    const second = await runHook(stdinPayload, GENEROUS_GATE_DEADLINE_ENV);
     expect(second.code).toBe(0);
     expect(second.stdout).toBe('');
     expect(second.stderr).toBe('');

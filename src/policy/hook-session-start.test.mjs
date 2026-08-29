@@ -69,6 +69,26 @@ test('a directory kaprek knows nothing about, no cwd, and malformed input all pr
   }
 });
 
+test('SessionStart writes the shared context state after a non-empty context block, for hook-user-prompt.mjs to read', async () => {
+  openMissions(dataDir).create({ title: 'Hook me', goal: 'prove the hook', cwd });
+  const { code } = await runHook(JSON.stringify({ session_id: 'ctx-nonempty', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }));
+  expect(code).toBe(0);
+  const statePath = path.join(dataDir, 'context', 'ctx-nonempty.json');
+  expect(fs.existsSync(statePath)).toBe(true);
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  expect(state.cwd).toBe(cwd);
+});
+
+test('SessionStart writes the shared context state even when the context block was empty (unknown directory)', async () => {
+  const { code, stdout } = await runHook(JSON.stringify({ session_id: 'ctx-empty', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }));
+  expect(code).toBe(0);
+  expect(stdout).toBe('');
+  const statePath = path.join(dataDir, 'context', 'ctx-empty.json');
+  expect(fs.existsSync(statePath)).toBe(true);
+  const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+  expect(state.cwd).toBe(cwd);
+});
+
 test('SessionStart writes a start event to the session ledger', async () => {
   const { code } = await runHook(JSON.stringify({ session_id: 'ledger-1', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }));
   expect(code).toBe(0);
