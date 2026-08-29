@@ -185,3 +185,36 @@ export function snapshotFiles(paths, { cwd, roots, limits = SNAPSHOT_LIMITS } = 
 
   return { snapshots, refused };
 }
+
+/**
+ * The same shape snapshotFiles() gives a real file — sha256 of the raw text,
+ * then redaction, then a cap — for text that was never a path on disk to
+ * begin with. `kaprek council --diff` uses this for its combined
+ * `git-diff.patch`: the diff comes from running git, not from reading a
+ * file, so it never goes through snapshotFiles()'s path/root/refusal checks
+ * (a diff's OWN secrets-file hunks are stripped separately beforehand — see
+ * src/council/diff.mjs's redactSecretHunks() — before this ever sees the
+ * text).
+ *
+ * The cap here is characters, not SNAPSHOT_LIMITS.maxFileBytes' bytes, and
+ * has no shared totalBytes budget the way snapshotFiles()'s loop does: this
+ * produces exactly one snapshot, standing alone, sized for a diff rather
+ * than for a handful of files that share one package.
+ *
+ * @param {object} options
+ * @param {string} options.name - the virtual path shown to the peer
+ * @param {string} options.text - the raw text to include
+ * @param {number} [options.maxChars] - character cap, default 200,000
+ */
+export function snapshotText({ name, text, maxChars = 200_000 }) {
+  const raw = typeof text === 'string' ? text : '';
+  const sha256 = crypto.createHash('sha256').update(raw, 'utf8').digest('hex');
+  let content = redactSecrets(raw);
+  let truncated = false;
+  if (content.length > maxChars) {
+    const cut = content.length - maxChars;
+    content = `${content.slice(0, maxChars)}\n… [truncated: ${cut} more characters]`;
+    truncated = true;
+  }
+  return { path: name, content, truncated, sha256 };
+}

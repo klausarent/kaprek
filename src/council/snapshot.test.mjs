@@ -3,7 +3,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { snapshotFiles, refusalReason, SNAPSHOT_LIMITS, MAX_REQUESTED_PATHS } from './snapshot.mjs';
+import { snapshotFiles, snapshotText, refusalReason, SNAPSHOT_LIMITS, MAX_REQUESTED_PATHS } from './snapshot.mjs';
 
 let root;
 beforeEach(() => {
@@ -166,5 +166,33 @@ describe('snapshotFiles', () => {
     const { snapshots, refused } = snapshotFiles(['a.txt', 'b.txt', 'c.txt'], { cwd: root, roots: [root], limits });
     expect(snapshots).toHaveLength(2);
     expect(refused[0].path).toBe('c.txt');
+  });
+});
+
+describe('snapshotText', () => {
+  test('carries the sha256 of the raw text, redacted content, and the given virtual path', () => {
+    const text = `key: ${FAKE_ANT}\nordinary line`;
+    const snapshot = snapshotText({ name: 'git-diff.patch', text });
+    expect(snapshot.path).toBe('git-diff.patch');
+    expect(snapshot.sha256).toBe(crypto.createHash('sha256').update(text, 'utf8').digest('hex'));
+    expect(snapshot.content).not.toContain(FAKE_ANT);
+    expect(snapshot.content).toContain('[REDACTED]');
+    expect(snapshot.content).toContain('ordinary line');
+    expect(snapshot.truncated).toBe(false);
+  });
+
+  test('caps at maxChars and says so, without touching the sha256 of the untruncated text', () => {
+    const text = 'x'.repeat(1000);
+    const snapshot = snapshotText({ name: 'git-diff.patch', text, maxChars: 100 });
+    expect(snapshot.truncated).toBe(true);
+    expect(snapshot.content.length).toBeLessThan(text.length);
+    expect(snapshot.content).toContain('truncated');
+    expect(snapshot.sha256).toBe(crypto.createHash('sha256').update(text, 'utf8').digest('hex'));
+  });
+
+  test('non-string text is treated as empty rather than thrown', () => {
+    const snapshot = snapshotText({ name: 'git-diff.patch', text: undefined });
+    expect(snapshot.content).toBe('');
+    expect(snapshot.truncated).toBe(false);
   });
 });

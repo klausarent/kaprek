@@ -74,12 +74,19 @@ const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 //     tool is called, and that text must never become part of a command line.
 //   - src/resume/launch.mjs opens the user's own already-authenticated agent
 //     CLIs as terminal tabs (kaprek resume).
+//   - src/lib/git-exec.mjs runs `git diff`/`git ls-files` in a caller-given
+//     cwd for the council gate (Stop hook) and `kaprek council --diff`. The
+//     gate and the diff builder (council-gate.mjs, src/council/diff.mjs)
+//     take this as an injected `exec` function instead of importing it, so
+//     they stay outside this exemption; only the concrete implementation is
+//     listed here.
 const ALLOWED_CHILD_PROCESS_FILES = [
   path.join(ROOT, 'bin', 'cli.mjs'),
   path.join(ROOT, 'src', 'triggers', 'clipboard.mjs'),
   path.join(ROOT, 'src', 'cli', 'update.mjs'),
   path.join(ROOT, 'src', 'server', 'notify.mjs'),
   path.join(ROOT, 'src', 'resume', 'launch.mjs'),
+  path.join(ROOT, 'src', 'lib', 'git-exec.mjs'),
 ];
 const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
 
@@ -164,6 +171,12 @@ it('src/resume/launch.mjs spawns only wt.exe / powershell.exe / where.exe / net.
   expect(src).toMatch(/execFileSync\('net\.exe'/);
   expect(src).toMatch(/spawn\(PATHS\.wt,/);
   expect(src).toMatch(/spawn\(PATHS\.powershell,/);
+});
+
+test('src/lib/git-exec.mjs only ever runs the local git binary, never through a shell', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'src', 'lib', 'git-exec.mjs'), 'utf8');
+  expect(src).toMatch(/execFileSync\('git',/);
+  expect(src).not.toMatch(/shell:\s*true/);
 });
 
 test('the update command talks to the npm registry and to nothing else', () => {

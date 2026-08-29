@@ -28,6 +28,7 @@ import { availablePeerIds, makeAskPeer } from '../src/council/ask.mjs';
 import { snapshotFiles } from '../src/council/snapshot.mjs';
 import { consultPeers } from '../src/council/consult.mjs';
 import { listEngines } from '../src/harness/registry.mjs';
+import { gitExec } from '../src/lib/git-exec.mjs';
 
 // Same value as server.mjs's PEER_TURN_TIMEOUT_MS (not exported there — kept
 // in sync by hand; see src/server/server.mjs around the council imports).
@@ -286,6 +287,7 @@ async function main() {
       peersFor,
       snapshotFiles,
       consultPeers: (args) => consultPeers({ ...args, askPeer: makeAskPeer({ timeoutMs: PEER_TURN_TIMEOUT_MS }), timeoutMs: PEER_TURN_TIMEOUT_MS }),
+      exec: gitExec,
     });
     return;
   }

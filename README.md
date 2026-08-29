@@ -195,7 +195,9 @@ interrupted by a restart says so instead of being quietly asked again.
 
 ### From the terminal (`kaprek council`)
 
-`kaprek council "<question>" [--file <path>]... [--cwd <dir>] [--constraint <text>]... [--json]` asks the configured peers blind and in parallel, from any terminal — no browser turn needed. Files go out as the same redacted snapshots the web council uses; a secrets file is refused. The verdicts are printed and saved under `<dataDir>/council/cli/<timestamp>.json`. Exit 0 with answers, 1 when a peer or snapshot failed, 2 on bad arguments.
+`kaprek council "<question>" [--file <path>]... [--cwd <dir>] [--constraint <text>]... [--diff [<ref>]] [--json]` asks the configured peers blind and in parallel, from any terminal — no browser turn needed. Files go out as the same redacted snapshots the web council uses; a secrets file is refused. The verdicts are printed and saved under `<dataDir>/council/cli/<timestamp>.json`. Exit 0 with answers, 1 when a peer or snapshot failed, 2 on bad arguments.
+
+`--diff [<ref>]` adds the working tree's changes against `<ref>` (default `HEAD`) as one more snapshot — `git diff --stat`, `git diff`, and the untracked files, combined into a virtual `git-diff.patch` and put through the same redaction as `--file`, at hunk granularity: a secrets file's own hunk is removed and named as `[redacted: <path>]` rather than the whole diff being refused. Capped at 200,000 characters; past that the snapshot is cut with a note. `--diff` and `--file` combine freely. Outside a git repo, or with nothing to diff, it prints why and exits 1.
 
 ## Engines
 
@@ -502,6 +504,12 @@ Since the terminal is where the work happens, the Stop hook also makes the termi
 - Budget: 1.5 s for the harvest, exit 0 always; anything unfinished waits for the next Stop.
 
 Policy mode lives in `<dataDir>/policy.json`: `observe` (default) fully evaluates both rules and logs any violation to `policy.log`, but always resolves to allow — it's for seeing what would happen before switching modes. `warn` writes its reasons to stderr (Claude Code hooks reference exit 0 as no objection either way, so this is best-effort visibility, not a blocking signal). `block` is the only mode that can actually end a turn abnormally, and even then at most once per session. The hook fails open on any internal error — a bug here must never stop you from ending a turn. This is the single exception to kaprek's read-only promise; every other feature only reads `~/.claude/projects`.
+
+### Council as a gate
+
+The Stop hook also runs a second, independent check: has this session's uncommitted change grown large enough that ending the turn without a second opinion would be reckless? It fires — once per session — when the working directory is a git repo, `git diff --stat HEAD` covers at least 5 files (untracked files count as files) or at least 150 changed lines, and no `kaprek council` result from this session already exists. The turn is blocked with a message telling Claude exactly what to run: `kaprek council "Review this change: defects, missed requirements, risky assumptions" --diff`, then act on the verdicts or say why not, then finish.
+
+Unlike the policy engine's block above (JSON on stdout, exit 0), this uses the other block form Claude Code's Stop hooks support: exit code 2 with the reason on stderr. Every condition fails open — no git, git timing out, or anything else going wrong just means the gate does not fire, never that the turn hangs or errors out. Set `KAPREK_COUNCIL_GATE=0` to turn it off.
 
 ## Posture and hard denials
 

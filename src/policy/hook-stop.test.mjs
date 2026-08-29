@@ -4,7 +4,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openBoard } from '../board/store.mjs';
 
@@ -25,6 +25,28 @@ afterEach(() => {
 
 function writePolicy(policy) {
   fs.writeFileSync(path.join(dataDir, 'policy.json'), JSON.stringify(policy), 'utf8');
+}
+
+/**
+ * A real git repo (temp dir), with `fileCount` tracked files committed and
+ * then all modified — an uncommitted change big enough to trip the council
+ * gate's file-count threshold on its own, regardless of line count.
+ */
+function initGitRepoWithChanges(fileCount) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstop-git-'));
+  const git = (args) => execFileSync('git', args, { cwd: dir, stdio: 'pipe', encoding: 'utf8' });
+  git(['init', '-q']);
+  git(['config', 'user.email', 'kaprek-test@example.com']);
+  git(['config', 'user.name', 'kaprek test']);
+  for (let i = 0; i < fileCount; i++) {
+    fs.writeFileSync(path.join(dir, `f${i}.txt`), 'base\n', 'utf8');
+  }
+  git(['add', '.']);
+  git(['commit', '-q', '-m', 'init']);
+  for (let i = 0; i < fileCount; i++) {
+    fs.writeFileSync(path.join(dir, `f${i}.txt`), 'base\nchanged\n', 'utf8');
+  }
+  return dir;
 }
 
 function writeTranscript(sessionId, { withGitCommit = false } = {}) {
@@ -270,4 +292,60 @@ test('a 5 MB transcript is harvested well inside the hook\'s 3 s self-timeout', 
 
   const events = fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8');
   expect(events).toContain('Perf-Test-Fakt');
+}, 10000);
+
+test('council gate: 6 changed files with no review yet exits 2, writes the reason to stderr, and no policy JSON to stdout', async () => {
+  const repoDir = initGitRepoWithChanges(6);
+  try {
+    const { code, stdout, stderr } = await runHook(JSON.stringify({ session_id: 'e2e-gate-block', cwd: repoDir }));
+    expect(code).toBe(2);
+    expect(stdout).toBe('');
+    expect(stderr).toMatch(/kaprek council gate/);
+    expect(stderr).toMatch(/--diff/);
+    expect(stderr).toMatch(/6 files/);
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+}, 10000);
+
+test('council gate: a second Stop for the same session does not fire again (once-marker), exits 0', async () => {
+  const repoDir = initGitRepoWithChanges(6);
+  try {
+    const stdinPayload = JSON.stringify({ session_id: 'e2e-gate-once', cwd: repoDir });
+    const first = await runHook(stdinPayload);
+    expect(first.code).toBe(2);
+
+    const second = await runHook(stdinPayload);
+    expect(second.code).toBe(0);
+    expect(second.stdout).toBe('');
+    expect(second.stderr).toBe('');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+}, 15000);
+
+test('council gate: stop_hook_active guard applies to the gate too — exits 0, no stderr', async () => {
+  const repoDir = initGitRepoWithChanges(6);
+  try {
+    const { code, stdout, stderr } = await runHook(
+      JSON.stringify({ session_id: 'e2e-gate-active', cwd: repoDir, stop_hook_active: true }),
+    );
+    expect(code).toBe(0);
+    expect(stdout).toBe('');
+    expect(stderr).toBe('');
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+}, 10000);
+
+test('council gate: no git repo at cwd never fires — exits 0, no stderr', async () => {
+  const nonRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstop-nogit-'));
+  try {
+    const { code, stdout, stderr } = await runHook(JSON.stringify({ session_id: 'e2e-gate-nogit', cwd: nonRepoDir }));
+    expect(code).toBe(0);
+    expect(stdout).toBe('');
+    expect(stderr).toBe('');
+  } finally {
+    fs.rmSync(nonRepoDir, { recursive: true, force: true });
+  }
 }, 10000);

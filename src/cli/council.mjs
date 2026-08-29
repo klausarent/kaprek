@@ -4,22 +4,33 @@
 // and answer with a verdict. The result is printed and kept as a file.
 import fs from 'node:fs';
 import path from 'node:path';
+import { buildDiffSnapshot } from '../council/diff.mjs';
 
-export const COUNCIL_USAGE = `Usage: kaprek council "<question>" [--file <path>]... [--cwd <dir>] [--constraint <text>]... [--json]
+export const COUNCIL_USAGE = `Usage: kaprek council "<question>" [--file <path>]... [--cwd <dir>] [--constraint <text>]... [--diff [<ref>]] [--json]
 
   Asks the configured peers (codex, grok, …) blind and in parallel. Files are
-  passed as redacted snapshots; secrets files are refused. Result is printed
-  and saved under <dataDir>/council/cli/.
+  passed as redacted snapshots; secrets files are refused. --diff adds the
+  working tree's changes against <ref> (default HEAD, plus untracked files)
+  as one more snapshot, with any secrets file's hunk removed. Result is
+  printed and saved under <dataDir>/council/cli/.
 `;
 
 function parse(argv) {
-  const opts = { question: null, files: [], cwd: process.cwd(), constraints: [], json: false };
+  const opts = { question: null, files: [], cwd: process.cwd(), constraints: [], json: false, diff: false, diffRef: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--file') opts.files.push(argv[++i]);
     else if (a === '--cwd') opts.cwd = argv[++i];
     else if (a === '--constraint') opts.constraints.push(argv[++i]);
     else if (a === '--json') opts.json = true;
+    else if (a === '--diff') {
+      opts.diff = true;
+      // A ref is optional and must not swallow the NEXT flag (e.g.
+      // `--diff --json`): only consumed when it does not itself start '--'.
+      if (i + 1 < argv.length && typeof argv[i + 1] === 'string' && !argv[i + 1].startsWith('--')) {
+        opts.diffRef = argv[++i];
+      }
+    }
     else if (a.startsWith('--')) throw new Error(`unknown option: ${a}`);
     else if (opts.question === null) opts.question = a;
     else throw new Error(`unexpected argument: ${a}`);
@@ -41,7 +52,7 @@ function render(result, stdout) {
   else stdout(result.consensus ? '\nconsensus: yes' : '\nconsensus: no');
 }
 
-export async function runCouncilCommand(argv, { dataDir, peersFor, snapshotFiles, consultPeers, stdout = (l) => console.log(l), stderr = (l) => console.error(l) }) {
+export async function runCouncilCommand(argv, { dataDir, peersFor, snapshotFiles, consultPeers, exec, stdout = (l) => console.log(l), stderr = (l) => console.error(l) }) {
   let opts;
   try {
     opts = parse(argv);
@@ -60,12 +71,29 @@ export async function runCouncilCommand(argv, { dataDir, peersFor, snapshotFiles
     cwd = path.resolve(opts.cwd);
     const files = opts.files.map((f) => path.resolve(cwd, f));
     ({ snapshots, refused } = snapshotFiles(files, { cwd, roots: [cwd] }));
+    if (opts.diff) {
+      const diffResult = buildDiffSnapshot({ cwd, ref: opts.diffRef ?? 'HEAD', exec });
+      if (diffResult.error) {
+        stderr(diffResult.error);
+        return 1;
+      }
+      snapshots = [...snapshots, diffResult.snapshot];
+    }
     result = await consultPeers({ peers: status.peers, question: opts.question, snapshots, refused, constraints: opts.constraints, tried: [] });
   } catch (err) {
     stderr(`council failed: ${err.message}`);
     return 1;
   }
-  const record = { ts: new Date().toISOString(), question: opts.question, files: opts.files, cwd, peers: status.peers, refused, result };
+  const record = {
+    ts: new Date().toISOString(),
+    question: opts.question,
+    files: opts.files,
+    diff: opts.diff ? { ref: opts.diffRef ?? 'HEAD' } : null,
+    cwd,
+    peers: status.peers,
+    refused,
+    result,
+  };
   try {
     const dir = path.join(dataDir, 'council', 'cli');
     fs.mkdirSync(dir, { recursive: true });
