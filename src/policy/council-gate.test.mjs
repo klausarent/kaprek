@@ -2,7 +2,7 @@ import { describe, test, expect, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { evaluateCouncilGate, MIN_FILES, MIN_LINES } from './council-gate.mjs';
+import { evaluateCouncilGate, MIN_FILES, MIN_LINES, DEFAULT_GATE_DEADLINE_MS, resolveGateDeadlineMs } from './council-gate.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
 
 function tmpDataDir() {
@@ -135,5 +135,61 @@ describe('evaluateCouncilGate', () => {
     expect(evaluateCouncilGate({ ...baseOpts(), dataDir: '' }).block).toBe(false);
     expect(evaluateCouncilGate({ ...baseOpts(), cwd: '' }).block).toBe(false);
     expect(evaluateCouncilGate({ ...baseOpts(), sessionId: '' }).block).toBe(false);
+  });
+});
+
+describe('resolveGateDeadlineMs / KAPREK_COUNCIL_GATE_DEADLINE_MS', () => {
+  afterEach(() => {
+    delete process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS;
+  });
+
+  test('the default is used when the env var is unset', () => {
+    expect(resolveGateDeadlineMs()).toBe(DEFAULT_GATE_DEADLINE_MS);
+  });
+
+  test('a valid integer within bounds overrides the default', () => {
+    process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = '3000';
+    expect(resolveGateDeadlineMs()).toBe(3000);
+  });
+
+  test.each(['0', '99', '5001', '10000', 'abc', '600.5', '-200', '', '  '])(
+    'falls back to the default for an invalid or out-of-range value: %j',
+    (value) => {
+      process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = value;
+      expect(resolveGateDeadlineMs()).toBe(DEFAULT_GATE_DEADLINE_MS);
+    },
+  );
+
+  test('the bounds are inclusive: 100 and 5000 are both accepted', () => {
+    process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = '100';
+    expect(resolveGateDeadlineMs()).toBe(100);
+    process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = '5000';
+    expect(resolveGateDeadlineMs()).toBe(5000);
+  });
+
+  test('evaluateCouncilGate actually applies the env-raised deadline when no explicit deadlineMs is given', () => {
+    process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = '3000';
+    const opts = baseOpts();
+    delete opts.deadlineMs; // baseOpts() never sets one — confirms the default path picks up the env var
+    let calls = 0;
+    opts.now = () => {
+      calls += 1;
+      return calls === 1 ? 0 : 2000; // 2000ms elapsed: over the old 600/1000ms default, under the env-raised 3000ms
+    };
+    seedSessionStart(opts.dataDir, opts.sessionId, new Date(0).toISOString());
+    expect(evaluateCouncilGate(opts).block).toBe(true);
+  });
+
+  test('an explicit deadlineMs argument overrides KAPREK_COUNCIL_GATE_DEADLINE_MS entirely', () => {
+    process.env.KAPREK_COUNCIL_GATE_DEADLINE_MS = '3000';
+    const opts = baseOpts();
+    opts.deadlineMs = 5; // far smaller than the env override — must still win
+    let calls = 0;
+    opts.now = () => {
+      calls += 1;
+      return calls === 1 ? 0 : 10; // 10ms elapsed already exceeds the explicit 5ms deadline
+    };
+    seedSessionStart(opts.dataDir, opts.sessionId, new Date(0).toISOString());
+    expect(evaluateCouncilGate(opts).block).toBe(false);
   });
 });

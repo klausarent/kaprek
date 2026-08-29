@@ -31,14 +31,17 @@ const SELF_TIMEOUT_MS = 3000;
 const hookStart = Date.now();
 
 // A short leash on every individual git call the gate makes: the gate's own
-// deadlineMs (600ms default, see council-gate.mjs) bounds how long the gate
-// spends overall, but a single hung `git` process could still burn through
-// that budget on its own without this — and this hook's SELF_TIMEOUT_MS is
-// what stands between that and hanging the user's turn. 250ms, not 400: the
-// gate makes up to two git calls (`diff --stat` then `ls-files`), and
-// 2*400ms could already exceed the 600ms overall deadline on its own before
-// isOverdue() ever gets a chance to catch it; 2*250ms stays under it.
-const gateExec = (args, options) => gitExec(args, { ...options, timeoutMs: 250 });
+// deadlineMs (1000ms default, see council-gate.mjs — overridable via
+// KAPREK_COUNCIL_GATE_DEADLINE_MS) bounds how long the gate spends overall,
+// but a single hung `git` process could still burn through that budget on
+// its own without this — and this hook's SELF_TIMEOUT_MS is what stands
+// between that and hanging the user's turn. 400ms, not more: the gate makes
+// up to two git calls (`diff --stat` then `ls-files`), and 2*400ms stays at
+// the 1000ms default deadline rather than exceeding it on its own before
+// isOverdue() ever gets a chance to catch it. An env-raised deadline widens
+// the budget isOverdue() enforces, not this per-call leash — a single git
+// process hanging past 400ms is still worth cutting off regardless.
+const gateExec = (args, options) => gitExec(args, { ...options, timeoutMs: 400 });
 
 // Test-only override, mirroring KAPREK_DATA_DIR (see appdir.mjs): hook-stop.mjs
 // runs as a spawned child process (see hook-stop.test.mjs), so its tests need
@@ -100,9 +103,14 @@ async function main() {
   // without a second opinion would be reckless? See council-gate.mjs for the
   // full set of conditions — every one of them fails toward NOT blocking.
   // Only attempted while there is still meaningfully more than the gate's
-  // own default deadline left in this hook's own SELF_TIMEOUT_MS, so a git
-  // call added here can never be what pushes an ordinary turn over it.
-  if (typeof input?.session_id === 'string' && cwd && Date.now() - hookStart < 2300) {
+  // own default deadline left in this hook's own SELF_TIMEOUT_MS (3000 -
+  // 1000 default deadline - 100 margin = 1900), so a git call added here can
+  // never be what pushes an ordinary turn over it. This threshold is not
+  // recomputed from an env-raised KAPREK_COUNCIL_GATE_DEADLINE_MS — it only
+  // decides whether to bother calling the gate at all, and SELF_TIMEOUT_MS
+  // above remains the actual backstop no matter how generous that env var
+  // makes the gate's own overrun check.
+  if (typeof input?.session_id === 'string' && cwd && Date.now() - hookStart < 1900) {
     try {
       const gate = evaluateCouncilGate({
         dataDir,

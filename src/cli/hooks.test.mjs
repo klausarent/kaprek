@@ -5,7 +5,7 @@ import { test, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { install, uninstall, status, HOOK_SCRIPT_PATH, SESSION_START_SCRIPT_PATH, SESSION_END_SCRIPT_PATH } from './hooks.mjs';
+import { install, uninstall, status, HOOK_SCRIPT_PATH, SESSION_START_SCRIPT_PATH, SESSION_END_SCRIPT_PATH, USER_PROMPT_SCRIPT_PATH } from './hooks.mjs';
 
 let tmpDir;
 let settingsPath;
@@ -245,7 +245,7 @@ test('an install from before the SessionStart hook existed gains it, and says wh
   fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }] } }), 'utf8');
   const result = install({ settingsPath, packageName: 'kaprek' });
   expect(result.alreadyInstalled).toBe(true);
-  expect(result.added).toEqual(['SessionStart', 'SessionEnd']);
+  expect(result.added).toEqual(['SessionStart', 'SessionEnd', 'UserPromptSubmit']);
   const settings = readJson(settingsPath);
   expect(settings.hooks.Stop).toHaveLength(1);
   expect(settings.hooks.SessionStart).toHaveLength(1);
@@ -254,9 +254,9 @@ test('an install from before the SessionStart hook existed gains it, and says wh
   expect(again.alreadyInstalled).toBe(true);
   expect(again.added).toEqual([]);
   expect(readJson(settingsPath).hooks.SessionStart).toHaveLength(1);
-  // A fresh install adds all three.
+  // A fresh install adds all four.
   fs.rmSync(settingsPath);
-  expect(install({ settingsPath, packageName: 'kaprek' }).added).toEqual(['Stop', 'SessionStart', 'SessionEnd']);
+  expect(install({ settingsPath, packageName: 'kaprek' }).added).toEqual(['Stop', 'SessionStart', 'SessionEnd', 'UserPromptSubmit']);
 });
 
 test('uninstall removes both entries and leaves a foreign SessionStart hook alone', () => {
@@ -304,7 +304,7 @@ test('an install from before the SessionEnd hook existed gains it, keeping Stop 
   );
   const result = install({ settingsPath, packageName: 'kaprek' });
   expect(result.alreadyInstalled).toBe(true);
-  expect(result.added).toEqual(['SessionEnd']);
+  expect(result.added).toEqual(['SessionEnd', 'UserPromptSubmit']);
   const settings = readJson(settingsPath);
   expect(settings.hooks.Stop).toHaveLength(1);
   expect(settings.hooks.SessionStart).toHaveLength(1);
@@ -327,4 +327,54 @@ test('status reports SessionEnd as missing before install and installed after', 
   install({ settingsPath, packageName: 'kaprek' });
   const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
   expect(after.events.SessionEnd).toMatchObject({ installed: true, recordedPath: SESSION_END_SCRIPT_PATH, recordedPathMissing: false });
+});
+
+// -------------------------------------------------------- UserPromptSubmit
+
+test('install adds the UserPromptSubmit hook alongside the other three, all under one marker', () => {
+  install({ settingsPath });
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.UserPromptSubmit).toHaveLength(1);
+  expect(settings.hooks.UserPromptSubmit[0].hooks[0].command).toContain(USER_PROMPT_SCRIPT_PATH);
+  expect(settings.hooks.UserPromptSubmit[0].hooks[0].command).toContain('--managed-by=');
+});
+
+test('an install from before the UserPromptSubmit hook existed gains it, keeping Stop, SessionStart and SessionEnd untouched', () => {
+  fs.writeFileSync(
+    settingsPath,
+    JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [{ type: 'command', command: `node "${HOOK_SCRIPT_PATH}" --managed-by=kaprek` }] }],
+        SessionStart: [{ hooks: [{ type: 'command', command: `node "${SESSION_START_SCRIPT_PATH}" --managed-by=kaprek` }] }],
+        SessionEnd: [{ hooks: [{ type: 'command', command: `node "${SESSION_END_SCRIPT_PATH}" --managed-by=kaprek` }] }],
+      },
+    }),
+    'utf8',
+  );
+  const result = install({ settingsPath, packageName: 'kaprek' });
+  expect(result.alreadyInstalled).toBe(true);
+  expect(result.added).toEqual(['UserPromptSubmit']);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.Stop).toHaveLength(1);
+  expect(settings.hooks.SessionStart).toHaveLength(1);
+  expect(settings.hooks.SessionEnd).toHaveLength(1);
+  expect(settings.hooks.UserPromptSubmit).toHaveLength(1);
+});
+
+test('uninstall removes the UserPromptSubmit entry and leaves a foreign UserPromptSubmit hook alone', () => {
+  fs.writeFileSync(settingsPath, JSON.stringify({ hooks: { UserPromptSubmit: [{ hooks: [{ type: 'command', command: 'echo theirs' }] }] } }), 'utf8');
+  install({ settingsPath, packageName: 'kaprek' });
+  expect(readJson(settingsPath).hooks.UserPromptSubmit).toHaveLength(2);
+  const result = uninstall({ settingsPath, packageName: 'kaprek' });
+  expect(result.uninstalled).toBe(true);
+  const settings = readJson(settingsPath);
+  expect(settings.hooks.UserPromptSubmit).toEqual([{ hooks: [{ type: 'command', command: 'echo theirs' }] }]);
+});
+
+test('status reports UserPromptSubmit as missing before install and installed after', () => {
+  const before = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(before.events.UserPromptSubmit.installed).toBe(false);
+  install({ settingsPath, packageName: 'kaprek' });
+  const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
+  expect(after.events.UserPromptSubmit).toMatchObject({ installed: true, recordedPath: USER_PROMPT_SCRIPT_PATH, recordedPathMissing: false });
 });

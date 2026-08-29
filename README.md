@@ -29,6 +29,7 @@ With the hooks installed (`kaprek hooks install`, once), the daily loop needs no
 
 - Your first Claude Code session of the day **starts the server itself** — no command, no browser tab ([Starting and stopping](#starting-and-stopping)).
 - Every session start **injects what kaprek knows** about that directory — mission, project memory — and **syncs your memory files** into the store ([SessionStart](#sessionstart-what-kaprek-knows-about-this-directory)).
+- If the session then wanders to a different directory — you open Claude Code in `~` and only `cd` into a project afterward — **the context follows it**: the next prompt you send re-checks the working directory and, if it changed, injects what kaprek knows about the new one ([UserPromptSubmit](#userpromptsubmit-context-that-follows-the-directory)).
 - Every session end **updates the ledger** and **harvests remember blocks** ([Stop](#stop-what-the-hook-writes), [SessionEnd](#sessionend-closing-the-ledger-entry)).
 - A big change that ends without a peer review **gets one automatic council nudge** ([Council as a gate](#council-as-a-gate)).
 
@@ -505,9 +506,9 @@ kaprek can install a Claude Code **Stop** hook that gently enforces the policy e
 
 Important: a Stop hook fires *after* the turn already ended — after any tool call in it, including a `git commit`, already ran. It cannot prevent a commit or require a task link "before" one happens; it can only look back at the transcript once the turn is over and react (log, warn, or refuse to end that particular Stop event) to what already occurred. Think of it as a nag, not a gate.
 
-- `kaprek hooks install` adds three entries to `~/.claude/settings.json` — the Stop hook, the SessionStart hook below, and the SessionEnd hook (backs up the file first, leaves any other hooks untouched).
+- `kaprek hooks install` adds four entries to `~/.claude/settings.json` — the Stop hook, the SessionStart hook below, the SessionEnd hook, and the UserPromptSubmit hook (backs up the file first, leaves any other hooks untouched).
 - `kaprek hooks uninstall` removes only those entries, at any time, identified by a stable `--managed-by` marker so a later reinstall never creates a duplicate.
-- `kaprek hooks status` shows whether each of the three is installed (one line per hook) and which policy mode is active.
+- `kaprek hooks status` shows whether each of the four is installed (one line per hook) and which policy mode is active.
 
 ### SessionStart: what kaprek knows about this directory
 
@@ -516,6 +517,12 @@ The same install adds a **SessionStart** hook. When a Claude Code session opens 
 ### SessionEnd: closing the ledger entry
 
 The same install adds a **SessionEnd** hook. It does exactly one thing: appends an `end` event (with Claude Code's session-end reason) to the session ledger described below, so `kaprek resume` can tell an open session from one that already ended. It reads nothing, writes nothing back to Claude Code (there is no output shape for this event), never blocks, and exits within one second on its own — this hook shares Claude Code's 1.5 s SessionEnd budget with whatever else has hooked into it.
+
+### UserPromptSubmit: context that follows the directory
+
+The same install adds a **UserPromptSubmit** hook. SessionStart only looks once, at the moment a session opens — a session that starts in one directory and later moves into another (Klaus often opens Claude Code in his home directory and `cd`s into a project from there) never gets the context for the directory it actually ends up working in. This hook re-checks the working directory on every prompt and, when it changed since the last one, sends the same `buildSessionStartContext` block SessionStart would have sent had the session opened there.
+
+The common case — no directory change since the last prompt — is checked against a small per-session state file under `<dataDir>/context/` and costs nothing more than that one read: none of kaprek's mission/memory/chat stores are even loaded unless the directory actually changed. An unknown directory or an unchanged one produces no output either way. Exit code 2 on this event would both block *and delete* the person's prompt, so unlike every other kaprek hook a bug here is not just unhelpful but destructive — it fails open on every error, never blocks, and exits within one second on its own. State files untouched for over a week are swept the next time a directory change writes a new one.
 
 ### Memory follows your memory files
 
