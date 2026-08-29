@@ -242,6 +242,41 @@ test('person:local missing entirely: the file is skipped rather than filed under
   expect(result.written).toBe(0);
 });
 
+test('a scope-less skip is not recorded in the state: once the scope exists, the very same run of the file is written, not skipped again', () => {
+  // No scope at all yet — the file has nowhere to go.
+  writeMemoryFile('project_late_scope.md', { description: 'waiting for its scope to exist' });
+  const first = syncMemoryDir({ dataDir, memoryDir });
+  expect(first).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 1, deferred: false });
+  expect(readStateFiles()).toEqual({}); // nothing recorded — the file itself never changed
+
+  // The scope now exists, the file on disk is untouched (same mtime/size).
+  const memory = openMemory(dataDir);
+  memory.addScope({ id: 'person:local' });
+  memory.addScope({ id: 'project:late-scope', parent: 'person:local' });
+
+  const second = syncMemoryDir({ dataDir, memoryDir });
+  expect(second).toEqual({ scanned: 1, written: 1, confirmed: 0, skipped: 0, deferred: false });
+  const facts = openMemory(dataDir).list({ scopeId: 'project:late-scope' });
+  expect(facts).toHaveLength(1);
+  expect(facts[0].text).toBe('waiting for its scope to exist');
+});
+
+test('a content skip (no description) IS recorded: the fast unchanged path takes over on the next run, still skipped', () => {
+  const memory = openMemory(dataDir);
+  memory.addScope({ id: 'person:local' });
+  writeMemoryFile('feedback_no_desc.md', { description: undefined });
+
+  const first = syncMemoryDir({ dataDir, memoryDir });
+  expect(first).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 1, deferred: false });
+  const stateAfterFirst = readStateFiles();
+  expect(Object.keys(stateAfterFirst)).toContain('feedback_no_desc.md');
+
+  const second = syncMemoryDir({ dataDir, memoryDir });
+  expect(second).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 0, deferred: false }); // unchanged path: not even reopened, so not counted as skipped again
+  expect(readStateFiles()).toEqual(stateAfterFirst);
+  expect(openMemory(dataDir).list({ scopeId: 'person:local' })).toEqual([]);
+});
+
 test('deadline: processes what it can before the budget runs out and reports deferred, without losing progress on files already done', () => {
   const memory = openMemory(dataDir);
   memory.addScope({ id: 'person:local' });

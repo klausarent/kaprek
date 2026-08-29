@@ -132,10 +132,11 @@ function slugFor(stem) {
 /**
  * Which scope a memory file belongs to: an exact scope-map hit first, then
  * the `project_<x>` -> `project:<x>` guess for a file whose slug already
- * matches a project folder's basename, then `person:local` — each only if
- * that scope already exists in this store. sync.mjs never creates a scope;
- * a file that resolves to nothing usable (including `person:local` itself
- * missing) is skipped rather than filed under a scope invented for it.
+ * matches a project folder's basename, then `person:local` as the catch-all
+ * — each candidate only counts if that scope already exists in this store.
+ * sync.mjs never creates a scope, so this returns null only when even
+ * `person:local` itself is missing; every other file lands somewhere, at
+ * worst under `person:local`.
  */
 export function resolveScopeId({ stem, scopeMap, existingScopeIds }) {
   const mapped = scopeMap[slugFor(stem)];
@@ -177,11 +178,22 @@ export function resolveScopeId({ stem, scopeMap, existingScopeIds }) {
  */
 /**
  * Handles one file: reads it if (and only if) it changed since the saved
- * state, updates `files[name]` in place, and reports what happened —
- * `'unchanged'`, `'skipped'` (no usable description, a secret, or no scope
- * to file it under) or `'written'`/`'confirmed'` (what `remember()` itself
- * returned). A file that cannot even be stat'd or read counts as
- * `'unchanged'`: there is nothing new to record, and no state to update.
+ * state, and reports what happened — `'unchanged'`, `'skipped'` (no usable
+ * description, a secret, no scope to file it under, or `remember()` itself
+ * refused it) or `'written'`/`'confirmed'`. A file that cannot even be
+ * stat'd or read counts as `'unchanged'`: there is nothing new to record,
+ * and no state to update.
+ *
+ * `files[name]` is only ever written for a skip that depends purely on the
+ * file's OWN content (no description, a secret) — content that cannot
+ * change without the file's mtime/size changing with it, so the fast
+ * `'unchanged'` path above will always catch a later edit regardless.
+ * A skip caused by something OUTSIDE the file — no scope resolves for it
+ * yet, or the store refused the write — must NOT be recorded: the file
+ * itself never changes once its target scope is created later (or the
+ * store recovers), so recording it now would make the fast path skip it
+ * forever. Leaving no entry means the next run re-reads and retries it,
+ * at the cost of a stat+read it would otherwise have skipped.
  */
 function syncOneFile({ memoryDir, name, files, scopeMap, existingScopeIds, memory }) {
   const fullPath = path.join(memoryDir, name);
@@ -202,25 +214,32 @@ function syncOneFile({ memoryDir, name, files, scopeMap, existingScopeIds, memor
     return 'unchanged';
   }
 
-  files[name] = { mtimeMs: stat.mtimeMs, size: stat.size, sha256: crypto.createHash('sha256').update(raw).digest('hex') };
+  const state = { mtimeMs: stat.mtimeMs, size: stat.size, sha256: crypto.createHash('sha256').update(raw).digest('hex') };
 
   const frontmatter = parseFrontmatter(raw);
-  if (!frontmatter || typeof frontmatter.description !== 'string' || frontmatter.description.trim() === '') return 'skipped';
+  if (!frontmatter || typeof frontmatter.description !== 'string' || frontmatter.description.trim() === '') {
+    files[name] = state; // content-only skip: a later edit still changes mtime/size, so this is safe to remember
+    return 'skipped';
+  }
 
   let text = frontmatter.description.trim();
   if (text.length > MAX_TEXT_CHARS) text = `${text.slice(0, MAX_TEXT_CHARS - 1)}…`;
-  if (looksLikeSecret(text)) return 'skipped';
+  if (looksLikeSecret(text)) {
+    files[name] = state; // same: content-only skip
+    return 'skipped';
+  }
 
   const stem = name.slice(0, -3); // strip '.md'
   const scopeId = resolveScopeId({ stem, scopeMap, existingScopeIds });
-  if (!scopeId) return 'skipped';
+  if (!scopeId) return 'skipped'; // scope may still appear later — do not record, or it never gets retried
 
   const kind = frontmatter.type === 'user' ? 'profile' : 'fact';
   try {
     const outcome = memory.remember({ scopeId, text, kind, origin: `memory-sync:${name}`, confidence: 0.9 });
+    files[name] = state;
     return outcome.confirmed ? 'confirmed' : 'written';
   } catch {
-    return 'skipped';
+    return 'skipped'; // the store's refusal is not about this file's content — same reasoning, do not record
   }
 }
 
