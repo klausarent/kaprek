@@ -13,6 +13,10 @@
 import { buildSessionStartContext } from './session-start.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
+import { syncMemoryDir } from '../memory/sync.mjs';
+
+/** Sources where the session actually starts fresh context for a person to read — not a compaction or a fork mid-conversation, where re-syncing buys nothing. */
+const SYNC_SOURCES = ['startup', 'resume', 'clear'];
 
 const SELF_TIMEOUT_MS = 3000;
 
@@ -43,6 +47,15 @@ async function main() {
   try {
     if (typeof input?.session_id === 'string') appendSessionEvent(dataDir, { type: 'start', sessionId: input.session_id, cwd, transcriptPath: input?.transcript_path ?? null });
   } catch {
+  }
+
+  // Before building the context, not after: a fact synced this run should
+  // already be there for this same session's own memory block.
+  if (SYNC_SOURCES.includes(input?.source)) {
+    try {
+      syncMemoryDir({ dataDir, deadlineMs: 700 });
+    } catch {
+    }
   }
 
   const context = buildSessionStartContext({ dataDir, cwd });

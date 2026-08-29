@@ -493,6 +493,10 @@ Important: a Stop hook fires *after* the turn already ended — after any tool c
 
 The same install adds a **SessionStart** hook. When a Claude Code session opens in a directory that is a kaprek mission's working directory, the session starts with what kaprek knows about that work, as context it can see: the mission's title and goal, how many questions are waiting in the kaprek inbox for it (with the address to answer them), the rules a person accepted from failure-to-policy proposals, and what earlier sessions wrote down for that project — the same rules and memory kaprek's own turns get, so a terminal session is no longer the one place they do not reach. Outside a mission directory the hook adds only the accepted rules, if any; with nothing to say it says nothing. The whole block is capped at 1,500 characters, the hook reads kaprek's data and never writes it, fails open on every error, and exits on its own after three seconds — it must never slow a session down. Same shape as the Stop hook: one script, no daemon, uninstalled with the same command.
 
+### Memory follows your memory files
+
+On startup, resume and clear, the SessionStart hook also reads your own Claude Code memory files (`~/.claude/projects/<slug>/memory/*.md`, override with `KAPREK_MEMORY_DIR`) and remembers each file's `description` as a fact in its project scope, so a fresh kaprek starts already knowing what you have written down elsewhere. It only reads files that changed since the last sync, skips anything that looks like a bare secret, and gives up after 700 ms — a directory of hundreds of files catches up over a few session starts, not all at once.
+
 ### Stop: what the hook writes
 
 Since the terminal is where the work happens, the Stop hook also makes the terminal count:

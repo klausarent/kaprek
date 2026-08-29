@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { openMissions } from '../missions/store.mjs';
+import { openMemory } from '../memory/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_PATH = path.join(__dirname, 'hook-session-start.mjs');
@@ -12,20 +13,23 @@ const DATA_DIR_ENV = 'KAPREK_DATA_DIR';
 
 let dataDir;
 let cwd;
+let memoryDir;
 
 beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-'));
   cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-cwd-'));
+  memoryDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstart-mem-'));
 });
 
 afterEach(() => {
   fs.rmSync(dataDir, { recursive: true, force: true });
   fs.rmSync(cwd, { recursive: true, force: true });
+  fs.rmSync(memoryDir, { recursive: true, force: true });
 });
 
-function runHook(stdinPayload) {
+function runHook(stdinPayload, extraEnv = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [HOOK_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, [DATA_DIR_ENV]: dataDir } });
+    const child = spawn(process.execPath, [HOOK_PATH], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, [DATA_DIR_ENV]: dataDir, ...extraEnv } });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (chunk) => {
@@ -70,4 +74,34 @@ test('no cwd: no ledger event is written either (nothing to scope it to)', async
   const { code } = await runHook(JSON.stringify({ session_id: 'ledger-2' }));
   expect(code).toBe(0);
   expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
+});
+
+function writeMemoryFile(name, description) {
+  fs.writeFileSync(
+    path.join(memoryDir, name),
+    `---\nname: ${name.replace(/\.md$/, '')}\ndescription: ${description}\nmetadata: \n  type: feedback\n---\n\nbody\n`,
+    'utf8',
+  );
+}
+
+test('source=startup runs the memory sync before building context — a memory file becomes a fact', async () => {
+  openMemory(dataDir).addScope({ id: 'person:local' });
+  writeMemoryFile('feedback_hooked.md', 'Learned through the SessionStart hook');
+
+  const { code } = await runHook(JSON.stringify({ session_id: 's-sync', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'startup' }), {
+    KAPREK_MEMORY_DIR: memoryDir,
+  });
+  expect(code).toBe(0);
+  expect(fs.existsSync(path.join(dataDir, 'memory', 'sync-state.json'))).toBe(true);
+  const facts = openMemory(dataDir).list({ scopeId: 'person:local' });
+  expect(facts.some((fact) => fact.text === 'Learned through the SessionStart hook')).toBe(true);
+});
+
+test('source=compact does not run the memory sync', async () => {
+  writeMemoryFile('feedback_skipped.md', 'Must not be synced on compact');
+  const { code } = await runHook(JSON.stringify({ session_id: 's-compact', transcript_path: 'x', cwd, hook_event_name: 'SessionStart', source: 'compact' }), {
+    KAPREK_MEMORY_DIR: memoryDir,
+  });
+  expect(code).toBe(0);
+  expect(fs.existsSync(path.join(dataDir, 'memory', 'sync-state.json'))).toBe(false);
 });
