@@ -1,10 +1,12 @@
 // Manages kaprek's Claude Code hook entries in ~/.claude/settings.json:
 // the Stop hook (policy engine, artifact sweep), the SessionStart hook
 // (mission, open questions, rules and memory for the directory a session
-// opens in — see src/policy/hook-session-start.mjs), and the SessionEnd
-// hook (marks that session's ledger entry ended, so `kaprek resume` can
-// tell it apart from one still open — see src/policy/hook-session-end.mjs).
-// One install, one uninstall, one marker for all three.
+// opens in — see src/policy/hook-session-start.mjs), the SessionEnd hook
+// (marks that session's ledger entry ended, so `kaprek resume` can tell it
+// apart from one still open — see src/policy/hook-session-end.mjs), and the
+// UserPromptSubmit hook (re-sends that same context when the session
+// changes directory mid-conversation — see src/policy/hook-user-prompt.mjs).
+// One install, one uninstall, one marker for all four.
 //
 // Pure fs work, no console output — bin/cli.mjs owns printing, this module
 // only returns plain result objects so it stays easy to test against a
@@ -21,9 +23,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const HOOK_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-stop.mjs');
 export const SESSION_START_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-session-start.mjs');
 export const SESSION_END_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-session-end.mjs');
+export const USER_PROMPT_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-user-prompt.mjs');
 
 /** The events kaprek hooks into, and which script answers each. */
-export const HOOK_EVENTS = Object.freeze({ Stop: 'hookScriptPath', SessionStart: 'sessionStartScriptPath', SessionEnd: 'sessionEndScriptPath' });
+export const HOOK_EVENTS = Object.freeze({ Stop: 'hookScriptPath', SessionStart: 'sessionStartScriptPath', SessionEnd: 'sessionEndScriptPath', UserPromptSubmit: 'userPromptScriptPath' });
 
 const MANAGED_BY_PREFIX = '--managed-by=';
 
@@ -137,40 +140,42 @@ function upsertEntry(settings, event, command, packageName) {
 }
 
 /**
- * Idempotently adds kaprek's hooks — Stop, SessionStart and SessionEnd — to
- * `settingsPath` (default `~/.claude/settings.json`). Backs up the file
- * first (if it exists), leaves any other hooks byte-for-byte untouched. If
- * an entry with our `--managed-by` marker already exists under an event
- * (even at a different path), its command is updated in place rather than
- * adding a duplicate; an install from before SessionStart or SessionEnd
- * existed gains that entry and keeps the others.
+ * Idempotently adds kaprek's hooks — Stop, SessionStart, SessionEnd and
+ * UserPromptSubmit — to `settingsPath` (default `~/.claude/settings.json`).
+ * Backs up the file first (if it exists), leaves any other hooks
+ * byte-for-byte untouched. If an entry with our `--managed-by` marker
+ * already exists under an event (even at a different path), its command is
+ * updated in place rather than adding a duplicate; an install from before
+ * SessionStart, SessionEnd or UserPromptSubmit existed gains that entry and
+ * keeps the others.
  */
 export function install({
   settingsPath = defaultSettingsPath(),
   hookScriptPath = HOOK_SCRIPT_PATH,
   sessionStartScriptPath = SESSION_START_SCRIPT_PATH,
   sessionEndScriptPath = SESSION_END_SCRIPT_PATH,
+  userPromptScriptPath = USER_PROMPT_SCRIPT_PATH,
   packageName = getPackageName(),
 } = {}) {
   const settings = readSettings(settingsPath);
   const backupPath = backupSettings(settingsPath);
 
-  const scripts = { hookScriptPath, sessionStartScriptPath, sessionEndScriptPath };
+  const scripts = { hookScriptPath, sessionStartScriptPath, sessionEndScriptPath, userPromptScriptPath };
   const already = {};
   for (const [event, key] of Object.entries(HOOK_EVENTS)) {
     already[event] = upsertEntry(settings, event, buildCommand(scripts[key], packageName), packageName);
   }
   // `alreadyInstalled` keeps its old meaning — the Stop hook was there —
   // and `added` names what this run actually put in, so an install from
-  // before SessionStart or SessionEnd existed reads as "already installed,
-  // SessionEnd added" rather than as either extreme.
+  // before SessionStart, SessionEnd or UserPromptSubmit existed reads as
+  // "already installed, <event> added" rather than as either extreme.
   const alreadyInstalled = already.Stop === true;
   const added = Object.entries(already)
     .filter(([, wasThere]) => !wasThere)
     .map(([event]) => event);
 
   writeSettings(settingsPath, settings);
-  return { installed: true, alreadyInstalled, added, settingsPath, backupPath, hookScriptPath, sessionStartScriptPath, sessionEndScriptPath, events: Object.keys(HOOK_EVENTS) };
+  return { installed: true, alreadyInstalled, added, settingsPath, backupPath, hookScriptPath, sessionStartScriptPath, sessionEndScriptPath, userPromptScriptPath, events: Object.keys(HOOK_EVENTS) };
 }
 
 /**

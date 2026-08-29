@@ -67,7 +67,7 @@ Autostart (start kaprek when you log in — off unless you ask):
   autostart status     Show whether it is there, and print its path
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
-  hooks install    Add the kaprek Stop + SessionStart + SessionEnd hooks to ~/.claude/settings.json
+  hooks install    Add the kaprek Stop + SessionStart + SessionEnd + UserPromptSubmit hooks to ~/.claude/settings.json
   hooks uninstall  Remove only the kaprek hook entries
   hooks status     Show whether the hooks are installed and the active policy mode
 
@@ -83,11 +83,12 @@ Manages kaprek's Claude Code hooks: the Stop hook the policy engine uses to
 gently enforce workflow rules (e.g. requiring a linked board task for
 commits), the SessionStart hook that tells a session opening in a mission
 directory about the mission, its open questions, the rules a person
-accepted, and what earlier sessions wrote down, and the SessionEnd hook
-that marks a session's ledger entry as ended so \`kaprek resume\` can tell
-it apart from one still open.
+accepted, and what earlier sessions wrote down, the SessionEnd hook that
+marks a session's ledger entry as ended so \`kaprek resume\` can tell it
+apart from one still open, and the UserPromptSubmit hook that re-sends that
+same context if the session changes directory mid-conversation.
 
-  install    Adds all three kaprek hooks to ~/.claude/settings.json
+  install    Adds all four kaprek hooks to ~/.claude/settings.json
              (backs up the existing file first; leaves other hooks intact)
   uninstall  Removes only the kaprek hook entries
   status     Shows whether the hooks are installed and the active policy mode
@@ -153,7 +154,7 @@ function runHooksCommand(args) {
   try {
     if (sub === 'install') {
       const result = installHook();
-      console.log(`Installed Stop + SessionStart + SessionEnd hooks -> ${result.settingsPath}`);
+      console.log(`Installed Stop + SessionStart + SessionEnd + UserPromptSubmit hooks -> ${result.settingsPath}`);
       if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       if (result.alreadyInstalled) console.log(result.added?.length ? `(Stop hook was already installed; added: ${result.added.join(', ')})` : '(already installed, left unchanged)');
     } else if (sub === 'uninstall') {
@@ -166,7 +167,7 @@ function runHooksCommand(args) {
       }
     } else if (sub === 'status') {
       const result = hookStatus();
-      for (const event of ['Stop', 'SessionStart', 'SessionEnd']) {
+      for (const event of ['Stop', 'SessionStart', 'SessionEnd', 'UserPromptSubmit']) {
         const report = result.events?.[event];
         console.log(`${event}: ${report?.installed ? 'installed' : 'not installed'}`);
       }

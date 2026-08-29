@@ -17,6 +17,7 @@ import { getAppDir } from '../lib/appdir.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
 import { ensureServerRunning } from '../server/ensure.mjs';
 import { syncMemoryDir } from '../memory/sync.mjs';
+import { writeContextState } from './prompt-context-state.mjs';
 
 /** Sources where the session actually starts fresh context for a person to read — not a compaction or a fork mid-conversation, where re-syncing buys nothing. */
 const SYNC_SOURCES = ['startup', 'resume', 'clear'];
@@ -81,6 +82,19 @@ async function main() {
   }
 
   const context = buildSessionStartContext({ dataDir, cwd });
+
+  // Records the directory this context was just built for, so the first
+  // UserPromptSubmit in this same session and directory does not repeat it
+  // — see hook-user-prompt.mjs, which reads this same state. Written even
+  // when the block was empty: an empty result for this directory is itself
+  // worth remembering, so the prompt hook's fast path applies immediately.
+  if (typeof input?.session_id === 'string') {
+    try {
+      writeContextState(dataDir, input.session_id, cwd);
+    } catch {
+    }
+  }
+
   if (context === '') return;
   process.stdout.write(JSON.stringify({ hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: context } }));
 }
