@@ -74,12 +74,18 @@ const FORBIDDEN_PATTERNS = [...NETWORK_PATTERNS, ...CHILD_PROCESS_PATTERNS];
 //     tool is called, and that text must never become part of a command line.
 //   - src/resume/launch.mjs opens the user's own already-authenticated agent
 //     CLIs as terminal tabs (kaprek resume).
+//   - src/server/ensure.mjs spawns a second, detached kaprek process
+//     (bin/cli.mjs --no-open, this same package's own entrypoint — see the
+//     spawn-argument pin below) when a Claude Code SessionStart hook fires
+//     and no instance is running yet: kaprek starting itself, not a foreign
+//     command.
 const ALLOWED_CHILD_PROCESS_FILES = [
   path.join(ROOT, 'bin', 'cli.mjs'),
   path.join(ROOT, 'src', 'triggers', 'clipboard.mjs'),
   path.join(ROOT, 'src', 'cli', 'update.mjs'),
   path.join(ROOT, 'src', 'server', 'notify.mjs'),
   path.join(ROOT, 'src', 'resume', 'launch.mjs'),
+  path.join(ROOT, 'src', 'server', 'ensure.mjs'),
 ];
 const ALLOWED_CHILD_PROCESS_DIR = path.join(ROOT, 'src', 'harness');
 
@@ -87,13 +93,17 @@ function isAllowedChildProcessSource(file) {
   return ALLOWED_CHILD_PROCESS_FILES.includes(file) || file.startsWith(`${ALLOWED_CHILD_PROCESS_DIR}${path.sep}`);
 }
 
-// One sanctioned outbound connect in the whole tree: the instance lock asks
-// whoever holds its derived port whether they are a kaprek on the same data
-// dir (see src/lib/instance-lock.mjs). That is a connect to 127.0.0.1 and
-// nothing else — the loopback test below pins it there, so this exemption
-// cannot quietly widen into a real network call. Every other network
-// pattern, fetch() first among them, stays forbidden in that file too.
-const ALLOWED_LOOPBACK_CONNECT_FILE = path.join(ROOT, 'src', 'lib', 'instance-lock.mjs');
+// Two sanctioned outbound connects in the whole tree, both to 127.0.0.1 and
+// nothing else — the loopback test below pins both, so neither exemption can
+// quietly widen into a real network call:
+//   - the instance lock asks whoever holds its derived port whether they are
+//     a kaprek on the same data dir (src/lib/instance-lock.mjs).
+//   - src/server/ensure.mjs asks whether the port named in instance.lock is
+//     actually accepting connections, before deciding whether to spawn a
+//     second kaprek.
+// Every other network pattern, fetch() first among them, stays forbidden in
+// both files too.
+const ALLOWED_LOOPBACK_CONNECT_FILES = [path.join(ROOT, 'src', 'lib', 'instance-lock.mjs'), path.join(ROOT, 'src', 'server', 'ensure.mjs')];
 
 // THE ONE FILE THAT MAY LEAVE THIS MACHINE, and it exists to be that: an
 // update command that cannot ask what the newest version is would be a
@@ -136,7 +146,7 @@ test('static guard: no network-client or subprocess APIs outside test files (exc
     const isAllowedChildProcessFile = isAllowedChildProcessSource(file);
     for (const pattern of FORBIDDEN_PATTERNS) {
       if (isAllowedChildProcessFile && CHILD_PROCESS_PATTERNS.includes(pattern)) continue;
-      if (file === ALLOWED_LOOPBACK_CONNECT_FILE && pattern === LOOPBACK_CONNECT_PATTERN) continue;
+      if (ALLOWED_LOOPBACK_CONNECT_FILES.includes(file) && pattern === LOOPBACK_CONNECT_PATTERN) continue;
       // The update command's registry call. Confined by the test below to
       // registry.npmjs.org and nothing else.
       if (file === ALLOWED_REGISTRY_FILE && NETWORK_PATTERNS.includes(pattern)) continue;
@@ -176,12 +186,12 @@ test('the update command talks to the npm registry and to nothing else', () => {
 });
 
 test('the instance lock only ever talks to 127.0.0.1', () => {
-  // Pins the one exemption above. The lock derives a port from the data dir
-  // path and asks whoever holds it whether they are a kaprek on that same
-  // dir; if a hostname or a second address ever appears in this file, the
-  // exemption is no longer about loopback and this test has to be the thing
-  // that says so.
-  const content = fs.readFileSync(ALLOWED_LOOPBACK_CONNECT_FILE, 'utf8');
+  // Pins one of the two loopback exemptions above. The lock derives a port
+  // from the data dir path and asks whoever holds it whether they are a
+  // kaprek on that same dir; if a hostname or a second address ever appears
+  // in this file, the exemption is no longer about loopback and this test
+  // has to be the thing that says so.
+  const content = fs.readFileSync(ALLOWED_LOOPBACK_CONNECT_FILES[0], 'utf8');
   const addresses = [...content.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)].map((match) => match[0]);
   expect([...new Set(addresses)]).toEqual(['127.0.0.1']);
 
@@ -203,6 +213,27 @@ test('the instance lock only ever talks to 127.0.0.1', () => {
   // bound"); these two lines make the static guard fail for the same reason.
   expect(content).toMatch(/net\.connect\([^;]*host:\s*LOCK_HOST/);
   expect(content).toMatch(/\.listen\([^;]*host:\s*LOCK_HOST/);
+});
+
+test('the autostart aliveness probe only ever talks to 127.0.0.1', () => {
+  // Pins the other loopback exemption. src/server/ensure.mjs decides whether
+  // to spawn a second kaprek based on whether the port named in
+  // instance.lock answers, never by resolving a hostname — the same
+  // ::1-vs-127.0.0.1 trap instance-lock.mjs documents for net.connect's
+  // default host.
+  const content = fs.readFileSync(ALLOWED_LOOPBACK_CONNECT_FILES[1], 'utf8');
+  const addresses = [...content.matchAll(/\d{1,3}(?:\.\d{1,3}){3}/g)].map((match) => match[0]);
+  expect([...new Set(addresses)]).toEqual(['127.0.0.1']);
+  expect(content).toMatch(/net\.connect\(\{[^}]*host:\s*'127\.0\.0\.1'/);
+});
+
+test('the autostart spawn only ever launches this same package\'s bin/cli.mjs, detached, with --no-open', () => {
+  // Pins the child-process exemption for src/server/ensure.mjs: it must stay
+  // "kaprek launches another kaprek", never grow into running an arbitrary
+  // command.
+  const content = fs.readFileSync(path.join(ROOT, 'src', 'server', 'ensure.mjs'), 'utf8');
+  expect(content).toMatch(/spawn\(execPath,\s*\[cliPath,\s*'--no-open'\]/);
+  expect(content).toMatch(/detached:\s*true/);
 });
 
 test('root package.json declares no runtime dependencies', () => {

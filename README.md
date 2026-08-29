@@ -468,6 +468,10 @@ Claude Code writes scratchpad work products (scripts, data files, images) under 
 
 kaprek sweeps every session's scratchpad into `<dataDir>/artifacts/<projectSlug>/<sessionId>/` in two ways: automatically (best-effort, small byte budget) when the Stop hook fires for that session, and fully (no budget beyond the caps below) whenever the search index is rebuilt (`POST /api/search/reindex`, including the button in `#/search`). A per-session `manifest.json` makes repeat sweeps idempotent — unchanged files are neither re-hashed nor re-copied. Two caps bound disk usage: a single file over 25 MB is skipped (recorded in the manifest as `too-large`), and once a session's preserved total crosses 100 MB (20 MB for the hook's own smaller sweep) further files are skipped as `session-budget`. A session's preserved artifacts, if any, show up under an "Artifacts" section on its thread view.
 
+## Starting and stopping
+
+kaprek starts itself: once its SessionStart hook is installed (see [Claude Code hook](#claude-code-hook-optional)), opening your first Claude Code session of the day brings it up in the background, with no browser tab and no command to remember (`KAPREK_NO_AUTOSTART=1` turns this off). Running `kaprek` yourself afterwards opens the browser on the instance that is already up instead of erroring. `kaprek stop` ends it.
+
 ## Resume after a crash (`kaprek resume`)
 
 Windows Terminal dies, twenty sessions with it. kaprek reads the session stores of all four engines — `~/.claude/projects`, `~/.codex/sessions`, `~/.grok/sessions`, `~/.kimi-code/sessions` — and reopens them as terminal tabs, one `wt` tab per session, with the engine's own resume command (`claude --resume <id>`, `codex resume <id>`, and so on).
