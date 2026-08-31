@@ -119,7 +119,7 @@ Fünf Optionen, bewertet gegen zwei kaprek-Eigenheiten: der Server hat **null La
 | **Tauri v2 mit Node-Sidecar** | Läuft auch ohne installiertes Node | Bundling einer Node-Runtime, Signatur-Fragen | L | mittel bis hoch |
 | **Electron** | Node ist eingebaut, der Server läuft direkt im Main-Prozess | ~85 MB Chromium und ein großer Abhängigkeitsbaum in einem Zero-Dep-Projekt | M | mittel |
 
-**Empfehlung: Stufenweise, mit Tauri v2 als Ziel und ohne gebündeltes Node.**
+**Empfehlung: Stufenweise, mit Tauri v2 als Ziel und ohne gebündeltes Node — und das Ergebnis heißt dann nicht „standalone".** Solange Node und die CLIs getrennt installiert sein müssen, ist es eine umgebungsabhängige Desktop-Hülle. Das Zip bleibt der Rückfallweg, nicht der abgelöste Vorgänger.
 
 Der entscheidende Punkt wird meist übersehen: **wer kaprek benutzt, hat Node und die `claude`-CLI ohnehin installiert** — sonst gäbe es nichts zu beaufsichtigen. Damit ist die teure Hälfte jeder Desktop-Verpackung, das Mitliefern einer Laufzeit, für die heutige Zielgruppe unnötig. Die Hülle muss nur ein Fenster aufmachen, `node bin/cli.mjs` starten, das Token entgegennehmen und es dem WebView per Init-Script übergeben, statt es in `GET /` auszuliefern.
 
@@ -133,6 +133,21 @@ Der entscheidende Punkt wird meist übersehen: **wer kaprek benutzt, hat Node un
 - **Signierung und SmartScreen.** Eine unsignierte Windows-App wird beim ersten Start blockiert. Das Zip hat dieses Problem heute schon, eine `.exe` macht es sichtbarer. Zertifikat kostet Geld und Zeit; ohne das bleibt der erste Start hässlich.
 - **Auto-Update.** Der Netz-Wächter zwingt den Updater in die Hülle. Sauber, aber es heißt: zwei Release-Kanäle (npm und App) mit getrennter Versionslogik.
 - **Zwei Oberflächen, ein Zustand.** Solange die Hülle nur die vorhandene Web-UI zeigt, gibt es keinen zweiten Frontend-Code. Sobald jemand „native Menüs" will, gibt es ihn. Nicht anfangen.
+
+### 1.7 Einwände aus dem Council (Codex, 31.08.2026)
+
+Der Entwurf ist blind gegen Codex gelaufen. Grok kam nicht durch („max turns"), es gibt also kein Zweitvotum. Was Codex geliefert hat, trifft und steht deshalb hier, statt weggeglättet zu werden:
+
+- **Die Token-Lücke wird kleiner, nicht geschlossen.** Der Satz aus 1.5, Stufe 2, war zu stark. Das Token bleibt für JavaScript im WebView erreichbar — XSS, unerwünschte Navigation oder eingebetteter Fremdinhalt kommen daran. Zur Stufe 2 gehören deshalb zwingend: CSP im WebView, Navigations-Sperre auf die eigene Herkunft, und Tauri-Capabilities so eng wie möglich. Der Gewinn ist, dass `GET /` das Token nicht mehr an jeden lokalen Prozess ausliefert; mehr ist es nicht.
+- **Der Bootstrap braucht eine Server-Identität.** Ein feindlicher lokaler Prozess kann den erwarteten Port besetzen, bevor die Hülle verbindet; das WebView bekäme dann das Token auf einen fremden Server. Die Hülle darf sich nicht auf „Port 4900 antwortet" verlassen, sondern muss Kindprozess, Port und WebView-Sitzung aneinander binden (Token aus dem stdout genau dieses Kindes, Abgleich vor der Injektion).
+- **`injectTokenMeta()` abschalten ist kein Flag.** Ein Umgebungsschalter, der versehentlich im Browser-Betrieb greift, macht die Oberfläche unbrauchbar oder inkonsistent. Der Hüllen-Modus braucht eine eindeutige, geprüfte Bedingung und einen Test für beide Betriebsarten.
+- **PATH.** Ein aus der GUI gestarteter Prozess erbt die Shell-Umgebung nicht zuverlässig. Node und `claude` können installiert und trotzdem nicht auffindbar sein. Zur Stufe 2 gehören Auffinden der ausführbaren Datei, Mindestversions-Prüfung und eine Fehlermeldung, die sagt, was zu tun ist — kein stiller Fehlstart.
+- **Lebenszyklus.** Herunterfahren des Kindprozesses, Absturz, stdout-Pufferung, Portwahl, Andocken an eine bereits laufende Instanz, Waisen nach einem Absturz der Hülle: alles ungelöst und alles der Grund, warum solche Hüllen sich „manchmal komisch" verhalten.
+- **Das Zero-Dependency-Argument gilt nur für den Server.** Tauri bringt Rust-Crates, WebView2, Plugins, Signierung und eine Release-Infrastruktur mit. Gegen Electron zählt das Argument also schwächer, als es in der Tabelle klingt. Es bleibt bei der Empfehlung, aber aus dem Größen- und Token-Grund, nicht aus Reinheit.
+- **Fixtures allein reichen nicht (Abschnitt 3.4, E0).** Aufgezeichnete Ausgaben prüfen kapreks Parser gegen bekannte Beispiele; sie merken nicht, dass eine frisch installierte CLI live etwas anderes spricht. Fixtures brauchen Versions-Metadaten und dazu einen Rauchtest gegen die tatsächlich installierte CLI-Version.
+- **Der Auslöser „mehr als zweimal im Quartal" ist willkürlich** und wird in 3.3 entsprechend ersetzt.
+
+Nicht übernommen: Codex hält „N=1" für eine schwache Begründung und will stattdessen Zuverlässigkeit, Kosten, Kontrollbedarf und Upstream-Stabilität als Maßstab. Die Kriterien sind besser, aber die Frage nach der Zahl der Nutzer kam von Klaus und wird beantwortet — die Kriterien stehen jetzt zusätzlich in 3.3.
 
 ### 1.6 Marktüberblick: was gerade taugt
 
@@ -262,11 +277,13 @@ Drei Ausnahmen, in denen es sich lohnt — und nur diese drei:
 
 1. **Formatvertrag festnageln (S bis M, lohnt sofort).** Die Adapter-Schicht steht bereits (`adapter.mjs`, `registry.mjs`, `fake.mjs`); was fehlt, sind Fixtures echter Stream-Ausgaben beider Engines und Tests, die brechen, wenn sich das Format ändert. Heute merkt kaprek einen Bruch erst im Live-Lauf. Das ist die billigste Versicherung gegen den teuersten Fehler — und sie ist kein Harness, sondern Hygiene.
 2. **Mini-Harness für nicht-agentische Turns (M, opt-in).** Digest-Zusammenfassung, Titelvorschlag, Klassifikation: ein HTTP-Aufruf gegen ein kleines Modell, kein Loop, kein Werkzeug. Bricht allerdings sowohl das „kein Netz"-Versprechen des Node-Codes als auch „kein API-Key" — deshalb nur als ausdrücklich einzuschaltendes Extra mit eigenem README-Absatz, oder gar nicht.
-3. **Eigener Loop (L+, nur bei Auslöser).** Gerechtfertigt, wenn eines davon eintritt: das CLI-Format bricht mehr als zweimal im Quartal; kaprek soll Nutzer bedienen, die keine CLI installiert haben (das ist die Verbindung zu Abschnitt 1.5, Stufe 3); oder die Abrechnung macht den CLI-Weg dauerhaft teurer als den direkten.
+3. **Eigener Loop (L+, nur bei Auslöser).** Nicht die Häufigkeit von Änderungen entscheidet, sondern ihre Schwere: ein einziger Bruch, der Freigaben, Resume oder unbeaufsichtigte Läufe unbrauchbar macht, wiegt schwerer als zehn harmlose Formatwechsel. Gerechtfertigt ist der eigene Loop, wenn eines davon eintritt: ein Bruch trifft einen dieser drei Kernwege und lässt sich nicht im Adapter auffangen; kaprek soll Nutzer bedienen, die keine CLI installiert haben (das ist die Verbindung zu Abschnitt 1.5, Stufe 3); oder die Abrechnung macht den CLI-Weg dauerhaft teurer als den direkten.
+
+Codex' Einwand dazu ist berechtigt: „ein Operator" ist für sich kein Argument. Die Maßstäbe sind Zuverlässigkeit, Kosten, benötigte Kontrolltiefe und Stabilität der fremden Schnittstelle. Sie fallen heute alle vier zugunsten der CLIs aus — die Zuverlässigkeit, weil die CLIs täglich unter echter Last laufen; die Kosten, solange die Abrechnungsfrage aus 3.2 nicht anders beantwortet ist; die Kontrolltiefe, weil kaprek Freigaben bereits über strukturierte Kanäle bekommt statt über geratene Ausgaben; die Stabilität, weil beide Anbieter maschinenlesbare Modi pflegen. Kippt einer dieser vier, kippt das Verdikt — nicht wenn die Nutzerzahl steigt. Ebenfalls offen und ehrlich zu benennen: dass ein eigener Loop „jede Verbesserung der CLIs verliert", ist eine Annahme, kein Messwert. Bevor E4 startet, gehört eine Fähigkeits-Gegenüberstellung auf den Tisch (das ist genau E2).
 
 ### 3.4 Migrationspfad in Etappen
 
-- **E0 — Formatvertrag.** Fixtures und Verträge-Tests für die Stream-Ausgaben beider Engines. Aufwand S. Ohne Nutzen-Verlust, auch wenn nie ein Harness kommt.
+- **E0 — Formatvertrag.** Fixtures und Verträge-Tests für die Stream-Ausgaben beider Engines, mit Versions-Metadaten am Fixture und einem Rauchtest gegen die tatsächlich installierte CLI-Version — sonst prüft man nur sich selbst. Aufwand S. Ohne Nutzen-Verlust, auch wenn nie ein Harness kommt.
 - **E1 — Adapter-Schicht.** Ein Modul je Engine, das rohe CLI-Ereignisse in kapreks eigenes Ereignis-Modell übersetzt; der Rest des Codes sieht die CLI nicht mehr. Aufwand M.
 - **E2 — Fähigkeits-Matrix.** Je Engine festhalten, was sie kann (Resume, Werkzeug-Freigabe, Kostenmeldung, Strukturierte Ausgabe) und was kaprek deshalb anders macht. Aufwand S. Nebengewinn: die Council-Auswahl wird begründbar statt gefühlt.
 - **E3 — Mini-Harness** für die drei bis vier nicht-agentischen Aufgaben, hinter einem Schalter. Aufwand M.
