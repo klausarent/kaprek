@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { parseArgs } from '../src/cli/args.mjs';
 import { startServer } from '../src/server/server.mjs';
 import { encodeQr, qrToText } from '../src/server/qr.mjs';
-import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from '../src/cli/update.mjs';
+import { fallbackAdvice, installKind, latestVersion, runInstall, updatePlan, askRunningInstance, gitStatusDirty, runningInstanceNotice } from '../src/cli/update.mjs';
 import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir, getAppDir } from '../src/lib/appdir.mjs';
@@ -35,6 +35,17 @@ import { gitExec } from '../src/lib/git-exec.mjs';
 // Same value as server.mjs's PEER_TURN_TIMEOUT_MS (not exported there — kept
 // in sync by hand; see src/server/server.mjs around the council imports).
 const PEER_TURN_TIMEOUT_MS = 9 * 60 * 1000;
+
+// This copy of kaprek: where its package.json lives, and which version it
+// declares. Read at server start so the instance-lock greeting can say which
+// version is running, and again by `kaprek update` for the same question
+// from the other side.
+const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/** The version string of THIS copy of kaprek, from its package.json. */
+function installedVersion() {
+  return JSON.parse(fs.readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8')).version;
+}
 
 const USAGE = `Usage: kaprek [options]
        kaprek stop
@@ -198,8 +209,8 @@ function runHooksCommand(args) {
  */
 async function runUpdateCommand(args) {
   const checkOnly = args.includes('--check');
-  const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  const current = JSON.parse(fs.readFileSync(path.join(packageRoot, 'package.json'), 'utf8')).version;
+  const packageRoot = PACKAGE_ROOT;
+  const current = installedVersion();
   const kind = installKind(packageRoot);
 
   console.log('Asking the npm registry which version is newest. (This is the one thing kaprek sends off this machine, and only when you ask for it.)');
@@ -214,7 +225,12 @@ async function runUpdateCommand(args) {
     return;
   }
 
-  const plan = updatePlan({ kind, current, latest });
+  // Decided BEFORE the plan message is printed, never after: for a git
+  // checkout the advice depends on whether the working tree is clean, and an
+  // afterthought sentence nobody connects to the advice is not advice.
+  const repoDirty = kind === 'repo' ? gitStatusDirty(packageRoot) : false;
+
+  const plan = updatePlan({ kind, current, latest, repoDirty });
   console.log(plan.message);
   if (plan.action !== 'install') return;
   if (checkOnly) {
@@ -225,6 +241,13 @@ async function runUpdateCommand(args) {
   const code = await runInstall(plan.command);
   if (code === 0) {
     console.log(`kaprek ${latest} installed. Start it again to use it.`);
+    // Success only counts as success if it is honest about what is running.
+    // The question goes over the same loopback greeting the instance lock
+    // already answers — no second transport, no new address. No instance
+    // running means nothing to be stale, so no sentence at all.
+    const running = await askRunningInstance({ dataDir: getAppDir() });
+    const notice = runningInstanceNotice({ installed: latest, running });
+    if (notice) console.log(notice);
   } else {
     console.error(fallbackAdvice(`Update failed (npm exited ${code}). You can try it yourself: ${plan.command.join(' ')}`));
     process.exitCode = code;
