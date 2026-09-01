@@ -1,0 +1,7 @@
+{
+  "id": "nightly-refactor",
+  "title": "Nightly refactor",
+  "description": "A small, bounded refactor run overnight.",
+  "goalTemplate": "Refactor <module> without changing behavior.",
+  "firstPrompt": "Read the tests first, then propose the refactor plan before touching code."
+}

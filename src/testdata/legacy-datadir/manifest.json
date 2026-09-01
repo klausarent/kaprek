@@ -1,0 +1,37 @@
+{
+  "description": "Legacy data-dir fixtures: the file formats kaprek wrote BEFORE the planned schema extensions. Every persistence package that changes a file format extends or adds its file here (DESIGN-SPEC.md, P0).",
+  "createdAt": "2026-09-01",
+  "kaprekVersion": "0.9.0",
+  "files": {
+    "approvals.json": {
+      "fields": "version (schreibt der Code heute, liest ihn nie), approvals[] mit id, chatId, requestId, triggerId, mode, askedCount, toolName, displayName, input, inputPreview, description, reason, agentId, source, deadlineAt, requestedAt, pid, status, decision, decidedAt, expired",
+      "legacyBecause": "ohne runId/cancelled/cancelledAt (geplant fuer P1, Approval-Lebenslauf)",
+      "note": "Enthaelt einen decided- und einen pending-interactive-Eintrag. Der pending-interactive-Eintrag wird beim Oeffnen von createApprovalStore() als 'expired: process gone' markiert und die Datei beim ersten Store-Vorgang zurueckgeschrieben — dokumentiertes Verhalten (approval-store.mjs loadFromDisk/persist)."
+    },
+    "policy.json": {
+      "fields": "version, mode, rules.requireTaskDoc, rules.requireCommitTask",
+      "legacyBecause": "ohne posture/hardDenials — beide Felder sind im heutigen loadPolicy() optional und fallen auf DEFAULT_POLICY zurueck"
+    },
+    "ledger/sessions.jsonl": {
+      "fields": "ts, type ('start'|'stop'|'end'), sessionId, cwd, transcriptPath, reason",
+      "legacyBecause": "nur start/stop-Zeilen, keine end-Events — readLedgerIndex() liefert endReason: null"
+    },
+    "search.db": {
+      "fields": "SQLite, PRAGMA user_version = 1, FTS5-Tabelle sessions_fts(sessionId, title, content) ohne projectSlug, Tabelle indexed, KEINE Tabelle mentioned",
+      "legacyBecause": "user_version 1 < SCHEMA_VERSION 2 (v2 hat 'mentioned' hinzugefuegt)",
+      "note": "ACHTUNG, by design: openSearchDb() droppt beim Oeffnen einer Datei mit niedrigerer user_version saemtliche Tabellen und setzt user_version = 2 (src/search/index.mjs). Diese Datei ist beim ersten Oeffnen bewusst weg — der Byte-Gleichheits-Check im Test schliesst sie aus. WAL-Modus erzeugt zusaetzlich search.db-wal/-shm."
+    },
+    "presets/nightly-refactor.json": {
+      "fields": "id, title, description, goalTemplate, firstPrompt",
+      "legacyBecause": "gueltiges Nutzer-Preset im heutigen Format (loadPresets-Kontrast zum kaputten Nachbarn)"
+    },
+    "presets/broken.json": {
+      "fields": "absichtlich trunciertes JSON",
+      "legacyBecause": "loadPresets() muss es ueberspringen und warnen, nie werfen"
+    },
+    "context/stale-session.json": {
+      "fields": "cwd, ts",
+      "legacyBecause": "verwaiste State-Datei; das Test-Setzen des mtimes (>7 Tage, STATE_MAX_AGE_MS) passiert im Test an der tmpdir-Kopie, nicht an dieser Datei"
+    }
+  }
+}

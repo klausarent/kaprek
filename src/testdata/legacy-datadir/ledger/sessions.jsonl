@@ -1,0 +1,4 @@
+{"ts":"2026-08-24T08:00:00.000Z","type":"start","sessionId":"legacy-session-a","cwd":"C:\\tmp\\demo","transcriptPath":null,"reason":null}
+{"ts":"2026-08-24T09:30:00.000Z","type":"stop","sessionId":"legacy-session-a","cwd":"C:\\tmp\\demo","transcriptPath":null,"reason":null}
+{"ts":"2026-08-25T10:00:00.000Z","type":"start","sessionId":"legacy-session-b","cwd":"C:\\tmp\\other","transcriptPath":null,"reason":null}
+{"ts":"2026-08-25T10:15:00.000Z","type":"stop","sessionId":"legacy-session-b","cwd":"C:\\tmp\\other","transcriptPath":null,"reason":null}
