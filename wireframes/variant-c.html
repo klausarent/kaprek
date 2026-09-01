@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>kaprek — Variant C: reading surface (minimal, single column, mono accents)</title>
+<style>
+  :root { --bg:#fafaf7; --ink:#222; --mut:#87847c; --line:#e6e4de; --acc:#1a5fb4; --warn:#a05a00; --bad:#a02c2c; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 Georgia,serif; }
+  .top { border-bottom:1px solid var(--line); background:#fff; position:sticky; top:0; }
+  .top .in { max-width:820px; margin:0 auto; display:flex; align-items:baseline; gap:20px; padding:12px 20px; }
+  .logo { font-family:Consolas,monospace; font-weight:700; }
+  .top nav { display:flex; gap:2px; flex:1; }
+  .top nav a { font:13px "Segoe UI",sans-serif; padding:4px 10px; color:var(--mut); text-decoration:none; border-radius:4px; }
+  .top nav a.on { background:var(--line); color:var(--ink); font-weight:600; }
+  .top .status { font:12px Consolas,monospace; color:var(--mut); }
+  .top .status b { color:var(--acc); }
+  main { max-width:820px; margin:0 auto; padding:36px 20px 80px; }
+  .view { display:none; } .view.on { display:block; }
+  h1 { font-size:26px; font-weight:400; margin:0 0 4px; }
+  .sub { color:var(--mut); font:14px "Segoe UI",sans-serif; margin:0 0 28px; }
+  h2 { font:13px "Segoe UI",sans-serif; letter-spacing:1px; text-transform:uppercase; color:var(--mut); margin:34px 0 10px; border-bottom:1px solid var(--line); padding-bottom:6px; display:flex; justify-content:space-between; }
+  h2 a { text-transform:none; letter-spacing:0; color:var(--acc); text-decoration:none; font-weight:600; }
+  .line { display:flex; gap:14px; align-items:baseline; padding:7px 0; border-bottom:1px dotted var(--line); }
+  .line .t { flex:1; min-width:0; }
+  .line .t .b { color:var(--mut); font:13px "Segoe UI",sans-serif; }
+  .line .t .a { font-weight:600; }
+  .num { font:14px Consolas,monospace; color:var(--mut); white-space:nowrap; }
+  .tag { font:11px "Segoe UI",sans-serif; padding:1px 8px; border:1px solid var(--line); border-radius:3px; color:var(--mut); background:#fff; white-space:nowrap; }
+  .tag.live { color:var(--acc); border-color:var(--acc); font-weight:700; }
+  .tag.warn { color:var(--warn); border-color:var(--warn); }
+  .unknown { color:var(--mut); font-style:italic; }
+  .acts { display:flex; gap:8px; }
+  button { font:13px "Segoe UI",sans-serif; background:none; border:1px solid var(--line); background:#fff; border-radius:4px; padding:3px 12px; cursor:pointer; color:var(--ink); }
+  button.pri { border-color:var(--acc); color:var(--acc); font-weight:600; }
+  button.danger { color:var(--bad); }
+  .qa { border:1px solid var(--line); background:#fff; border-radius:6px; padding:16px 18px; margin-bottom:14px; }
+  .qa .inp { font:13px/1.55 Consolas,monospace; background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:10px 12px; margin:10px 0; white-space:pre-wrap; word-break:break-word; }
+  .qa .meta { color:var(--mut); font:12px "Segoe UI",sans-serif; }
+  pre.digest { font:13px/1.55 Consolas,monospace; background:#fff; border:1px solid var(--line); border-radius:6px; padding:16px 18px; overflow-x:auto; }
+  .quote { border-left:3px solid var(--line); padding:2px 0 2px 14px; color:var(--mut); font-style:italic; margin:8px 0 0; }
+  footer.demo { text-align:center; color:var(--mut); font:12px "Segoe UI",sans-serif; padding:24px; }
+</style>
+</head>
+<body>
+<div class="top"><div class="in">
+  <span class="logo">kaprek</span>
+  <nav>
+    <a href="#start" data-v="start" class="on">Start</a>
+    <a href="#chat" data-v="chat">Chat</a>
+    <a href="#inbox" data-v="inbox">Inbox (3)</a>
+    <a href="#missions" data-v="missions">Missions</a>
+    <a href="#sessions" data-v="sessions">Sessions</a>
+  </nav>
+  <span class="status">2 running · <b>3 waiting</b> · $1.12 known</span>
+</div></div>
+
+<main>
+<!-- START -->
+<section class="view on" id="v-start">
+  <h1>What the night did</h1>
+  <p class="sub">Tuesday, 09:12 — read it like a log, act where it points. Nothing here is hidden; nothing here runs without the inbox.</p>
+
+  <h2>Needs an answer <a href="#inbox">inbox →</a></h2>
+  <div class="line"><span class="t"><span class="a">Bash · rm -rf build/</span><span class="b"> — mission kaprek-gui</span></span><span class="num">22 h left</span><span class="acts"><button class="pri">Answer</button></span></div>
+  <div class="line"><span class="t"><span class="a">Write · docs/release-2.1.md</span></span><span class="num">19 h left</span><span class="acts"><button class="pri">Answer</button></span></div>
+  <div class="line"><span class="t"><span class="a">Guided · which engine leads the council?</span></span><span class="num">21 h left</span><span class="acts"><button class="pri">Answer</button></span></div>
+
+  <h2>Running now</h2>
+  <div class="line"><span class="t"><span class="a">approval-store refactor</span> <span class="tag">claude</span><span class="b"> — editing src/server/approval-store.mjs</span></span><span class="num">12 m · 3 files</span><button class="danger">Abort</button></div>
+  <div class="line"><span class="t"><span class="a">release-notes draft</span> <span class="tag">codex</span><span class="b"> — cost will stay unknown, codex reports no dollars</span></span><span class="num">4 m</span><button class="danger">Abort</button></div>
+
+  <h2>Overnight</h2>
+  <div class="line"><span class="t"><span class="a">heartbeat (kaprek-gui)</span><span class="b"> — ran 02:00, finished 22 min, 41k tokens</span></span><span class="num">$1.12</span><a href="#missions">digest →</a></div>
+  <div class="line"><span class="t"><span class="a">schedule (backup-verify)</span><span class="b"> — ran 03:30, 18k tokens</span></span><span class="num"><span class="unknown">unknown</span></span><a href="#missions">digest →</a></div>
+  <div class="line"><span class="t"><span class="a">watch-builds</span><span class="b"> — skipped 01:00 and 03:00, condition false (no new files) — no cost, on purpose</span></span><span class="num">—</span><a href="#missions">digest →</a></div>
+  <div class="line"><span class="t"><span class="a">watch-builds</span> <span class="tag warn">degraded</span><span class="b"> — five condition errors in a row; the condition, not the agent, is broken</span></span><span class="num">—</span><button>Inspect</button></div>
+
+  <h2>Worth knowing</h2>
+  <div class="line"><span class="t"><span class="a">search index read-only</span><span class="b"> — written by a newer kaprek. Update kaprek, or delete search.db yourself; kaprek will not.</span></span></div>
+  <div class="line"><span class="t"><span class="a">one stale grant</span><span class="b"> — Write docs/** · hard denials changed since you confirmed it; its next use asks once</span></span><span class="acts"><button>Review grants</button></span></div>
+</section>
+
+<!-- INBOX -->
+<section class="view" id="v-inbox">
+  <h1>Inbox</h1>
+  <p class="sub">Filed questions survive the turn and the restart. Nothing runs while it waits here.</p>
+
+  <div class="qa">
+    <div><b>Bash</b> · mission kaprek-gui · <span class="meta">asked 2 h ago · 22 h of 24 h left</span></div>
+    <div class="inp">rm -rf build/</div>
+    <div class="acts">
+      <button class="pri">Approve &amp; run now</button>
+      <button class="danger">Deny</button>
+      <button>Always for this form</button>
+      <span class="meta" style="align-self:center">— exact: same tool, same raw input, nothing else</span>
+    </div>
+  </div>
+  <div class="qa">
+    <div><b>Write</b> · mission kaprek-gui · <span class="meta">19 h left</span></div>
+    <div class="inp">file_path: docs/release-2.1.md
+content: "# 2.1 — what changed …" (1.2 kB)</div>
+    <div class="acts"><button class="pri">Approve &amp; run now</button><button class="danger">Deny</button><button>Always for this form</button></div>
+  </div>
+  <div class="qa">
+    <div><b>Guided question</b> · <span class="meta">21 h left</span></div>
+    <div class="inp">Which engine should lead the next council?
+[ ] claude — cheapest at long context
+[ ] codex — fastest writes
+[ free text ] something else — or skip</div>
+    <div class="acts"><button class="pri">Answer</button><button>Skip — carry on</button></div>
+  </div>
+
+  <h2>History</h2>
+  <div class="line"><span class="t"><span class="a">Bash · npm test</span><span class="b"> — allowed via standing grant, 14th use</span></span><span class="num">waited 2 min</span></div>
+  <div class="line"><span class="t"><span class="a">Write · config.toml</span><span class="b"> — denied by you: "not this branch" · via web</span></span><span class="num">waited 3 h</span></div>
+  <div class="line"><span class="t"><span class="a">Bash · git push</span><span class="b"> — lapsed, nobody answered in 24 h</span></span><span class="num">waited 24 h</span></div>
+  <div class="line"><span class="t"><span class="a">Edit · src/relay.mjs</span><span class="b"> — cancelled (run-failed): nobody denied anything</span></span><span class="num">waited 11 min</span></div>
+
+  <h2>Standing grants <a href="#inbox">no expiry — revocation is the off switch</a></h2>
+  <div class="line"><span class="t"><span class="a">Bash · npm test</span><span class="b"> — exact · mission kaprek-gui</span></span><span class="num">14 hits · 06:40</span><button class="danger">Revoke</button></div>
+  <div class="line"><span class="t"><span class="a">Write · docs/**</span><span class="b"> — shape · stale (hard denials changed) · next use asks once</span></span><span class="num">3 hits</span><button class="danger">Revoke</button></div>
+</section>
+
+<!-- MISSIONS -->
+<section class="view" id="v-missions">
+  <h1>Missions</h1>
+  <p class="sub">A goal, a directory, and the whole record of that work. The digest is numbers — a summary that wrote itself would be prose you cannot audit.</p>
+
+  <h2>kaprek-gui redesign <span class="tag">C:\…\tools\ccview</span></h2>
+  <pre class="digest"># Morning digest — kaprek-gui redesign
+# window: 31.08.2026, local day — 24 h, 00:00 → 24:00
+
+## Trigger-Läufe
+heartbeat     ran 02:00   22 min   41k tok   $1.12
+schedule      ran 03:30   9 min    18k tok   unknown
+watch-builds  skipped ×2  condition false — no cost, on purpose
+
+## Offene Fragen
+Bash · rm -rf build/        22 h of 24 h
+Write · docs/release-2.1.md 19 h of 24 h
+
+## Kosten und Tokens
+costs known for 2 of 3 runs — $1.12 (known part; 1 run unknown)
+tokens 59k · 1 turn aborted</pre>
+  <div class="acts" style="margin-top:10px"><button class="pri">Regenerate (rewrites the same file)</button><button>All digest files (4)</button></div>
+
+  <h2>What kaprek knows about this</h2>
+  <div class="line"><span class="t"><span class="a">"approval inbox outlives restarts by design"</span><span class="b"> — from chat c-447 · verified 3 d ago</span></span><button class="danger">Forget</button></div>
+  <div class="line"><span class="t"><span class="a">"GUI speaks English, briefing speaks German"</span> <span class="tag warn">unconfirmed</span><span class="b"> — imported, never verified. "Still true" stamps it.</span></span><button>Still true</button><button class="danger">Forget</button></div>
+  <div class="line"><span class="t"><span class="a">"zero runtime deps — no dashboard libraries"</span><span class="b"> — from DESIGN-SPEC.md:12 · verified 12 d ago</span></span><button class="danger">Forget</button></div>
+  <p class="quote">Forgetting a project-scope entry reaches the other missions of this project. kaprek says that before the button does anything.</p>
+
+  <h2>backup-verify <span class="tag">D:\backups</span></h2>
+  <div class="line"><span class="t"><span class="a">last night: 1 run, 0 questions</span><span class="b"> — cost unknown: the engine reported none. Shown as unknown, never as 0.</span></span><a href="#missions">digest →</a></div>
+</section>
+
+<!-- CHAT -->
+<section class="view" id="v-chat">
+  <h1>Chat</h1>
+  <p class="sub">One conversation is one engine, fixed at creation. The terminal is where the work happens — this is where you watch and answer.</p>
+  <div class="qa">
+    <div class="meta">you · 12 min ago</div>
+    <div>Split cancel() out of decide() before P6b lands on it.</div>
+  </div>
+  <div class="qa">
+    <div class="meta">assistant · now · claude</div>
+    <div>Reading the store first, then the edit …</div>
+    <div class="inp">tool: Read  src/server/approval-store.mjs   ✓
+tool: Edit  src/server/approval-store.mjs   running…
+files touched: approval-store.mjs · approval-store.test.mjs</div>
+    <div class="acts"><button class="danger">Abort turn</button><button>Ask the peers (--diff)</button></div>
+  </div>
+</section>
+
+<!-- SESSIONS -->
+<section class="view" id="v-sessions">
+  <h1>Sessions</h1>
+  <p class="sub">Terminal sessions from the ledger are resumable; headless runs are listed for the record and never opened by a test.</p>
+  <div class="line"><span class="t"><span class="a">Refactor approval store</span><span class="b"> — terminal · open · 08:59</span></span><button>Resume</button></div>
+  <div class="line"><span class="t"><span class="a">Council verdicts P6b</span><span class="b"> — terminal · ended (prompt_input_exit) · yesterday</span></span><button>Open</button></div>
+  <div class="line"><span class="t"><span class="a">heartbeat run 02:00</span><span class="b"> — headless · record only, not resumable</span></span><span class="num">—</span></div>
+</section>
+
+</main>
+<footer class="demo">Wireframe — synthetic data. Variant C: minimal reading surface · <a href="index.html">overview</a> · <a href="variant-a.html">A</a> · <a href="variant-b.html">B</a></footer>
+<script>
+function go(v){ document.querySelectorAll('.view').forEach(x=>x.classList.remove('on'));
+  document.getElementById('v-'+v)?.classList.add('on');
+  document.querySelectorAll('.top nav a').forEach(a=>a.classList.toggle('on',a.dataset.v===v)); }
+window.addEventListener('hashchange',()=>go(location.hash.slice(1)||'start'));
+go(location.hash.slice(1)||'start');
+</script>
+</body>
+</html>

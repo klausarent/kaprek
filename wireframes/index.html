@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>kaprek — GUI-Wireframes: Übersicht</title>
+<style>
+  :root { --bg:#f2f1ee; --ink:#222; --mut:#73716a; --line:#dddad3; --acc:#0f6b4f; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.6 "Segoe UI",system-ui,sans-serif; }
+  header { border-bottom:1px solid var(--line); background:#fff; padding:22px 32px; }
+  header h1 { margin:0 0 4px; font-size:22px; }
+  header p { margin:0; color:var(--mut); }
+  main { max-width:1100px; margin:0 auto; padding:30px 32px 70px; }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin:26px 0; }
+  .card { background:#fff; border:1px solid var(--line); border-radius:10px; overflow:hidden; display:flex; flex-direction:column; text-decoration:none; color:var(--ink); }
+  .thumb { height:150px; padding:16px; font:11px Consolas,monospace; overflow:hidden; border-bottom:1px solid var(--line); }
+  .card .body { padding:14px 16px 16px; }
+  .card h2 { margin:0 0 6px; font-size:15px; }
+  .card p { margin:0; color:var(--mut); font-size:13px; }
+  .card .go { margin-top:12px; color:var(--acc); font-weight:600; font-size:13px; }
+  h2 { font-size:14px; letter-spacing:.8px; text-transform:uppercase; color:var(--mut); margin:34px 0 10px; }
+  ul { margin:8px 0; padding-left:22px; } li { margin:5px 0; }
+  .sw { display:inline-block; width:14px; height:14px; border-radius:3px; border:1px solid var(--line); vertical-align:-2px; margin-right:4px; }
+  .note { background:#fff; border:1px solid var(--line); border-radius:8px; padding:16px 20px; font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>kaprek — GUI-Wireframes</h1>
+  <p>Drei klickbare Varianten des Leitstands · Stand 01.09.2026 · synthetische Daten · Briefing für externe KIs: <b>BRIEFING.md</b> (gleicher Ordner)</p>
+</header>
+<main>
+
+  <div class="grid">
+    <a class="card" href="variant-a.html">
+      <div class="thumb" style="background:#f6f5f2;color:#444">▐ Start &nbsp;Chat&nbsp; Inbox(3)&nbsp; Missions<br><br>┌────────────┬──────┐<br>│ Running now│Wait 4u│<br>│  ● edit …  │ 3 rows│<br>├────────────┼──────┤<br>│ Overnight  │Attn  │<br>└────────────┴──────┘</div>
+      <div class="body">
+        <h2><span class="sw" style="background:#0f6b4f"></span> A — Leitstand (hell)</h2>
+        <p>Karten-first: KPIs oben, „Running now" und „Overnight" links, Inbox-Auszug und Attention rechts. Freundlichste Variante; der Wiederkehrer landet im Vorgang, nicht im Menü.</p>
+        <div class="go">Öffnen →</div>
+      </div>
+    </a>
+    <a class="card" href="variant-b.html">
+      <div class="thumb" style="background:#14161a;color:#9aa">│kaprek│Start ││ RUNNING  ●●   LIVE FEED<br>│Inbox③│──────││ r-881 Read store…<br>│Miss. │Needs ││ grant stale 08:40<br>│Sess. │Overnt││ skipped 03:00</div>
+      <div class="body">
+        <h2><span class="sw" style="background:#14161a"></span> B — Operations-Konsole (dunkel)</h2>
+        <p>Drei Spalten: Navigations-Rail, dichte Arbeitsfläche, dauerhaft sichtbarer Live-Feed rechts. Operator-Ästhetik, maximaler Informationsdichte, Keyboard-nah.</p>
+        <div class="go">Öffnen →</div>
+      </div>
+    </a>
+    <a class="card" href="variant-c.html">
+      <div class="thumb" style="background:#fafaf7;color:#555">kaprek   Start Chat Inbox(3)      2 running<br><br>What the night did<br>──────────────────<br>● Bash · rm -rf build/  22h left<br>● heartbeat   $1.12  digest→</div>
+      <div class="body">
+        <h2><span class="sw" style="background:#fafaf7"></span> C — Leseoberfläche (minimal)</h2>
+        <p>Eine Spalte, Serif, Status-Streifen statt Kartenwald. Der Nachtbericht liest sich wie ein Log; jede Zeile ist handelbar. Die ruhigste und texttreueste Deutung von „looking things up, then acting".</p>
+        <div class="go">Öffnen →</div>
+      </div>
+    </a>
+  </div>
+
+  <h2>In allen drei Varianten gleich</h2>
+  <ul>
+    <li><b>Fünf Einträge in der Hauptnavigation</b> — Start, Chat, Inbox, Missionen, Sessions; alles Weitere (Triggers, Plans, Council, Memory, Apps, Board, Search, Setup) hinter „more".</li>
+    <li><b>Die Ansichten:</b> Start (Leitstand), Inbox (mit History-Tab und Standing Grants), Missions-Detail (Morning-Digest-Karte + Memory-Karte mit Herkunft), Chat (laufender Turn mit Abbruch), Sessions (Ledger-Filter sichtbar).</li>
+    <li><b>Ehrlichkeits-Stil als UI-Regel:</b> <i>unknown</i> statt 0 bei nicht gemeldeten Kosten; <i>skipped (condition false)</i> statt stillem Nichtstun; <i>degraded</i> nach fünf Bedingungsfehlern; unbestätigte Importe markiert statt ausgeblendet; leere Zustände sagen ihren Grund.</li>
+    <li><b>Jede Zeile handelbar:</b> Beantworten, Abbrechen, Digest öffnen, Grant widerrufen — keine Karte ist rein informativ.</li>
+  </ul>
+
+  <h2>Für externe KIs</h2>
+  <div class="note">
+    Das Briefing liegt als <b>BRIEFING.md</b> in diesem Ordner: Positionierung, der zu entwerfende Umfang (Leitstand + 5-Einträge-Navigation), die Daten, die wirklich existieren (runs.jsonl-Felder, Inbox, Grants, Digest, Memory-Herkunft, degraded-Zähler), und sechs harte Design-Grundsätze. Diese drei Varianten sind Referenz und Unter grenze zugleich — eine Abgabe muss nicht so aussehen, aber jede Anordnung muss begründen, was im Blickfeld des Wiederkehrers steht und warum.
+  </div>
+
+</main>
+</body>
+</html>
