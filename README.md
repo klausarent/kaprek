@@ -58,7 +58,12 @@ those can be updated by npm:
 | global (`npm i -g kaprek`) | installs the new version |
 | through `npx` | tells you to run `npx kaprek@latest` — nothing is installed to update, and without `@latest` npx reuses its cache |
 | a project's dependency | tells you to update it in that project |
-| a git checkout | tells you to `git pull` — npm would overwrite your working tree |
+| a git checkout | tells you to `git pull` — npm would overwrite your working tree; with uncommitted changes it says so first, because `git pull` is not allowed to overwrite them |
+
+After a successful install, `kaprek update` asks the running instance which
+version it actually carries (the same local question the single-instance lock
+answers on start). If an older kaprek is still running, it says so and notes
+that the running server picks up the new version at the next `kaprek stop`.
 
 When anything goes wrong — npm missing, no permission to write the global
 install, the registry not answering — the message ends with the line that

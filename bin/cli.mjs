@@ -386,7 +386,7 @@ async function main() {
   // actually has one.
   let lock;
   try {
-    lock = await acquireInstanceLock({ dataDir, port: undefined });
+    lock = await acquireInstanceLock({ dataDir, port: undefined, version: installedVersion() });
   } catch (err) {
     if (err instanceof InstanceLockHeldError) {
       if (err.url) {
