@@ -1041,6 +1041,39 @@ export function fetchApprovalInbox(): Promise<{ approvals: InboxApproval[] }> {
   return getJson<{ approvals: InboxApproval[] }>("/api/approvals");
 }
 
+/**
+ * One finished entry of the approval history (GET /api/approvals?status=all,
+ * P1): the inbox shape plus what the record knows about its END. Fields an
+ * older record never had (runId, cancelledAt, decidedVia) are absent or null
+ * — the UI renders "—", never an invented value.
+ */
+export type HistoryApproval = InboxApproval & {
+  status: "decided" | "lapsed" | "cancelled" | "expired";
+  /** The decision itself; null for everything that ended without one. */
+  decision: { behavior: "allow" | "deny"; message?: string } | null;
+  decidedAt: number | null;
+  /** WHO answered: the browser, the phone token, or the server's own deadline. */
+  decidedVia: "web" | "phone-token" | "auto-deny" | null;
+  runId?: string;
+  lapsedAt: number | null;
+  expiredAt: number | null;
+  expired: string | null;
+  cancelledAt: number | null;
+  cancelledReason: "run-aborted" | "run-failed" | "trigger-deleted" | "mission-archived" | "shutdown" | null;
+  /** requestedAt -> the end that actually happened. */
+  waitMs: number | null;
+};
+
+/** Query for the history: which entries, how many, since when (epoch ms). */
+export function fetchApprovalHistory(
+  query: { limit?: number; since?: number } = {},
+): Promise<{ approvals: HistoryApproval[] }> {
+  const params = new URLSearchParams({ status: "all" });
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.since !== undefined) params.set("since", String(query.since));
+  return getJson<{ approvals: HistoryApproval[] }>(`/api/approvals?${params.toString()}`);
+}
+
 // ---------------------------------------------------------------------------
 // Relay (src/relay/dispatcher.mjs via /api/chat/<id>/relay and /api/relay/*)
 // ---------------------------------------------------------------------------
