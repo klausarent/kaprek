@@ -1095,32 +1095,29 @@ function makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approval
  * three things (unknown id, already decided, expired), all of which mean the
  * durable record is already at least as final as this call would make it.
  */
-function recordDecision(approvalStore, key, decision) {
+function recordDecision(approvalStore, key, decision, via = 'auto-deny') {
   if (!approvalStore) return;
-  approvalStore.decide(key, decision).catch(() => {});
+  approvalStore.decide(key, { ...decision, via }).catch(() => {});
 }
 
 /**
- * Resolves (or garbage-collects) every pending approval belonging to
- * `chatId` — called once per turn, from handleChatTurn's finally block, so
- * turn end, cancel (POST /api/chat/<id>/cancel), and client disconnect all
- * go through this ONE cleanup path (all three simply end the same in-flight
- * runTurn() call, which always reaches this finally). An approval nobody
- * ever answers must not dangle forever once its turn is gone — a HUNG
- * onApprovalRequest promise inside the harness would otherwise never
- * resolve, leaking an async call and (if a caller ever awaited on it) a
- * hung request. `entry.chatId !== chatId` entries (a DIFFERENT chat's still
- * in-flight approval) are left completely untouched — see the module's
- * approval-route doc comment.
+ * Cancels a pending approval because its RUN ended without an answer —
+ * abort, failure, turn end (P1). The in-memory entry in `pendingApprovals`
+ * is still resolved with a deny (that is what unblocks the harness), but the
+ * durable record now says `cancelled` with WHO ended it ('run-aborted' or
+ * 'run-failed') instead of pretending a human denied the question. Fired for
+ * the interactive entries this process holds a promise for; a deferred entry
+ * is untouched — it was filed to outlive its turn on purpose, and its own
+ * deadline is still what ends it.
  */
-function cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore = null) {
+function cancelApprovalsForChat(pendingApprovals, chatId, approvalStore = null, reason = 'run-aborted') {
   for (const [key, entry] of pendingApprovals) {
     if (entry.chatId !== chatId) continue;
     clearTimeout(entry.timer);
     if (!entry.decided) {
       entry.decided = true;
-      recordDecision(approvalStore, key, { behavior: 'deny', message: 'turn ended' });
-      entry.resolve({ behavior: 'deny', message: 'turn ended' });
+      if (approvalStore) approvalStore.cancel(key, { reason }).catch(() => {});
+      entry.resolve({ behavior: 'deny', message: reason === 'run-failed' ? 'the turn failed' : 'the turn was aborted' });
     }
     pendingApprovals.delete(key);
   }
@@ -1140,7 +1137,7 @@ function cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore = null)
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null, { decidedVia = 'web' } = {}) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -1170,15 +1167,22 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
     // it is a decision plus, for an allow, a fresh turn that runs the action.
     const filed = approvalStore ? await approvalStore.get(key) : null;
     if (filed?.kind === RELAY_GATE_KIND && filed.status === 'pending') {
-      await decideRelayGate(res, { key, entry: filed, behavior, approvalStore, getRelay });
+      await decideRelayGate(res, { key, entry: filed, behavior, approvalStore, getRelay, decidedVia });
       return;
     }
     if (filed?.mode === 'deferred' && filed.status === 'pending') {
-      await decideDeferredApproval(res, { key, entry: filed, behavior, message: body.data?.message, approvalStore, getRunner });
+      await decideDeferredApproval(res, { key, entry: filed, behavior, message: body.data?.message, approvalStore, getRunner, decidedVia });
       return;
     }
     if (filed?.status === 'lapsed') {
       sendJson(res, 410, { error: 'approval lapsed: nobody answered it before its deadline' });
+      return;
+    }
+    // A question the run, the trigger delete, the mission archive or the
+    // shutdown withdrew before anyone answered (P1): a 409 that says what
+    // state the entry is in, not a silent success that decided nothing.
+    if (filed?.status === 'cancelled') {
+      sendJson(res, 409, { error: `approval was cancelled (${filed.cancelledReason ?? 'unknown reason'})`, already: 'cancelled', cancelledReason: filed.cancelledReason ?? null });
       return;
     }
     // Nothing is waiting in THIS process. The durable record can still say
@@ -1204,7 +1208,7 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   clearTimeout(entry.timer);
   const message = typeof body.data?.message === 'string' ? body.data.message : undefined;
   const decision = behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' };
-  recordDecision(approvalStore, key, decision);
+  recordDecision(approvalStore, key, decision, decidedVia);
   entry.resolve(decision);
   sendJson(res, 200, { ok: true });
 }
@@ -1223,12 +1227,15 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
  * The turn itself is NOT awaited. It can take minutes, and the browser is
  * waiting for an answer to "did my approval land", not for the work to finish.
  */
-async function decideDeferredApproval(res, { key, entry, behavior, message, approvalStore, getRunner }) {
+async function decideDeferredApproval(res, { key, entry, behavior, message, approvalStore, getRunner, decidedVia = 'web' }) {
   if (behavior === 'deny') {
     try {
-      await approvalStore.decide(key, { behavior: 'deny', message: typeof message === 'string' ? message : 'denied by user' });
+      await approvalStore.decide(key, { behavior: 'deny', message: typeof message === 'string' ? message : 'denied by user', via: decidedVia });
     } catch (err) {
-      sendJson(res, 409, { error: err.message });
+      // `already` (P1/M6): the entry was cancelled or lapsed before this
+      // answer landed. A 409 naming the state that beat it, never a blank
+      // ok that hides that nothing happened.
+      sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
       return;
     }
     sendJson(res, 200, { ok: true, followUp: false });
@@ -1248,9 +1255,9 @@ async function decideDeferredApproval(res, { key, entry, behavior, message, appr
   }
 
   try {
-    await approvalStore.decide(key, { behavior: 'allow' });
+    await approvalStore.decide(key, { behavior: 'allow', via: decidedVia });
   } catch (err) {
-    sendJson(res, 409, { error: err.message });
+    sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
     return;
   }
 
@@ -1270,7 +1277,7 @@ async function decideDeferredApproval(res, { key, entry, behavior, message, appr
  * about a specific run at a specific moment, and this is what keeps it from
  * being spent on a different one.
  */
-async function decideRelayGate(res, { key, entry, behavior, approvalStore, getRelay }) {
+async function decideRelayGate(res, { key, entry, behavior, approvalStore, getRelay, decidedVia = 'web' }) {
   const relay = getRelay ? getRelay() : null;
   if (!relay) {
     sendJson(res, 503, { error: 'the relay is not available in this server' });
@@ -1279,10 +1286,10 @@ async function decideRelayGate(res, { key, entry, behavior, approvalStore, getRe
 
   if (behavior === 'deny') {
     try {
-      await approvalStore.decide(key, { behavior: 'deny', message: 'the operator stopped the run' });
+      await approvalStore.decide(key, { behavior: 'deny', message: 'the operator stopped the run', via: decidedVia });
       await relay.denyGate({ chatId: entry.chatId, reason: 'the operator stopped the run at the gate' });
     } catch (err) {
-      sendJson(res, 409, { error: err.message });
+      sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
       return;
     }
     sendJson(res, 200, { ok: true, relay: 'stopped' });
@@ -1290,9 +1297,9 @@ async function decideRelayGate(res, { key, entry, behavior, approvalStore, getRe
   }
 
   try {
-    await approvalStore.decide(key, { behavior: 'allow' });
+    await approvalStore.decide(key, { behavior: 'allow', via: decidedVia });
   } catch (err) {
-    sendJson(res, 409, { error: err.message });
+    sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
     return;
   }
 
@@ -1448,10 +1455,44 @@ async function handleRelayStop(res, runId, { getRelay }) {
  * Entries left over from a previous process are NOT listed: they cannot be
  * answered (see approval-store.mjs's own doc comment), and offering buttons
  * that can only fail is worse than not showing the entry.
+ *
+ * P1 — the HISTORY query. `?status=all` returns the finished entries
+ * (decided, lapsed, cancelled, expired) alongside the pending ones; `limit`
+ * caps the count, `since` (epoch ms) keeps only entries whose end is at or
+ * after that instant. A history entry adds what the record knows about its
+ * END: `status`, the decision itself (`decision` — behavior and message),
+ * WHO answered (`decidedVia`: 'web', 'phone-token' or 'auto-deny'), how long
+ * the question went unanswered (`waitMs`, requestedAt -> decidedAt /
+ * lapsedAt / cancelledAt / expiredAt), `runId` when the question belongs to
+ * a run that has one (a relay gate does; an ordinary chat turn does not, and
+ * the field is then simply absent — never a null invented to fill a table
+ * column), and `cancelledAt`/`cancelledReason` for a withdrawn question.
+ * The default response (no query) is unchanged: pending entries only, same
+ * fields as before.
  */
-async function handleApprovalsList(res, approvalStore) {
+async function handleApprovalsList(res, approvalStore, query = null) {
+  const status = query?.get('status') ?? 'pending';
+  if (!['pending', 'all'].includes(status)) {
+    sendJson(res, 400, { error: `invalid status: ${status} (pending | all)` });
+    return;
+  }
+  const limitParam = query?.get('limit');
+  const limit = limitParam === null || limitParam === undefined ? null : Number(limitParam);
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    sendJson(res, 400, { error: 'invalid limit (positive integer expected)' });
+    return;
+  }
+  const sinceParam = query?.get('since');
+  const since = sinceParam === null || sinceParam === undefined ? null : Number(sinceParam);
+  if (since !== null && !Number.isFinite(since)) {
+    sendJson(res, 400, { error: 'invalid since (epoch milliseconds expected)' });
+    return;
+  }
+
   const pending = approvalStore ? await approvalStore.listPending() : [];
-  const approvals = pending.map((entry) => ({
+  const finished = status === 'all' && approvalStore ? await approvalStore.listHistory({ limit, since }) : [];
+
+  const shapePending = (entry) => ({
     id: entry.requestId,
     chatId: entry.chatId,
     source: entry.source ?? null,
@@ -1481,8 +1522,30 @@ async function handleApprovalsList(res, approvalStore) {
     // dedupe). Worth showing: a question asked five times is a different kind
     // of pending than one asked once.
     askedCount: entry.askedCount ?? 1,
-  }));
-  sendJson(res, 200, { approvals });
+  });
+
+  /** The fields a finished entry adds: its end, and what the record can honestly say about it. */
+  const shapeHistory = (entry) => {
+    const endedAt = entry.decidedAt ?? entry.lapsedAt ?? entry.cancelledAt ?? entry.expiredAt ?? null;
+    return {
+      ...shapePending(entry),
+      status: entry.status,
+      decision: entry.decision ?? null,
+      decidedAt: entry.decidedAt ?? null,
+      decidedVia: entry.decidedVia ?? null,
+      // Only when the question belongs to something with a run id. Absent is
+      // the truthful form of "no run"; a null column invites rendering it.
+      ...(entry.runId !== undefined ? { runId: entry.runId } : {}),
+      lapsedAt: entry.lapsedAt ?? null,
+      expiredAt: entry.expiredAt ?? null,
+      expired: entry.expired ?? null,
+      cancelledAt: entry.cancelledAt ?? null,
+      cancelledReason: entry.cancelledReason ?? null,
+      waitMs: endedAt !== null ? endedAt - (entry.requestedAt ?? 0) : null,
+    };
+  };
+
+  sendJson(res, 200, { approvals: [...pending.map(shapePending), ...finished.map(shapeHistory)] });
 }
 
 /**
@@ -2137,7 +2200,25 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     }
     try {
       if (segments[3] === 'status') {
-        sendJson(res, 200, { mission: missions.setStatus(segments[2], body.data?.status) });
+        const status = body.data?.status;
+        const missionBefore = status === 'archived' ? missions.get(segments[2]) : null;
+        sendJson(res, 200, { mission: missions.setStatus(segments[2], status) });
+        // P1 cascade, over the store's own id list: archiving a mission
+        // withdraws its open questions — the ones whose chat belongs to THIS
+        // mission (its linked chats, union with chats claiming it, same rule
+        // the detail view above uses). No scan across all chats: the store
+        // names the pending ids, the mission only narrows them.
+        if (missionBefore) {
+          const chatIds = new Set(missionBefore.chats ?? []);
+          try {
+            for (const chat of getChats().list()) if (chat.missionId === missionBefore.id) chatIds.add(chat.id);
+          } catch {
+            // Linked chats alone still bound the cascade correctly.
+          }
+          getApprovalStore()
+            .cancelOpen({ reason: 'mission-archived', match: (entry) => entry.chatId !== null && chatIds.has(entry.chatId) })
+            .catch(() => {});
+        }
         return;
       }
       // The mission's own posture ceiling (null clears it). Only ever
@@ -2428,7 +2509,7 @@ async function handleChatTurn(
   // second, idempotent pass for any approval that outlives the turn without
   // ever going through abort (e.g. it resolves on its own right as the turn
   // is wrapping up for some other reason).
-  controller.signal.addEventListener('abort', () => cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore));
+  controller.signal.addEventListener('abort', () => cancelApprovalsForChat(pendingApprovals, chatId, approvalStore, 'run-aborted'));
 
   // The posture ceiling: the global dial, tightened by the mission's own.
   // A stance past it is refused with the reason — never clamped, because a
@@ -2456,6 +2537,10 @@ async function handleChatTurn(
   chatSseQueues.set(chatId, enqueue);
   enqueue({ type: 'chat-id', chatId });
 
+  // Set when the turn ended in failure, so the finally block records the
+  // open approvals' cancellation with the honest reason ('run-failed')
+  // rather than the abort one.
+  let turnFailed = false;
   try {
     const result = await runTurn({
       dataDir,
@@ -2496,6 +2581,7 @@ async function handleChatTurn(
       }),
       signal: controller.signal,
     });
+    if (result?.stopReason === 'error') turnFailed = true;
     // A plan just landed on disk: the moment a second opinion is worth most
     // and costs least. The consultation itself does NOT run on this stream —
     // it takes minutes, and holding the turn open for it would keep the chat
@@ -2507,6 +2593,7 @@ async function handleChatTurn(
     }
     await enqueue({ type: 'turn-complete', ...result });
   } catch (err) {
+    turnFailed = true;
     // A harness/orchestrator throw here is a genuine programming error (see
     // adapter.mjs's contract note), not a normal turn failure — those are
     // already reported via result.error above. Headers are long sent by this
@@ -2525,7 +2612,11 @@ async function handleChatTurn(
     // Turn end, cancel, AND client disconnect all reach here (see this
     // function's own doc comment) — the single place that must never leave
     // a pending approval for this chat dangling (SECURITY: fail-closed).
-    cleanupApprovalsForChat(pendingApprovals, chatId, approvalStore);
+    // The record now says WHY the question died with the turn: 'run-failed'
+    // when the turn errored, 'run-aborted' otherwise (abort, cancel, client
+    // disconnect — a leftover at a normal end is also a run that ended
+    // without its answer).
+    cancelApprovalsForChat(pendingApprovals, chatId, approvalStore, turnFailed ? 'run-failed' : 'run-aborted');
     if (!res.writableEnded) res.end();
   }
 }
@@ -2826,7 +2917,7 @@ async function handleTriggerFire(res, getRunner, id, chatSseQueues, approvalStre
 }
 
 /** DELETE /api/triggers/<id>. */
-function handleTriggerDelete(res, getTriggers, id) {
+function handleTriggerDelete(res, getTriggers, id, approvalStore = null) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid trigger id' });
     return;
@@ -2836,11 +2927,17 @@ function handleTriggerDelete(res, getTriggers, id) {
     sendJson(res, 404, { error: `unknown trigger: ${id}` });
     return;
   }
+  // P1 cascade: the trigger's open questions are withdrawn with it, by the
+  // store's own list of pending ids filtered on triggerId — no scan through
+  // chats, no guessed ids. Not awaited (this handler stays synchronous like
+  // it was); a failed write is logged by the store and the entries are
+  // refused in memory regardless.
+  if (approvalStore) approvalStore.cancelOpen({ reason: 'trigger-deleted', match: (entry) => entry.triggerId === id }).catch(() => {});
   sendJson(res, 200, { removed: true });
 }
 
 /** Trigger routes, mounted at /api/triggers/*. */
-async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams }) {
+async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams, getApprovalStore = null }) {
   // /api/triggers
   if (segments.length === 2) {
     if (req.method === 'GET') {
@@ -2860,7 +2957,7 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
       sendJson(res, 405, { error: 'method not allowed' });
       return;
     }
-    handleTriggerDelete(res, getTriggers, segments[2]);
+    handleTriggerDelete(res, getTriggers, segments[2], getApprovalStore ? getApprovalStore() : null);
     return;
   }
   // /api/triggers/<id>/toggle | /api/triggers/<id>/fire
@@ -3399,7 +3496,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'triggers') {
-      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams });
+      await handleTriggerRoutes(req, res, segments, { getTriggers, getRunner, dataDir, chatSseQueues, approvalStreams, getApprovalStore });
       return;
     }
     if (segments.length === 3 && segments[1] === 'approvals') {
@@ -3407,7 +3504,14 @@ async function handleRequest(
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay);
+      // WHO answers, as far as HTTP can tell: the phone token (the QR
+      // token's narrow allowlist) versus the browser's own instance token.
+      // Recorded on the decision as `decidedVia`; a timeout or turn-end
+      // decision records 'auto-deny' instead (see recordDecision).
+      const viaPhoneToken = approvalToken !== null && timingSafeTokenEqual(req.headers[TOKEN_HEADER], approvalToken);
+      await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay, {
+        decidedVia: viaPhoneToken ? 'phone-token' : 'web',
+      });
       return;
     }
     if (segments.length === 2 && segments[1] === 'approvals') {
@@ -3415,7 +3519,7 @@ async function handleRequest(
         sendJson(res, 405, { error: 'method not allowed' });
         return;
       }
-      await handleApprovalsList(res, getApprovalStore());
+      await handleApprovalsList(res, getApprovalStore(), url.searchParams);
       return;
     }
 
@@ -3793,7 +3897,7 @@ export function startServer({
         // leave the wall clock at 8h45m, which would kill the turn before its
         // own approval could ever lapse (panel Fix-Runde 1, M5).
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
-        releaseApprovals: (chatId) => cleanupApprovalsForChat(pendingApprovals, chatId, getApprovalStore()),
+        releaseApprovals: (chatId) => cancelApprovalsForChat(pendingApprovals, chatId, getApprovalStore(), 'run-aborted'),
         makeUiApprovalHandler: uiApprovalHandlerFor,
       });
     }
@@ -4139,6 +4243,14 @@ export function startServer({
     // gate question into a directory the test had already deleted, which is
     // the same bug wearing a test's clothes.
     if (relay) relay.stopAll('kaprek is shutting down').catch(() => {});
+    // P1: a graceful shutdown withdraws every question still open, over the
+    // store's own list of pending ids — with `cancelled/shutdown` on the
+    // record instead of a pending entry that only the NEXT start could
+    // mark dead. That next-start marking (interactive pending -> expired
+    // 'process gone' in loadFromDisk) stays exactly as it is: it is what a
+    // CRASH leaves behind, where no shutdown code ran. Not awaited — 'close'
+    // is synchronous; the store queues the write and logs if it fails.
+    if (approvalStore) approvalStore.cancelOpen({ reason: 'shutdown' }).catch(() => {});
   });
 
   return new Promise((resolve, reject) => {

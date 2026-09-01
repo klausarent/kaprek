@@ -434,6 +434,10 @@ export function createRelayDispatcher({
         // AS IT STANDS: change the route or the budget in between and it is
         // an approval for a run that no longer exists.
         relayRunId: relay.runId,
+        // P1: the run this question belongs to, on the record. A relay gate
+        // is the one approval that HAS a run id; ordinary chat turns are
+        // filed without one (the field is simply absent there, never null).
+        runId: relay.runId,
         participantsHash: participantsHashOf(relay),
         budgetSnapshotHash: budgetSnapshotHashOf(relay),
       });
@@ -457,6 +461,15 @@ export function createRelayDispatcher({
       turn: relay.turns,
       reason: reason ?? null,
     });
+    // P1: a run that ends while parked at a gate withdraws the gate question
+    // — nobody can answer "one more round?" for a run that no longer runs.
+    // 'run-failed' when the run failed, 'run-aborted' when it was stopped.
+    // The denyGate path already decides its own gate; this covers the rest.
+    if (relay.gateKey && ['stopped', 'failed'].includes(status)) {
+      approvalStore
+        .cancel(relay.gateKey, { reason: status === 'failed' ? 'run-failed' : 'run-aborted' })
+        .catch(() => {});
+    }
     return done;
   }
 

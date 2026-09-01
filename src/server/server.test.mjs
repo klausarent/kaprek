@@ -1414,7 +1414,7 @@ test('chat: approval — POST /api/approvals/<id> rejects a missing/invalid beha
   expect(missingChatIdStatus).toBe(400);
 });
 
-test('chat: approval — cancelling the chat resolves an open approval as deny("turn ended"), the harness observes exactly that decision (no deadlock)', async () => {
+test('chat: approval — cancelling the chat resolves an open approval as deny("the turn was aborted") and cancels the record, the harness observes exactly that decision (no deadlock)', async () => {
   // A custom harness (not approvalHarness — that one skips emitting its
   // decision-echoing text event once aborted, so it can't prove WHAT the
   // harness actually received) that captures the resolved decision
@@ -1444,12 +1444,18 @@ test('chat: approval — cancelling the chat resolves an open approval as deny("
   });
 
   expect(frames.at(-1)).toMatchObject({ type: 'turn-complete', stopReason: 'aborted' });
-  expect(capturedDecision).toEqual({ behavior: 'deny', message: 'turn ended' });
+  // P1: the harness still gets a deny (that is what unblocks it), but the
+  // store records a CANCELLATION with the honest reason — no human denied
+  // this question, the run ended under it.
+  expect(capturedDecision).toEqual({ behavior: 'deny', message: 'the turn was aborted' });
 
   // The approval id is gone from the pending map once the turn is cleaned
-  // up — deciding it now is an unknown/expired id, not a "double decision".
+  // up — deciding it now does not decide anything. P1: the record was
+  // cancelled with the turn, so the answer is an honest 409 naming the state
+  // that beat the click, not a silent ok.
   const lateRes = await postJson(`${url}/api/approvals/cancel-me-1`, { chatId, behavior: 'allow' });
-  expect(lateRes.status).toBe(404);
+  expect(lateRes.status).toBe(409);
+  expect((await lateRes.json()).already).toBe('cancelled');
 });
 
 test('chat: approval — deciding with a chatId that does not own this id is rejected 404, never resolves it', async () => {
@@ -1570,7 +1576,7 @@ test('chat: approval — closing the SSE response (client disconnect) also resol
     })(),
     new Promise((resolve) => setTimeout(() => resolve(timedOut), 3000)),
   ]);
-  expect(outcome).toEqual({ behavior: 'deny', message: 'turn ended' });
+  expect(outcome).toEqual({ behavior: 'deny', message: 'the turn was aborted' });
 });
 
 test('chat: approval — an unanswered approval is auto-denied once approvalTimeoutMs elapses', async () => {
@@ -2642,7 +2648,7 @@ test('a deferred question OUTLIVES its turn, while an interactive one is still r
   const chatId = chatFrames[0].chatId;
   const chatEntries = (await settledApprovalsFile(url)).filter((e) => e.chatId === chatId);
   expect(chatEntries).toHaveLength(1);
-  expect(chatEntries[0]).toMatchObject({ mode: 'interactive', status: 'decided', decision: { behavior: 'deny', message: 'turn ended' } });
+  expect(chatEntries[0]).toMatchObject({ mode: 'interactive', status: 'cancelled', cancelledReason: 'run-aborted', decision: null });
 });
 
 test('approvals: the SSE frame carries the server\'s own deadlineAt, so the client never has to guess which of the two deadlines applies', async () => {

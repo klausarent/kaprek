@@ -145,6 +145,22 @@ function isFinished(entry) {
 }
 
 /**
+ * The reasons a pending question can be withdrawn without anyone answering
+ * it (P1). Each names the caller that did the cancelling, never the moral
+ * of the story — the UI renders the wording.
+ */
+export const CANCELLED_REASONS = ['run-aborted', 'run-failed', 'trigger-deleted', 'mission-archived', 'shutdown'];
+
+/**
+ * An error that says WHICH final state the entry is already in. `err.already`
+ * is what the HTTP layer turns into a 409 `{already: '<status>'}` — the
+ * honest answer to "your click did nothing, and here is what beat it".
+ */
+function alreadyError(status, message) {
+  return Object.assign(new Error(message), { already: status });
+}
+
+/**
  * When a finished entry stopped being live — the retention clock's zero
  * point. Deliberately NOT `requestedAt`: that is the caller's own timestamp
  * for when the QUESTION was raised, and an entry answered a second ago must
@@ -153,7 +169,12 @@ function isFinished(entry) {
  * requestedAt only for a record that somehow finished without either stamp.
  */
 function finishedAt(entry) {
-  return entry.decidedAt ?? entry.expiredAt ?? entry.lapsedAt ?? entry.requestedAt ?? 0;
+  // `cancelledAt` is the cancelled entry's own zero point (H4): a question
+  // withdrawn with its run must be kept for a week from WHEN it was
+  // withdrawn, not from when it was asked — without this field the sweep
+  // would fall through to requestedAt and could prune a minutes-old
+  // cancelled entry whose question was a day old.
+  return entry.decidedAt ?? entry.expiredAt ?? entry.lapsedAt ?? entry.cancelledAt ?? entry.requestedAt ?? 0;
 }
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -259,9 +280,12 @@ export function storableInput(input) {
  *   a write can only assert that atomic code looks atomic).
  * @returns {{
  *   put: (entry: object) => Promise<object>,
- *   decide: (id: string, decision: {behavior: 'allow'|'deny', message?: string}) => Promise<object>,
+ *   decide: (id: string, decision: {behavior: 'allow'|'deny', message?: string, via?: string}) => Promise<object>,
+ *   cancel: (id: string, options?: {reason?: string}) => Promise<object>,
+ *   cancelOpen: (options?: {reason?: string, match?: (entry: object) => boolean}) => Promise<object>,
  *   reopen: (id: string, options?: {reason?: string}) => Promise<object>,
  *   listPending: () => Promise<object[]>,
+ *   listHistory: (options?: {limit?: number|null, since?: number|null}) => Promise<object[]>,
  *   get: (id: string) => Promise<object|null>,
  * }}
  */
@@ -718,10 +742,13 @@ export function createApprovalStore({
     // stopped being tracked as live — would tell someone their kaprek had
     // died when all that happened is that they clicked twice.
     if (entry.status === 'decided') {
-      throw new Error(`approval ${id} was already decided (${entry.decision?.behavior ?? 'unknown'})`);
+      throw alreadyError('decided', `approval ${id} was already decided (${entry.decision?.behavior ?? 'unknown'})`);
     }
     if (entry.status === 'lapsed') {
-      throw new Error(`approval ${id} lapsed: nobody answered it before its deadline, and the agent has moved on`);
+      throw alreadyError('lapsed', `approval ${id} lapsed: nobody answered it before its deadline, and the agent has moved on`);
+    }
+    if (entry.status === 'cancelled') {
+      throw alreadyError('cancelled', `approval ${id} was cancelled (${entry.cancelledReason ?? 'unknown reason'}) before it was answered`);
     }
     // The ownership gate is for INTERACTIVE entries only. A deferred entry is
     // redeemed by starting a new turn, not by resolving a promise this process
@@ -743,6 +770,12 @@ export function createApprovalStore({
       status: 'decided',
       decidedAt: now(),
       decision: behavior === 'allow' ? { behavior } : { behavior, message: decision.message ?? 'denied' },
+      // WHO answered, as far as the server can know it: 'web' (the browser's
+      // own token), 'phone-token' (the QR token's narrow routes), or
+      // 'auto-deny' (a deadline or a turn end decided for you). Recorded
+      // only when the caller says so — an older caller that does not name
+      // its channel leaves the field null rather than a guessed value.
+      decidedVia: decision.via ?? null,
     };
     // ownedIds is NOT cleared here: it records who created the entry, and
     // that stays true after the answer. `status` is what makes a decision
@@ -821,6 +854,119 @@ export function createApprovalStore({
     });
   }
 
+  /**
+   * Withdraws one pending question without an answer (P1). Only a PENDING
+   * entry can be cancelled — a decision, a lapse and a cancellation are all
+   * final states, and the response says honestly which one beat the call:
+   *   - pending        -> {ok: true, entry}   (status 'cancelled',
+   *                                              cancelledAt, cancelledReason)
+   *   - cancelled      -> {ok: true, already: 'cancelled', entry} — idempotent,
+   *                      no second event is written
+   *   - lapsed/decided -> {ok: false, already: '<status>'}
+   *   - unknown id     -> {ok: false, error: 'unknown'}
+   *
+   * Runs on the same serialized queue as decide(), so a cancel and a decide
+   * arriving in the same tick are ordered by ARRIVAL: the first one wins and
+   * the second one reports what beat it (both orders are pinned by tests).
+   * Like decide(), the transition is check-and-set with no await in between.
+   *
+   * `reason` must be one of CANCELLED_REASONS — a cancellation that cannot
+   * say who cancelled it is exactly the kind of silent `ok: true` this
+   * status exists to replace.
+   */
+  function cancel(id, { reason } = {}) {
+    return serialized(async () => {
+      if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
+      if (!CANCELLED_REASONS.includes(reason)) {
+        throw new Error(`approval cancel needs a reason from CANCELLED_REASONS, got: ${reason}`);
+      }
+      const entry = entries.get(id);
+      if (!entry) return { ok: false, error: 'unknown' };
+      if (entry.status === 'cancelled') return { ok: true, already: 'cancelled', entry };
+      if (entry.status !== 'pending') return { ok: false, already: entry.status };
+      const cancelled = {
+        ...entry,
+        status: 'cancelled',
+        cancelledAt: now(),
+        cancelledReason: reason,
+      };
+      ownedIds.delete(id);
+      entries.set(id, cancelled);
+      try {
+        await persist();
+      } catch (err) {
+        entries.set(id, entry);
+        // Undo the ownership withdrawal too, or a cancelled-in-memory-only
+        // entry would be invisible to a retry of the same cancel.
+        if (entry.mode !== 'deferred') ownedIds.add(id);
+        log(`approvals: could not record the cancellation of ${id} (${err.message})`);
+        throw err;
+      }
+      return { ok: true, entry: cancelled };
+    });
+  }
+
+  /**
+   * Cancels a SET of pending entries by the store's own id list — the
+   * cascade path for trigger deletion, mission archiving and shutdown
+   * (P1, "Kaskade ohne Breitensuche"). The callers never scan chats or
+   * reconstruct ids; they name a reason and, where it applies, a predicate
+   * over the entry (`match`), and the store cancels exactly the pending
+   * entries it itself knows are open (deferred ones, and interactive ones
+   * this process owns). The response lists the ids that were actually
+   * cancelled, so a caller can say what it ended rather than assume.
+   *
+   * One queue entry, one persist: a shutdown cancelling twelve questions
+   * writes the file once, not twelve times.
+   */
+  function cancelOpen({ reason, match = null } = {}) {
+    return serialized(async () => {
+      if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
+      if (!CANCELLED_REASONS.includes(reason)) {
+        throw new Error(`approval cancelOpen needs a reason from CANCELLED_REASONS, got: ${reason}`);
+      }
+      const open = [...entries.values()].filter(
+        (entry) =>
+          entry.status === 'pending' &&
+          (entry.mode === 'deferred' || ownedIds.has(entry.id)) &&
+          (typeof match === 'function' ? match(entry) : true),
+      );
+      const cancelledAt = now();
+      const cancelled = [];
+      for (const entry of open) {
+        entries.set(entry.id, { ...entry, status: 'cancelled', cancelledAt, cancelledReason: reason });
+        ownedIds.delete(entry.id);
+        cancelled.push(entry.id);
+      }
+      if (cancelled.length > 0) {
+        try {
+          await persist();
+        } catch (err) {
+          log(`approvals: could not record the ${reason} cancellations (${err.message}); they are refused in memory regardless`);
+        }
+      }
+      return { ok: true, cancelled };
+    });
+  }
+
+  /**
+   * The history (P1/D): finished entries — decided, lapsed, cancelled,
+   * expired — newest first, for GET /api/approvals?status=all. Pending
+   * entries are the inbox's job (listPending), never this list's. `since`
+   * keeps only entries whose zero point (finishedAt) is at or after it;
+   * `limit` caps the count after sorting. Records missing the newer fields
+   * (runId, cancelledAt, decidedVia) come back as they are — the reader,
+   * not the store, decides how a missing field renders.
+   */
+  function listHistory({ limit = null, since = null } = {}) {
+    return serialized(async () => {
+      let list = [...entries.values()].filter((entry) => isFinished(entry));
+      if (Number.isFinite(since)) list = list.filter((entry) => finishedAt(entry) >= since);
+      list.sort((a, b) => finishedAt(b) - finishedAt(a));
+      return Number.isFinite(limit) && limit > 0 ? list.slice(0, limit) : list;
+    });
+  }
+
   /** Every entry still waiting for an answer, oldest first — the inbox, in the order it should be worked. */
   function listPending() {
     return serialized(async () =>
@@ -835,5 +981,5 @@ export function createApprovalStore({
     return serialized(async () => entries.get(id) ?? null);
   }
 
-  return { put, decide, reopen, listPending, get };
+  return { put, decide, cancel, cancelOpen, reopen, listPending, listHistory, get };
 }
