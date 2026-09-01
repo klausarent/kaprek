@@ -590,6 +590,10 @@ This is a deliberate trade. The agent does not get to do the thing it asked for 
 
 Two limits worth knowing. The action is replayed from the input kaprek stored, and inputs over 1 MiB are kept only as a preview — approving one of those starts a turn that asks again before it runs, with you there to answer. And a follow-up turn is a trigger turn like any other, so it is refused while another turn is running in that chat; approve again once it is done.
 
+**Cancelled: a question withdrawn without an answer.** Some questions end because nobody answered AND nobody can any more — the run that asked was aborted or failed, its trigger was deleted, its mission was archived, or kaprek shut down. Those are recorded as `cancelled` with the reason, not as a deny (no human denied anything) and not as a pending entry that looks answerable. The record keeps its own `cancelledAt`, and the seven-day history window is counted from that moment, not from when the question was asked — a question asked on Monday and cancelled on Thursday stays on the record until the following Thursday. `#/approvals` has a second tab, **History**, showing what became of everything that is no longer waiting: the decision (allow or deny, with the message), who answered (you in the browser, the phone token, or the server's own deadline), how long the question waited, and — for relay gates, the only questions that belong to a run — the run id. Answering something that was already cancelled or lapsed is refused with a 409 naming the state that beat your click; nothing is ever answered twice, and nothing pretends a click worked when it changed nothing.
+
+Entries from before this feature (no `runId`, no `cancelledAt`) stay valid records; the history tab shows a dash where a field was never written.
+
 ## What leaves your machine
 
 kaprek runs agent turns. That changes the honest answer to "does anything leave my machine", so this section states it plainly rather than in a slogan.
@@ -643,7 +647,7 @@ These are not just claims in prose — each one is enforced by a test in `src/`.
 Things this version does not do, listed here because each one is a limit you can run into rather than a feature nobody got to.
 
 - **An unattended agent does not get to wait for you.** A question a trigger raises is filed, not waited on, so the action does not happen until you approve it and kaprek runs the follow-up turn. Work that genuinely cannot proceed without that action ends unfinished, and the turn's own report is where you find out. This is the trade described in [Approvals](#approvals), not an oversight.
-- **A live chat question still dies with the server.** Only filed questions survive a restart. One raised in a chat you are sitting in belongs to a turn that is waiting, and that turn ends when the process does.
+- **A live chat question still dies with the server.** Only filed questions survive a restart. One raised in a chat you are sitting in belongs to a turn that is waiting, and that turn ends when the process does. A *graceful* shutdown now withdraws every open question on the record (`cancelled/shutdown`), but a crash cannot run that code — those leave interactive questions that the next start can only mark `process gone`, and that is what the record will say.
 - **Nobody has to be there.** A `question` trigger now runs whether or not anyone will ever look at what it asks. The failure direction is safe (unanswered means not done), but the turn did run and did cost.
 - **Three trigger turns at a time.** A tick starts at most three; the rest stay due and try again a minute later. A scheduled trigger whose window closes while all three slots are busy misses that run outright.
 - **The instance token does not stop local programs.** See [What leaves your machine](#what-leaves-your-machine). A desktop shell that never puts the token on HTTP is the fix.
