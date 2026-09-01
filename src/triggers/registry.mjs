@@ -424,17 +424,26 @@ function normalizeStoredTriggers(entries, knownAppIds, report) {
  * throwing — a broken triggers.json must never take the whole server down
  * (same posture as src/orchestrator/runs.mjs::readRuns() skipping corrupt
  * lines), it just means no trigger fires until the file is fixed.
+ *
+ * P0.5: also reads the `version` field (written since the first revision,
+ * never read before) for the schema gate. Missing field = version 1, so
+ * every file written before the gate existed stays valid. A HIGHER version
+ * is reported back so openTriggers() can open the registry read-only — a
+ * newer kaprek may have written fields here this binary would silently drop
+ * on the next rewrite.
+ *
+ * @returns {{ triggers: Array, schemaVersion: number }}
  */
 function readTriggersFile(dataDir) {
   const triggersPath = triggersPathFor(dataDir);
-  if (!fs.existsSync(triggersPath)) return [];
+  if (!fs.existsSync(triggersPath)) return { triggers: [], schemaVersion: 1 };
 
   let raw;
   try {
     raw = fs.readFileSync(triggersPath, 'utf8');
   } catch (err) {
     console.warn(`triggers: failed to read ${triggersPath}: ${err.message}`);
-    return [];
+    return { triggers: [], schemaVersion: 1 };
   }
 
   let parsed;
@@ -442,14 +451,14 @@ function readTriggersFile(dataDir) {
     parsed = JSON.parse(raw);
   } catch (err) {
     console.warn(`triggers: corrupt JSON in ${triggersPath}, starting from an empty list: ${err.message}`);
-    return [];
+    return { triggers: [], schemaVersion: 1 };
   }
 
   if (!isPlainObject(parsed) || !Array.isArray(parsed.triggers)) {
     console.warn(`triggers: unexpected shape in ${triggersPath}, starting from an empty list`);
-    return [];
+    return { triggers: [], schemaVersion: 1 };
   }
-  return parsed.triggers;
+  return { triggers: parsed.triggers, schemaVersion: typeof parsed.version === 'number' ? parsed.version : 1 };
 }
 
 /** Atomic write (tmp file + rename), matching src/cli/hooks.mjs::writeSettings / src/orchestrator/run.mjs::writeHarnessMeta. */
@@ -483,7 +492,22 @@ function writeTriggersFile(dataDir, triggers) {
  */
 export function openTriggers(dataDir, { knownAppIds = null, log = (message) => console.warn(`triggers: ${message}`) } = {}) {
   const currentAppIds = () => (typeof knownAppIds === 'function' ? knownAppIds() : knownAppIds);
-  let triggers = normalizeStoredTriggers(readTriggersFile(dataDir), currentAppIds(), log);
+  const read = readTriggersFile(dataDir);
+  let triggers = normalizeStoredTriggers(read.triggers, currentAppIds(), log);
+
+  // P0.5, schema gate: a newer kaprek's triggers.json is opened READ-ONLY —
+  // listing works, every mutating call refuses with an honest message. This
+  // binary must not rewrite (and thereby silently drop) fields it cannot
+  // understand. Missing version field = version 1 = fully writable.
+  const SCHEMA_VERSION = 1;
+  const readOnly = read.schemaVersion > SCHEMA_VERSION;
+  const readOnlyVersion = read.schemaVersion;
+  const refuseWrite = () => {
+    throw new Error(
+      `triggers.json was written by a newer kaprek version (schema version ${readOnlyVersion} > ${SCHEMA_VERSION}); ` +
+        'this process opens the registry READ-ONLY and refuses to modify it',
+    );
+  };
 
   return {
     list() {
@@ -497,6 +521,7 @@ export function openTriggers(dataDir, { knownAppIds = null, log = (message) => c
 
     /** Validates `trigger` (including its appScope against the installed apps), then inserts it (new id) or replaces the existing entry with the same id. Returns the normalized, stored trigger. */
     upsert(trigger) {
+      if (readOnly) refuseWrite();
       const validated = validateTrigger(trigger, { knownAppIds: currentAppIds() });
       const index = triggers.findIndex((t) => t.id === validated.id);
       const next = triggers.slice();
@@ -509,6 +534,7 @@ export function openTriggers(dataDir, { knownAppIds = null, log = (message) => c
 
     /** Removes the trigger with `id`, if any. Returns whether one was removed. */
     remove(id) {
+      if (readOnly) refuseWrite();
       const index = triggers.findIndex((t) => t.id === id);
       if (index < 0) return false;
       const next = triggers.slice();
@@ -520,6 +546,7 @@ export function openTriggers(dataDir, { knownAppIds = null, log = (message) => c
 
     /** Flips `enabled` on the trigger with `id`. Returns the updated trigger, or null if unknown. */
     setEnabled(id, enabled) {
+      if (readOnly) refuseWrite();
       const index = triggers.findIndex((t) => t.id === id);
       if (index < 0) return null;
       const next = triggers.slice();

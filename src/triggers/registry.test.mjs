@@ -492,3 +492,39 @@ test('file-watch config: the relay directory is not a valid source', () => {
   // the directory, not about the word.
   expect(() => validateTrigger(validFileWatch({ config: { path: 'relayers/notes' } }))).not.toThrow();
 });
+
+// ----------------------------------------------------- P0.5: schema gate (newer file = read-only)
+
+test('P0.5: a triggers.json with a higher version opens READ-ONLY — list works, every mutation refuses, nothing is rewritten', () => {
+  const raw = { version: 99, triggers: [{ ...storedHeartbeat(), futureField: 'a newer kaprek wrote this' }] };
+  const before = `${JSON.stringify(raw, null, 2)}\n`;
+  fs.writeFileSync(path.join(tmpDir, 'triggers.json'), before, 'utf8');
+
+  const log = [];
+  const triggers = openTriggers(tmpDir, { log: (m) => log.push(m) });
+
+  // Reading works — no crash. The entry itself carries a field this binary
+  // cannot validate, so it is dropped IN MEMORY ONLY (never on disk) and the
+  // drop is reported; that is the honest maximum an older binary can do.
+  expect(triggers.list()).toEqual([]);
+  expect(triggers.get('daily-checkin')).toBeNull();
+
+  // Every mutating path refuses with the honest "newer kaprek" message.
+  const newerSchema = /newer kaprek version \(schema version 99 > 1\)/;
+  expect(() => triggers.upsert(validHeartbeat())).toThrow(newerSchema);
+  expect(() => triggers.remove('daily-checkin')).toThrow(newerSchema);
+  expect(() => triggers.setEnabled('daily-checkin', false)).toThrow(newerSchema);
+  expect(log.join('\n')).toMatch(/unknown field/); // normalizeStoredTriggers still reports what it had to skip
+
+  // Nothing was rewritten: the newer kaprek's field is still on disk, bytes untouched.
+  expect(fs.readFileSync(path.join(tmpDir, 'triggers.json'), 'utf8')).toBe(before);
+});
+
+test('P0.5: a triggers.json WITHOUT a version field counts as version 1 and stays fully writable (backwards-readable)', () => {
+  fs.writeFileSync(path.join(tmpDir, 'triggers.json'), JSON.stringify({ triggers: [storedHeartbeat()] }), 'utf8');
+  const triggers = openTriggers(tmpDir, { log: () => {} });
+  expect(triggers.get('daily-checkin').id).toBe('daily-checkin');
+  expect(() => triggers.setEnabled('daily-checkin', false)).not.toThrow();
+  // The next write stamps the current schema version again.
+  expect(JSON.parse(fs.readFileSync(path.join(tmpDir, 'triggers.json'), 'utf8')).version).toBe(1);
+});
