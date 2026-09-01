@@ -281,7 +281,17 @@ function classifySpokenData(raw, dataDirHash) {
     return { kind: PROBE_SPOKEN };
   }
   if (parsed.dataDirHash !== dataDirHash) return { kind: PROBE_SPOKEN, otherDataDir: true };
-  return { kind: PROBE_OURS, pid: parsed.pid, url: typeof parsed.url === 'string' ? parsed.url : null };
+  // version/startedAt arrived with P2's update verification. An older holder
+  // does not send them (see the protocol-version note above), and that is
+  // fine: the caller reports "unknown version" instead of guessing. Same
+  // extension rule as `kaprek: 1` itself — add alongside, never replace.
+  return {
+    kind: PROBE_OURS,
+    pid: parsed.pid,
+    url: typeof parsed.url === 'string' ? parsed.url : null,
+    version: typeof parsed.version === 'string' ? parsed.version : undefined,
+    startedAt: typeof parsed.startedAt === 'string' ? parsed.startedAt : undefined,
+  };
 }
 
 /**
@@ -341,6 +351,34 @@ function probeOnce(target, dataDirHash, timeoutMs) {
 }
 
 /**
+ * Asks the instance holding `dataDir`'s lock address who it is — one question,
+ * one answer, outside of any start.
+ *
+ * This is the SAME loopback path the start path uses (probeOnce against the
+ * derived pipe/port, same greeting classification); it exists so code that is
+ * not starting a server — `kaprek update` wanting to know which version is
+ * still running — can ask without growing a second transport. A refusal or
+ * silence means nothing is proven, which here simply means: no instance to
+ * report. A stranger on the address is likewise not our instance.
+ *
+ * @returns {Promise<{running: boolean, pid?: number, url?: ?string, version?: string, startedAt?: string}>}
+ */
+export async function askInstance({
+  dataDir,
+  platform = process.platform,
+  timeoutMs = GREETING_TIMEOUT_MS,
+}) {
+  const digest = digestFor(dataDir);
+  const dataDirHash = digest.toString('hex');
+  const target = usesPipe(platform)
+    ? { path: `${PIPE_PREFIX}${dataDirHash}` }
+    : { port: LOCK_PORT_BASE + (digest.readUInt32BE(0) % LOCK_PORT_RANGE) };
+  const answer = await probeOnce(target, dataDirHash, timeoutMs);
+  if (answer.kind !== PROBE_OURS) return { running: false };
+  return { running: true, pid: answer.pid, url: answer.url, version: answer.version, startedAt: answer.startedAt };
+}
+
+/**
  * Acquires the single-instance lock for `dataDir`, throwing
  * InstanceLockHeldError if another kaprek already holds it. `dataDir` should
  * already exist (see src/lib/appdir.mjs) — this module neither resolves nor
@@ -359,13 +397,14 @@ function probeOnce(target, dataDirHash, timeoutMs) {
 export async function acquireInstanceLock({
   dataDir,
   port,
+  version,
   platform = process.platform,
   greetingTimeoutMs = GREETING_TIMEOUT_MS,
 }) {
   const digest = digestFor(dataDir);
   const dataDirHash = digest.toString('hex');
   const lockPath = path.join(dataDir, LOCK_FILE);
-  const startedAt = Date.now();
+  const startedAt = new Date().toISOString();
   const target = usesPipe(platform)
     ? { path: `${PIPE_PREFIX}${dataDirHash}` }
     : { port: LOCK_PORT_BASE + (digest.readUInt32BE(0) % LOCK_PORT_RANGE) };
@@ -388,8 +427,19 @@ export async function acquireInstanceLock({
     // First statement in the handler, nothing awaited before it: a caller
     // that has to wait on our event loop to schedule an async step before it
     // hears anything is a caller that may time out and refuse to start.
+    // The greeting EXTENDS rather than replaces: an older starter facing this
+    // holder must still read it as OURS (see classifySpokenData). version is
+    // omitted entirely when unknown so a pre-P2 starter sees exactly the old
+    // shape; startedAt is always present.
     socket.end(
-      `${JSON.stringify({ kaprek: 1, dataDirHash, pid: process.pid, url: urlFor(currentPort) })}\n`,
+      `${JSON.stringify({
+        kaprek: 1,
+        dataDirHash,
+        pid: process.pid,
+        url: urlFor(currentPort),
+        ...(version !== undefined ? { version } : {}),
+        startedAt,
+      })}\n`,
     );
   });
   server.unref();

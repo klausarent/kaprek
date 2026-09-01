@@ -13,6 +13,7 @@ import {
   LOCK_PORT_RANGE,
   MAX_GREETING_BYTES,
   PIPE_PREFIX,
+  askInstance,
   lockPipePathFor,
   lockPortFor,
 } from './instance-lock.mjs';
@@ -806,4 +807,27 @@ test('releaseSync() frees the lock for the next acquire', async () => {
   await new Promise((resolve) => setTimeout(resolve, 50));
   const second = await acquire(dataDir, { port: 4712 });
   expect(second.lockAddress).toBe(first.lockAddress);
+});
+
+test('the greeting carries version and startedAt, and askInstance reads them back', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const lock = await acquire(dataDir, { port: 4711, version: '9.9.9' });
+  try {
+    // Same loopback path the start refusal uses — asked from outside a start.
+    const answer = await askInstance({ dataDir, platform: TCP.platform, timeoutMs: FAST_GREETING_MS });
+    expect(answer.running).toBe(true);
+    expect(answer.pid).toBe(process.pid);
+    expect(answer.version).toBe('9.9.9');
+    // An ISO timestamp of the server start, not an epoch number.
+    expect(answer.startedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+    expect(Number.isNaN(Date.parse(answer.startedAt))).toBe(false);
+  } finally {
+    await lock.release();
+  }
+});
+
+test('askInstance reports no instance when nothing holds the address', async () => {
+  const dataDir = await tmpDataDirWithFreePort();
+  const answer = await askInstance({ dataDir, platform: TCP.platform, timeoutMs: FAST_GREETING_MS });
+  expect(answer).toEqual({ running: false });
 });
