@@ -40,13 +40,36 @@ CREATE TABLE IF NOT EXISTS mentioned (
  * index is dropped whole rather than served with a silent gap, and the
  * search view offers its reindex button as it does for an empty index.
  */
-const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 2;
 
-/** Opens (creating if needed) the search DB at `<dataDir>/search.db`, pragmas + schema applied. */
+/**
+ * The specific reason reported when the index on disk was written by a NEWER
+ * kaprek version (user_version > SCHEMA_VERSION): unlike the generic
+ * "search not available" fallback this names the actual situation and what
+ * to do about it — use the newer version, or delete search.db by hand if
+ * rebuilding here is really wanted. kaprek never deletes or overwrites a
+ * newer index on its own.
+ */
+export const FUTURE_SCHEMA_REASON =
+  'Der Search-Index wurde von einer neueren kaprek-Version geschrieben. ' +
+  'Bitte benutze die neuere kaprek-Version, oder lösche die Index-Datei (search.db) von Hand, ' +
+  'wenn du den Index hier neu aufbauen willst.';
+
+/**
+ * Opens (creating if needed) the search DB at `<dataDir>/search.db`.
+ * Returns `{ db, future: false }` after pragmas + schema applied, or
+ * `{ db, future: true }` when the file was written by a newer kaprek
+ * (user_version > SCHEMA_VERSION) — the caller must close `db` immediately
+ * and touch nothing: no drops, no schema, no writes. Only a read of
+ * user_version has happened at that point, so the file stays byte-identical.
+ */
 function openDbSync(dataDir, DatabaseSync) {
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, 'search.db'));
   const version = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
+  if (version > SCHEMA_VERSION) {
+    return { db, future: true };
+  }
   if (version < SCHEMA_VERSION) {
     db.exec('DROP TABLE IF EXISTS sessions_fts; DROP TABLE IF EXISTS indexed; DROP TABLE IF EXISTS mentioned;');
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
@@ -59,20 +82,28 @@ function openDbSync(dataDir, DatabaseSync) {
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec(SCHEMA_SQL);
-  return db;
+  return { db, future: false };
 }
 
 /**
  * Opens the search DB (availability-checked, pragmas + schema applied).
  * Returns `{ db }` on success or `{ unavailable: true, reason }` instead of
- * throwing when node:sqlite isn't available. Exported so callers/tests can
+ * throwing when node:sqlite isn't available — or when the index on disk was
+ * written by a newer kaprek version (user_version > SCHEMA_VERSION): in that
+ * case the file is not opened for writes, not dropped, and not rebuilt; the
+ * reason is FUTURE_SCHEMA_REASON. Exported so callers/tests can
  * open the exact connection buildSearchIndex/searchSessions use, e.g. to
  * inspect PRAGMA state on that same connection.
  */
 export async function openSearchDb({ dataDir, importSqlite } = {}) {
   const { available, DatabaseSync, reason } = await getSqlite(importSqlite);
   if (!available) return { unavailable: true, reason };
-  return { db: openDbSync(dataDir, DatabaseSync) };
+  const opened = openDbSync(dataDir, DatabaseSync);
+  if (opened.future) {
+    opened.db.close();
+    return { unavailable: true, reason: FUTURE_SCHEMA_REASON };
+  }
+  return { db: opened.db };
 }
 
 /**

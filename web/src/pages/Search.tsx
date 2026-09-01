@@ -40,7 +40,7 @@ export function verdictLine(files: SearchVerdict): string {
 type State =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "unavailable"; reason: string }
+  | { status: "unavailable"; reason: string; future?: boolean }
   | { status: "no-results" }
   | { status: "results"; results: SearchHit[] }
   | { status: "error"; message: string };
@@ -60,7 +60,7 @@ export default function Search({ query }: { query: string }) {
       .then((res) => {
         if (cancelled) return;
         if (!res.available) {
-          setState({ status: "unavailable", reason: res.reason });
+          setState({ status: "unavailable", reason: res.reason, future: res.future });
         } else if (res.results.length === 0) {
           setState({ status: "no-results" });
         } else {
@@ -81,7 +81,7 @@ export default function Search({ query }: { query: string }) {
       await reindexSearch();
       const res = await fetchSearch(query);
       if (!res.available) {
-        setState({ status: "unavailable", reason: res.reason });
+        setState({ status: "unavailable", reason: res.reason, future: res.future });
       } else if (res.results.length === 0) {
         setState({ status: "no-results" });
       } else {
@@ -117,8 +117,17 @@ export default function Search({ query }: { query: string }) {
 
       {state.status === "unavailable" && (
         <div className="empty-box">
-          Search requires Node 22+ (built-in SQLite).
-          <div className="page-subtitle">{state.reason}</div>
+          {state.future ? (
+            <>
+              Search index was written by a newer kaprek version.
+              <div className="page-subtitle">{state.reason}</div>
+            </>
+          ) : (
+            <>
+              Search requires Node 22+ (built-in SQLite).
+              <div className="page-subtitle">{state.reason}</div>
+            </>
+          )}
         </div>
       )}
 

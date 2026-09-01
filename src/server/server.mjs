@@ -13,7 +13,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession, registerSecret } from '../parser/parse.mjs';
-import { buildSearchIndex, searchSessions } from '../search/index.mjs';
+import { buildSearchIndex, searchSessions, FUTURE_SCHEMA_REASON } from '../search/index.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { sweepArtifacts, readArtifactManifest } from '../artifacts/preserve.mjs';
 import {
@@ -422,7 +422,9 @@ async function handleSearch(res, dataDir, query, importSqlite) {
   }
   const results = await searchSessions({ dataDir, query, importSqlite });
   if (results && results.unavailable) {
-    sendJson(res, 200, { available: false, reason: results.reason });
+    // `future: true` marks the specific "written by a newer kaprek" case so
+    // the UI can show that explanation instead of the generic fallback text.
+    sendJson(res, 200, { available: false, reason: results.reason, future: results.reason === FUTURE_SCHEMA_REASON });
     return;
   }
   sendJson(res, 200, { available: true, results });
@@ -447,7 +449,14 @@ async function handleReindex(res, rootDir, dataDir, importSqlite, tmpRoot) {
   }
 
   if (result && result.unavailable) {
-    sendJson(res, 200, { available: false, reason: result.reason, artifacts });
+    // `future: true` — same explanation as the search route; the reindex
+    // attempt did NOT touch search.db (no drop, no overwrite).
+    sendJson(res, 200, {
+      available: false,
+      reason: result.reason,
+      future: result.reason === FUTURE_SCHEMA_REASON,
+      artifacts,
+    });
     return;
   }
   sendJson(res, 200, {

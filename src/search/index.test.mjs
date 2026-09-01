@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
-import { buildSearchIndex, searchSessions, openSearchDb } from './index.mjs';
+import { buildSearchIndex, searchSessions, openSearchDb, SCHEMA_VERSION, FUTURE_SCHEMA_REASON } from './index.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MINI_FIXTURE = path.join(__dirname, '..', 'parser', 'fixtures', 'mini-session.jsonl');
@@ -437,4 +437,77 @@ test('the reindex removes the mentioned paths of a session whose file is gone', 
   expect(db.prepare('SELECT COUNT(*) AS n FROM mentioned').get().n).toBe(0);
   db.close();
   fs.rmSync(cwd, { recursive: true, force: true });
+});
+
+// --- P3: index written by a NEWER kaprek (user_version > SCHEMA_VERSION) ---
+
+/** Creates a search.db at `<dataDir>/search.db` with user_version = SCHEMA_VERSION + 1 and a marker row, the way a future kaprek version would have left it. */
+function seedFutureIndex(dataDir) {
+  const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  db.exec('CREATE TABLE future_marker (note TEXT)');
+  db.prepare('INSERT INTO future_marker VALUES (?)').run('written by a newer kaprek');
+  db.exec(`PRAGMA user_version = ${SCHEMA_VERSION + 1}`);
+  db.close();
+}
+
+/** Byte content of the index file (sidecars like -wal/-shm excluded by design). */
+function indexBytes(dataDir) {
+  return fs.readFileSync(path.join(dataDir, 'search.db'));
+}
+
+test('an index written by a newer kaprek is not opened: unavailable with the future-schema reason, file untouched', async () => {
+  seedFutureIndex(dataDir);
+  const before = indexBytes(dataDir);
+
+  const opened = await openSearchDb({ dataDir });
+  expect(opened.unavailable).toBe(true);
+  expect(opened.reason).toBe(FUTURE_SCHEMA_REASON);
+
+  // Not dropped, not migrated: version and content are exactly as the newer version left them.
+  const raw = new DatabaseSync(path.join(dataDir, 'search.db'));
+  expect(raw.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION + 1);
+  expect(raw.prepare('SELECT note FROM future_marker').get().note).toBe('written by a newer kaprek');
+  raw.close();
+  expect(indexBytes(dataDir)).toEqual(before);
+});
+
+test('searchSessions in that state reports the future-schema reason instead of results', async () => {
+  seedFutureIndex(dataDir);
+  const result = await searchSessions({ dataDir, query: 'anything' });
+  expect(result.unavailable).toBe(true);
+  expect(result.reason).toBe(FUTURE_SCHEMA_REASON);
+});
+
+test('a reindex attempt against a newer index reports the reason and leaves the file byte-identical', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  seedFutureIndex(dataDir);
+  const before = indexBytes(dataDir);
+
+  const result = await buildSearchIndex({ rootDir, dataDir });
+  expect(result.unavailable).toBe(true);
+  expect(result.reason).toBe(FUTURE_SCHEMA_REASON);
+
+  // No overwrite, no drop, no rebuild — not even schema/WAL churn on the file itself.
+  expect(indexBytes(dataDir)).toEqual(before);
+  const raw = new DatabaseSync(path.join(dataDir, 'search.db'));
+  expect(raw.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION + 1);
+  expect(raw.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name = 'indexed'").get().n).toBe(0);
+  raw.close();
+});
+
+test('the normal (older schema) direction is unchanged: drop on open, then a fresh rebuild works', async () => {
+  seedSession('proj-a', 'mini-session', MINI_FIXTURE);
+  // An index one version behind gets dropped on open, as before.
+  const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+  db.exec('CREATE TABLE indexed (sessionId TEXT PRIMARY KEY)');
+  db.prepare('INSERT INTO indexed VALUES (?)').run('stale');
+  db.exec('PRAGMA user_version = 1');
+  db.close();
+
+  await buildSearchIndex({ rootDir, dataDir });
+  const { db: reopened } = await openSearchDb({ dataDir });
+  expect(reopened.prepare('PRAGMA user_version').get().user_version).toBe(SCHEMA_VERSION);
+  expect(reopened.prepare('SELECT COUNT(*) AS n FROM indexed').get().n).toBe(1);
+  reopened.close();
+  expect((await searchSessions({ dataDir, query: 'fixture' })).length).toBeGreaterThan(0);
 });

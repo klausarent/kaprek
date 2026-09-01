@@ -358,11 +358,13 @@ export type SearchVerdict = {
   sample: { path: string; verdict: "present" | "changed" | "gone" }[];
 };
 
-export type SearchResponse = { available: true; results: SearchHit[] } | { available: false; reason: string };
+export type SearchResponse =
+  | { available: true; results: SearchHit[] }
+  | { available: false; reason: string; /** true when the index was written by a newer kaprek — shown with its own explanation */ future?: boolean };
 
 export type ReindexResponse =
   | { available: true; indexed: number; skipped: number }
-  | { available: false; reason: string };
+  | { available: false; reason: string; future?: boolean };
 
 export function fetchSearch(query: string): Promise<SearchResponse> {
   return getJson<SearchResponse>(`/api/search?q=${encodeURIComponent(query)}`);

@@ -15,6 +15,8 @@
 import https from 'node:https';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { askInstance } from '../lib/instance-lock.mjs';
+import { gitExec } from '../lib/git-exec.mjs';
 
 const REGISTRY_URL = 'https://registry.npmjs.org/kaprek/latest';
 
@@ -126,8 +128,12 @@ export function latestVersion({ timeoutMs = 8000, get = https.get } = {}) {
  * Split out from the doing so it can be tested without a network or a
  * package manager, and so every branch reads as one sentence rather than as
  * a nest of ifs.
+ *
+ * `repoDirty` is the `git status --porcelain` result for a git checkout, and
+ * it is decided BEFORE this message is built — a clean/dirty verdict that
+ * arrives after the advice would be an afterthought nobody acts on.
  */
-export function updatePlan({ kind, current, latest }) {
+export function updatePlan({ kind, current, latest, repoDirty = false }) {
   const behind = compareVersions(current, latest) < 0;
   if (!behind) {
     return { action: 'none', message: compareVersions(current, latest) > 0 ? `You are on ${current}, which is newer than the published ${latest}.` : `Already on the newest version (${current}).` };
@@ -148,7 +154,17 @@ export function updatePlan({ kind, current, latest }) {
   if (kind === 'repo') {
     return {
       action: 'none',
-      message: [`${latest} is published (this checkout says ${current}).`, 'This is a git checkout, so updating it means `git pull` — npm would overwrite your working tree.'].join('\n'),
+      message: [
+        `${latest} is published (this checkout says ${current}).`,
+        'This is a git checkout, so updating it means `git pull` — npm would overwrite your working tree.',
+        // Only said when it is true, and said as a prohibition rather than a
+        // warning: git pull refuses to run over uncommitted changes, so the
+        // working copy is safe — but the pull simply will not happen until
+        // the changes are committed or stashed.
+        ...(repoDirty
+          ? ['This checkout has uncommitted changes, and `git pull` is not allowed to overwrite your working copy — commit or stash them first.']
+          : []),
+      ].join('\n'),
     };
   }
 
@@ -190,4 +206,60 @@ export function runInstall(command, { spawnFn = spawn } = {}) {
     });
     child.on('exit', (code) => resolve(code ?? 1));
   });
+}
+
+/**
+ * True when a git checkout has uncommitted changes.
+ *
+ * Any failure to ask (no git, not a repo, timeout) counts as dirty: a false
+ * "clean" here would promise a pull that then refuses mid-run, while a false
+ * "dirty" only costs one extra honest sentence. Never throws.
+ */
+export function gitStatusDirty(packageRoot, { git = gitExec } = {}) {
+  try {
+    return git(['status', '--porcelain'], { cwd: packageRoot }).trim().length > 0;
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Asks the running instance of THIS data dir which version it carries — the
+ * same loopback greeting the instance lock answers on start, never a second
+ * transport. Any failure to ask reads as "no instance": an install that
+ * succeeded must not be reported as failed just because a question did not.
+ *
+ * @param {object} [options]
+ * @param {string} options.dataDir
+ * @param {typeof askInstance} [options.ask] - injectable for tests; tests fake
+ *   the greeting at THIS level (the one the lock provides), not the network.
+ * @returns {Promise<{running: boolean, version?: string}>}
+ */
+export async function askRunningInstance({ dataDir, ask = askInstance } = {}) {
+  try {
+    const answer = await ask({ dataDir });
+    return { running: Boolean(answer.running), version: answer.version };
+  } catch {
+    return { running: false };
+  }
+}
+
+/**
+ * The honest-success sentence, or null when there is nothing to add.
+ *
+ * Four shapes, decided only from the greeting the lock provided:
+ *   - no instance running  -> null (nothing to be stale)
+ *   - running == installed -> null (plain success stands)
+ *   - running != installed -> the restart note with both versions
+ *   - no version field     -> "unbekannt", for a holder older than this logic
+ */
+export function runningInstanceNotice({ installed, running }) {
+  if (!running || !running.running) return null;
+  const version = running.version;
+  const restart = 'der laufende Server startet beim nächsten kaprek stop neu.';
+  if (typeof version !== 'string') {
+    return `Läuft Version: unbekannt (älter als diese Update-Meldung) — ${restart}`;
+  }
+  if (version === installed) return null;
+  return `Installiert ${installed}, läuft noch ${version} — ${restart}`;
 }
