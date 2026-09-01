@@ -590,6 +590,16 @@ This is a deliberate trade. The agent does not get to do the thing it asked for 
 
 Two limits worth knowing. The action is replayed from the input kaprek stored, and inputs over 1 MiB are kept only as a preview — approving one of those starts a turn that asks again before it runs, with you there to answer. And a follow-up turn is a trigger turn like any other, so it is refused while another turn is running in that chat; approve again once it is done.
 
+### Standing grants
+
+Answering a question with **Always for this form** mints a standing grant: kaprek stops asking for that one exact call — same tool, and a hash of the *raw* input (before redaction, salted with a per-installation key kept in `grants.salt`), so two calls that differ only in a secret are different forms and ask separately. Matching happens at the moment a question would be raised, in a fixed order: a hard denial is answered first, the posture ceiling is never lifted by a grant, and only then does a grant speak — a grant replaces a question, nothing else.
+
+The grant is bound to the authorities you saw when you confirmed it. If the hard-denials list changes, or the posture ceiling **tightens** (a mission dials itself below where you granted), the grant goes stale: it lifts nothing, and you are asked as if it did not exist. If the ceiling **loosens**, the grant does not silently wake up either — its first hit asks one reactivation question, and your answer re-confirms the grant (it acts again) or denies it away (it is discarded). Under a posture of `auto` grants simply sleep: there is no question for them to replace, and there is deliberately no silent fulfilment either.
+
+There is no expiry date. A grant ends when you revoke it (the button in `#/approvals` under *Standing grants* — revocation is an event, the record stays readable, marked) or when a minted replacement supersedes it. Visibility replaces lifetime: every use is its own event in `grants.jsonl` with a hit counter and `lastUsedAt`, `#/setup` shows how many are active, and nothing depends on the approval log, which prunes after a week. Grants live only in the mission their question was asked in — a chat outside any mission cannot mint one, and "always, everywhere" is not offered in this phase. What exists today is the exact form only; broader patterns (a shape of call, not one call) are a later, separately-guarded step.
+
+The honest limit is the same one every local gate here has: kaprek runs your CLI with your rights, and a local process that can act as you can call the same tools directly — a standing grant makes *you* less bored, it does not make the machine fence off another process. Against the agent itself the binding is real: different input, changed hard denials, a tightened posture, or a revoked grant all bring the question back.
+
 ## What leaves your machine
 
 kaprek runs agent turns. That changes the honest answer to "does anything leave my machine", so this section states it plainly rather than in a slogan.

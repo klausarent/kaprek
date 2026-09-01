@@ -263,6 +263,12 @@ export async function runTurn({
   absoluteTimeoutMs,
   onEvent,
   onApprovalRequest,
+  // P6a: hashes the RAW (pre-redaction) tool input for the standing-grant
+  // path — sha256(salt ‖ canonical(input)) built by the caller, which owns
+  // the salt. Only the hash travels with the sanitized request; a chat turn
+  // passes this so a grant can match, a trigger/relay turn leaves it off so
+  // grants never apply there.
+  computeInputHash = null,
   signal,
   maxTextLen = DEFAULT_MAX_TEXT_LEN,
   maxToolLen = DEFAULT_MAX_TOOL_LEN,
@@ -470,6 +476,17 @@ export async function runTurn({
         // The caller (e.g. server.mjs, streaming this over SSE) gets the
         // SANITIZED request, never `request` itself — redaction must happen
         // before the data reaches ANY new write site, SSE included.
+        //
+        // P6a: the hash of the RAW input travels beside the redacted copy —
+        // a standing grant matches (and mints) on sha256(salt ‖ canonical
+        // raw input), because the redacted input would either never match or
+        // match a different secret (K1). Only the hash crosses the boundary,
+        // never the raw input itself. Null when the caller passed no hasher
+        // (triggers, relay — grants never apply there) or the input cannot
+        // honestly be hashed (unserialisable, or over the store's cap: an
+        // over-cap form mints nothing and matches nothing, mirroring the
+        // truncated approval record exactly).
+        const rawInputHash = computeInputHash ? computeInputHash(request.input) : null;
         const sanitizedRequest = {
           ...request,
           toolName: sanitizedToolName,
@@ -478,6 +495,7 @@ export async function runTurn({
           description: sanitizedDescription,
           reason: sanitizedReason,
           suggestions: sanitizedSuggestions,
+          ...(rawInputHash ? { inputHash: rawInputHash } : {}),
         };
 
         // Hard denials first: what no turn may do on this machine is not a
@@ -514,7 +532,12 @@ export async function runTurn({
           phase: 'resolved',
           requestId: request.id,
           toolName: request.toolName,
-          behavior: decision?.behavior ?? 'deny',
+          // 'granted', not 'allow': a standing grant redeemed this call
+          // without a question. Visibility of grant uses must not hang on
+          // the 7-day approval log (H2) — grants.jsonl carries its own use
+          // events — but the transcript still says what happened, and it
+          // did NOT happen the ordinary way.
+          behavior: decision?.granted ? 'granted' : (decision?.behavior ?? 'deny'),
           message: sanitizeText(decision?.message, maxToolLen, redact),
         });
 
