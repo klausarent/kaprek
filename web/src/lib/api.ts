@@ -592,6 +592,33 @@ export function fetchMissionMemory(id: string): Promise<MissionMemory> {
   return getJson<MissionMemory>(`/api/missions/${encodeURIComponent(id)}/memory`);
 }
 
+/** One stored digest file of a mission (P8), as the list route reports it. */
+export type MissionDigestFile = {
+  name: string;
+  path: string;
+  bytes: number;
+};
+
+/**
+ * GET /api/missions/<id>/digest?since=&until= — builds (and stores) the
+ * morning digest for a window and serves it as text/markdown. Since/until
+ * are epoch-ms or ISO strings; omitted means yesterday's local day.
+ */
+export async function fetchMissionDigest(id: string, since?: string, until?: string): Promise<string> {
+  const params = new URLSearchParams();
+  if (since !== undefined) params.set("since", since);
+  if (until !== undefined) params.set("until", until);
+  const qs = params.toString();
+  const res = await apiFetch(`/api/missions/${encodeURIComponent(id)}/digest${qs ? `?${qs}` : ""}`);
+  await throwOnError(res);
+  return res.text();
+}
+
+/** GET /api/missions/<id>/digests — the digest files already on disk, newest first. */
+export function fetchMissionDigests(id: string): Promise<{ digests: MissionDigestFile[] }> {
+  return getJson<{ digests: MissionDigestFile[] }>(`/api/missions/${encodeURIComponent(id)}/digests`);
+}
+
 export function setMissionStatus(id: string, status: MissionStatus): Promise<Mission> {
   return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/status`, { status }).then((r) => r.mission);
 }

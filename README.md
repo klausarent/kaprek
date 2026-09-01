@@ -130,6 +130,44 @@ Presets pre-fill a new mission: two generic ones ship built in (`blank` and
 A user preset with a builtin's id replaces it; an invalid file is skipped with
 a warning, never a crash.
 
+**Morning digest.** A mission's detail page has a digest card, and
+`GET /api/missions/<id>/digest?since=&until=` builds the same thing: a
+Markdown report of one window — the trigger runs of the night (ran / skipped
+because the skip-if condition was false / skipped because the condition could
+not be judged, with the short cause / failed, each with duration), the open
+deferred questions with the time they have left against their 24-hour
+deadline, costs and tokens, and the files the run records themselves name.
+The digest is **numbers only, deliberately** — no model call, no engine, no
+network anywhere behind the route — because kaprek's promise is "no network
+except the update check", and a morning report that spends a turn to say what
+the log already says would break both that promise and the rule that a digest
+must never cost more than what it reports. A missing value stays `unknown`:
+it is never written as 0 and never silently swallowed by a sum — the header
+counts coverage ("Kosten bekannt für 3 von 5 Läufen"), and sums are labelled
+as the known part. A mission with no runs in the window still gets its
+digest, with the 0-line, not an absence. The window is the interval between
+two local midnights as real time points, so a DST day is honestly 23 or 25
+hours and the header states the actual span; the default window (no
+`since`/`until`, epoch-ms or ISO) is yesterday's local day. Each build is
+stored as `<dataDir>/missions/<id>/digests/<datum>.md` (the local date of the
+window's end — for the morning default, today) and building again on the same
+day **overwrites that one file**: the digest is a report, not a store; history
+lives in `runs.jsonl`. `GET /api/missions/<id>/digests` lists the files on
+disk. Delivery is kaprek's usual single command (`notify.json`), and the
+digest's header names the window when you pipe it there. You wire that up
+yourself with a schedule trigger whose command fetches the digest route and
+feeds it to your notifier — for example, a trigger whose prompt is one line
+that runs:
+
+```
+curl -s -H "x-kaprek-token: <token>" -H "x-app-request: 1" \
+  "http://127.0.0.1:<port>/api/missions/<id>/digest" | ntfy publish my-morning-topic
+```
+
+No digest trigger is created for you — kaprek does not send anything you did
+not ask it to send.
+
+
 ## Advanced
 
 The systems in this section are the advanced layer. They are in the app and they are not going away —
