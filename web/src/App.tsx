@@ -1,6 +1,6 @@
 // Tiny hash-based router — no react-router dependency. Routes:
-//   #/                          → chat (a newcomer lands in the chat, not in
-//                                 an empty list)
+//   #/                          → start (the Leitstand; a FIRST-time visitor
+//                                 comes from #/home, the guided assistant)
 //   #/chat/<id>                 → one chat
 //   #/chats                     → chat list (?triggerId=, ?includeSilent=1)
 //   #/triggers                  → trigger page
@@ -29,11 +29,13 @@ import CouncilPage from "./pages/Council";
 import Setup from "./pages/Setup";
 import Memory from "./pages/Memory";
 import Home from "./pages/Home";
+import Start from "./pages/Start";
 import { Experiments } from "./pages/Experiments";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
 
 export type Route =
+  | { name: "start" }
   | { name: "list"; project: string | null }
   | { name: "thread"; project: string; sessionId: string }
   | { name: "search"; query: string }
@@ -124,11 +126,21 @@ export function parseRoute(hash: string): Route {
   if (parts[0] === "experiments") {
     return { name: "experiments" };
   }
+  if (parts[0] === "start") {
+    return { name: "start" };
+  }
   if (parts[0] === "list") {
     return { name: "list", project: null };
   }
-  // Empty hash (and anything unrecognized) is the chat.
-  return { name: "chat", chatId: undefined, missionId: undefined };
+  // Empty hash (and anything unrecognized) is the Leitstand: the landing
+  // page for RETURNING users — "what is running right now", not a menu (see
+  // ALMANAC-PLAN §1.1). A first-time visitor comes from #/home, the guided
+  // assistant, which stays reachable from "more".
+  return { name: "start" };
+}
+
+export function navigateToStart() {
+  window.location.hash = "#/start";
 }
 
 export function navigateToProjects() {
@@ -318,20 +330,36 @@ function MissingTokenScreen() {
  * vitest.config.ts): App.test.tsx checks `NAV_ITEMS.map(i => i.label)`.
  */
 export const NAV_ITEMS: { href: string; label: string; navigate: () => void; isActive: (route: Route) => boolean }[] = [
+  { href: "#/start", label: "Start", navigate: navigateToStart, isActive: (r) => r.name === "start" },
+  { href: "#/chat", label: "Chat", navigate: () => navigateToChat(), isActive: (r) => r.name === "chat" || r.name === "chats" },
+  { href: "#/approvals", label: "Inbox", navigate: navigateToApprovals, isActive: (r) => r.name === "approvals" },
+  { href: "#/missions", label: "Missions", navigate: navigateToMissions, isActive: (r) => r.name === "missions" || r.name === "mission" },
   { href: "#/list", label: "Sessions", navigate: navigateToProjects, isActive: (r) => r.name === "list" || r.name === "thread" },
+];
+
+/**
+ * The rest of the surface, one click behind "more" — every one an existing
+ * page, none needed to answer "what is the machine doing right now" (see
+ * ALMANAC-PLAN §1.1). Data, not inline JSX, for the same testability reason
+ * as NAV_ITEMS above.
+ */
+export const MORE_ITEMS: { href: string; label: string; navigate: () => void }[] = [
+  { href: "#/triggers", label: "Triggers", navigate: navigateToTriggers },
+  { href: "#/plans", label: "Plans", navigate: navigateToPlans },
+  { href: "#/council", label: "Council", navigate: navigateToCouncil },
+  { href: "#/memory", label: "Memory", navigate: navigateToMemory },
+  { href: "#/apps", label: "Apps", navigate: navigateToApps },
+  { href: "#/board", label: "Board", navigate: navigateToBoard },
   {
     href: "#/search",
     label: "Suche",
     navigate: () => {
       window.location.hash = "#/search";
     },
-    isActive: (r) => r.name === "search",
   },
-  { href: "#/approvals", label: "Inbox", navigate: navigateToApprovals, isActive: (r) => r.name === "approvals" },
-  { href: "#/board", label: "Board", navigate: navigateToBoard, isActive: (r) => r.name === "board" },
-  { href: "#/memory", label: "Memory", navigate: navigateToMemory, isActive: (r) => r.name === "memory" },
-  { href: "#/setup", label: "Setup", navigate: navigateToSetup, isActive: (r) => r.name === "setup" },
-  { href: "#/experiments", label: "Experimente", navigate: navigateToExperiments, isActive: (r) => r.name === "experiments" },
+  { href: "#/setup", label: "Setup", navigate: navigateToSetup },
+  { href: "#/experiments", label: "Experimente", navigate: navigateToExperiments },
+  { href: "#/home", label: "Home-Assistent", navigate: navigateToHome },
 ];
 
 export default function App() {
@@ -343,11 +371,11 @@ export default function App() {
     <div className="app-shell">
       <header className="app-header">
         <a
-          href="#/list"
+          href="#/start"
           className="app-title"
           onClick={(e) => {
             e.preventDefault();
-            navigateToProjects();
+            navigateToStart();
           }}
         >
           kaprek
@@ -366,12 +394,33 @@ export default function App() {
               {item.label}
             </a>
           ))}
+          {/* Plain <details>, not a menu component: no dependency, and a
+              keyboard user gets the browser's own toggle for free. */}
+          <details className="nav-more">
+            <summary>more</summary>
+            <div className="nav-more-menu">
+              {MORE_ITEMS.map((item) => (
+                <a
+                  key={item.href}
+                  href={item.href}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    item.navigate();
+                  }}
+                >
+                  {item.label}
+                </a>
+              ))}
+            </div>
+          </details>
         </nav>
         <StatusDot />
         <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
       </header>
       <main className="app-main">
-        {route.name === "thread" ? (
+        {route.name === "start" ? (
+          <Start />
+        ) : route.name === "thread" ? (
           <Thread project={route.project} sessionId={route.sessionId} />
         ) : route.name === "search" ? (
           <Search query={route.query} />
