@@ -42,6 +42,7 @@ import {
   InvalidPostureError,
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
+import { buildDigest, listDigests } from '../missions/digest.mjs';
 import { InvalidWorkflowError, buildWorkflow, importSummary, loadWorkflows, saveWorkflow, validateWorkflow } from '../missions/workflow.mjs';
 import { HOME_MISSIONS, buildHomePrompt, homeMission } from '../missions/home.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
@@ -2724,6 +2725,74 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
       return;
     }
     sendJson(res, 200, missionMemoryView({ dataDir, mission }));
+    return;
+  }
+
+  // /api/missions/<id>/digest?since=&until= — the P8 morning digest: built
+  // from runs.jsonl and the open deferred questions, served as Markdown,
+  // and stored under the mission's digests/ directory (overwrite, no
+  // revisions). Numbers only — no engine call anywhere behind this route.
+  if (segments.length === 4 && segments[3] === 'digest') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    const url = new URL(req.url, 'http://127.0.0.1');
+    let mission;
+    try {
+      mission = missions.get(segments[2]);
+    } catch (err) {
+      const status = missionErrorStatus(err);
+      if (status === null) throw err;
+      sendJson(res, status, { error: err.message });
+      return;
+    }
+    // Same chat-union rule as the detail route: a run or a question belongs
+    // to this mission when its chat is linked to it or claims it.
+    const chatIds = new Set(mission.chats ?? []);
+    try {
+      for (const chat of getChats().list()) if (chat.missionId === mission.id) chatIds.add(chat.id);
+    } catch {
+      // Linked chats alone still bound the digest correctly.
+    }
+    const pendingQuestions = (await getApprovalStore().listPending()).filter(
+      (entry) => entry.mode === 'deferred' && entry.chatId != null && chatIds.has(entry.chatId),
+    );
+    let built;
+    try {
+      built = buildDigest({
+        dataDir,
+        mission,
+        chatIds,
+        pendingQuestions,
+        since: url.searchParams.get('since'),
+        until: url.searchParams.get('until'),
+      });
+    } catch (err) {
+      // A bad since/until is the caller's error, not a server fault.
+      sendJson(res, 400, { error: err.message });
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/markdown; charset=utf-8' });
+    res.end(built.markdown);
+    return;
+  }
+
+  // /api/missions/<id>/digests — the digest files already on disk, newest first.
+  if (segments.length === 4 && segments[3] === 'digests') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    try {
+      missions.get(segments[2]);
+    } catch (err) {
+      const status = missionErrorStatus(err);
+      if (status === null) throw err;
+      sendJson(res, status, { error: err.message });
+      return;
+    }
+    sendJson(res, 200, { digests: listDigests(dataDir, segments[2]) });
     return;
   }
 

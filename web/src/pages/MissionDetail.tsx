@@ -5,6 +5,8 @@
 import { useEffect, useState } from "react";
 import {
   fetchMission,
+  fetchMissionDigest,
+  fetchMissionDigests,
   fetchMissionMemory,
   forgetMemory,
   setMissionStatus,
@@ -12,6 +14,7 @@ import {
   POSTURES,
   type Mission,
   type MissionDetail as MissionDetailData,
+  type MissionDigestFile,
   type MissionMemory as MissionMemoryData,
   type MissionMemoryEntry,
   type MissionStatus,
@@ -232,6 +235,87 @@ export function MissionMemoryCardBody({
   );
 }
 
+/**
+ * The P8 morning digest, as a card: numbers only, built on click (the
+ * default window is yesterday's local day), previewed as plain text in a
+ * pre-block — no Markdown renderer, the document IS numbers and states.
+ * The same build writes `digests/<datum>.md`; the file list link shows
+ * what is already on disk.
+ *
+ * Hook-free body like MissionMemoryCardBody, so it renders on the
+ * element-tree level in tests; the wrapper owns the fetch state.
+ */
+export const DIGEST_WINDOW_NOTE = "Default window: yesterday's local day — DST days are 23 or 25 hours, the header states the real span.";
+
+export function MissionDigestCardBody({
+  markdown,
+  files,
+  windowNote = DIGEST_WINDOW_NOTE,
+  loading,
+  onBuild,
+  onListFiles,
+}: {
+  markdown: string | null;
+  files: MissionDigestFile[];
+  windowNote?: string;
+  loading: boolean;
+  onBuild: () => void;
+  onListFiles: () => void;
+}) {
+  return (
+    <section className="mission-section mission-digest" aria-label="Morning digest">
+      <h3>Morning digest</h3>
+      <p className="muted mission-digest-note">{windowNote}</p>
+      <p>
+        <button type="button" className="mission-digest-build" onClick={onBuild} disabled={loading}>
+          {loading ? "Building…" : "Digest erzeugen/aktualisieren"}
+        </button>{" "}
+        <button type="button" className="link-button mission-digest-files" onClick={onListFiles}>
+          Digest-Dateien ({files.length})
+        </button>
+      </p>
+      {files.length > 0 && (
+        <ul className="mission-digest-file-list">
+          {files.map((file) => (
+            <li key={file.name}>
+              {file.name} <span className="mission-digest-file-bytes">({file.bytes} bytes)</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {markdown === null ? (
+        <p className="muted mission-digest-empty">No digest built yet — the button builds yesterday's numbers.</p>
+      ) : (
+        <pre className="mission-digest-preview">{markdown}</pre>
+      )}
+    </section>
+  );
+}
+
+/** The card wrapper: fetch on demand, never take the page down on error. */
+export function MissionDigestCard({ missionId, onError }: { missionId: string; onError: (message: string) => void }) {
+  const [markdown, setMarkdown] = useState<string | null>(null);
+  const [files, setFiles] = useState<MissionDigestFile[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  function build() {
+    setLoading(true);
+    // No since/until: the server's default — yesterday's local day.
+    fetchMissionDigest(missionId)
+      .then(setMarkdown)
+      .catch((e) => onError((e as Error).message))
+      .finally(() => setLoading(false));
+  }
+
+  function listFiles() {
+    fetchMissionDigests(missionId)
+      .then((r) => setFiles(r.digests))
+      .catch((e) => onError((e as Error).message));
+  }
+
+  return <MissionDigestCardBody markdown={markdown} files={files} loading={loading} onBuild={build} onListFiles={listFiles} />;
+}
+
 export default function MissionDetail({ missionId }: { missionId: string }) {
   const [detail, setDetail] = useState<MissionDetailData | null>(null);
   const [memory, setMemory] = useState<MissionMemoryData | null>(null);
@@ -304,6 +388,8 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
       />
 
       {memory && <MissionMemoryCard memory={memory} onForget={handleForget} />}
+
+      <MissionDigestCard missionId={missionId} onError={(message) => setError(message)} />
 
       {pendingApprovals.length > 0 && (
         <section className="mission-section mission-pending">
