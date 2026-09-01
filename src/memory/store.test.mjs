@@ -129,6 +129,70 @@ describe('freshness', () => {
   });
 });
 
+describe('provenance (P4b)', () => {
+  test('a turn write carries sourceKind turn plus its chatId', () => {
+    const memory = seeded();
+    const fact = memory.remember({ scopeId: 'project:kaprek', text: 'the relay resumes its own session', origin: 'chat:c1', sourceKind: 'turn', chatId: 'c1' });
+    expect(fact.sourceKind).toBe('turn');
+    expect(fact.chatId).toBe('c1');
+    expect(fact.path).toBe(null);
+  });
+
+  test('a file write carries sourceKind file plus its path, redacted', () => {
+    const memory = seeded();
+    // The secret surfaced inside the path string; the store redacts the
+    // provenance like every other text it writes down — the path yes, the
+    // file's contents never.
+    const fact = memory.remember({
+      scopeId: 'project:kaprek',
+      text: 'the nightly deploy runs at 03:00 UTC',
+      origin: 'memory-sync:project_kaprek.md',
+      sourceKind: 'file',
+      path: 'C:\\Users\\klaus\\.claude\\Bearer sk-a1b2c3d4e5f6g7h8\\memory\\project_kaprek.md',
+      pathRange: { from: 3, to: 9 },
+    });
+    expect(fact.sourceKind).toBe('file');
+    expect(fact.path).toBe('C:\\Users\\klaus\\.claude\\Bearer [REDACTED]\\memory\\project_kaprek.md');
+    expect(fact.pathRange).toEqual({ from: 3, to: 9 });
+  });
+
+  test('an import write starts unverified, and only Still true stamps it', () => {
+    const memory = seeded();
+    const fact = memory.remember({ scopeId: 'project:kaprek', text: 'a guess from an old note', origin: 'import:notes', sourceKind: 'import', unverified: true });
+    expect(fact.lastVerifiedAt).toBe(null);
+    expect(fact.unverified).toBe(true);
+    expect(fact.stale).toBe(false); // unconfirmed, not stale — different mark, different corner
+
+    // Re-importing the same line confirms the count but not the clock.
+    const again = memory.remember({ scopeId: 'project:kaprek', text: 'a guess from an old note', origin: 'import:notes', sourceKind: 'import', unverified: true });
+    expect(again.confirmed).toBe(true);
+    expect(memory.get(fact.id).lastVerifiedAt).toBe(null);
+
+    // "Still true" — the existing verify path — is what stamps it.
+    memory.verify(fact.id);
+    const verified = memory.get(fact.id);
+    expect(verified.lastVerifiedAt).toBe(new Date(clock).toISOString());
+    expect(verified.unverified).toBe(false);
+  });
+
+  test('a manual write carries sourceKind manual, and an unknown sourceKind is refused', () => {
+    const memory = seeded();
+    const fact = memory.remember({ scopeId: 'project:kaprek', text: 'written by hand', origin: 'person', sourceKind: 'manual' });
+    expect(fact.sourceKind).toBe('manual');
+    expect(() => memory.remember({ scopeId: 'project:kaprek', text: 'x', origin: 'o', sourceKind: 'vibes' })).toThrow(InvalidMemoryError);
+  });
+
+  test('a provenance path survives the event log round trip', () => {
+    const memory = seeded();
+    memory.remember({ scopeId: 'project:kaprek', text: 'replayed later', origin: 'import:x', sourceKind: 'import', path: 'C:\\notes\\old.md', unverified: true });
+    const reopened = openMemory(dataDir, { now });
+    const [entry] = reopened.list({ scopeId: 'project:kaprek' });
+    expect(entry.sourceKind).toBe('import');
+    expect(entry.path).toBe('C:\\notes\\old.md');
+    expect(entry.unverified).toBe(true);
+  });
+});
+
 describe('forget', () => {
   test('is an event, not a deleted line', () => {
     const memory = seeded();

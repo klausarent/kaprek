@@ -2299,6 +2299,23 @@ pre,
   gap: 0.75rem;
 }
 
+/* P4b: where a memory came from, as a link — thread, run, or file. An
+   entry without provenance gets the quiet "ohne Herkunft" mark instead:
+   shown, never hidden. */
+.memory-source {
+  display: inline-flex;
+  gap: 0.5rem;
+}
+
+.memory-source-link {
+  color: var(--accent, #2563eb);
+}
+
+.memory-source-none {
+  font-style: italic;
+  opacity: 0.7;
+}
+
 /* A rule kaprek is asking about — never quiet, never pre-applied. */
 .memory-proposal {
   border: 1px solid var(--accent, #f2542d);

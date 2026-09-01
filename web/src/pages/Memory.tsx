@@ -15,6 +15,38 @@ export function ageLabel(entry: { ageMs: number; stale: boolean }): string {
   return `verified ${days} day${days === 1 ? "" : "s"} ago`;
 }
 
+/**
+ * Where an entry came from, as a link target (P4b). A turn points back to
+ * its thread, a run to the log that carries its run id, a file into the
+ * search that knows the sessions that touched it. Entries written before
+ * provenance existed — and hand-written ones — point nowhere: they are
+ * marked "ohne Herkunft" instead, never hidden.
+ */
+export function provenanceLinks(entry: MemoryEntry): { label: string; href: string }[] {
+  const links: { label: string; href: string }[] = [];
+  if (entry.chatId) links.push({ label: "thread", href: `#/chat/${encodeURIComponent(entry.chatId)}` });
+  if (entry.runId) links.push({ label: "run", href: `#/search?q=${encodeURIComponent(entry.runId)}` });
+  if (entry.path) {
+    const range = entry.pathRange ? ` (lines ${entry.pathRange.from}–${entry.pathRange.to})` : "";
+    links.push({ label: `file: ${entry.path}${range}`, href: `#/search?q=${encodeURIComponent(entry.path)}` });
+  }
+  return links;
+}
+
+/**
+ * Unconfirmed entries first, then the order the server chose (newest first,
+ * profiles before facts). Consistent with the stale handling: stale entries
+ * keep their place and carry their badge — sorting them to the top would
+ * bury fresh facts behind every neglected one, while an import nobody has
+ * checked yet is exactly what a person opening this page needs to see first.
+ */
+export function orderEntries(entries: MemoryEntry[]): MemoryEntry[] {
+  const rest: MemoryEntry[] = [];
+  const unconfirmed: MemoryEntry[] = [];
+  for (const entry of entries) (entry.unverified ? unconfirmed : rest).push(entry);
+  return [...unconfirmed, ...rest];
+}
+
 /** The scope tree as a flat list, children under their parent. */
 export function orderScopes(scopes: MemoryScope[]): MemoryScope[] {
   const byParent = new Map<string | null, MemoryScope[]>();
@@ -34,12 +66,32 @@ export function orderScopes(scopes: MemoryScope[]): MemoryScope[] {
 }
 
 export function MemoryRow({ entry, onVerify, onForget }: { entry: MemoryEntry; onVerify: () => void; onForget: () => void }) {
+  const links = provenanceLinks(entry);
   return (
     <div className={entry.stale ? "memory-row memory-row-stale" : "memory-row"}>
       <div className="memory-row-head">
         <span className="badge badge-muted">{entry.kind}</span>
-        <span className="memory-age">{ageLabel(entry)}</span>
+        {entry.unverified ? (
+          <span className="badge" title="Aus einem Import übernommen — von niemandem bestätigt.">
+            unconfirmed
+          </span>
+        ) : (
+          <span className="memory-age">{ageLabel(entry)}</span>
+        )}
         <span className="memory-origin">from {entry.origin}</span>
+        {links.length > 0 ? (
+          <span className="memory-source">
+            {links.map((link) => (
+              <a key={link.label} href={link.href} className="memory-source-link">
+                {link.label}
+              </a>
+            ))}
+          </span>
+        ) : (
+          <span className="memory-source memory-source-none" title="Keine Herkunft verzeichnet — vor P4b geschrieben oder von Hand eingetragen.">
+            ohne Herkunft
+          </span>
+        )}
         {(entry.confirmations ?? 1) > 1 && (
           <span className="badge badge-muted" title={(entry.origins ?? []).join(", ")}>
             confirmed {entry.confirmations}× by {(entry.origins ?? [entry.origin]).length} source{(entry.origins ?? [entry.origin]).length === 1 ? "" : "s"}
@@ -151,15 +203,14 @@ export default function Memory() {
       ) : entries.length === 0 ? (
         <p className="muted">This scope has nothing to say yet.</p>
       ) : (
-        entries.map((entry) => (
+        orderEntries(entries).map((entry) => (
           <MemoryRow
             key={entry.id}
             entry={entry}
             onVerify={() => void verifyMemory(entry.id).then(() => setReloads((n) => n + 1))}
             onForget={() => void forgetMemory(entry.id, "withdrawn by hand").then(() => setReloads((n) => n + 1))}
           />
-        ))
-      )}
+        ))      )}
     </div>
   );
 }

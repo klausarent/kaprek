@@ -203,8 +203,17 @@ function runImport({ dataDir, scopeMap, facts, missions, now, allowBackup }) {
     ensureScope(entry.id, entry.parent ?? rootId);
   }
 
-  /** Remembers one fact, honouring the secret checks and the two counters. Returns nothing — mutates `result` directly, like the loops around it. */
-  function rememberFact({ scopeId, kind, text, origin, confidence }) {
+  /**
+   * Remembers one fact, honouring the secret checks and the two counters.
+   * Returns nothing — mutates `result` directly, like the loops around it.
+   *
+   * P4b: the import names its source (`sourceKind: 'import'`, the manifest
+   * row's source file when it carries one) instead of discarding it, and
+   * writes the fact UNVERIFIED (`lastVerifiedAt: null`): an import that
+   * wrote its guesses down as checked facts would poison the memory faster
+   * than a person can correct it. Only "Still true" stamps it.
+   */
+  function rememberFact({ scopeId, kind, text, origin, confidence, path = null }) {
     if (typeof text !== 'string' || text.trim() === '') {
       result.skipped += 1;
       return;
@@ -235,7 +244,7 @@ function runImport({ dataDir, scopeMap, facts, missions, now, allowBackup }) {
     backupOnce();
     let outcome;
     try {
-      outcome = memory.remember({ scopeId, kind, text: cleanText, origin: cleanOrigin, confidence: cleanConfidence });
+      outcome = memory.remember({ scopeId, kind, text: cleanText, origin: cleanOrigin, confidence: cleanConfidence, sourceKind: 'import', path, unverified: true });
     } catch {
       result.skipped += 1;
       return;
@@ -255,6 +264,7 @@ function runImport({ dataDir, scopeMap, facts, missions, now, allowBackup }) {
       text: row.text,
       origin: row.origin,
       confidence: row.confidence,
+      path: typeof row.path === 'string' ? row.path : null,
     });
   }
 
@@ -293,7 +303,7 @@ function runImport({ dataDir, scopeMap, facts, missions, now, allowBackup }) {
     const missionScopeId = `mission:${mission.id}`;
     ensureScope(missionScopeId, scopeId);
     for (const factText of Array.isArray(missionFacts) ? missionFacts : []) {
-      rememberFact({ scopeId: missionScopeId, kind: 'fact', text: factText, origin: `import:mc:${mcId}`, confidence: 0.8 });
+      rememberFact({ scopeId: missionScopeId, kind: 'fact', text: factText, origin: `import:mc:${mcId}`, confidence: 0.8, path: typeof row.path === 'string' ? row.path : null });
     }
   }
 

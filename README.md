@@ -346,6 +346,15 @@ one nobody can reason about. Forgetting is an event with a reason, and
 evidence is a pointer into a session, never a copied excerpt. `#/memory`
 shows one scope at a time; there is deliberately no "everything" view.
 
+Every memory also carries its **origin**: a turn names the chat it was
+learned in, a sync names the memory file, an import names its source file —
+and `#/memory` renders each as a link back to that source. Import entries
+start *unconfirmed* (`lastVerifiedAt` stays empty until a person presses
+"Still true"): an import that wrote its assumptions down as checked facts
+would poison the memory faster than anyone could correct it. Entries written
+before origins were recorded are marked "ohne Herkunft" — shown, never
+hidden.
+
 When the same failure pattern shows up three times, kaprek writes down the
 rule it would add and asks. Until someone accepts it, that proposal reaches
 no prompt at all — a system that turns its own observations into active rules

@@ -782,7 +782,9 @@ function rememberFromTurn({ dataDir, scopeId, chatId, text }) {
   try {
     const memory = openMemory(dataDir);
     for (const entry of wanted) {
-      written.push(memory.remember({ scopeId, text: entry.text, kind: entry.kind, confidence: entry.confidence, origin: `chat:${chatId}` }));
+      // P4b: the provenance travels with the line — sourceKind 'turn' plus
+      // the chat it was learned in, so the UI can link back to the thread.
+      written.push(memory.remember({ scopeId, text: entry.text, kind: entry.kind, confidence: entry.confidence, origin: `chat:${chatId}`, sourceKind: 'turn', chatId }));
     }
   } catch (err) {
     console.warn(`memory: could not write what this turn learned (${err.message})`);

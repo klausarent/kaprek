@@ -1,8 +1,24 @@
 import { describe, expect, test } from "vitest";
-import { render, textOf } from "../test/tree";
-import { MemoryRow, ProposalCard, ageLabel, orderScopes } from "./Memory";
+import { findByType, render, textOf } from "../test/tree";
+import { MemoryRow, ProposalCard, ageLabel, orderEntries, orderScopes, provenanceLinks } from "./Memory";
+import type { MemoryEntry } from "../lib/api";
 
 const DAY = 24 * 60 * 60 * 1000;
+
+const baseEntry: MemoryEntry = {
+  id: "1",
+  scopeId: "project:kaprek",
+  kind: "fact",
+  text: "codex needs its own session id",
+  origin: "chat:abc",
+  confidence: 0.8,
+  createdAt: "2026-08-02T10:00:00.000Z",
+  lastVerifiedAt: "2026-08-02T10:00:00.000Z",
+  evidenceRef: null,
+  forgotten: false,
+  stale: false,
+  ageMs: 0,
+};
 
 describe("ageLabel", () => {
   test("says how long it has been unverified when it is stale", () => {
@@ -36,20 +52,7 @@ describe("orderScopes", () => {
 });
 
 describe("MemoryRow", () => {
-  const entry = {
-    id: "1",
-    scopeId: "project:kaprek",
-    kind: "fact" as const,
-    text: "codex needs its own session id",
-    origin: "chat:abc",
-    confidence: 0.8,
-    createdAt: "2026-08-02T10:00:00.000Z",
-    lastVerifiedAt: "2026-08-02T10:00:00.000Z",
-    evidenceRef: null,
-    forgotten: false,
-    stale: false,
-    ageMs: 0,
-  };
+  const entry = baseEntry;
 
   test("shows the statement and where it came from", () => {
     const text = textOf(render(<MemoryRow entry={entry} onVerify={() => {}} onForget={() => {}} />));
@@ -60,6 +63,67 @@ describe("MemoryRow", () => {
   test("a stale entry says so rather than disappearing", () => {
     const text = textOf(render(<MemoryRow entry={{ ...entry, stale: true, ageMs: 100 * DAY }} onVerify={() => {}} onForget={() => {}} />));
     expect(text).toContain("unverified for 100 days");
+  });
+
+  test("provenance renders as links — thread, run, file with its line range (P4b)", () => {
+    const tree = render(
+      <MemoryRow
+        entry={{
+          ...entry,
+          sourceKind: "turn",
+          chatId: "c-42",
+          runId: "relay-run-7",
+          path: "C:\\notes\\projekt.md",
+          pathRange: { from: 3, to: 9 },
+        }}
+        onVerify={() => {}}
+        onForget={() => {}}
+      />,
+    );
+    const anchors = findByType(tree, "a");
+    const hrefs = anchors.map((a) => a.props.href as string);
+    expect(hrefs).toContain("#/chat/c-42");
+    expect(hrefs.some((href) => href.startsWith("#/search?q=relay-run-7"))).toBe(true);
+    expect(hrefs.some((href) => href.startsWith("#/search?q=C%3A%5Cnotes%5Cprojekt.md"))).toBe(true);
+    expect(textOf(tree)).toContain("lines 3–9");
+  });
+
+  test("an entry without provenance is marked, not hidden (P4b)", () => {
+    const text = textOf(render(<MemoryRow entry={{ ...entry, sourceKind: undefined }} onVerify={() => {}} onForget={() => {}} />));
+    expect(text).toContain("codex needs its own session id");
+    expect(text).toContain("ohne Herkunft");
+  });
+
+  test("an unconfirmed import says so instead of a verification age (P4b)", () => {
+    const text = textOf(
+      render(<MemoryRow entry={{ ...entry, lastVerifiedAt: null, unverified: true, sourceKind: "import" }} onVerify={() => {}} onForget={() => {}} />),
+    );
+    expect(text).toContain("unconfirmed");
+    expect(text).not.toContain("verified today");
+  });
+});
+
+describe("orderEntries", () => {
+  test("unconfirmed entries come first, the rest keeps its order (P4b)", () => {
+    const a = { ...baseEntry, id: "a" };
+    const b = { ...baseEntry, id: "b", unverified: true, lastVerifiedAt: null };
+    const c = { ...baseEntry, id: "c" };
+    const d = { ...baseEntry, id: "d", unverified: true, lastVerifiedAt: null };
+    expect(orderEntries([a, b, c, d]).map((entry) => entry.id)).toEqual(["b", "d", "a", "c"]);
+  });
+});
+
+describe("provenanceLinks", () => {
+  test("an entry pointing nowhere links nothing", () => {
+    expect(provenanceLinks(baseEntry)).toEqual([]);
+  });
+
+  test("a file range is part of the label, not the link target", () => {
+    const links = provenanceLinks({ ...baseEntry, path: "C:\\p.md", pathRange: { from: 1, to: 2 } });
+    expect(links).toHaveLength(1);
+    expect(links[0].label).toContain("C:\\p.md");
+    expect(links[0].label).toContain("lines 1–2");
+    expect(links[0].href).not.toContain("lines");
   });
 });
 
