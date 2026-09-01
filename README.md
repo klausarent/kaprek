@@ -485,6 +485,40 @@ changes nothing about the question — it stays in the inbox either way.
 kaprek ships no channels of its own on purpose. A built-in list of them is
 never finished, and every entry is a dependency or a vendor.
 
+### Skip-if conditions (schedule and heartbeat triggers)
+
+A schedule that fires every morning into an empty inbox is nine blind turns
+out of ten. A heartbeat or schedule trigger may therefore carry one
+`condition`, checked after its window is claimed and before the turn starts:
+
+- `file-exists` — the path must be there, or the run is skipped.
+- `file-newer-than-last-run` — the path's modification time must be newer
+  than the trigger's own last run in `runs.jsonl`. No separate state file:
+  the run log is the source of truth.
+
+A skipped run never becomes a turn — no cost, no request to Anthropic — but
+it is written to `runs.jsonl` (`skipped: "condition"`) and shown as
+"übersprungen (Bedingung)" in the trigger's run history. The window stays
+spent, so the condition is not re-checked in the same slot.
+
+Failure is a different thing than "false". A path the condition cannot even
+judge — outside the workspace (including via a symlink out of it), or a stat
+that fails for a reason other than "not there" — skips the run too, but
+loudly: `skipped: "condition-error"` in the log, a notification naming the
+cause ("Bedingung fehlgeschlagen: … — Lauf übersprungen"), and a counter on
+the trigger. Five in a row mark the trigger as **degraded** in the trigger
+list. By default a trigger stays skipped while its condition is broken;
+`onConditionError: "run"` makes it run anyway, with the error recorded on
+that run and the counter still counting. The form runs the condition once
+before you can save and shows you the verdict, including the resolved
+absolute path that gets stored.
+
+Deliberately missing: a `command` condition. Probing it at save time would
+make the save button an exec surface, killing a misbehaving child cleanly
+needs real process-group semantics, and the environment it would inherit is
+unchecked authority. It comes back as its own package if a case appears that
+the two file conditions do not cover.
+
 ## Search
 
 Full-text search across every indexed session, backed by SQLite FTS5. Requires Node 22+, since it uses the built-in `node:sqlite` module — on older Node it degrades cleanly, the UI reports search as unavailable instead of crashing. Only redacted content is indexed, same as the digest view. Build or refresh the index from the reindex button in the search view (`#/search`), or `POST /api/search/reindex`.

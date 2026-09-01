@@ -98,7 +98,12 @@ export function checkLimits({ dataDir, trigger, now = Date.now(), inFlightRuns =
   const dayStart = startOfLocalDay(now);
   const dayEndExclusive = dayStart + 24 * 60 * 60 * 1000;
 
-  const runsForTrigger = readRuns(dataDir).filter((run) => run.triggerId === trigger.id);
+  // P7: a run that never became a turn (`skipped: 'condition'` — the
+  // condition was merely false — or 'condition-error') has cost nothing and
+  // used no run slot, so it counts against neither cap. A real run that went
+  // ahead despite a condition error (onConditionError: 'run') has skipped ===
+  // null and counts, as it always did.
+  const runsForTrigger = readRuns(dataDir).filter((run) => run.triggerId === trigger.id && !run.skipped);
   const todaysRuns = runsForTrigger.filter((run) => {
     const ts = Date.parse(run.ts);
     return Number.isFinite(ts) && ts >= dayStart && ts < dayEndExclusive;
@@ -162,6 +167,9 @@ export function checkGlobalTriggerLimits({ dataDir, now = Date.now(), inFlightRu
     // walk around is not a ceiling. A user's own chat turns are still never
     // throttled by this.
     if (!UNATTENDED_ORIGINS.has(run.origin)) continue;
+    // P7: a skipped precondition check started no turn (see checkLimits
+    // above) — it does not consume the shared ceilings either.
+    if (run.skipped) continue;
     const ts = Date.parse(run.ts);
     if (!Number.isFinite(ts)) continue;
     if (ts >= hourStart) turnsLastHour += 1;

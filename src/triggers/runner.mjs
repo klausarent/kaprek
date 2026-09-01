@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { openChats } from '../chats/store.mjs';
 import { readFile as readWorkspaceFile, resolveWorkspacePath } from '../workspace/fs.mjs';
-import { readRuns } from '../orchestrator/runs.mjs';
+import { appendRun, readRuns } from '../orchestrator/runs.mjs';
 import { redactSecrets, truncate } from '../parser/parse.mjs';
 import { wrapExternal } from '../parser/external.mjs';
 import { SERVER_NAME as MCP_SERVER_NAME } from '../apps/mcp-server.mjs';
@@ -32,6 +32,8 @@ import { isAskCoverageGap } from '../harness/claude-code.mjs';
 import { APPROVAL_INBOX_TTL_MS, canonicalInput } from '../server/approval-store.mjs';
 import { checkLimits, checkGlobalTriggerLimits, MAX_CONCURRENT_UNATTENDED_TURNS } from './limits.mjs';
 import { isClipboardSupported, readWindowsClipboard } from './clipboard.mjs';
+import { conditionErrorStreak, DEGRADED_STREAK_THRESHOLD, evaluateCondition } from './condition.mjs';
+import { notify as defaultNotify } from '../server/notify.mjs';
 
 const CLAIM_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
@@ -387,6 +389,9 @@ export function createTriggerRunner({
   approvalStore = null,
   approvalDeadlineMs = APPROVAL_INBOX_TTL_MS,
   releaseApprovals = () => {},
+  // P7: the condition-error notification, seam-injected so tests never spawn
+  // a real notifier. Fire-and-forget by contract (see notify.mjs).
+  notify = defaultNotify,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -1038,6 +1043,9 @@ export function createTriggerRunner({
    * omits them.
    */
   async function fireTrigger(id, { cause, onEvent, onChatId } = {}) {
+    // Wall-clock start of THIS fire decision, for the durationMs a skipped
+    // run records (a skip has no turn to time, only the check itself).
+    const fireStartedAtMs = Date.now();
     // 1/2. Loop guard, part 1: a run CAUSED by a trigger must never itself
     // fire another trigger — checked before even looking the trigger up, so
     // no trigger-shape detail can influence this decision.
@@ -1199,6 +1207,72 @@ export function createTriggerRunner({
       reasonText = 'manual fire (saved prompt)';
     }
 
+    // P7 — skip-if precondition (see DESIGN-SPEC.md). Checked here, AFTER the
+    // window claim and BEFORE buildPrompt(): a skipped run must still spend
+    // the slot (otherwise the next tick re-checks the same condition in the
+    // same window forever), but must never become a turn.
+    let conditionErrorForRun = null;
+    if (trigger.condition !== undefined) {
+      const kind = trigger.condition.kind;
+      // The trigger's OWN last run — readRuns, never a state file of our own
+      // (same source of truth as limits.mjs and heartbeatDue()).
+      const ownRuns = readRuns(dataDir).filter((run) => run.triggerId === id);
+      const lastRun = ownRuns[ownRuns.length - 1] ?? null;
+      const lastRunStartedAt = lastRun && Number.isFinite(Date.parse(lastRun.ts)) ? Date.parse(lastRun.ts) : null;
+      const verdict = evaluateCondition({ kind, path: trigger.condition.path, cwd, dataDir, lastRunStartedAt });
+
+      if (verdict.error !== null && (trigger.onConditionError ?? 'skip') === 'run') {
+        // The per-trigger exception: the run happens DESPITE the unjudgeable
+        // condition. The run line carries conditionError (plumbed through
+        // runTurn), and the degraded streak counts it (see
+        // condition.mjs::conditionErrorStreak).
+        conditionErrorForRun = `${kind}: ${verdict.error}`;
+        log(`trigger ${id}: condition could not be evaluated (${verdict.error}) — running anyway (onConditionError: 'run')`);
+      } else if (verdict.error !== null) {
+        const runLine = {
+          origin: 'trigger',
+          triggerId: id,
+          skipped: 'condition-error',
+          conditionKind: kind,
+          conditionError: verdict.error,
+          durationMs: Date.now() - fireStartedAtMs,
+        };
+        try {
+          appendRun(dataDir, runLine);
+        } catch (err) {
+          log(`trigger ${id}: could not record the skipped run: ${err?.message ?? String(err)}`);
+        }
+        // LOUD, unlike a plain skip: whatever made the condition unjudgeable
+        // (a path outside the allowed roots, a dying disk) is a fault, and a
+        // fault that silences a trigger is the outcome kaprek exists to
+        // avoid. The claim stays set — this window is spent either way.
+        void notify({
+          dataDir,
+          text: `Bedingung fehlgeschlagen: ${kind}: ${verdict.error} — Lauf übersprungen`,
+          context: { source: { kind: 'trigger', triggerId: id } },
+          log,
+        });
+        log(`trigger ${id}: skipped (condition error: ${kind}: ${verdict.error})`);
+        return { fired: false, reason: `condition error: ${verdict.error}`, skipped: 'condition-error' };
+      } else if (!verdict.met) {
+        try {
+          appendRun(dataDir, {
+            origin: 'trigger',
+            triggerId: id,
+            skipped: 'condition',
+            conditionKind: kind,
+            durationMs: Date.now() - fireStartedAtMs,
+          });
+        } catch (err) {
+          log(`trigger ${id}: could not record the skipped run: ${err?.message ?? String(err)}`);
+        }
+        // The feature working as designed, not a fault: no notification, no
+        // error counter (conditionErrorStreak treats this as a reset).
+        log(`trigger ${id}: skipped (condition not met: ${kind})`);
+        return { fired: false, reason: `condition not met (${kind})`, skipped: 'condition' };
+      }
+    }
+
     // Everything past this point is synchronous up to the `await runTurn`
     // call below, so runningIds.add() here is what makes the "already
     // running" check above race-free against a second fireTrigger() call
@@ -1283,6 +1357,9 @@ export function createTriggerRunner({
         },
         origin: 'trigger',
         triggerId: id,
+        // P7, onConditionError: 'run': the turn goes ahead despite an
+        // unjudgeable condition, and its run line says so (see runs.mjs).
+        ...(conditionErrorForRun === null ? {} : { conditionError: conditionErrorForRun }),
         silent: false,
       });
 
@@ -1312,6 +1389,20 @@ export function createTriggerRunner({
         }
       }
     }
+  }
+
+  /**
+   * P7 — a trigger's condition-error streak and whether it has crossed the
+   * degraded threshold (DEGRADED_STREAK_THRESHOLD consecutive unjudgeable
+   * conditions). Derived from runs.jsonl on every call (see
+   * condition.mjs::conditionErrorStreak), so it is restart-proof and exposed
+   * through GET /api/triggers (see server.mjs::handleTriggersList) — a
+   * degraded trigger is visible in the list, not just in the log.
+   */
+  function conditionStatus(trigger) {
+    if (trigger.condition === undefined) return { degraded: false, conditionErrorStreak: 0 };
+    const streak = conditionErrorStreak(readRuns(dataDir), trigger.id);
+    return { degraded: streak >= DEGRADED_STREAK_THRESHOLD, conditionErrorStreak: streak };
   }
 
   /**
@@ -1619,5 +1710,6 @@ export function createTriggerRunner({
     approvalCapability,
     supportStatus,
     limitStatus,
+    conditionStatus,
   };
 }

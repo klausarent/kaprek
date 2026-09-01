@@ -71,6 +71,8 @@ import { planPathFor, PLAN_MODES } from '../plans/prompt.mjs';
 import { runTurn, readHarnessMeta } from '../orchestrator/run.mjs';
 import { startTurn as claudeCodeStartTurn } from '../harness/claude-code.mjs';
 import { openTriggers, InvalidTriggerError } from '../triggers/registry.mjs';
+import { readRuns } from '../orchestrator/runs.mjs';
+import { CONDITION_KINDS, evaluateCondition } from '../triggers/condition.mjs';
 import { loadApps, resolveToolOwnership } from '../apps/loader.mjs';
 import { createTriggerRunner } from '../triggers/runner.mjs';
 import { createRelayDispatcher, RELAY_DEFAULT_ROUTE, RELAY_GATE_KIND, RELAY_ROUNDS_PER_GATE } from '../relay/dispatcher.mjs';
@@ -2693,9 +2695,51 @@ function handleTriggersList(res, getTriggers, getRunner) {
         // the two answers.
         blocked: capability.blocked ?? blockedReason,
         ...runner.supportStatus(trigger),
+        // P7: whether the trigger's skip-if condition has failed to JUDGE
+        // often enough in a row to count as degraded (see
+        // runner.mjs::conditionStatus). Always present, false for a trigger
+        // without a condition.
+        ...runner.conditionStatus(trigger),
       };
     });
   sendJson(res, 200, { triggers });
+}
+
+/** How many of a trigger's past runs GET /api/triggers/<id>/runs returns (newest last). */
+const TRIGGER_RUN_HISTORY_LIMIT = 10;
+
+/**
+ * POST /api/triggers/probe-condition — body `{kind, path, triggerId?}`. The
+ * ONE probe execution P7 gives the form before it may save: it answers
+ * `{met, error, resolvedPath}` for the condition AS THE RUNNER WOULD JUDGE
+ * IT (same evaluateCondition, same allowed roots, and — when triggerId names
+ * an existing trigger — the same last-run comparison), without claiming,
+ * logging or starting anything. An unknown kind is a 400, not a guess.
+ */
+async function handleTriggerConditionProbe(req, res, { dataDir, workspaceDir }) {
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const { kind, path: rawPath, triggerId = null } = body.data ?? {};
+  if (!CONDITION_KINDS.includes(kind)) {
+    sendJson(res, 400, { error: `kind must be one of ${CONDITION_KINDS.join(', ')}` });
+    return;
+  }
+  if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
+    sendJson(res, 400, { error: 'path must be a non-empty string' });
+    return;
+  }
+  let lastRunStartedAt = null;
+  if (typeof triggerId === 'string' && triggerId.length > 0) {
+    const own = readRuns(dataDir).filter((run) => run.triggerId === triggerId);
+    const last = own[own.length - 1];
+    const ts = last ? Date.parse(last.ts) : NaN;
+    lastRunStartedAt = Number.isFinite(ts) ? ts : null;
+  }
+  const verdict = evaluateCondition({ kind, path: rawPath, cwd: workspaceDir, dataDir, lastRunStartedAt });
+  sendJson(res, 200, { met: verdict.error === null && verdict.met, error: verdict.error, resolvedPath: verdict.resolvedPath });
 }
 
 /** POST /api/triggers — upsert (create or replace by id). Body is the full trigger shape (see src/triggers/registry.mjs::validateTrigger); 400 with a field name on a validation error. */
@@ -2856,11 +2900,30 @@ async function handleTriggerRoutes(req, res, segments, { getTriggers, getRunner,
   }
   // /api/triggers/<id>
   if (segments.length === 3) {
+    // POST /api/triggers/probe-condition — the form's "check the condition
+    // once before saving" probe (P7). Evaluates the condition NOW, against
+    // the same roots the runner will use, and answers met/error plus the
+    // resolved absolute path the editor should display. Read-only by
+    // contract: no claim, no run line, no turn.
+    if (segments[2] === 'probe-condition' && req.method === 'POST') {
+      await handleTriggerConditionProbe(req, res, { dataDir, workspaceDir });
+      return;
+    }
     if (req.method !== 'DELETE') {
       sendJson(res, 405, { error: 'method not allowed' });
       return;
     }
     handleTriggerDelete(res, getTriggers, segments[2]);
+    return;
+  }
+  // GET /api/triggers/<id>/runs — the trigger's last runs (runs.jsonl), for
+  // the page's run history, including the P7 skip lines.
+  if (segments.length === 4 && segments[3] === 'runs' && req.method === 'GET') {
+    sendJson(res, 200, {
+      runs: readRuns(dataDir)
+        .filter((run) => run.triggerId === segments[2])
+        .slice(-TRIGGER_RUN_HISTORY_LIMIT),
+    });
     return;
   }
   // /api/triggers/<id>/toggle | /api/triggers/<id>/fire
@@ -3694,7 +3757,12 @@ export function startServer({
   // checkable: it may only name an app that is actually installed.
   let triggers = null;
   function getTriggers() {
-    if (!triggers) triggers = openTriggers(dataDir, { knownAppIds: installedAppIds });
+    // `conditionBaseDir` (P7): a trigger condition's RELATIVE path is
+    // resolved against the dedicated workspace at save time and stored
+    // absolute — triggers have no missionId of their own, so the workspace
+    // (the same cwd every trigger turn runs in) is the base here; see
+    // src/triggers/condition.mjs.
+    if (!triggers) triggers = openTriggers(dataDir, { knownAppIds: installedAppIds, conditionBaseDir: workspaceDir });
     return triggers;
   }
 

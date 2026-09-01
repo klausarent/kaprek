@@ -1138,6 +1138,9 @@ export type TriggerConfig = {
   matchPattern?: string;
 };
 
+/** The skip-if precondition kinds a schedule/heartbeat trigger may carry (see src/triggers/condition.mjs). */
+export type ConditionKind = "file-exists" | "file-newer-than-last-run";
+
 export type Trigger = {
   id: string;
   type: TriggerType;
@@ -1148,6 +1151,10 @@ export type Trigger = {
   enabled: boolean;
   approvalRequired: boolean;
   limits: { maxRunsPerDay: number; maxCostPerDay: number };
+  /** Optional precondition (P7); the stored path is absolute (resolved at save time). */
+  condition?: { kind: ConditionKind; path: string };
+  /** What happens when the condition cannot be judged at all; default 'skip'. */
+  onConditionError?: "skip" | "run";
 };
 
 /**
@@ -1168,6 +1175,9 @@ export type TriggerStatus = Trigger & {
   blocked: string | null;
   supported: boolean;
   unsupportedReason: string | null;
+  /** P7: the trigger's condition has failed to JUDGE often enough in a row (see runner.mjs::conditionStatus). */
+  degraded?: boolean;
+  conditionErrorStreak?: number;
 };
 
 /** Thrown on POST /api/triggers 400 — carries the offending field so the form can show the message at it. */
@@ -1190,6 +1200,37 @@ export class TriggerBusyError extends Error {
 
 export function fetchTriggers(): Promise<TriggerStatus[]> {
   return getJson<{ triggers: TriggerStatus[] }>("/api/triggers").then((r) => r.triggers);
+}
+
+/** One line of a trigger's run history (GET /api/triggers/<id>/runs), as runs.jsonl stores it (see src/orchestrator/runs.mjs). */
+export type TriggerRun = {
+  ts: string;
+  skipped: "condition" | "condition-error" | null;
+  conditionKind: string | null;
+  conditionError: string | null;
+  costUsd: number | null;
+  stopReason: string | null;
+};
+
+/** The last few runs of one trigger, newest last — including the P7 skip lines. */
+export function fetchTriggerRuns(id: string): Promise<TriggerRun[]> {
+  return getJson<{ runs: TriggerRun[] }>(`/api/triggers/${encodeURIComponent(id)}/runs`).then((r) => r.runs);
+}
+
+/** The answer of the form's "check the condition once before saving" probe (POST /api/triggers/probe-condition). */
+export type ConditionProbeResult = {
+  met: boolean;
+  error: string | null;
+  resolvedPath: string;
+};
+
+/** Evaluates a condition NOW, exactly as the runner would judge it, without claiming, logging or starting anything. */
+export function probeCondition(kind: ConditionKind, path: string, triggerId?: string): Promise<ConditionProbeResult> {
+  return postJson<ConditionProbeResult>("/api/triggers/probe-condition", {
+    kind,
+    path,
+    ...(triggerId ? { triggerId } : {}),
+  });
 }
 
 /** Creates or replaces a trigger by id. A 400 becomes TriggerValidationError, never a generic message. */
