@@ -717,7 +717,30 @@ Things this version does not do, listed here because each one is a limit you can
 ## FAQ
 
 **Claude Code changed its transcript format and kaprek broke — now what?**
-The JSONL format Claude Code writes is undocumented and has drifted before. The parser is deliberately tolerant, but in two different ways depending on where the drift shows up: a line that isn't even valid JSON is silently skipped and counted (`brokenLines`), never thrown on. A well-formed line whose `type` the parser doesn't recognize is also silently skipped — it never becomes an event at all, so it does not surface anywhere in the UI. Separately, the web UI's event renderer falls back to a generic `UnknownBlock` for any event *kind* the parser itself emits that the renderer has no component for yet — a safety net for the UI lagging behind the parser, not a way to see raw unrecognized transcript lines. If a session renders oddly, missing content is more likely a silently-skipped line than a crash — a `doctor` command to diagnose format drift is planned but not built yet.
+The JSONL format Claude Code writes is undocumented and has drifted before. The parser is deliberately tolerant, but in two different ways depending on where the drift shows up: a line that isn't even valid JSON is silently skipped and counted (`brokenLines`), never thrown on. A well-formed line whose `type` the parser doesn't recognize is also silently skipped — it never becomes an event at all, so it does not surface anywhere in the UI. Separately, the web UI's event renderer falls back to a generic `UnknownBlock` for any event *kind* the parser itself emits that the renderer has no component for yet — a safety net for the UI lagging behind the parser, not a way to see raw unrecognized transcript lines. If a session renders oddly, missing content is more likely a silently-skipped line than a crash — run `kaprek doctor`: its `transcript-drift` check samples the ten newest transcripts through the real parser and tells you the broken/unknown-type share (see [kaprek doctor](#kaprek-doctor)).
+
+## kaprek doctor
+
+`kaprek doctor [--fix] [--json]` is a read-only health report over kaprek's own data directory. It reads local files only — it never calls anything. Every check prints one line (`status + message`, details indented), then a summary line. **The exit code is always 0, even with `fail` results: doctor is a report, not a gate.** `--json` prints one machine-readable document (`{ checks, fix, summary }`).
+
+What is checked:
+
+- **transcript-drift** — the ten most recently written session transcripts, sampled through the real parser: the share of broken (non-JSON) and unknown-type lines. Warn from 1 %, fail from 10 %.
+- **hooks** — the four managed hook entries in `~/.claude/settings.json`: the script file they point at exists, the `--managed-by` marker is intact, the entry is well-formed. Problems warn; re-running `kaprek hooks install` fixes them.
+- **search-index** — the index schema version, both directions: a *newer* index (written by a newer kaprek) warns — kaprek opens it read-only anyway; an *older* one is fine, kaprek drops and rebuilds it on next open.
+- **policy** — the `policy.json` load result: normal, or the P0.5 fail-closed fallback to `posture: 'ask'` with the reason (warn), or a readable policy whose ceiling is `ask` (said out loud).
+- **presets** — every `<dataDir>/presets/*.json` parsed; broken files are named (warn), valid ones counted.
+- **ledger** — the last ledger event of each recent session; an `end` without a `start` (orphaned) or a second `end` (circular) warns.
+- **context-state** — per-session cwd state files: stale ones (older than the 7-day sweep age) and unreadable ones are counted.
+- **grants** — the number of active grants; grants unused for over 30 days are named as cleanup candidates with their idle age. **Grants never expire on their own** — doctor advises, you decide, nothing is revoked by a clock.
+- **triggers-degraded** — per-trigger condition-error streaks from `runs.jsonl`; streaks past the degraded threshold warn. Skipped (as ok) when the feature is not present in this build.
+
+`--fix` does **exactly two things**, lists them before they happen, and nothing else:
+
+1. deletes orphaned context state files (the same 7-day condition as the automatic sweep);
+2. triggers a search index rebuild through the existing reindex path — only at an equal or lower schema version, **never** a newer one.
+
+Hooks are not fixed by `--fix` in this version. Without `--fix`, `kaprek doctor` changes no files.
 
 **Which platforms are supported?**
 Windows, macOS, Linux. Requires Node.js ≥ 22 (the search index uses the built-in `node:sqlite`). Clipboard triggers are Windows-only; the trigger page says so on the trigger itself.
