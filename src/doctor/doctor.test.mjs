@@ -37,7 +37,24 @@ const FIXTURE_DIR = path.join(__dirname, '..', 'testdata', 'legacy-datadir');
 
 const tmpDirs = [];
 afterAll(() => {
-  for (const dir of tmpDirs) fs.rmSync(dir, { recursive: true, force: true });
+  // Windows can hold a just-closed sqlite handle (AV scan, WAL teardown) for
+  // seconds after close() — even with retries the unlink can lose. A temp dir
+  // that survives is the OS temp cleaner's job, never a test failure: every
+  // assertion above ran against the copies, not these directories.
+  for (const dir of tmpDirs) {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        fs.rmSync(dir, { recursive: true, force: true });
+        break;
+      } catch (err) {
+        if (attempt >= 4 || err.code !== 'EBUSY') {
+          if (err.code === 'EBUSY') break; // give up quietly; temp cleaner wins
+          throw err;
+        }
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      }
+    }
+  }
 });
 
 /** A fresh tmpdir, registered for cleanup. */
