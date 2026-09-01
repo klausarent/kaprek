@@ -246,13 +246,13 @@ test('once-marker is per-session: a different session in the same dataDir still 
 });
 
 test('evaluateStop never throws, even with a corrupt policy.json (schema error inside)', async () => {
+  // P0.5: the fail-open loader degrades FAIL-CLOSED for a readable policy it
+  // does not understand — posture drops to 'ask', but the valid mode dial
+  // ('block') is kept, so the violation is still enforced, not silenced.
   writePolicy({ mode: 'block', bogus: true });
   const transcriptPath = writeTranscript('s-badpolicy', { withGitCommit: true });
   const result = await evaluateStop({ dataDir, transcriptPath, sessionId: 's-badpolicy' });
-  // Falls back to DEFAULT_POLICY, whose mode is 'observe' — decision is
-  // 'allow', but (per observe's fully-evaluate-and-log behavior) the
-  // violation still surfaces in `reasons`, it just never escalates.
-  expect(result.decision).toBe('allow');
+  expect(result.decision).toBe('block');
   expect(result.reasons.length).toBeGreaterThan(0);
 });
 
@@ -301,9 +301,78 @@ test('policyVersion is stable for the same policy and changes with a posture or 
   expect(policyVersion(loadPolicy(dataDir))).not.toBe(withPosture);
 });
 
+// ------------------------------------------------ P0.5: fail-closed loader
+
+test('loadPolicyFailOpen: an unknown field loads fail-closed to posture ask, never auto', () => {
+  writePolicy({ version: 1, mode: 'block', posture: 'auto', hardDenials: [{ id: 'no-prod', tools: ['Bash'], command: 'prod' }], futureField: true });
+  const policy = loadPolicyFailOpen(dataDir);
+  // The ceiling drops — a field from a newer kaprek must not silently lift
+  // the ceiling or strip the denials.
+  expect(policy.posture).toBe('ask');
+  expect(policy.posture).not.toBe('auto');
+  // Hard denials "soweit erkennbar": the denial itself still validates, so
+  // it survives the fail-closed load.
+  expect(policy.hardDenials).toEqual([{ id: 'no-prod', why: 'denied by policy.json', tools: ['Bash'], command: 'prod' }]);
+  // The reason is carried and names the schema problem.
+  expect(policy.reason).toContain('futureField');
+});
+
+test('loadPolicyFailOpen: a malformed hard denial degrades to none, a valid one next to it is kept', () => {
+  writePolicy({ posture: 'edits', hardDenials: [{ id: 'good', tools: ['Bash'], command: 'prod' }, { id: 'bad', tools: 'nope' }], newDenialKind: [] });
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy.posture).toBe('ask');
+  expect(policy.hardDenials).toEqual([{ id: 'good', why: 'denied by policy.json', tools: ['Bash'], command: 'prod' }]);
+});
+
+test('loadPolicyFailOpen: an unknown version loads fail-closed to posture ask and logs the reason to policy.log', () => {
+  writePolicy({ version: 2, mode: 'block' });
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy.posture).toBe('ask');
+  expect(policy.posture).not.toBe('auto');
+  expect(policy.hardDenials).toEqual([]);
+  expect(policy.reason).toContain('version');
+  // The ground is on the record: policy.log names the fail-closed fallback.
+  const logPath = path.join(dataDir, 'policy.log');
+  const entry = JSON.parse(fs.readFileSync(logPath, 'utf8').trim().split('\n').pop());
+  expect(entry.event).toBe('policy-load');
+  expect(entry.outcome).toBe('fail-closed');
+  expect(entry.reason).toContain('schema');
+});
+
+test('loadPolicyFailOpen: a missing policy file keeps the old fail-open DEFAULT behavior (posture auto)', () => {
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy).toEqual(DEFAULT_POLICY);
+  expect(fs.existsSync(path.join(dataDir, 'policy.log'))).toBe(false);
+});
+
+test('loadPolicyFailOpen: an empty policy file is DEFAULT (fail-open), not fail-closed', () => {
+  fs.writeFileSync(path.join(dataDir, 'policy.json'), '{}', 'utf8');
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy.posture).toBe('auto');
+  expect(policy.mode).toBe('observe');
+});
+
+test('loadPolicyFailOpen: a valid policy is loaded unchanged, no fail-closed marking', () => {
+  writePolicy({ version: 1, mode: 'warn', posture: 'edits', hardDenials: [{ id: 'x', tools: ['Bash'], command: 'y' }] });
+  const policy = loadPolicyFailOpen(dataDir);
+  expect(policy).toEqual(loadPolicy(dataDir));
+  expect(policy.posture).toBe('edits');
+  expect(policy).not.toHaveProperty('reason');
+});
+
+test('loadPolicy still throws PolicyValidationError for an unsupported version (the throw survives, P0.5)', () => {
+  writePolicy({ version: 2 });
+  expect(() => loadPolicy(dataDir)).toThrow(PolicyValidationError);
+});
+
 test('loadPolicyFailOpen keeps the built-in guards reachable even when policy.json is broken', () => {
   writePolicy({ posture: 'yolo' });
   const policy = loadPolicyFailOpen(dataDir);
-  expect(policy.posture).toBe('auto');
-  expect(policy.reason).toContain('invalid policy.json');
+  // P0.5: fail-CLOSED now — the ceiling drops to 'ask' instead of opening.
+  expect(policy.posture).toBe('ask');
+  expect(policy.reason).toContain("posture 'ask'");
+  // Corrupt JSON stays on the old fail-open path (an unreadable file says
+  // nothing, so there is nothing newer to defer to).
+  fs.writeFileSync(path.join(dataDir, 'policy.json'), '{ not json', 'utf8');
+  expect(loadPolicyFailOpen(dataDir).posture).toBe('auto');
 });
