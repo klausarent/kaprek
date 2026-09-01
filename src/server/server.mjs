@@ -78,7 +78,7 @@ import { loadRecipes } from '../relay/recipes.mjs';
 import { engineIdsByReadiness, nextSteps, scanEnvironment } from '../scan/environment.mjs';
 import { openMemory, MemoryNotFoundError, InvalidMemoryError } from '../memory/store.mjs';
 import { notify, readNotify, writeNotify, InvalidNotifyError } from './notify.mjs';
-import { InvalidScopeError } from '../memory/scopes.mjs';
+import { InvalidScopeError, visibleScopes, parseScopeId } from '../memory/scopes.mjs';
 import { openPolicy, ProposalNotFoundError } from '../memory/policy.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
@@ -1528,6 +1528,82 @@ function missionErrorStatus(err) {
 }
 
 /**
+ * The P0.5 read-only gate, observed from the outside. openMemory() refuses
+ * writes once a newer kaprek's events.jsonl has been seen, but it does not
+ * say so; this reads the same field the store's gate reads (the highest
+ * schemaVersion on the log) so the mission-memory view can label itself
+ * read-only without poking at the store's internals. Missing file: not
+ * read-only, just empty.
+ */
+function memoryStoreReadOnly(dataDir) {
+  let raw;
+  try {
+    raw = fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8');
+  } catch {
+    return false;
+  }
+  let max = 1;
+  for (const line of raw.split('\n')) {
+    if (line.trim() === '') continue;
+    try {
+      const event = JSON.parse(line);
+      if (typeof event?.schemaVersion === 'number' && event.schemaVersion > max) max = event.schemaVersion;
+    } catch {
+      // One unreadable line never turns a store read-only by itself.
+    }
+  }
+  return max > 1;
+}
+
+/**
+ * Everything this mission can read, as one view: the scope chain
+ * mission:<id> → project:<label> → person:<label> walked with the store's
+ * own visibility rule (visibleScopes — upwards only, fail-closed), the
+ * entries per scope, stale flags by the existing 90-day rule, and the
+ * read-only bit. Read-only over the store's read API (list()); no new data
+ * model, no write path.
+ */
+function missionMemoryView({ dataDir, mission }) {
+  const memory = openMemory(dataDir);
+  const missionScopeId = `mission:${mission.id}`;
+  const visible = visibleScopes(missionScopeId, memory.scopes());
+  const visibleSet = new Set(visible);
+
+  const entries = memory
+    .list()
+    .filter((fact) => visibleSet.has(fact.scopeId) && !fact.forgotten)
+    .map((fact) => ({
+      id: fact.id,
+      scope: fact.scopeId,
+      scopeKind: parseScopeId(fact.scopeId).kind,
+      kind: fact.kind,
+      text: fact.text,
+      origin: fact.origin,
+      confidence: fact.confidence,
+      firstSeenAt: fact.createdAt,
+      // P4b will make lastVerifiedAt nullable (unconfirmed imports); the
+      // fallback keeps the sort and the card honest until then.
+      lastVerifiedAt: fact.lastVerifiedAt ?? fact.createdAt,
+      stale: fact.stale,
+      ageMs: fact.ageMs,
+      confirmations: fact.confirmations,
+      origins: fact.origins,
+    }))
+    // Oldest-verified first, stale entries ahead of everything: "what do we
+    // still believe" is answered top-down.
+    .sort((a, b) => (b.stale ? 1 : 0) - (a.stale ? 1 : 0) || a.lastVerifiedAt.localeCompare(b.lastVerifiedAt));
+
+  // The five most recently WRITTEN — what kaprek learned last, which is a
+  // different question from the stale-first order above.
+  const recent = [...entries].sort((a, b) => b.firstSeenAt.localeCompare(a.firstSeenAt) || b.id.localeCompare(a.id)).slice(0, 5);
+
+  const counts = {};
+  for (const entry of entries) counts[entry.scopeKind] = (counts[entry.scopeKind] ?? 0) + 1;
+
+  return { missionId: mission.id, scopeId: missionScopeId, visibleScopes: visible, counts, entries, recent, readOnly: memoryStoreReadOnly(dataDir) };
+}
+
+/**
  * Mission routes, mounted at /api/missions/*. A mission is the central
  * object of Zielbild M0: a goal plus an optional working directory and
  * links to the chats and board tasks carrying the work. `getMissions()` is
@@ -2039,7 +2115,7 @@ async function handlePlanRoutes(req, res, segments, { getPlans }) {
   sendJson(res, 404, { error: 'not found' });
 }
 
-async function handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore }) {
+async function handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore, dataDir }) {
   const missions = getMissions();
 
   // /api/missions
@@ -2121,6 +2197,27 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     const pendingApprovals = (await getApprovalStore().listPending())
       .filter((entry) => entry.chatId && chats.some((chat) => chat.id === entry.chatId));
     sendJson(res, 200, { mission, chats, tasks, pendingApprovals });
+    return;
+  }
+
+  // /api/missions/<id>/memory — everything this mission can read, one view.
+  // Strictly a read: forgetting and verifying stay on /api/memory/<id>, so
+  // there is exactly one write path into the store.
+  if (segments.length === 4 && segments[3] === 'memory') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+    let mission;
+    try {
+      mission = missions.get(segments[2]);
+    } catch (err) {
+      const status = missionErrorStatus(err);
+      if (status === null) throw err;
+      sendJson(res, status, { error: err.message });
+      return;
+    }
+    sendJson(res, 200, missionMemoryView({ dataDir, mission }));
     return;
   }
 
@@ -3117,7 +3214,7 @@ async function handleRequest(
       return;
     }
     if (segments[1] === 'missions') {
-      await handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore });
+      await handleMissionRoutes(req, res, segments, { getMissions, getChats, getBoard, getApprovalStore, dataDir });
       return;
     }
     if (segments[1] === 'plans') {

@@ -85,9 +85,11 @@ export function ProposalCard({ proposal, onDecide }: { proposal: RuleProposal; o
   );
 }
 
-export default function Memory() {
+export default function Memory({ initialScopeId }: { initialScopeId?: string } = {}) {
   const [scopes, setScopes] = useState<MemoryScope[]>([]);
-  const [scopeId, setScopeId] = useState("");
+  // A deep link (mission card → "All memory") arrives with its scope set;
+  // the picker falls back to the first scope only when no preset was given.
+  const [scopeId, setScopeId] = useState(initialScopeId ?? "");
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [query, setQuery] = useState("");
   const [error, setError] = useState<string | null>(null);
