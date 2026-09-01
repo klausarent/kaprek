@@ -428,7 +428,7 @@ test('search routes report available:false when sqlite is unavailable, via impor
   const searchRes = await fetch(`${url}/api/search?q=anything`);
   expect(searchRes.status).toBe(200);
   const searchBody = await searchRes.json();
-  expect(searchBody).toEqual({ available: false, reason: 'no sqlite here' });
+  expect(searchBody).toEqual({ available: false, reason: 'no sqlite here', future: false });
 
   const reindexRes = await fetch(`${url}/api/search/reindex`, { method: 'POST', headers: APP_HEADERS });
   expect(reindexRes.status).toBe(200);
@@ -436,6 +436,7 @@ test('search routes report available:false when sqlite is unavailable, via impor
   expect(reindexBody).toEqual({
     available: false,
     reason: 'no sqlite here',
+    future: false,
     artifacts: { copied: 0, skipped: 0 },
   });
 });
