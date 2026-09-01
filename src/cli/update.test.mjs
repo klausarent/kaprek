@@ -1,6 +1,6 @@
 import { describe, test, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
-import { FALLBACK_COMMAND, compareVersions, fallbackAdvice, installKind, latestVersion, runInstall, updatePlan } from './update.mjs';
+import { FALLBACK_COMMAND, compareVersions, fallbackAdvice, gitStatusDirty, installKind, askRunningInstance, latestVersion, runInstall, runningInstanceNotice, updatePlan } from './update.mjs';
 
 describe('installKind', () => {
   test('npx has nothing installed to update', () => {
@@ -176,5 +176,73 @@ describe('fallbackAdvice', () => {
 
     expect(messages.join('\n')).toContain('ENOENT');
     expect(messages.join('\n')).toContain(FALLBACK_COMMAND);
+  });
+});
+
+describe('updatePlan with a dirty git checkout', () => {
+  test('uncommitted changes are named before the pull advice, as a prohibition', () => {
+    const plan = updatePlan({ kind: 'repo', current: '0.4.0', latest: '0.5.0', repoDirty: true });
+    expect(plan.action).toBe('none');
+    // The dirty line comes after the fact ("is published") but before any
+    // suggestion the reader could act on half-informed — the check happens
+    // before the message is built, so it can only ever be in front.
+    expect(plan.message).toMatch(/git pull` is not allowed to overwrite your working copy/);
+    expect(plan.message).toMatch(/commit or stash/);
+  });
+
+  test('a clean checkout gets no dirty sentence', () => {
+    const plan = updatePlan({ kind: 'repo', current: '0.4.0', latest: '0.5.0', repoDirty: false });
+    expect(plan.message).not.toMatch(/uncommitted/);
+  });
+});
+
+describe('gitStatusDirty', () => {
+  test('porcelain output means dirty', () => {
+    expect(gitStatusDirty('/repo', { git: () => ' M src/x.mjs\n' })).toBe(true);
+  });
+
+  test('empty porcelain output means clean', () => {
+    expect(gitStatusDirty('/repo', { git: () => '' })).toBe(false);
+  });
+
+  test('a failed git call counts as dirty, never throws', () => {
+    // A false "clean" would promise a pull that refuses mid-run; a false
+    // "dirty" only costs one extra sentence.
+    expect(gitStatusDirty('/repo', { git: () => { throw new Error('not a repo'); } })).toBe(true);
+  });
+});
+
+describe('runningInstanceNotice', () => {
+  test('same version: success stands, nothing is added', () => {
+    const notice = runningInstanceNotice({ installed: '1.2.3', running: { running: true, version: '1.2.3' } });
+    expect(notice).toBeNull();
+  });
+
+  test('different version: one sentence with both versions and the restart note', () => {
+    const notice = runningInstanceNotice({ installed: '1.3.0', running: { running: true, version: '1.2.3' } });
+    expect(notice).toBe('Installiert 1.3.0, läuft noch 1.2.3 — der laufende Server startet beim nächsten kaprek stop neu.');
+  });
+
+  test('no version field: the unknown variant, for a holder older than this logic', () => {
+    const notice = runningInstanceNotice({ installed: '1.3.0', running: { running: true } });
+    expect(notice).toMatch(/Läuft Version: unbekannt \(älter als diese Update-Meldung\)/);
+    expect(notice).toMatch(/kaprek stop/);
+  });
+
+  test('no instance running: no sentence at all', () => {
+    expect(runningInstanceNotice({ installed: '1.3.0', running: { running: false } })).toBeNull();
+    expect(runningInstanceNotice({ installed: '1.3.0', running: undefined })).toBeNull();
+  });
+});
+
+describe('askRunningInstance', () => {
+  test('passes the greeting the lock provided through', async () => {
+    const ask = async ({ dataDir }) => ({ running: true, pid: 1, version: '1.2.3', dataDir });
+    await expect(askRunningInstance({ dataDir: '/d', ask })).resolves.toEqual({ running: true, version: '1.2.3' });
+  });
+
+  test('a failed question reads as no instance, never a failed update', async () => {
+    const ask = async () => { throw new Error('pipe gone'); };
+    await expect(askRunningInstance({ dataDir: '/d', ask })).resolves.toEqual({ running: false, version: undefined });
   });
 });
