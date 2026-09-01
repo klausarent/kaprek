@@ -13,7 +13,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanProjects, readSessionMeta } from '../scan/scan.mjs';
 import { digestSession, registerSecret } from '../parser/parse.mjs';
-import { buildSearchIndex, searchSessions, FUTURE_SCHEMA_REASON } from '../search/index.mjs';
+import { buildSearchIndex, searchSessions, FUTURE_SCHEMA_REASON, SCHEMA_VERSION } from '../search/index.mjs';
+import { getSqlite } from '../lib/sqlite.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
 import { sweepArtifacts, readArtifactManifest } from '../artifacts/preserve.mjs';
 import {
@@ -1792,6 +1793,266 @@ async function handleApprovalsList(res, approvalStore, query = null) {
   };
 
   sendJson(res, 200, { approvals: [...pending.map(shapePending), ...finished.map(shapeHistory)] });
+}
+
+/**
+ * GET /api/leitstand — ONE read-only aggregation for the Start page (#/start).
+ * No new state, no writes: everything here is read from what already lies on
+ * disk (runs.jsonl, the approval store, the grants store) or lives in the
+ * server's runtime maps (chatAbortControllers, the runner's running chats).
+ * The only write paths the UI gets remain POST /api/approvals/<id> and the
+ * existing cancel route — this route never mutates anything.
+ *
+ * Query: ?since=<epoch ms> — the lower bound of the "overnight" window.
+ * Omitted means local midnight of the day the request arrives in.
+ *
+ * Response shape (every collection is absent-safe: an empty store yields an
+ * empty array, never an error):
+ * {
+ *   since: number,                        // the window's lower bound, epoch ms
+ *   running: [{ chatId, title, engine, origin, triggerId, missionId,
+ *               abortable }],             // abortable=true → POST /api/chat/<id>/cancel reaches this turn;
+ *                                         // false → a trigger turn the web UI has no abort route for (shown, not pretend-abortable)
+ *   pending: [{ id, chatId, toolName, displayName, inputPreview, source,
+ *               requestedAt, deadlineAt, remainingMs, mode, kind, triggerId,
+ *               askedCount }],            // the open approvals; remainingMs against deadlineAt (null when the record has none)
+ *   overnight: {
+ *     totals: { ran, skippedCondition, skippedConditionError, failed,
+ *               costUsd, costKnown, costUnknown, tokens, tokensKnown, tokensUnknown },
+ *                                       // sums only over KNOWN values; costUnknown/tokensUnknown count the runs a harness
+ *                                       // reported no figure for — "$1.12 + 1 unknown", never 0 for unknown
+ *     byMission: [{ missionId, triggerId, title, ...same counters }],  // only runs attributable via the run's chat's mission
+ *                                       // or the run's own triggerId; unattributable runs sit only in totals
+ *   },
+ *   attention: {
+ *     degradedTriggers: [{ id, type, degraded, conditionErrorStreak, condition }],
+ *     staleGrants: [{ id, toolName, scope, match }],   // active grants asleep because their authorities changed (reconfirmPending)
+ *     grantsActive: number,
+ *     searchReadOnly: { reason } | undefined,          // present ONLY when the search index was written by a newer kaprek
+ *   },                                                 // (user_version > SCHEMA_VERSION) — never invented when unknowable
+ *   history: [{ id, chatId, toolName, displayName, inputPreview, source,
+ *               requestedAt, status, decision, decidedAt, decidedVia, waitMs }],  // the last few finished approvals
+ *   grants: [{ id, toolName, scope, match, useCount, lastUsedAt }],      // ACTIVE grants only (revoked ones stay on #/approvals)
+ * }
+ */
+async function handleLeitstand(res, { dataDir, getChats, getMissions, getApprovalStore, getGrantStore, getTriggers, getRunner, chatAbortControllers, importSqlite, sinceParam }) {
+  let since = NaN;
+  if (sinceParam !== null && sinceParam !== undefined && sinceParam !== '') {
+    const parsed = Number(sinceParam);
+    since = Number.isFinite(parsed) ? parsed : NaN;
+  }
+  if (!Number.isFinite(since)) {
+    // Local midnight of today — "what ran since I last looked this morning".
+    const now = new Date();
+    since = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  }
+
+  const chats = getChats().list();
+  const chatById = new Map(chats.map((chat) => [chat.id, chat]));
+  const runner = getRunner();
+
+  // Running turns: a chat-origin turn holds an entry in chatAbortControllers
+  // (the same map POST /api/chat/<id>/cancel reads), a trigger turn is only
+  // visible through the runner's per-chat guard. A trigger turn is NOT
+  // reported abortable — there is no abort route for it, and inventing one
+  // would be a lie the button cannot keep.
+  const runningChatIds = new Set(chatAbortControllers.keys());
+  for (const chat of chats) {
+    try {
+      if (runner.isChatRunning(chat.id)) runningChatIds.add(chat.id);
+    } catch {
+      // a runner without the guard (or a chat it never saw) contributes nothing
+    }
+  }
+  const running = [...runningChatIds].map((chatId) => {
+    const chat = chatById.get(chatId) ?? {};
+    return {
+      chatId,
+      title: chat.title ?? null,
+      engine: chat.engine ?? null,
+      origin: chat.origin ?? null,
+      triggerId: chat.triggerId ?? null,
+      missionId: chat.missionId ?? null,
+      abortable: chatAbortControllers.has(chatId),
+    };
+  });
+
+  // The open questions, oldest first — the store's own order.
+  const approvalStore = getApprovalStore();
+  const pendingEntries = approvalStore ? await approvalStore.listPending() : [];
+  const now = Date.now();
+  const pending = pendingEntries.map((entry) => ({
+    id: entry.requestId,
+    chatId: entry.chatId,
+    toolName: entry.toolName,
+    displayName: entry.displayName,
+    inputPreview: entry.inputPreview ?? null,
+    source: entry.source ?? null,
+    requestedAt: entry.requestedAt,
+    deadlineAt: entry.deadlineAt,
+    remainingMs: entry.deadlineAt !== null && entry.deadlineAt !== undefined ? Math.max(0, entry.deadlineAt - now) : null,
+    mode: entry.mode ?? 'interactive',
+    kind: entry.kind ?? null,
+    triggerId: entry.triggerId ?? null,
+    askedCount: entry.askedCount ?? 1,
+  }));
+
+  // The overnight window: every run line since `since`, counted honestly.
+  const missionTitles = new Map(getMissions().list().map((mission) => [mission.id, mission.title]));
+  const newGroup = () => ({ ran: 0, skippedCondition: 0, skippedConditionError: 0, failed: 0, costUsd: 0, costKnown: 0, costUnknown: 0, tokens: 0, tokensKnown: 0, tokensUnknown: 0 });
+  const totals = newGroup();
+  const groups = new Map();
+  for (const run of readRuns(dataDir)) {
+    const ts = Date.parse(run.ts);
+    if (!Number.isFinite(ts) || ts < since) continue;
+    const bucket = totals;
+    if (run.skipped === 'condition') bucket.skippedCondition += 1;
+    else if (run.skipped === 'condition-error') bucket.skippedConditionError += 1;
+    else if (run.stopReason === 'error' || run.error) bucket.failed += 1;
+    else bucket.ran += 1;
+    if (typeof run.costUsd === 'number' && Number.isFinite(run.costUsd)) {
+      bucket.costUsd += run.costUsd;
+      bucket.costKnown += 1;
+    } else {
+      bucket.costUnknown += 1;
+    }
+    if (typeof run.tokens === 'number' && Number.isFinite(run.tokens)) {
+      bucket.tokens += run.tokens;
+      bucket.tokensKnown += 1;
+    } else {
+      bucket.tokensUnknown += 1;
+    }
+
+    // Attribution: the run's chat names its mission; a trigger run with no
+    // mission at least names its trigger. Neither → totals only.
+    const chat = run.chatId ? chatById.get(run.chatId) : null;
+    const missionId = chat?.missionId ?? null;
+    const triggerId = missionId ? null : (run.triggerId ?? (run.origin === 'trigger' ? chat?.triggerId ?? null : null));
+    if (!missionId && !triggerId) continue;
+    const key = missionId ? `mission:${missionId}` : `trigger:${triggerId}`;
+    if (!groups.has(key)) {
+      groups.set(key, {
+        missionId,
+        triggerId,
+        title: missionId ? (missionTitles.get(missionId) ?? null) : triggerId,
+        ...newGroup(),
+      });
+    }
+    const group = groups.get(key);
+    if (run.skipped === 'condition') group.skippedCondition += 1;
+    else if (run.skipped === 'condition-error') group.skippedConditionError += 1;
+    else if (run.stopReason === 'error' || run.error) group.failed += 1;
+    else group.ran += 1;
+    if (typeof run.costUsd === 'number' && Number.isFinite(run.costUsd)) {
+      group.costUsd += run.costUsd;
+      group.costKnown += 1;
+    } else {
+      group.costUnknown += 1;
+    }
+    if (typeof run.tokens === 'number' && Number.isFinite(run.tokens)) {
+      group.tokens += run.tokens;
+      group.tokensKnown += 1;
+    } else {
+      group.tokensUnknown += 1;
+    }
+  }
+
+  // Attention: degraded triggers, stale grants, a read-only search index.
+  // Each list is computed defensively — an attention panel that cannot be
+  // computed must be empty, never a broken route.
+  const degradedTriggers = [];
+  try {
+    for (const trigger of getTriggers().list()) {
+      const status = runner.conditionStatus(trigger);
+      if (status.degraded || status.conditionErrorStreak > 0) {
+        degradedTriggers.push({
+          id: trigger.id,
+          type: trigger.type,
+          degraded: status.degraded,
+          conditionErrorStreak: status.conditionErrorStreak,
+          condition: trigger.condition ?? null,
+        });
+      }
+    }
+  } catch {
+    // no trigger store in this server → nothing degraded to report
+  }
+  const grantStore = getGrantStore();
+  const allGrants = grantStore ? grantStore.list() : [];
+  const activeGrants = allGrants.filter((grant) => grant.revokedAt === null && grant.supersededBy === null);
+  const staleGrants = activeGrants
+    .filter((grant) => grant.reconfirmPending === true)
+    .map((grant) => ({ id: grant.id, toolName: grant.toolName, scope: grant.scope, match: grant.match }));
+
+  let searchReadOnly;
+  try {
+    // Read-only probe of the index's schema version — PRAGMA user_version
+    // only, nothing applied, nothing written. A file that cannot be probed
+    // (no sqlite, no index yet) simply leaves the field out: absent is the
+    // honest form of "nothing to report", a guessed status is not.
+    if (fs.existsSync(path.join(dataDir, 'search.db'))) {
+      const { available, DatabaseSync } = await getSqlite(importSqlite);
+      if (available) {
+        const db = new DatabaseSync(path.join(dataDir, 'search.db'));
+        try {
+          const version = db.prepare('PRAGMA user_version').get()?.user_version ?? 0;
+          if (version > SCHEMA_VERSION) searchReadOnly = { reason: FUTURE_SCHEMA_REASON };
+        } finally {
+          db.close();
+        }
+      }
+    }
+  } catch {
+    searchReadOnly = undefined;
+  }
+
+  // The last few finished approvals — the store's history, untouched.
+  let history = [];
+  if (approvalStore) {
+    const finished = await approvalStore.listHistory({ limit: 4 });
+    history = finished.map((entry) => {
+      const endedAt = entry.decidedAt ?? entry.lapsedAt ?? entry.cancelledAt ?? entry.expiredAt ?? null;
+      return {
+        id: entry.requestId,
+        chatId: entry.chatId,
+        toolName: entry.toolName,
+        displayName: entry.displayName,
+        inputPreview: entry.inputPreview ?? null,
+        source: entry.source ?? null,
+        requestedAt: entry.requestedAt,
+        status: entry.status,
+        decision: entry.decision ?? null,
+        decidedAt: entry.decidedAt ?? null,
+        decidedVia: entry.decidedVia ?? null,
+        waitMs: endedAt !== null ? endedAt - (entry.requestedAt ?? 0) : null,
+      };
+    });
+  }
+
+  sendJson(res, 200, {
+    since,
+    running,
+    pending,
+    overnight: {
+      totals,
+      byMission: [...groups.values()],
+    },
+    attention: {
+      degradedTriggers,
+      staleGrants,
+      grantsActive: activeGrants.length,
+      ...(searchReadOnly !== undefined ? { searchReadOnly } : {}),
+    },
+    history,
+    grants: activeGrants.map((grant) => ({
+      id: grant.id,
+      toolName: grant.toolName,
+      scope: grant.scope,
+      match: grant.match,
+      useCount: grant.useCount ?? 0,
+      lastUsedAt: grant.lastUsedAt ?? null,
+    })),
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -4234,6 +4495,28 @@ async function handleRequest(
         return;
       }
       sendJson(res, 405, { error: 'method not allowed' });
+      return;
+    }
+
+    // GET /api/leitstand — the Start page's one aggregation. Read-only; see
+    // handleLeitstand for the documented response shape.
+    if (segments.length === 2 && segments[1] === 'leitstand') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      await handleLeitstand(res, {
+        dataDir,
+        getChats,
+        getMissions,
+        getApprovalStore,
+        getGrantStore,
+        getTriggers,
+        getRunner,
+        chatAbortControllers,
+        importSqlite,
+        sinceParam: url.searchParams.get('since'),
+      });
       return;
     }
 
