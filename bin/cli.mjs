@@ -24,6 +24,7 @@ import {
   LOCK_PORT_RANGE,
 } from '../src/lib/instance-lock.mjs';
 import { runCouncilCommand, COUNCIL_USAGE } from '../src/cli/council.mjs';
+import { runDoctorCommand, DOCTOR_USAGE } from '../src/cli/doctor.mjs';
 import { readCouncil } from '../src/council/config.mjs';
 import { suggestAssignment, councilStatus } from '../src/council/roles.mjs';
 import { availablePeerIds, makeAskPeer } from '../src/council/ask.mjs';
@@ -52,6 +53,7 @@ const USAGE = `Usage: kaprek [options]
        kaprek update [--check]
        kaprek autostart <install|uninstall|status>
        kaprek hooks <install|uninstall|status>
+       kaprek doctor [--fix] [--json]
        kaprek council "<q>"
        kaprek resume [key|--all]
 
@@ -83,6 +85,11 @@ Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks status     Show whether the hooks are installed and the active policy mode
 
   council "<q>"      Ask the peers (codex, grok) blind and in parallel from the terminal
+Doctor (read-only health report over kaprek's data dir — kaprek doctor --help for details):
+  doctor            Check transcripts, hooks, search index, policy, presets,
+                    ledger, context state, grants, trigger degradation.
+                    --fix does exactly two things: delete orphaned context
+                    state files, trigger a search index rebuild. Exit 0 always.
 Resume (bring a session of claude/codex/grok/kimi back as a terminal tab):
   resume [key|--all]  List or reopen sessions of claude/codex/grok/kimi as
                        terminal tabs. Run \`kaprek resume --help\` for details.
@@ -329,6 +336,11 @@ async function main() {
 
   if (argv[0] === 'hooks') {
     runHooksCommand(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'doctor') {
+    process.exitCode = await runDoctorCommand(argv.slice(1), { dataDir: getAppDir() });
     return;
   }
 
