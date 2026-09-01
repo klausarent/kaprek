@@ -670,6 +670,14 @@ export type ApprovalFrame = {
   requestedAt?: number;
   inputPreview?: string | null;
   triggerId?: string | null;
+  /**
+   * Present when a standing grant covers this tool form but did NOT act
+   * (P6a): 'stale' (authorities changed — the grant sleeps) or
+   * 'reactivation' (the ceiling loosened — this question confirms or
+   * discards the grant). The dialog shows the why, because "why is it
+   * asking again?" is exactly what a person will wonder.
+   */
+  standingGrant?: { id: string; state: "stale" | "reactivation"; why: string | null } | null;
 };
 
 export type ChatStreamEvent =
@@ -1072,6 +1080,79 @@ export function fetchApprovalHistory(
   if (query.limit !== undefined) params.set("limit", String(query.limit));
   if (query.since !== undefined) params.set("since", String(query.since));
   return getJson<{ approvals: HistoryApproval[] }>(`/api/approvals?${params.toString()}`);
+}
+
+// ---------------------------------------------------------------------------
+// Standing grants (P6a — GET/POST/DELETE /api/grants, see src/policy/grants.mjs)
+// ---------------------------------------------------------------------------
+
+/**
+ * One standing grant: "always for this exact form", as the person confirmed
+ * it. A grant has NO expiry by design — it ends when it is revoked (an
+ * event; the record stays readable) or superseded, and its authority is
+ * checked against the current posture ceiling and hard denials at every
+ * potential use. Timestamps are ISO strings from the server's event log.
+ */
+export type StandingGrant = {
+  id: string;
+  /** `mission:<id>` — the only mintable scope in this phase. */
+  scope: string;
+  toolName: string | null;
+  match: "exact";
+  postureAtGrant: string;
+  confirmedPosture?: string;
+  hardDenialsHash: string;
+  missionId: string | null;
+  createdAt: string;
+  createdFromApprovalId: string | null;
+  useCount: number;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  revokedReason: string | null;
+  supersededBy: string | null;
+};
+
+export function fetchGrants(): Promise<{ grants: StandingGrant[]; activeCount: number }> {
+  return getJson<{ grants: StandingGrant[]; activeCount: number }>("/api/grants");
+}
+
+/**
+ * Mints a grant from a just-answered question. Takes ONLY the approval id
+ * and the one-consumable nonce the answer returned — there is no scope or
+ * match parameter to send, because both are the server's decision (narrowest
+ * scope = the chat's own mission; match = 'exact' in this phase).
+ */
+export function mintGrant(approvalId: string, nonce: string): Promise<{ ok: boolean; grant: StandingGrant }> {
+  return postJson<{ ok: boolean; grant: StandingGrant }>("/api/grants", { approvalId, nonce });
+}
+
+/** Revokes a grant. Revocation is an event: the record stays in the list, marked. */
+export async function revokeGrant(id: string): Promise<void> {
+  const res = await apiFetch(`/api/grants/${encodeURIComponent(id)}`, { method: "DELETE", headers: APP_HEADERS });
+  await throwOnError(res);
+}
+
+/**
+ * Answers an approval with the "always for this form" intent: allow + grant.
+ * The response carries `grantNonce` — the one-time secret POST /api/grants
+ * needs. A 404/409/410 is the same "nothing left to answer" as
+ * answerApproval(); a 200 with a null nonce means the answer landed but the
+ * question could not seed a grant (e.g. its input was too large to hash) —
+ * the allow still happened either way.
+ */
+export async function answerApprovalWithGrant(
+  id: string,
+  { chatId }: { chatId: string },
+): Promise<{ outcome: "ok" | "gone"; nonce: string | null }> {
+  const res = await apiFetch(`/api/approvals/${encodeURIComponent(id)}`, {
+    method: "POST",
+    headers: { ...APP_HEADERS, "Content-Type": "application/json" },
+    body: JSON.stringify({ chatId, behavior: "allow", grant: true }),
+  });
+  if (res.status === 404 || res.status === 409 || res.status === 410) return { outcome: "gone", nonce: null };
+  await throwOnError(res);
+  const data = (await res.json()) as { grantNonce?: string | null };
+  return { outcome: "ok", nonce: data?.grantNonce ?? null };
 }
 
 // ---------------------------------------------------------------------------

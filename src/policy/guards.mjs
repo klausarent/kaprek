@@ -26,6 +26,7 @@
 // them), so those live in the handler only, and this file says so.
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 /** Strict to open. The index IS the rank. */
 export const POSTURES = Object.freeze(['ask', 'edits', 'auto']);
@@ -229,4 +230,34 @@ export function cliDenyRules(rules = BUILTIN_HARD_DENIALS) {
     }
   }
   return out;
+}
+
+/**
+ * A stable hash over the effective hard-denials list (P6a, K2). A standing
+ * grant records this at mint time; when the list the machine enforces CHANGES
+ * — a rule added, removed, reworded — every grant minted under the old list
+ * is stale and asks once again instead of silently authorising under
+ * authorities its person never looked at.
+ *
+ * Canonical on purpose: only what the rules SAY goes into the hash (id, why,
+ * sorted tools, sorted paths, command), never key order or array order, so
+ * reordering policy.json does not stale every grant. `why` is included: it is
+ * part of what a person confirming a grant read and agreed to.
+ */
+export function hardDenialsHash(rules = BUILTIN_HARD_DENIALS) {
+  const canonical = (rules ?? []).map((rule) =>
+    JSON.stringify({
+      id: rule.id,
+      why: rule.why,
+      tools: [...rule.tools].sort(),
+      ...(rule.paths ? { paths: [...rule.paths].sort() } : {}),
+      ...(rule.command ? { command: rule.command } : {}),
+    }),
+  );
+  return crypto.createHash('sha256').update(canonical.join('\n'), 'utf8').digest('hex');
+}
+
+/** Convenience for callers that hold a loaded policy, not a rules list. */
+export function hardDenialsHashOf(policy) {
+  return hardDenialsHash(hardDenialsOf(policy));
 }

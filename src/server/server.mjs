@@ -50,7 +50,7 @@ import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError, PlanNotConvergedError, PLAN_STATUSES } from '../plans/store.mjs';
 import { loadPolicyFailOpen, policyVersion } from '../policy/policy.mjs';
 import { latestRateLimits } from '../orchestrator/usage.mjs';
-import { effectivePosture, postureAllows, POSTURES } from '../policy/guards.mjs';
+import { effectivePosture, postureAllows, POSTURES, stricterPosture, hardDenialsHashOf } from '../policy/guards.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
 import { suggestAssignment, councilStatus, COUNCIL_LEVELS, COUNCIL_ROLES } from '../council/roles.mjs';
@@ -92,6 +92,7 @@ import {
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_INBOX_TTL_MS,
 } from './approval-store.mjs';
+import { createGrantStore, inputHashOf } from '../policy/grants.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 
 // The apps/ directory shipped with kaprek, resolved the same way
@@ -903,6 +904,97 @@ export function effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDe
  * capped to it; see effectiveApprovalDeadline() for why that is a
  * correctness issue and not a nicety.
  */
+/**
+ * P6a — the standing-grant check on the approval path. The order at the
+ * question gate is: Hard Denial (run.mjs, answered before this handler is
+ * ever called) → Posture ceiling (enforced where the turn's stance is picked;
+ * a stance above the ceiling never starts a turn) → GRANT → question. A grant
+ * therefore lifts exactly one thing: the question. Never a denial, never the
+ * ceiling.
+ *
+ * The verdict for one incoming call (raw-input hash already computed in
+ * run.mjs; only the hash arrives here):
+ *   - {kind:'grant'}         a standing grant covers this exact form — the
+ *                            caller allows without asking; the use event has
+ *                            been written here
+ *   - {kind:'stale'}         a grant EXISTS but may not act: the hard-denials
+ *                            list changed, or the current posture ceiling is
+ *                            STRICTER than the one the grant was confirmed
+ *                            under — ask, and say so on the frame
+ *   - {kind:'reactivation'}  the ceiling is LOOSER than at last confirmation:
+ *                            the grant's first hit asks once (the answer
+ *                            confirms or discards it); the "once" is
+ *                            persisted on the grant itself
+ *   - null                   no grant, or grants asleep (posture 'auto': no
+ *                            question the grant could replace is coming, and
+ *                            there must be no silent fulfilment either — the
+ *                            grant simply sleeps until a fragende posture
+ *                            returns), or this chat has no mission scope
+ *
+ * Every failure direction is toward ASKING: an unknown tool, a missing hash
+ * (over-cap or unserialisable input — the same condition that blocks minting),
+ * a store that cannot be read, a scope that does not match.
+ */
+function makeGrantCheck({ grantStore, dataDir, mission, scope }) {
+  return function grantCheck(request) {
+    if (!grantStore || typeof request?.inputHash !== 'string' || !scope) return null;
+    const policy = loadPolicyFailOpen(dataDir);
+    const ceiling = effectivePosture({ global: policy.posture, mission: mission?.posture ?? null });
+    // Under 'auto' grants are never consulted (see the verdict doc above).
+    if (ceiling === 'auto') return null;
+    const denialsHash = hardDenialsHashOf(policy);
+    const [grant] = grantStore.match({ toolName: request.toolName, inputHash: request.inputHash, scope });
+    if (!grant) return null;
+
+    // Authority binding (K2). The grant acts only under the authorities its
+    // person saw when they confirmed it.
+    if (grant.hardDenialsHash !== denialsHash) {
+      return { kind: 'stale', grantId: grant.id, why: 'the hard-denials list changed since this grant was made' };
+    }
+    const binding = grant.confirmedPosture ?? grant.postureAtGrant;
+    if (binding && ceiling !== binding) {
+      const stricter = stricterPosture(ceiling, binding);
+      if (stricter === ceiling) {
+        return { kind: 'stale', grantId: grant.id, why: `the posture ceiling tightened to "${ceiling}" since this grant was made` };
+      }
+      // Loosened: one fresh question, exactly once (persisted so a restart
+      // cannot quietly skip it). The human's answer confirms or discards.
+      try {
+        grantStore.markReactivation(grant.id);
+      } catch {
+        return null; // cannot even record the owed question — ask plain
+      }
+      return { kind: 'reactivation', grantId: grant.id, why: 'the posture loosened; this question reactivates the standing grant' };
+    }
+
+    // A hit: write the use event BEFORE allowing — if the log cannot take
+    // it, the grant does not act (an unredeemed allowance that nobody can
+    // see is not an allowance this design is willing to make quietly).
+    try {
+      grantStore.use(grant.id);
+    } catch {
+      return { kind: 'stale', grantId: grant.id, why: 'the grant log could not be written' };
+    }
+    return { kind: 'grant', grantId: grant.id };
+  };
+}
+
+/**
+ * Scope derivation, server-side only (P6a): a chat inside a mission can mint
+ * — and be covered by — exactly `mission:<id>`. There is no client scope
+ * parameter, and 'global' is deliberately NOT mintable in this phase: a
+ * standing "always, everywhere" grant is the posture UI's decision to offer,
+ * not a checkbox's. Minting without a mission is refused 409.
+ */
+function grantScopeForChat(getChats, chatId) {
+  try {
+    const missionId = getChats().get(chatId)?.missionId ?? null;
+    return missionId ? `mission:${missionId}` : null;
+  } catch {
+    return null;
+  }
+}
+
 function makeApprovalHandler({
   chatId,
   enqueue,
@@ -913,11 +1005,32 @@ function makeApprovalHandler({
   mode = 'interactive',
   triggerId = null,
   describeSource = () => null,
+  // P6a: standing-grant check (makeGrantCheck above). Only the interactive
+  // chat path gets one — an unattended turn never redeems a grant.
+  grantCheck = null,
 }) {
   if (mode === 'deferred') {
     return makeDeferringApprovalHandler({ chatId, enqueue, approvalStore, approvalTimeoutMs, triggerId, describeSource });
   }
   return async (request) => {
+    // GRANT before question (P6a): a matching standing grant answers here,
+    // before any pending entry, timer or inbox write exists — no question is
+    // raised that a grant would replace. Everything it returns besides
+    // `behavior` is for the transcript: run.mjs records `granted` (not
+    // `allow`) as the resolved approval event, so the chat log shows that a
+    // standing permission acted, and which one.
+    let standingGrant = null;
+    if (grantCheck) {
+      try {
+        standingGrant = grantCheck(request);
+      } catch {
+        standingGrant = null; // a broken grant check asks, never allows
+      }
+      if (standingGrant?.kind === 'grant') {
+        return { behavior: 'allow', granted: standingGrant.grantId, message: `standing grant ${standingGrant.grantId} (exact match)` };
+      }
+    }
+
     const key = approvalKey(chatId, request.id);
     const requestedAt = Date.now();
     const { deadlineAt, cappedByTurn } = effectiveApprovalDeadline(requestedAt, approvalTimeoutMs, turnDeadlineAt);
@@ -951,7 +1064,19 @@ function makeApprovalHandler({
       // mid-wait by a clock, with the CLI killed and the record left saying
       // the question was still open.
     }, Math.max(0, deadlineAt - requestedAt));
-    pendingApprovals.set(key, { chatId, decided: false, resolve: resolveDecision, timer, createdAt: requestedAt });
+    pendingApprovals.set(key, {
+      chatId,
+      decided: false,
+      resolve: resolveDecision,
+      timer,
+      createdAt: requestedAt,
+      // P6a: the raw-input hash (never the input itself) and, when a grant
+      // exists but may not act, WHY the question is being asked anyway. The
+      // hash rides on the map entry so handleApprovalDecision can hand it to
+      // decide() as the grant intent without any raw input ever returning.
+      inputHash: typeof request.inputHash === 'string' ? request.inputHash : null,
+      standingGrant: standingGrant ? { id: standingGrant.grantId, state: standingGrant.kind, why: standingGrant.why ?? null } : null,
+    });
 
     // Written down before the question is shown anywhere, and awaited: from
     // here on the CLI is blocked, and a GET /api/approvals arriving one
@@ -973,6 +1098,12 @@ function makeApprovalHandler({
           agentId: request.agentId ?? null,
           requestedAt,
           deadlineAt,
+          // P6a: hash of the raw input at question time (pre-redaction, K1)
+          // and the grant context, so a decided record can mint a grant and
+          // the inbox can show why an existing grant did not act.
+          inputHash: typeof request.inputHash === 'string' ? request.inputHash : null,
+          standingGrantId: standingGrant?.grantId ?? null,
+          standingGrantState: standingGrant?.kind ?? null,
         });
       } catch (err) {
         // Take the registration back, unless the turn already ended during
@@ -998,7 +1129,17 @@ function makeApprovalHandler({
     // watching this chat - a user shown "allow Bash?" out of nowhere has to be
     // able to see what asked, or they are granting rights blind.
 
-      enqueue({ type: 'approval', chatId, source: describeSource(chatId), ...request, deadlineAt }).catch(() => {});
+      enqueue({
+        type: 'approval',
+        chatId,
+        source: describeSource(chatId),
+        ...request,
+        deadlineAt,
+        // A grant exists but did not act ('stale' | 'reactivation') — the
+        // dialog says so, because "why is it asking again?" is exactly the
+        // question a person will have.
+        standingGrant: standingGrant ? { id: standingGrant.grantId, state: standingGrant.kind, why: standingGrant.why ?? null } : null,
+      }).catch(() => {});
     return decided;
   };
 }
@@ -1137,7 +1278,7 @@ function cancelApprovalsForChat(pendingApprovals, chatId, approvalStore = null, 
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null, { decidedVia = 'web' } = {}) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null, { decidedVia = 'web', grants = null } = {}) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -1207,7 +1348,42 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   entry.decided = true;
   clearTimeout(entry.timer);
   const message = typeof body.data?.message === 'string' ? body.data.message : undefined;
+  const wantsGrant = behavior === 'allow' && body.data?.grant === true;
   const decision = behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' };
+
+  // P6a, reactivation (K2): the question was asked because a standing grant's
+  // ceiling loosened — its one owed reactivation question. A HUMAN answer
+  // here confirms the grant (allow) or discards it (deny). Everything that
+  // resolves an approval WITHOUT this route (deadline, turn end) is nobody's
+  // verdict and leaves the grant exactly as it was.
+  if (entry.standingGrant?.state === 'reactivation' && grants) {
+    try {
+      grants.resolveStanding(chatId, entry.standingGrant, behavior === 'allow');
+    } catch {
+      // Best-effort bookkeeping; the question itself is already answered.
+    }
+  }
+
+  // "Always for this form": the answer lands with a grant intent — the
+  // raw-input hash from question time rides along, decide() stamps a
+  // one-consumable nonce beside it, and the nonce comes back here so the
+  // client can mint (POST /api/grants). Awaited (unlike the plain path
+  // below) because the response must carry the nonce; a store refusal is a
+  // 409 that names what beat it, and the tool decision STILL resolved — the
+  // click's primary effect (allow/deny this call) is never lost to the
+  // grant's bookkeeping.
+  if (wantsGrant && typeof entry.inputHash === 'string' && approvalStore) {
+    try {
+      const decided = await approvalStore.decide(key, { ...decision, via: decidedVia, grantIntent: { inputHash: entry.inputHash } });
+      entry.resolve({ behavior: 'allow' });
+      sendJson(res, 200, { ok: true, grantNonce: decided?.grantIntent?.nonce ?? null });
+    } catch (err) {
+      entry.resolve(decision);
+      sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}), grantNonce: null });
+    }
+    return;
+  }
+
   recordDecision(approvalStore, key, decision, decidedVia);
   entry.resolve(decision);
   sendJson(res, 200, { ok: true });
@@ -1546,6 +1722,125 @@ async function handleApprovalsList(res, approvalStore, query = null) {
   };
 
   sendJson(res, 200, { approvals: [...pending.map(shapePending), ...finished.map(shapeHistory)] });
+}
+
+// ---------------------------------------------------------------------------
+// Standing grants (P6a) — GET /api/grants, POST /api/grants, DELETE /api/grants/<id>
+// ---------------------------------------------------------------------------
+
+/** GET /api/grants — every grant, revoked and superseded included (a list that hid withdrawals would lie about the past), plus the active count for #/setup. */
+function handleGrantsList(res, grantStore) {
+  if (!grantStore) {
+    sendJson(res, 503, { error: 'grant store not available' });
+    return;
+  }
+  sendJson(res, 200, { grants: grantStore.list(), activeCount: grantStore.countActive() });
+}
+
+/**
+ * POST /api/grants — mints a standing grant from a JUST-answered question.
+ * Body: {approvalId, nonce} — nothing else. There is deliberately no
+ * `match` and no `scope` parameter: match is 'exact' in this phase, and the
+ * scope is derived server-side as the NARROWEST thing the question's own
+ * chat belongs to (its mission). Minting rules, each refusal honest:
+ *   - the nonce must be the unconsumed one decide() stamped on an ALLOWED,
+ *     THIS-process-owned, just-decided approval (replay, a lapsed/cancelled
+ *     entry, a foreign instance, a deny, a truncated input → 409)
+ *   - the chat must belong to a mission — scope 'global' is not mintable in
+ *     this phase (→ 409); a mission chat mints at most mission:<id>, never
+ *     anything broader
+ *   - minting an exact twin supersedes the older grant (same scope, tool,
+ *     form): one question, one grant
+ */
+async function handleGrantMint(req, res, { approvalStore, grantStore, getChats, getMissions, dataDir }) {
+  if (!grantStore || !approvalStore) {
+    sendJson(res, 503, { error: 'grant store not available' });
+    return;
+  }
+  const body = await readJsonBody(req);
+  if (!body.ok) {
+    sendJson(res, body.status, { error: body.error });
+    return;
+  }
+  const approvalId = body.data?.approvalId;
+  const nonce = body.data?.nonce;
+  if (typeof approvalId !== 'string' || approvalId.length === 0 || approvalId.includes('/') || approvalId.includes('\\')) {
+    sendJson(res, 400, { error: 'approvalId is required' });
+    return;
+  }
+  if (typeof nonce !== 'string' || nonce.length === 0) {
+    sendJson(res, 400, { error: 'nonce is required' });
+    return;
+  }
+  const ro = grantStore.isReadOnly();
+  if (ro.readOnly) {
+    sendJson(res, 409, { error: `grants were written by a newer kaprek version (schema version ${ro.version}); this process opens the store READ-ONLY and cannot mint` });
+    return;
+  }
+
+  let intent;
+  try {
+    intent = await approvalStore.consumeGrantIntent(approvalId, nonce);
+  } catch (err) {
+    if (err.already === 'unknown') {
+      sendJson(res, 404, { error: err.message });
+    } else {
+      sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
+    }
+    return;
+  }
+
+  const scope = grantScopeForChat(getChats, intent.chatId);
+  if (!scope) {
+    sendJson(res, 409, {
+      error: 'this question was asked outside any mission; a standing grant needs a mission scope, and "always, everywhere" is not mintable in this phase',
+      already: 'no-mission',
+    });
+    return;
+  }
+  const missionId = scope.slice('mission:'.length);
+
+  const policy = loadPolicyFailOpen(dataDir);
+  let missionPosture = null;
+  try {
+    missionPosture = getMissions().get(missionId)?.posture ?? null;
+  } catch {
+    missionPosture = null;
+  }
+  const postureAtGrant = effectivePosture({ global: policy.posture, mission: missionPosture });
+  const grant = grantStore.mint({
+    scope,
+    toolName: intent.toolName,
+    inputHash: intent.inputHash,
+    postureAtGrant,
+    hardDenialsHash: hardDenialsHashOf(policy),
+    missionId,
+    createdFromApprovalId: approvalId,
+  });
+  sendJson(res, 200, { ok: true, grant });
+}
+
+/** DELETE /api/grants/<id> — revocation is an EVENT: the record stays in grants.jsonl, marked revoked. Idempotent. */
+function handleGrantRevoke(res, grantStore, id) {
+  if (!grantStore) {
+    sendJson(res, 503, { error: 'grant store not available' });
+    return;
+  }
+  if (typeof id !== 'string' || id.length === 0 || id.includes('/') || id.includes('\\')) {
+    sendJson(res, 400, { error: 'invalid grant id' });
+    return;
+  }
+  const ro = grantStore.isReadOnly();
+  if (ro.readOnly) {
+    sendJson(res, 409, { error: `grants were written by a newer kaprek version (schema version ${ro.version}); this process opens the store READ-ONLY and cannot revoke` });
+    return;
+  }
+  const result = grantStore.revoke(id, 'revoked-by-user');
+  if (!result.ok) {
+    sendJson(res, 404, { error: 'unknown grant' });
+    return;
+  }
+  sendJson(res, 200, { ok: true, ...(result.already ? { already: true } : {}), grant: result.grant });
 }
 
 /**
@@ -2273,6 +2568,7 @@ async function handleChatTurn(
     approvalTimeoutMs,
     chatAbsoluteTimeoutMs = CHAT_ABSOLUTE_TIMEOUT_MS,
     approvalStore,
+    getGrantStore = null,
     getRunner,
     isRelayChatRunning,
     chatSseQueues,
@@ -2578,7 +2874,17 @@ async function handleChatTurn(
         approvalStore,
         turnDeadlineAt: turnStartedAt + chatAbsoluteTimeoutMs,
         describeSource,
+        // P6a: standing grants act only on THIS path — a chat turn a human
+        // is watching. Triggers and relay steps (uiApprovalHandlerFor) get
+        // no grantCheck, so an unattended turn never redeems one.
+        grantCheck:
+          getGrantStore && mission?.id
+            ? makeGrantCheck({ grantStore: getGrantStore(), dataDir, mission, scope: `mission:${mission.id}` })
+            : null,
       }),
+      // P6a: the grant hash is computed over the RAW input, before
+      // redaction, exactly where the raw request still exists (K1).
+      computeInputHash: getGrantStore ? (rawInput) => inputHashOf(getGrantStore().salt, rawInput) : null,
       signal: controller.signal,
     });
     if (result?.stopReason === 'error') turnFailed = true;
@@ -3118,6 +3424,8 @@ async function handleRequest(
     approvalTimeoutMs,
     chatAbsoluteTimeoutMs,
     getApprovalStore,
+    getGrantStore,
+    resolveStanding,
     getRelay,
     isRelayChatRunning,
     getTriggers,
@@ -3487,6 +3795,7 @@ async function handleRequest(
         approvalTimeoutMs,
         chatAbsoluteTimeoutMs,
         approvalStore: getApprovalStore(),
+        getGrantStore,
         getRunner,
         isRelayChatRunning,
         chatSseQueues,
@@ -3511,6 +3820,7 @@ async function handleRequest(
       const viaPhoneToken = approvalToken !== null && timingSafeTokenEqual(req.headers[TOKEN_HEADER], approvalToken);
       await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay, {
         decidedVia: viaPhoneToken ? 'phone-token' : 'web',
+        grants: { store: getGrantStore(), resolveStanding },
       });
       return;
     }
@@ -3520,6 +3830,27 @@ async function handleRequest(
         return;
       }
       await handleApprovalsList(res, getApprovalStore(), url.searchParams);
+      return;
+    }
+
+    // Standing grants (P6a). Same instance-token gate as every /api route
+    // above; the phone token's allowlist (approvalTokenAllows) deliberately
+    // does NOT include these — revoking a standing permission is a full-UI
+    // decision, not a quick phone tap.
+    if (segments[1] === 'grants') {
+      if (segments.length === 2 && req.method === 'GET') {
+        handleGrantsList(res, getGrantStore());
+        return;
+      }
+      if (segments.length === 2 && req.method === 'POST') {
+        await handleGrantMint(req, res, { approvalStore: getApprovalStore(), grantStore: getGrantStore(), getChats, getMissions, dataDir });
+        return;
+      }
+      if (segments.length === 3 && req.method === 'DELETE') {
+        handleGrantRevoke(res, getGrantStore(), segments[2]);
+        return;
+      }
+      sendJson(res, 405, { error: 'method not allowed' });
       return;
     }
 
@@ -3808,9 +4139,47 @@ export function startServer({
   // Once opened it is shared by BOTH approval paths: a chat turn's questions
   // and a trigger's. One store, one file, one place GET /api/approvals reads.
   let approvalStore = null;
+  // The standing-grant log (see grants.mjs), same lazy one-per-data-dir
+  // pattern as the approval inbox above.
+  let grantStore = null;
   function getApprovalStore() {
     if (!approvalStore) approvalStore = createApprovalStore({ dataDir });
     return approvalStore;
+  }
+
+  // P6a: one grant store per data dir, opened lazily like the approval
+  // store. Its salt file (grants.salt) is drawn once per installation and
+  // survives restarts — a per-process salt would orphan every standing
+  // grant at every restart, the opposite of "standing".
+  function getGrantStore() {
+    if (!grantStore) grantStore = createGrantStore({ dataDir });
+    return grantStore;
+  }
+
+  /**
+   * The reactivation answer (K2): a HUMAN reply to a grant's one owed
+   * question. Allow confirms — the grant's binding posture moves to the
+   * current ceiling and it acts again; deny discards — revocation as an
+   * event, the record stays readable, reason says why. Called only from
+   * handleApprovalDecision (never from a deadline or turn-end cleanup), so
+   * an unanswered question is nobody's verdict.
+   */
+  function resolveStanding(chatId, standing, allow) {
+    const grantStore = getGrantStore();
+    if (!allow) {
+      grantStore.revoke(standing.id, 'reactivation-discarded');
+      return;
+    }
+    const policy = loadPolicyFailOpen(dataDir);
+    let missionPosture = null;
+    try {
+      const missionId = getChats().get(chatId)?.missionId ?? null;
+      missionPosture = missionId ? (getMissions().get(missionId)?.posture ?? null) : null;
+    } catch {
+      missionPosture = null;
+    }
+    const ceiling = effectivePosture({ global: policy.posture, mission: missionPosture });
+    grantStore.reconfirm(standing.id, { posture: ceiling });
   }
 
   // Same dedicated workspace a chat turn's cwd already is (see
@@ -4209,6 +4578,8 @@ export function startServer({
       approvalTimeoutMs,
       chatAbsoluteTimeoutMs,
       getApprovalStore,
+      getGrantStore,
+      resolveStanding,
       getRelay,
       isRelayChatRunning: (chatId) => relayChatIds.has(chatId),
       getTriggers,

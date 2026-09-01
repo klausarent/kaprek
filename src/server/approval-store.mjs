@@ -36,6 +36,7 @@
 // half-written inbox behind: that file is the only record of what was pending.
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 /**
  * How long ONE approval question raised by an interactive chat turn may wait
@@ -135,6 +136,18 @@ const SCHEMA_VERSION = 1;
 /** The one reason a loaded entry can never be answered — see this module's own doc comment (2). Kept as a single string because there is only one truthful answer here: whoever owned that wait is unreachable from this process. */
 const EXPIRED_PROCESS_GONE = 'process gone';
 
+/**
+ * An error that says WHICH state the entry is in and why the call therefore
+ * did nothing. `err.already` is what the HTTP layer turns into a 409
+ * `{already: '<state>'}` — the honest answer to "your click did nothing, and
+ * here is what beat it" (introduced for P1's decide/cancel refusals; the
+ * grant-intent redemption below uses the same shape so POST /api/grants can
+ * name exactly what refused it).
+ */
+function alreadyError(status, message) {
+  return Object.assign(new Error(message), { already: status });
+}
+
 /** The honest refusal every mutating call gives on a newer-schema file. */
 function newerSchemaMessage(version) {
   return `approvals.json was written by a newer kaprek version (schema version ${version} > ${SCHEMA_VERSION}); this process opens the store READ-ONLY and refuses to modify it`;
@@ -150,15 +163,6 @@ function isFinished(entry) {
  * of the story — the UI renders the wording.
  */
 export const CANCELLED_REASONS = ['run-aborted', 'run-failed', 'trigger-deleted', 'mission-archived', 'shutdown'];
-
-/**
- * An error that says WHICH final state the entry is already in. `err.already`
- * is what the HTTP layer turns into a 409 `{already: '<status>'}` — the
- * honest answer to "your click did nothing, and here is what beat it".
- */
-function alreadyError(status, message) {
-  return Object.assign(new Error(message), { already: status });
-}
 
 /**
  * When a finished entry stopped being live — the retention clock's zero
@@ -765,6 +769,23 @@ export function createApprovalStore({
 
     // Check-and-set with no await in between, so two answers arriving in the
     // same tick cannot both pass the status check above.
+    //
+    // P6a, grant intent: an "allow" that came with the person's "always for
+    // this form" carries the server-side hash of the RAW input (computed at
+    // question time, before any redaction — the stored `input` here is
+    // redacted/truncated and would either never match or match the wrong
+    // secret, K1). The store stamps a ONE-CONSUMABLE nonce beside it; POST
+    // /api/grants later redeems {approvalId, nonce} through
+    // consumeGrantIntent() below — the only reader of this field.
+    const grantIntent =
+      behavior === 'allow' && typeof decision.grantIntent?.inputHash === 'string'
+        ? {
+            inputHash: decision.grantIntent.inputHash,
+            nonce: crypto.randomBytes(24).toString('hex'),
+            createdAt: now(),
+            consumedAt: null,
+          }
+        : null;
     const decided = {
       ...entry,
       status: 'decided',
@@ -776,6 +797,8 @@ export function createApprovalStore({
       // only when the caller says so — an older caller that does not name
       // its channel leaves the field null rather than a guessed value.
       decidedVia: decision.via ?? null,
+      // Null for the ordinary answer — most questions mint nothing.
+      grantIntent,
     };
     // ownedIds is NOT cleared here: it records who created the entry, and
     // that stays true after the answer. `status` is what makes a decision
@@ -797,6 +820,61 @@ export function createApprovalStore({
       log(`approvals: ${id} was decided (${behavior}) but the record could not be written (${err.message}); the decision stands, the file is now out of date`);
     }
     return decided;
+    });
+  }
+
+  /**
+   * Redeems a grant intent (P6a): the one-time half of "always for this
+   * form". POST /api/grants calls this with {approvalId, nonce}; on success
+   * the nonce is burned (consumedAt set, persisted) and the caller gets the
+   * mint material — toolName and the RAW-input hash, never the input itself.
+   *
+   * Every refusal is an `alreadyError`, so the HTTP layer answers 409 with
+   * the honest reason (404 only for an id this store never heard of):
+   *   - 'unknown'         id never recorded (or pruned)
+   *   - 'not-owned'       a previous process filed it — the nonce died with
+   *                       that process's heap, as everything did
+   *   - '<status>'        not decided (pending / lapsed / cancelled / expired)
+   *   - 'denied'          the answer was a deny — nothing to stand on
+   *   - 'no-intent'       decided before this feature, or a plain allow
+   *   - 'truncated'       the stored input is a stub — an over-cap form
+   *                       mints nothing (there is no honest hash of it)
+   *   - 'bad-nonce'       a nonce that was never issued for this entry
+   *   - 'nonce-consumed'  REPLAY: correct nonce, already burned
+   */
+  function consumeGrantIntent(id, nonce) {
+    return serialized(async () => {
+      if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
+      const entry = entries.get(id);
+      if (!entry) throw alreadyError('unknown', `unknown approval: ${id}`);
+      if (!ownedIds.has(id)) throw alreadyError('not-owned', `approval ${id} was not filed by this kaprek process`);
+      if (entry.status !== 'decided') throw alreadyError(entry.status, `approval ${id} is ${entry.status}, not decided`);
+      if (entry.decision?.behavior !== 'allow') throw alreadyError('denied', `approval ${id} was denied; a deny mints no grant`);
+      if (typeof entry.grantIntent?.inputHash !== 'string') throw alreadyError('no-intent', `approval ${id} carries no grant intent`);
+      if (entry.input?._truncated === true) throw alreadyError('truncated', `approval ${id}'s input was too large to keep in full; it mints no grant`);
+      const given = typeof nonce === 'string' ? nonce : '';
+      const expected = entry.grantIntent.nonce;
+      const replay = entry.grantIntent.consumedAt !== null;
+      const matches = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+      if (!matches) throw alreadyError(replay ? 'nonce-consumed' : 'bad-nonce', `grant intent nonce for ${id} is wrong or already used`);
+      if (replay) throw alreadyError('nonce-consumed', `grant intent for ${id} was already consumed`);
+
+      const consumed = { ...entry, grantIntent: { ...entry.grantIntent, consumedAt: now() } };
+      entries.set(id, consumed);
+      try {
+        await persist();
+      } catch (err) {
+        // Same posture as decide(): the burn is real in memory and the mint
+        // may proceed; the file will show an unconsumed nonce, which the
+        // ownedIds/decided checks still refuse to double-redeem THIS process.
+        log(`approvals: the grant intent for ${id} was consumed but the record could not be written (${err.message})`);
+      }
+      return {
+        toolName: consumed.toolName ?? null,
+        inputHash: consumed.grantIntent.inputHash,
+        chatId: consumed.chatId ?? null,
+        approvalId: id,
+      };
     });
   }
 
@@ -960,7 +1038,16 @@ export function createApprovalStore({
    */
   function listHistory({ limit = null, since = null } = {}) {
     return serialized(async () => {
-      let list = [...entries.values()].filter((entry) => isFinished(entry));
+      let list = [...entries.values()]
+        .filter((entry) => isFinished(entry))
+        // A finished entry's grant intent is dead weight outside the mint
+        // path: the history view has no business exposing a nonce, and a
+        // stale intent must not look replayable. consumeGrantIntent() reads
+        // the live record, never this projection.
+        .map((entry) => {
+          const { grantIntent, ...rest } = entry;
+          return grantIntent ? rest : entry;
+        });
       if (Number.isFinite(since)) list = list.filter((entry) => finishedAt(entry) >= since);
       list.sort((a, b) => finishedAt(b) - finishedAt(a));
       return Number.isFinite(limit) && limit > 0 ? list.slice(0, limit) : list;
@@ -981,5 +1068,5 @@ export function createApprovalStore({
     return serialized(async () => entries.get(id) ?? null);
   }
 
-  return { put, decide, cancel, cancelOpen, reopen, listPending, listHistory, get };
+  return { put, decide, cancel, cancelOpen, reopen, consumeGrantIntent, listPending, listHistory, get };
 }

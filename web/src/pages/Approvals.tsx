@@ -16,7 +16,7 @@
 // ApprovalInboxItem is exported and hook-free so it can be tested without a
 // DOM (see src/test/tree.tsx).
 import { useCallback, useEffect, useState } from "react";
-import { answerApproval, fetchApprovalHistory, fetchApprovalInbox, fetchMissions, type HistoryApproval, type InboxApproval, type Mission } from "../lib/api";
+import { answerApproval, fetchApprovalHistory, fetchApprovalInbox, fetchGrants, fetchMissions, revokeGrant, type HistoryApproval, type InboxApproval, type Mission, type StandingGrant } from "../lib/api";
 import { approvalSourceLabel } from "../lib/approvals";
 
 /** The proposed tool input, pretty-printed — same treatment the live dialog gives it (a Write call's input can be a whole file). */
@@ -112,6 +112,61 @@ export function ApprovalInboxItem({
   );
 }
 
+/**
+ * One line about a grant's reach: `mission:<uuid>` alone says nothing a
+ * person can act on, so the raw scope stays but the readable part leads.
+ */
+export function formatGrantScope(grant: Pick<StandingGrant, "scope">): string {
+  if (grant.scope.startsWith("mission:")) return `mission ${grant.scope.slice("mission:".length)}`;
+  return grant.scope;
+}
+
+/**
+ * One standing grant (P6a). Deliberately plain: what is allowed, how far it
+ * reaches, how often it has actually been used, and — when revoked — that it
+ * WAS revoked rather than a silent disappearance. There is no expiry column
+ * because grants have none: visibility replaces lifetime.
+ */
+export function GrantItem({
+  grant,
+  busy = false,
+  nowMs,
+  onRevoke,
+}: {
+  grant: StandingGrant;
+  busy?: boolean;
+  nowMs: number;
+  onRevoke: (grant: StandingGrant) => void;
+}) {
+  const revoked = grant.revokedAt !== null;
+  const superseded = grant.supersededBy !== null;
+  const lastUsed = grant.lastUsedAt ? Date.parse(grant.lastUsedAt) : null;
+  return (
+    <div className="approval-dialog approval-inbox-item">
+      <div className="approval-dialog-head">
+        <span className="approval-dialog-title">
+          {revoked ? "🚫" : "✅"} {grant.toolName ?? "a tool"} — always, for this exact form
+        </span>
+        <span className="badge badge-muted">{formatGrantScope(grant)}</span>
+        {revoked && <span className="badge">revoked ({grant.revokedReason ?? "unknown reason"})</span>}
+        {superseded && !revoked && <span className="badge badge-muted">superseded</span>}
+      </div>
+      <p className="approval-dialog-note">
+        Granted {relativeTime(Date.parse(grant.createdAt) || nowMs, nowMs)} · used {grant.useCount ?? 0}{" "}
+        {grant.useCount === 1 ? "time" : "times"}
+        {lastUsed ? ` · last used ${relativeTime(lastUsed, nowMs)}` : " · never used"}
+      </p>
+      {!revoked && !superseded && (
+        <div className="approval-dialog-actions">
+          <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onRevoke(grant)}>
+            Revoke
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function Approvals() {
   const [approvals, setApprovals] = useState<InboxApproval[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -124,6 +179,9 @@ export default function Approvals() {
   const [missions, setMissions] = useState<Mission[]>([]);
   const [missionFilter, setMissionFilter] = useState<string>("");
   const [triggerFilter, setTriggerFilter] = useState<string>("");
+  // P6a: the standing grants — the section under the inbox.
+  const [grants, setGrants] = useState<StandingGrant[] | null>(null);
+  const [busyGrantId, setBusyGrantId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -147,9 +205,37 @@ export default function Approvals() {
     }
   }, []);
 
+  const loadGrants = useCallback(async () => {
+    // Best-effort: a grant list that cannot load is an empty section, not a
+    // broken inbox.
+    try {
+      const { grants: list } = await fetchGrants();
+      setGrants(list);
+    } catch {
+      setGrants([]);
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadGrants();
+  }, [load, loadGrants]);
+
+  const revoke = async (grant: StandingGrant) => {
+    setBusyGrantId(grant.id);
+    setError(null);
+    try {
+      // Revocation is an event on the record, not a deletion — the refreshed
+      // list still shows the grant, marked, because "this was allowed and
+      // then withdrawn" is worth seeing.
+      await revokeGrant(grant.id);
+      await Promise.all([loadGrants(), load()]);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyGrantId(null);
+    }
+  };
 
   useEffect(() => {
     if (tab === "history") {
@@ -212,7 +298,10 @@ export default function Approvals() {
         <button
           type="button"
           className="btn"
-          onClick={() => void (tab === "history" ? loadHistory() : load())}
+          onClick={() => {
+            void (tab === "history" ? loadHistory() : load());
+            void loadGrants();
+          }}
         >
           Refresh
         </button>
@@ -233,6 +322,17 @@ export default function Approvals() {
               busy={busyId === approval.id}
               onDecide={(entry, behavior) => void decide(entry, behavior)}
             />
+          ))}
+
+          <h2 className="page-section-title">Standing grants</h2>
+          <p className="muted">
+            What you allowed "always, for this exact form" — minted only from a question you answered yourself, scoped to its
+            mission, matched on a hash of the exact input, and never expiring on its own. Revoking takes effect immediately;
+            the record stays visible.
+          </p>
+          {grants !== null && grants.length === 0 && <div className="empty-box">No standing grants.</div>}
+          {grants?.map((grant) => (
+            <GrantItem key={grant.id} grant={grant} nowMs={nowMs} busy={busyGrantId === grant.id} onRevoke={(g) => void revoke(g)} />
           ))}
         </>
       )}

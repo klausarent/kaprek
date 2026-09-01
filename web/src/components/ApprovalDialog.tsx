@@ -31,6 +31,7 @@ export default function ApprovalDialog({
   busy = false,
   error = null,
   onDecide,
+  onGrant,
 }: {
   approvals: PendingApproval[];
   nowMs: number;
@@ -40,6 +41,12 @@ export default function ApprovalDialog({
   /** A failed answer attempt (not a 404/409 — those remove the entry). Shown here, next to the buttons the user has to press again. */
   error?: string | null;
   onDecide: (entry: PendingApproval, behavior: "allow" | "deny") => void;
+  /**
+   * P6a: "always, for this exact form" — allow AND seed a standing grant
+   * from this very question. Optional: only offered where the server can
+   * mint (a mission chat); when absent, the button simply does not exist.
+   */
+  onGrant?: (entry: PendingApproval) => void;
 }) {
   const entry = oldestApproval(approvals);
   if (!entry) return null;
@@ -69,6 +76,14 @@ export default function ApprovalDialog({
 
       {entry.description && <p className="approval-dialog-note">{entry.description}</p>}
       {entry.reason && <p className="approval-dialog-note">{entry.reason}</p>}
+      {entry.standingGrant && (
+        <p className="approval-dialog-note">
+          {entry.standingGrant.state === "reactivation"
+            ? "A standing grant covers this form, but the posture loosened since you confirmed it — answering this question once confirms the grant again, or denies it away."
+            : "A standing grant covers this form, but it may not act right now (the rules it was made under changed) — so you are being asked."}
+          {entry.standingGrant.why ? ` (${entry.standingGrant.why})` : ""}
+        </p>
+      )}
 
       <pre className="approval-dialog-input">{formatInput(entry.input)}</pre>
 
@@ -82,6 +97,11 @@ export default function ApprovalDialog({
         <button type="button" className="btn" disabled={busy} onClick={() => onDecide(entry, "allow")}>
           Allow
         </button>
+        {onGrant && (
+          <button type="button" className="btn" disabled={busy} onClick={() => onGrant(entry)} title="Allow this call, and stop asking for this exact form in this mission">
+            Always for this form
+          </button>
+        )}
         <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onDecide(entry, "deny")}>
           Deny
         </button>

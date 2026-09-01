@@ -6,9 +6,11 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import {
   answerApproval,
+  answerApprovalWithGrant,
   cancelChatTurn,
   fetchChat,
   fetchEngines,
+  mintGrant,
   streamChatTurn,
   toDigestEvent,
   type ApprovalMode,
@@ -554,6 +556,36 @@ Is this the right approach?`,
     }
   };
 
+  /**
+   * "Always for this exact form" (P6a): allow this call AND seed a standing
+   * grant from this very question. Two server steps by design — the answer
+   * burns a one-time nonce, the mint redeems it — and the ordering matters:
+   * if the mint fails, the allow STILL happened (the tool call is not held
+   * hostage to grant bookkeeping); only the "always" half is lost, and the
+   * error says so.
+   */
+  const handleGrant = async (entry: PendingApproval) => {
+    if (deciding) return;
+    setDeciding(true);
+    setDecideError(null);
+    try {
+      const { outcome, nonce } = await answerApprovalWithGrant(entry.id, { chatId: entry.chatId });
+      if (outcome === "ok" && nonce !== null) {
+        try {
+          await mintGrant(`${entry.chatId}:${entry.id}`, nonce);
+        } catch (e) {
+          setDecideError(`Your allow went through, but minting the standing grant failed (${(e as Error).message}).`);
+        }
+      }
+      setApprovals((prev) => removeApproval(prev, entry.chatId, entry.id));
+      setAgentPanel((prev) => clearAwaitingApproval(prev, entry.agentId));
+    } catch (e) {
+      setDecideError(`Could not send your answer (${(e as Error).message}). Try again.`);
+    } finally {
+      setDeciding(false);
+    }
+  };
+
   const handleStop = async () => {
     if (!chatId) {
       // No chat-id frame has arrived yet — abort the fetch locally, there is
@@ -653,6 +685,9 @@ Is this the right approach?`,
         busy={deciding}
         error={decideError}
         onDecide={handleDecide}
+        // Only a mission chat can mint (P6a): the server refuses anything
+        // broader, so the button simply does not exist elsewhere.
+        onGrant={missionId ? handleGrant : undefined}
       />
 
       <AgentPanel

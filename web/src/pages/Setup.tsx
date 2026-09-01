@@ -9,7 +9,7 @@
 // .env, or MCP config reaches this page, by construction on the server side
 // (src/scan/environment.mjs). It is written to be safe in a screenshot.
 import { useEffect, useState } from "react";
-import { fetchEnvironment, fetchUsage, type UsageEntry, saveCouncil, type EnvironmentReport } from "../lib/api";
+import { fetchEnvironment, fetchGrants, fetchUsage, type UsageEntry, saveCouncil, type EnvironmentReport } from "../lib/api";
 
 /** How one CLI's state reads. Three states, not two: installed and signed in are different problems. */
 export function cliStatusLabel(cli: { installed: boolean; signedIn: boolean }): string {
@@ -60,6 +60,10 @@ export function usageLine(entry: UsageEntry, now: number = Date.now()): string {
 export default function Setup() {
   const [report, setReport] = useState<EnvironmentReport | null>(null);
   const [usage, setUsage] = useState<UsageEntry[]>([]);
+  // P6a: one small line about standing grants — how many are active. The
+  // full list (and the revoke buttons) lives in #/approvals; this page only
+  // answers "does anything stand in for my permission right now?".
+  const [activeGrants, setActiveGrants] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
 
@@ -71,6 +75,10 @@ export default function Setup() {
     fetchUsage()
       .then(setUsage)
       .catch(() => setUsage([]));
+    // Same for the grant count.
+    fetchGrants()
+      .then(({ activeCount }) => setActiveGrants(activeCount))
+      .catch(() => setActiveGrants(null));
   }, []);
 
   if (error) return <div className="error-box">{error}</div>;
@@ -100,6 +108,15 @@ export default function Setup() {
       {environment.clis.map((cli) => (
         <CliRow cli={cli} key={cli.id} />
       ))}
+
+      <h3>Standing grants</h3>
+      <p className="muted">
+        {activeGrants === null
+          ? "Count not available."
+          : activeGrants === 0
+            ? "None active — every write-shaped action asks."
+            : `${activeGrants} active. These stand in for your answer on matching questions; see #/approvals for the list and revocation.`}
+      </p>
 
       <h3>Subscription windows</h3>
       {usage.length === 0 ? (
