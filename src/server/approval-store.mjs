@@ -121,8 +121,24 @@ const TRANSIENT_WRITE_CODES = new Set(['EPERM', 'EBUSY', 'EACCES', 'EMFILE', 'EN
 
 const FILE_NAME = 'approvals.json';
 
+/**
+ * The schema version this binary writes and reads. The field has been
+ * written since the first revision of this file but never READ — P0.5 makes
+ * the gate real: a file with a HIGHER version was written by a newer kaprek,
+ * whose fields this binary cannot know. Opening it read-only is the only
+ * honest option: reads still work, but nothing is written back, nothing is
+ * pruned, nothing is marked — a newer file must not be silently degraded to
+ * what an older binary happens to understand.
+ */
+const SCHEMA_VERSION = 1;
+
 /** The one reason a loaded entry can never be answered — see this module's own doc comment (2). Kept as a single string because there is only one truthful answer here: whoever owned that wait is unreachable from this process. */
 const EXPIRED_PROCESS_GONE = 'process gone';
+
+/** The honest refusal every mutating call gives on a newer-schema file. */
+function newerSchemaMessage(version) {
+  return `approvals.json was written by a newer kaprek version (schema version ${version} > ${SCHEMA_VERSION}); this process opens the store READ-ONLY and refuses to modify it`;
+}
 
 function isFinished(entry) {
   return entry.status !== 'pending';
@@ -281,6 +297,15 @@ export function createApprovalStore({
   let queue = Promise.resolve();
 
   /**
+   * Set when the file on disk carries a schema version NEWER than this
+   * binary understands (P0.5). Every mutating path — put/decide/reopen, the
+   * lapsed sweep, the constructor's write-back, even the stale-temp-file
+   * cleanup — checks it: reads work, nothing is written, nothing is deleted.
+   */
+  let readOnly = false;
+  let readOnlyVersion = null;
+
+  /**
    * Moves a corrupt file out of the way so the next persist() cannot silently
    * overwrite the only evidence of what was pending. Three levels, each one a
    * fallback for the one before (panel Fix-Runde 1, M3): rename it, else copy
@@ -331,11 +356,28 @@ export function createApprovalStore({
       return false;
     }
 
+    // P0.5, schema-version gate: a HIGHER version than this binary writes
+    // means a newer kaprek wrote fields here this binary cannot know. The
+    // store opens READ-ONLY — entries load as-is (no 'expired: process gone'
+    // marking, that is an in-memory reinterpretation this binary must not
+    // make durable), no write-back, no retention prune, no temp-file
+    // cleanup. Backwards-compatible: a missing version field is version 1.
+    const fileVersion = parsed?.version;
+    if (fileVersion !== undefined && fileVersion !== null && fileVersion > SCHEMA_VERSION) {
+      readOnly = true;
+      readOnlyVersion = fileVersion;
+      log(`approvals: ${filePath} was written by a newer kaprek version (schema version ${fileVersion} > ${SCHEMA_VERSION}); opening READ-ONLY — nothing is written back, pruned or deleted`);
+    }
+
     const list = Array.isArray(parsed?.approvals) ? parsed.approvals : [];
     let changed = false;
     const expiredAt = now();
     for (const entry of list) {
       if (!entry || typeof entry.id !== 'string') continue;
+      if (readOnly) {
+        entries.set(entry.id, entry);
+        continue;
+      }
       if (entry.status === 'pending' && entry.mode === 'deferred') {
         // A DEFERRED entry hangs on no process at all. Nothing is blocked on
         // it: the turn that raised it was told to carry on and ended long ago,
@@ -443,9 +485,11 @@ export function createApprovalStore({
    */
   function serialized(work) {
     // The sweep runs inside the queue, ahead of the work, so no operation can
-    // observe an entry that should already have lapsed.
+    // observe an entry that should already have lapsed. On a newer-schema
+    // file the store is read-only: no sweep, and therefore no persist —
+    // decide() refuses mutations before any of this could matter.
     const swept = async () => {
-      if (sweepLapsed()) {
+      if (!readOnly && sweepLapsed()) {
         try {
           await persist();
         } catch (err) {
@@ -507,7 +551,6 @@ export function createApprovalStore({
     }
   }
 
-  cleanupStaleTempFiles();
   if (loadFromDisk()) {
     // Queued rather than awaited: the constructor cannot await, and every
     // public method below goes through the same queue, so the first of them
@@ -515,10 +558,17 @@ export function createApprovalStore({
     // makes the 'process gone' marking durable); failing it costs an accurate
     // file, not correctness, since the ownership gate refuses those entries
     // either way. It must not cost the boot (panel Fix-Runde 1, C1).
+    //
+    // NEVER on a newer-schema file (P0.5): there loadFromDisk() marked
+    // nothing — changed stays false, so this branch is not even taken, and
+    // readOnly additionally guards the sweep-driven persists below.
     serialized(() => persist()).catch((err) => {
       log(`approvals: could not record expired entries in ${filePath} (${err.message}); they are refused in memory regardless`);
     });
   }
+  // Only after load: on a newer-schema file nothing under this data dir is
+  // touched, not even the temp files — deletion is a write, too.
+  if (!readOnly) cleanupStaleTempFiles();
 
   /**
    * Records one newly raised approval question. `entry.id` is the caller's own
@@ -543,6 +593,7 @@ export function createApprovalStore({
    */
   function put(entry) {
     return serialized(async () => {
+    if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
     const id = entry?.id;
     if (typeof id !== 'string' || id.length === 0) throw new Error('approval entry needs a non-empty string id');
     const existing = entries.get(id);
@@ -656,6 +707,7 @@ export function createApprovalStore({
    */
   function decide(id, decision) {
     return serialized(async () => {
+    if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
     const entry = entries.get(id);
     if (!entry) throw new Error(`unknown approval: ${id}`);
     // ORDER MATTERS, and a mutant found it: 'already decided' is checked
@@ -738,6 +790,7 @@ export function createApprovalStore({
    */
   function reopen(id, { reason } = {}) {
     return serialized(async () => {
+      if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
       const entry = entries.get(id);
       if (!entry) throw new Error(`unknown approval: ${id}`);
       if (entry.mode !== 'deferred') throw new Error(`approval ${id} is not a deferred question and cannot be reopened`);
