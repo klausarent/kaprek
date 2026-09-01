@@ -204,3 +204,49 @@ test('learning the same fact again confirms it instead of duplicating it — cou
   expect(reopened.list({ scopeId: 'project:p' }).find((f) => f.id === first.id)).toMatchObject({ confirmations: 3, forgotten: true });
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
+
+// --------------------------------------------- P0.5: schema gate (newer log = read-only)
+
+test('P0.5: every written event carries schemaVersion: 1', () => {
+  const memory = openMemory(dataDir, { now });
+  memory.addScope({ id: 'person:klaus' });
+  const line = JSON.parse(fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8').trim());
+  expect(line.schemaVersion).toBe(1);
+});
+
+test('P0.5: a log with a higher schemaVersion opens READ-ONLY — reads work, every append refuses, the file is untouched', () => {
+  const dir = path.join(dataDir, 'memory');
+  fs.mkdirSync(dir, { recursive: true });
+  const events = [
+    { schemaVersion: 1, id: 'e1', ts: '2026-08-01T10:00:00.000Z', type: 'scope.created', memoryId: 'person:alt', data: { id: 'person:alt' } },
+    // One event a newer kaprek wrote — enough to put the whole log past us.
+    { schemaVersion: 99, id: 'e2', ts: '2026-08-02T10:00:00.000Z', type: 'scope.created', memoryId: 'person:neu', data: { id: 'person:neu', futureField: true } },
+  ];
+  const before = `${events.map((e) => JSON.stringify(e)).join('\n')}\n`;
+  fs.writeFileSync(path.join(dir, 'events.jsonl'), before, 'utf8');
+
+  const memory = openMemory(dataDir, { now });
+  // Reading and projection work — including the event this binary only
+  // partially understands (unknown `data` fields ride along harmlessly).
+  expect(memory.scopes().map((s) => s.id)).toEqual(['person:alt', 'person:neu']);
+
+  // Every mutating path refuses with the honest "newer kaprek" message.
+  const newerSchema = /newer kaprek version \(schema version 99 > 1\)/;
+  expect(() => memory.addScope({ id: 'person:x' })).toThrow(newerSchema);
+  expect(() => memory.remember({ scopeId: 'person:alt', text: 'x', kind: 'fact', origin: 'chat:c' })).toThrow(newerSchema);
+
+  // Nothing was appended: byte-identical.
+  expect(fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8')).toBe(before);
+});
+
+test('P0.5: events without a schemaVersion field count as version 1 — an old log stays fully writable (backwards-readable)', () => {
+  const dir = path.join(dataDir, 'memory');
+  fs.mkdirSync(dir, { recursive: true });
+  const legacy = { id: 'e1', ts: '2026-08-01T10:00:00.000Z', type: 'scope.created', memoryId: 'person:alt', data: { id: 'person:alt' } };
+  fs.writeFileSync(path.join(dir, 'events.jsonl'), `${JSON.stringify(legacy)}\n`, 'utf8');
+
+  const memory = openMemory(dataDir, { now });
+  expect(memory.scopes().map((s) => s.id)).toEqual(['person:alt']);
+  expect(() => memory.addScope({ id: 'person:neu' })).not.toThrow();
+  expect(memory.scopes().map((s) => s.id)).toEqual(['person:alt', 'person:neu']);
+});

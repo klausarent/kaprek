@@ -41,6 +41,17 @@ export const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
 /** How many distinct sources a confirmed fact lists. Past this the count still climbs; the list does not. */
 const MAX_ORIGINS = 20;
 
+/**
+ * P0.5 schema gate, JSONL edition: every event this binary writes carries
+ * `schemaVersion` (readers written before the field existed are version 1 —
+ * backwards-readable). On load, any event with a HIGHER version means a
+ * newer kaprek appended here; this binary then opens the store READ-ONLY:
+ * reads and projections still work, but appendFileSync would be the one
+ * write this binary cannot honestly make onto a log whose newer event
+ * shapes it does not know.
+ */
+const SCHEMA_VERSION = 1;
+
 /** Two texts that say the same thing, for the purpose of confirming rather than duplicating. */
 function sameText(a, b) {
   const norm = (t) => String(t).toLowerCase().replace(/\s+/g, ' ').replace(/[.!]+$/, '').trim();
@@ -132,10 +143,22 @@ export function openMemory(dataDir, { now = Date.now } = {}) {
   const eventsFile = path.join(dir, 'events.jsonl');
 
   const state = { scopes: new Map(), facts: new Map(), seq: 0 };
-  for (const event of loadEvents(eventsFile)) applyEvent(state, event);
+  const events = loadEvents(eventsFile);
+  for (const event of events) applyEvent(state, event);
+
+  // P0.5: a newer kaprek's events.jsonl is opened read-only. Missing
+  // schemaVersion (every line written before the gate) counts as version 1.
+  const newestSchemaVersion = events.reduce((max, e) => Math.max(max, typeof e?.schemaVersion === 'number' ? e.schemaVersion : 1), 1);
+  const readOnly = newestSchemaVersion > SCHEMA_VERSION;
 
   function commit(type, memoryId, data) {
-    const event = { id: crypto.randomUUID(), ts: new Date(now()).toISOString(), type, memoryId, data };
+    if (readOnly) {
+      throw new Error(
+        `memory events were written by a newer kaprek version (schema version ${newestSchemaVersion} > ${SCHEMA_VERSION}); ` +
+          'this process opens the store READ-ONLY and refuses to append',
+      );
+    }
+    const event = { schemaVersion: SCHEMA_VERSION, id: crypto.randomUUID(), ts: new Date(now()).toISOString(), type, memoryId, data };
     fs.mkdirSync(dir, { recursive: true });
     fs.appendFileSync(eventsFile, `${JSON.stringify(event)}\n`, 'utf8');
     applyEvent(state, event);
