@@ -54,6 +54,18 @@ export function appendRun(dataDir, entry = {}) {
     // trigger in the same chat, which is exactly what an operator (or an
     // acceptance script) needs to tell apart. Null on every other turn.
     replayOf: entry.replayOf ?? null,
+    // P7 skip-if precondition (src/triggers/condition.mjs). `skipped` is set
+    // on a run that never became a turn at all: 'condition' (the condition
+    // was merely false — no cost, no notification) or 'condition-error' (the
+    // condition could not be JUDGED — loud, notified, feeds the trigger's
+    // degraded streak). `conditionKind`/`conditionError` name what was
+    // checked and why it could not be judged; a REAL run that went ahead
+    // despite an error (onConditionError: 'run') carries conditionError with
+    // skipped still null. Null on every ordinary turn; readers must treat a
+    // missing field as null (old lines predate P7).
+    skipped: entry.skipped ?? null,
+    conditionKind: entry.conditionKind ?? null,
+    conditionError: entry.conditionError ?? null,
   };
   fs.mkdirSync(dataDir, { recursive: true });
   fs.appendFileSync(runsPath, `${JSON.stringify(line)}\n`, 'utf8');

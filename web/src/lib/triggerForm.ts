@@ -8,7 +8,7 @@
 // and a second copy of those rules here would drift. A 400 comes back with the
 // offending `field`, which FORM_FIELD_FOR_SERVER_FIELD maps onto the input that
 // caused it.
-import type { Escalation, Trigger, TriggerType } from "./api";
+import type { ConditionKind, Escalation, Trigger, TriggerType } from "./api";
 
 export type ScheduleMode = "everyMinutes" | "dailyAt";
 
@@ -41,7 +41,23 @@ export type TriggerFormValue = {
   // clipboard
   pollMs: string;
   matchPattern: string;
+  // skip-if precondition (P7). conditionKind "" means "no condition". Only
+  // heartbeat/schedule triggers accept one (see registry.mjs); the path is
+  // typed as the user entered it — the STORED form is the resolved absolute
+  // path the server answers for probeCondition(...).resolvedPath.
+  conditionKind: "" | ConditionKind;
+  conditionPath: string;
+  onConditionError: "skip" | "run";
+  /** The result of the one probe execution the form runs before saving. */
+  conditionProbe: ConditionProbeState;
 };
+
+export type ConditionProbeState =
+  | { status: "idle" }
+  | { status: "running" }
+  /** A condition loaded from the registry was already resolved (and probed) when it was saved. */
+  | { status: "stored"; resolvedPath: string }
+  | { status: "done"; met: boolean; error: string | null; resolvedPath: string };
 
 export const TRIGGER_TYPE_LABELS: Record<TriggerType, string> = {
   heartbeat: "Heartbeat",
@@ -88,6 +104,9 @@ export const FORM_FIELD_FOR_SERVER_FIELD: Record<string, keyof TriggerFormValue>
   "config.matchPattern": "matchPattern",
   "limits.maxRunsPerDay": "maxRunsPerDay",
   "limits.maxCostPerDay": "maxCostPerDay",
+  "condition.kind": "conditionKind",
+  "condition.path": "conditionPath",
+  onConditionError: "onConditionError",
 };
 
 /**
@@ -122,6 +141,10 @@ export function emptyTriggerForm(): TriggerFormValue {
     debounceMs: "500",
     pollMs: "2000",
     matchPattern: "",
+    conditionKind: "",
+    conditionPath: "",
+    onConditionError: "skip",
+    conditionProbe: { status: "idle" },
   };
 }
 
@@ -148,6 +171,15 @@ export function triggerToForm(trigger: Trigger): TriggerFormValue {
     debounceMs: config.debounceMs === undefined ? blank.debounceMs : String(config.debounceMs),
     pollMs: config.pollMs === undefined ? blank.pollMs : String(config.pollMs),
     matchPattern: config.matchPattern ?? "",
+    conditionKind: trigger.condition?.kind ?? "",
+    conditionPath: trigger.condition?.path ?? "",
+    onConditionError: trigger.onConditionError ?? "skip",
+    // A stored condition was already resolved (and probed) when it was
+    // saved — show that verdict instead of asking for a fresh probe.
+    conditionProbe:
+      trigger.condition === undefined
+        ? { status: "idle" }
+        : { status: "stored", resolvedPath: trigger.condition.path },
   };
 }
 
@@ -166,6 +198,11 @@ function num(raw: string): number | undefined {
 function str(raw: string): string | undefined {
   const trimmed = raw.trim();
   return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/** Whether this trigger type accepts a skip-if condition at all (see registry.mjs's CONDITION_TYPES). */
+export function typeAcceptsCondition(type: TriggerType): boolean {
+  return type === "heartbeat" || type === "schedule";
 }
 
 /** Drops undefined values so an omitted field never reaches the server as `null`, which the registry would reject. */
@@ -199,6 +236,8 @@ function configFor(form: TriggerFormValue): Record<string, unknown> {
  * use any app's tools (see runner.mjs::notifyPolicyHandler).
  */
 export function formToTrigger(form: TriggerFormValue): Record<string, unknown> {
+  const kind = typeAcceptsCondition(form.type) ? form.conditionKind : "";
+  const path = kind === "" ? "" : form.conditionPath.trim();
   return {
     id: form.id.trim(),
     type: form.type,
@@ -208,5 +247,10 @@ export function formToTrigger(form: TriggerFormValue): Record<string, unknown> {
     appScope: [...form.appScope],
     enabled: form.enabled,
     limits: compact({ maxRunsPerDay: num(form.maxRunsPerDay), maxCostPerDay: num(form.maxCostPerDay) }),
+    // The RELATIVE path goes up as typed; the registry resolves it against
+    // the base dir and stores the absolute form.
+    ...(kind === "" || path === "" ? {} : { condition: { kind, path } }),
+    // Only meaningful together with a condition (the registry rejects it alone).
+    ...(kind === "" || path === "" ? {} : { onConditionError: form.onConditionError }),
   };
 }

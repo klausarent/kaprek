@@ -10,6 +10,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { assertSafeRelPath, WorkspacePathError } from '../workspace/fs.mjs';
+import { CONDITION_KINDS, MAX_CONDITION_PATH_LENGTH, resolveConditionPath } from './condition.mjs';
 
 const ID_RE = /^[a-z0-9-]{1,64}$/;
 
@@ -45,7 +46,14 @@ const MIN_POLL_MS = 1000;
 const MAX_POLL_MS = 60_000;
 const MAX_MATCH_PATTERN_LENGTH = 200;
 
-const KNOWN_TOP_FIELDS = ['id', 'type', 'config', 'promptTemplate', 'escalation', 'appScope', 'enabled', 'approvalRequired', 'limits'];
+const KNOWN_TOP_FIELDS = ['id', 'type', 'config', 'promptTemplate', 'escalation', 'appScope', 'enabled', 'approvalRequired', 'limits', 'condition', 'onConditionError'];
+
+// P7: a skip-if precondition exists for the TICK-driven types only. A
+// clipboard trigger's precondition is its own matchPattern, a file-watch
+// trigger's is the watched path — a second, separate condition there would
+// be two ways to answer the same question.
+const CONDITION_TYPES = ['heartbeat', 'schedule'];
+export const ON_CONDITION_ERROR_MODES = ['skip', 'run'];
 const KNOWN_HEARTBEAT_CONFIG_FIELDS = ['intervalMinutes', 'checklistPath'];
 const KNOWN_SCHEDULE_CONFIG_FIELDS = ['everyMinutes', 'dailyAt'];
 const KNOWN_FILE_WATCH_CONFIG_FIELDS = ['path', 'events', 'debounceMs', 'maxDepth'];
@@ -224,6 +232,39 @@ function validateSavedPromptConfig(config) {
   return {};
 }
 
+/**
+ * The P7 skip-if precondition. Shape: `{ kind, path }` with kind one of
+ * CONDITION_KINDS and `path` a non-empty string. A RELATIVE path is resolved
+ * against `conditionBaseDir` (the mission cwd, else `<dataDir>/workspace`)
+ * here — at SAVE time — and stored absolute, so what the registry persists
+ * and the editor displays is exactly what will later be contained and
+ * stat'ed; the containment/symlink judgement itself needs the real
+ * filesystem and happens at evaluation time (see condition.mjs and
+ * runner.mjs's condition gate). `command` is deliberately not a kind — see
+ * condition.mjs's module comment.
+ */
+function validateCondition(obj, type, conditionBaseDir) {
+  if (!CONDITION_TYPES.includes(type)) {
+    fail('condition', `only ${CONDITION_TYPES.join(' and ')} triggers take a condition (this trigger's own input is its precondition)`);
+  }
+  if (!isPlainObject(obj)) fail('condition', 'must be an object like { kind: "file-exists", path: "..." }');
+  assertNoUnknownFields(obj, ['kind', 'path'], 'condition');
+  if (!CONDITION_KINDS.includes(obj.kind)) {
+    fail('condition.kind', `must be one of ${CONDITION_KINDS.join(', ')}`);
+  }
+  if (typeof obj.path !== 'string' || obj.path.trim().length === 0) {
+    fail('condition.path', 'must be a non-empty string');
+  }
+  if (obj.path.length > MAX_CONDITION_PATH_LENGTH) {
+    fail('condition.path', `must not exceed ${MAX_CONDITION_PATH_LENGTH} characters`);
+  }
+  // Resolve NOW, not at evaluation time: the stored form is what the user
+  // confirmed in the probe (see the form's Bedingung prüfen), and a stored
+  // absolute path cannot later silently change meaning because the process
+  // happens to start in a different directory.
+  return { kind: obj.kind, path: resolveConditionPath(obj.path, { cwd: conditionBaseDir }) };
+}
+
 function validateLimits(limits) {
   if (limits === undefined) return { ...DEFAULT_LIMITS };
   if (!isPlainObject(limits)) fail('limits', 'must be an object');
@@ -287,7 +328,7 @@ function validateConfigForType(type, config) {
  * thought about escalation gets the safe default, not an error, but the
  * field itself always exists on every stored trigger.
  */
-export function validateTrigger(obj, { knownAppIds = null } = {}) {
+export function validateTrigger(obj, { knownAppIds = null, conditionBaseDir = null } = {}) {
   if (!isPlainObject(obj)) fail('<root>', 'trigger must be an object');
   assertNoUnknownFields(obj, KNOWN_TOP_FIELDS, '');
 
@@ -332,6 +373,20 @@ export function validateTrigger(obj, { knownAppIds = null } = {}) {
     fail('approvalRequired', 'must be a boolean');
   }
 
+  // P7: optional precondition. Absent on legacy triggers — they keep firing
+  // exactly as before. Present: validated (and its path resolved absolute)
+  // by validateCondition above.
+  const condition = obj.condition !== undefined ? validateCondition(obj.condition, obj.type, conditionBaseDir) : undefined;
+  if (obj.onConditionError !== undefined && !ON_CONDITION_ERROR_MODES.includes(obj.onConditionError)) {
+    fail('onConditionError', `must be one of ${ON_CONDITION_ERROR_MODES.join(', ')}`);
+  }
+  // Only meaningful together with a condition; harmless alone, but a trigger
+  // that carries the exception without the condition almost certainly edited
+  // the JSON by hand.
+  if (obj.onConditionError !== undefined && condition === undefined) {
+    fail('onConditionError', 'requires a condition to apply to');
+  }
+
   const config = validateConfigForType(obj.type, obj.config);
   const limits = validateLimits(obj.limits);
   const escalation = obj.escalation ?? 'notify';
@@ -351,6 +406,13 @@ export function validateTrigger(obj, { knownAppIds = null } = {}) {
     // by omission.
     approvalRequired: obj.approvalRequired ?? escalation !== 'notify',
     limits,
+    // Fail-closed default (runner.mjs reads onConditionError ?? 'skip'): a
+    // condition that cannot be JUDGED skips the run loudly rather than
+    // running it on a maybe. Only stored TOGETHER with a condition — a bare
+    // onConditionError without one is a validation error, so emitting the
+    // default on a legacy trigger would make every next load drop it.
+    ...(condition === undefined ? {} : { onConditionError: obj.onConditionError ?? 'skip' }),
+    ...(condition === undefined ? {} : { condition }),
   };
 }
 
@@ -404,13 +466,13 @@ function dropUnknownAppScope(entry, knownAppIds, report) {
  * makes "the ceilings hold" true across a restart, instead of only at the
  * moment a trigger is created.
  */
-function normalizeStoredTriggers(entries, knownAppIds, report) {
+function normalizeStoredTriggers(entries, knownAppIds, report, conditionBaseDir) {
   const normalized = [];
   for (const entry of entries) {
     const id = isPlainObject(entry) && typeof entry.id === 'string' ? entry.id : '<unnamed>';
     try {
       const clamped = dropUnknownAppScope(clampStoredLimits(entry, report), knownAppIds, report);
-      normalized.push(validateTrigger(clamped, { knownAppIds }));
+      normalized.push(validateTrigger(clamped, { knownAppIds, conditionBaseDir }));
     } catch (err) {
       report(`trigger "${id}": dropped while loading (${err.message})`);
     }
@@ -489,11 +551,16 @@ function writeTriggersFile(dataDir, triggers) {
  *   corrections (clamped limits, dropped app ids, skipped entries) are
  *   reported. Defaults to console.warn: a correction the user never hears
  *   about is indistinguishable from the tool ignoring their configuration.
+ * @param {string|null} [options.conditionBaseDir] - the directory a trigger
+ *   condition's RELATIVE path is resolved against at save time (P7): the
+ *   mission cwd where there is one, else `<dataDir>/workspace`. Null keeps
+ *   the raw path (an isolated registry, e.g. in tests) — evaluation resolves
+ *   against the real base either way.
  */
-export function openTriggers(dataDir, { knownAppIds = null, log = (message) => console.warn(`triggers: ${message}`) } = {}) {
+export function openTriggers(dataDir, { knownAppIds = null, log = (message) => console.warn(`triggers: ${message}`), conditionBaseDir = null } = {}) {
   const currentAppIds = () => (typeof knownAppIds === 'function' ? knownAppIds() : knownAppIds);
   const read = readTriggersFile(dataDir);
-  let triggers = normalizeStoredTriggers(read.triggers, currentAppIds(), log);
+  let triggers = normalizeStoredTriggers(read.triggers, currentAppIds(), log, conditionBaseDir);
 
   // P0.5, schema gate: a newer kaprek's triggers.json is opened READ-ONLY —
   // listing works, every mutating call refuses with an honest message. This
@@ -522,7 +589,7 @@ export function openTriggers(dataDir, { knownAppIds = null, log = (message) => c
     /** Validates `trigger` (including its appScope against the installed apps), then inserts it (new id) or replaces the existing entry with the same id. Returns the normalized, stored trigger. */
     upsert(trigger) {
       if (readOnly) refuseWrite();
-      const validated = validateTrigger(trigger, { knownAppIds: currentAppIds() });
+      const validated = validateTrigger(trigger, { knownAppIds: currentAppIds(), conditionBaseDir });
       const index = triggers.findIndex((t) => t.id === validated.id);
       const next = triggers.slice();
       if (index >= 0) next[index] = validated;

@@ -276,6 +276,10 @@ export async function runTurn({
   origin = 'user',
   triggerId = null,
   replayOf = null,
+  // P7 (onConditionError: 'run'): why the trigger's skip-if condition could
+  // not be judged even though this turn went ahead anyway. Written to this
+  // turn's runs.jsonl line and nowhere else (see runs.mjs).
+  conditionError = null,
   silent = false,
   onChatResolved,
 } = {}) {
@@ -620,6 +624,7 @@ export async function runTurn({
         error: { message },
         origin,
         triggerId,
+        conditionError,
       });
     } catch {
       // best-effort — see appendRun()'s own call further down for the same caveat
@@ -739,9 +744,10 @@ export async function runTurn({
       origin,
       triggerId,
       replayOf,
+      conditionError,
     });
   } catch {
-    // best-effort — see comment above
+    // best-effort — see appendRun()'s own call further down for the same caveat
   }
 
   return {

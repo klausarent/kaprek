@@ -15,12 +15,16 @@ import {
   TriggerValidationError,
   deleteTrigger,
   fetchApps,
+  fetchTriggerRuns,
   fetchTriggers,
   fireTrigger,
+  probeCondition,
   toggleTrigger,
   upsertTrigger,
   type AppSummary,
+  type ConditionKind,
   type Escalation,
+  type TriggerRun,
   type TriggerStatus,
   type TriggerType,
 } from "../lib/api";
@@ -29,6 +33,7 @@ import {
   TRIGGER_TYPE_HINTS,
   TRIGGER_TYPE_LABELS,
   emptyTriggerForm,
+  typeAcceptsCondition,
   formFieldForServerField,
   formToTrigger,
   triggerToForm,
@@ -47,10 +52,38 @@ function approvalPathLabel(path: "policy" | "ui" | "inbox"): string {
   return "asks you";
 }
 
+/**
+ * How one line of a trigger's run history reads. A P7 skip never became a
+ * turn, so it says so in plain words instead of a stop reason nobody could
+ * make sense of.
+ */
+export function triggerRunLabel(run: TriggerRun): string {
+  if (run.skipped === "condition") return "übersprungen (Bedingung)";
+  if (run.skipped === "condition-error") return `übersprungen (Bedingungsfehler: ${run.conditionError ?? "unbekannt"})`;
+  if (run.stopReason === "error") return "fehlgeschlagen";
+  return "gelaufen";
+}
+
+export function TriggerRunHistory({ runs }: { runs: TriggerRun[] | null }) {
+  if (runs === null) return null;
+  if (runs.length === 0) return null;
+  return (
+    <ul className="trigger-run-history">
+      {[...runs].reverse().map((run, i) => (
+        <li key={`${run.ts}-${i}`} className={run.skipped === "condition-error" ? "trigger-run-error" : undefined}>
+          <span>{new Date(run.ts).toLocaleString()}</span>
+          <span>{triggerRunLabel(run)}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function TriggerRow({
   trigger,
   busy,
   note,
+  runs = null,
   onToggleRequest,
   onFire,
   onEdit,
@@ -59,6 +92,8 @@ export function TriggerRow({
   trigger: TriggerStatus;
   busy: boolean;
   note: string | null;
+  /** The trigger's last runs (see fetchTriggerRuns), or null while loading. */
+  runs?: TriggerRun[] | null;
   onToggleRequest: (trigger: TriggerStatus, enabled: boolean) => void;
   onFire: (trigger: TriggerStatus) => void;
   onEdit: (trigger: TriggerStatus) => void;
@@ -96,6 +131,19 @@ export function TriggerRow({
       </div>
 
       <div className="trigger-row-prompt">{trigger.promptTemplate}</div>
+
+      {trigger.degraded && (
+        <div className="trigger-row-warning">
+          Degraded: the skip-if condition failed {trigger.conditionErrorStreak}× in a row — check its path.
+        </div>
+      )}
+      {trigger.condition && (
+        <div className="trigger-form-hint">
+          Condition: {trigger.condition.kind} <code>{trigger.condition.path}</code>
+        </div>
+      )}
+
+      <TriggerRunHistory runs={runs} />
 
       {trigger.blocked && <div className="trigger-row-warning">Cannot run: {trigger.blocked}</div>}
       {!trigger.supported && trigger.unsupportedReason && (
@@ -455,6 +503,71 @@ export function TriggerForm({
         </>
       )}
 
+      {typeAcceptsCondition(value.type) && (
+        <div className="trigger-form-field">
+          <label htmlFor="trigger-condition-kind">Skip-if condition</label>
+          <select
+            id="trigger-condition-kind"
+            name="conditionKind"
+            value={value.conditionKind}
+            onChange={(e) => onChange({ conditionKind: e.target.value as "" | ConditionKind, conditionProbe: { status: "idle" } })}
+          >
+            <option value="">None — run every time</option>
+            <option value="file-exists">File exists</option>
+            <option value="file-newer-than-last-run">File newer than last run</option>
+          </select>
+          {value.conditionKind !== "" && (
+            <>
+              <label htmlFor="trigger-condition-path">Condition path (absolute, or relative to the workspace)</label>
+              <input
+                id="trigger-condition-path"
+                name="conditionPath"
+                value={value.conditionPath}
+                onChange={(e) => onChange({ conditionPath: e.target.value, conditionProbe: { status: "idle" } })}
+              />
+              {value.conditionProbe.status === "running" && <div className="trigger-form-hint">Checking the condition…</div>}
+              {value.conditionProbe.status === "stored" && (
+                <div className="trigger-form-hint">
+                  Stored as <code>{value.conditionProbe.resolvedPath}</code>.
+                </div>
+              )}
+              {value.conditionProbe.status === "done" && value.conditionProbe.error !== null && (
+                <div className="trigger-field-error">
+                  Bedingungsfehler: {value.conditionProbe.error} — gespeichert als <code>{value.conditionProbe.resolvedPath}</code>
+                </div>
+              )}
+              {value.conditionProbe.status === "done" && value.conditionProbe.error === null && (
+                <div className="trigger-form-hint">
+                  Bedingung ist <strong>{value.conditionProbe.met ? "wahr" : "falsch"}</strong> — gespeichert als{" "}
+                  <code>{value.conditionProbe.resolvedPath}</code>.
+                </div>
+              )}
+              <div className="trigger-form-radios">
+                <label>
+                  <input
+                    type="radio"
+                    name="onConditionError"
+                    checked={value.onConditionError === "skip"}
+                    onChange={() => onChange({ onConditionError: "skip" })}
+                  />
+                  On condition error: skip the run
+                </label>
+                <label>
+                  <input
+                    type="radio"
+                    name="onConditionError"
+                    checked={value.onConditionError === "run"}
+                    onChange={() => onChange({ onConditionError: "run" })}
+                  />
+                  On condition error: run anyway
+                </label>
+              </div>
+            </>
+          )}
+          <FieldError message={errorFor("conditionKind") ?? errorFor("conditionPath")} />
+        </div>
+      )}
+
       <div className="trigger-form-field">
         <label htmlFor="trigger-prompt">Prompt</label>
         <textarea
@@ -537,6 +650,10 @@ export default function Triggers() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, string>>({});
 
+  // The last runs per trigger id, for the rows' run history (P7 skip lines
+  // included — a skip has no chat, so this is the only place it shows).
+  const [runsByTrigger, setRunsByTrigger] = useState<Record<string, TriggerRun[] | null>>({});
+
   const [form, setForm] = useState<TriggerFormValue | null>(null);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -550,8 +667,17 @@ export default function Triggers() {
 
   const reload = async () => {
     try {
-      setTriggers(await fetchTriggers());
+      const list = await fetchTriggers();
+      setTriggers(list);
       setLoadError(null);
+      // Best-effort history: a failed fetch leaves the rows without history
+      // rather than taking the page down.
+      for (const trigger of list) {
+        setRunsByTrigger((prev) => ({ ...prev, [trigger.id]: prev[trigger.id] ?? null }));
+        fetchTriggerRuns(trigger.id)
+          .then((runs) => setRunsByTrigger((prev) => ({ ...prev, [trigger.id]: runs })))
+          .catch(() => {});
+      }
     } catch (e) {
       setLoadError((e as Error).message);
     }
@@ -672,6 +798,26 @@ export default function Triggers() {
     setSaving(true);
     setFieldError(null);
     setFormError(null);
+    // P7: a condition is probed ONCE before the trigger may be saved — the
+    // result (true / false / error) is displayed, and the FIRST click only
+    // shows it. The second click (with an unchanged condition) saves.
+    const wire = formToTrigger(form);
+    if (wire.condition !== undefined && form.conditionProbe.status !== "done" && form.conditionProbe.status !== "stored") {
+      setForm((prev) => (prev ? { ...prev, conditionProbe: { status: "running" } } : prev));
+      try {
+        const kind = (wire.condition as { kind: ConditionKind }).kind;
+        const path = (wire.condition as { path: string }).path;
+        const result = await probeCondition(kind, path, editing ? form.id.trim() : undefined);
+        setForm((prev) =>
+          prev ? { ...prev, conditionProbe: { status: "done", met: result.met, error: result.error, resolvedPath: result.resolvedPath } } : prev,
+        );
+      } catch (e) {
+        setForm((prev) => (prev ? { ...prev, conditionProbe: { status: "idle" } } : prev));
+        setFormError((e as Error).message);
+      }
+      setSaving(false);
+      return;
+    }
     try {
       await upsertTrigger(formToTrigger(form));
       setForm(null);
@@ -760,6 +906,7 @@ export default function Triggers() {
               trigger={trigger}
               busy={busyId === trigger.id}
               note={notes[trigger.id] ?? null}
+              runs={runsByTrigger[trigger.id] ?? null}
               onToggleRequest={handleToggleRequest}
               onFire={handleFire}
               onEdit={startEdit}
