@@ -1,18 +1,23 @@
 // Mission detail (#/mission/<id>): the one place a mission's state is
 // visible — goal, status, where it runs, the questions waiting on a human,
-// the chats carrying the work, and the board tasks documenting it.
+// the chats carrying the work, the board tasks documenting it, and (P4a)
+// what kaprek remembers that this mission can read.
 import { useEffect, useState } from "react";
 import {
   fetchMission,
+  fetchMissionMemory,
+  forgetMemory,
   setMissionStatus,
   setMissionPosture,
   POSTURES,
   type Mission,
   type MissionDetail as MissionDetailData,
+  type MissionMemory as MissionMemoryData,
+  type MissionMemoryEntry,
   type MissionStatus,
   type Posture,
 } from "../lib/api";
-import { navigateToApprovals, navigateToBoard, navigateToChat, navigateToMissionChat, navigateToMissions } from "../App";
+import { navigateToApprovals, navigateToBoard, navigateToChat, navigateToMemoryWithScope, navigateToMissionChat, navigateToMissions } from "../App";
 
 export const MISSION_STATUS_OPTIONS: { value: MissionStatus; label: string }[] = [
   { value: "active", label: "Active" },
@@ -82,8 +87,154 @@ export function MissionHeader({
   );
 }
 
+/** Scope-kind label in the card's counter line, in the order the chain reads. */
+const SCOPE_KIND_ORDER = ["mission", "project", "person", "agent"];
+
+/** The project scope of the chain, for the deep link's preset filter. */
+export function projectScopeOf(memory: MissionMemoryData): string {
+  return memory.visibleScopes.find((id) => id.startsWith("project:")) ?? memory.scopeId;
+}
+
+/**
+ * The forget warning, stated where the click happens. A project- or
+ * person-scope entry is SHARED: mission A's card can withdraw a fact that
+ * mission B in the same codebase still relies on. This has to be on screen
+ * before any Forget button does anything — hence a permanent line in the
+ * card, not a tooltip behind the click.
+ */
+export const FORGET_REACH_WARNING =
+  "Forgetting reaches upwards: an entry in the project or person scope also disappears for the other missions of the same chain.";
+
+/**
+ * One entry of the card, with its own two-step forget. The first click only
+ * names what will be lost; the second one does it. Pure — the actual
+ * deletion arrives via onConfirm.
+ */
+export function MissionMemoryRow({
+  entry,
+  confirmOpen,
+  canWrite = true,
+  onRequestForget,
+  onConfirmForget,
+  onCancelForget,
+}: {
+  entry: MissionMemoryEntry;
+  confirmOpen: boolean;
+  /** P0.5 read-only store: no write is offered, not even the first click. */
+  canWrite?: boolean;
+  onRequestForget: () => void;
+  onConfirmForget: () => void;
+  onCancelForget: () => void;
+}) {
+  return (
+    <li className="mission-memory-entry">
+      <div className="memory-row-head">
+        <span className="badge badge-muted">{entry.scope}</span>
+        <span className="memory-age">{entry.stale ? `stale — unverified for ${Math.floor(entry.ageMs / (24 * 60 * 60 * 1000))} days` : `verified ${Math.floor(entry.ageMs / (24 * 60 * 60 * 1000))}d ago`}</span>
+      </div>
+      <p className="memory-text">{entry.text}</p>
+      {canWrite &&
+        (confirmOpen ? (
+          <div className="mission-memory-confirm">
+            <span className="mission-memory-warning">
+              {FORGET_REACH_WARNING} {entry.scopeKind === "mission" ? "" : "This entry lives outside this mission, so it is shared."}
+            </span>
+            <button type="button" className="link-button mission-memory-forget-confirm" onClick={onConfirmForget}>
+              Really forget
+            </button>
+            <button type="button" className="link-button" onClick={onCancelForget}>
+              Keep it
+            </button>
+          </div>
+        ) : (
+          <button type="button" className="link-button mission-memory-forget" onClick={onRequestForget}>
+            Forget
+          </button>
+        ))}
+    </li>
+  );
+}
+/**
+ * What this mission can read, as a card: the five most recently written
+ * entries, a count per scope kind, and the way to the full view with the
+ * scope filter preset. Read-only store (P0.5): shown, labelled, no Forget.
+ *
+ * The rendering lives in the hook-free MissionMemoryCardBody so it stays
+ * testable on the element-tree level; this wrapper only owns the two-step
+ * forget's confirm state.
+ */
+export function MissionMemoryCard({
+  memory,
+  onForget,
+}: {
+  memory: MissionMemoryData;
+  onForget: (entry: MissionMemoryEntry) => void;
+}) {
+  const [confirmId, setConfirmId] = useState<string | null>(null);
+  return (
+    <MissionMemoryCardBody
+      memory={memory}
+      confirmId={confirmId}
+      onRequestForget={(id) => setConfirmId(id)}
+      onCancelForget={() => setConfirmId(null)}
+      onConfirmForget={(id) => {
+        setConfirmId(null);
+        const entry = memory.recent.find((candidate) => candidate.id === id);
+        if (entry) onForget(entry);
+      }}
+    />
+  );
+}
+
+export function MissionMemoryCardBody({
+  memory,
+  confirmId,
+  onRequestForget,
+  onCancelForget,
+  onConfirmForget,
+}: {
+  memory: MissionMemoryData;
+  confirmId: string | null;
+  onRequestForget: (id: string) => void;
+  onCancelForget: () => void;
+  onConfirmForget: (id: string) => void;
+}) {
+  const counts = SCOPE_KIND_ORDER.filter((kind) => memory.counts[kind]).map((kind) => `${kind}: ${memory.counts[kind]}`);
+  return (
+    <section className="mission-section mission-memory" aria-label="Mission memory">
+      <h3>What kaprek remembers here</h3>
+      {memory.readOnly && <p className="plan-note mission-memory-readonly">written by a newer kaprek version — read-only here</p>}
+      <p className="muted mission-memory-warning">{FORGET_REACH_WARNING}</p>
+      <p className="muted">
+        {counts.length > 0 ? counts.join(" · ") : "nothing yet"} ·{" "}
+        <button type="button" className="link-button" onClick={() => navigateToMemoryWithScope(projectScopeOf(memory))}>
+          All memory
+        </button>
+      </p>
+      {memory.recent.length === 0 ? (
+        <p className="muted">Nothing readable yet — memory fills up while an agent works inside this mission.</p>
+      ) : (
+        <ul className="mission-memory-list">
+          {memory.recent.map((entry) => (
+            <MissionMemoryRow
+              key={entry.id}
+              entry={entry}
+              confirmOpen={confirmId === entry.id}
+              canWrite={!memory.readOnly}
+              onRequestForget={() => onRequestForget(entry.id)}
+              onCancelForget={onCancelForget}
+              onConfirmForget={() => onConfirmForget(entry.id)}
+            />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
 export default function MissionDetail({ missionId }: { missionId: string }) {
   const [detail, setDetail] = useState<MissionDetailData | null>(null);
+  const [memory, setMemory] = useState<MissionMemoryData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloads, setReloads] = useState(0);
 
@@ -96,10 +247,26 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
       .catch((e) => {
         if (!cancelled) setError((e as Error).message);
       });
+    // The memory view must never take the page down: a failed read leaves
+    // the card out, the mission stays on screen.
+    fetchMissionMemory(missionId)
+      .then((data) => {
+        if (!cancelled) setMemory(data);
+      })
+      .catch(() => {
+        if (!cancelled) setMemory(null);
+      });
     return () => {
       cancelled = true;
     };
   }, [missionId, reloads]);
+
+  function handleForget(entry: MissionMemoryEntry) {
+    // The existing route, the only write path: DELETE /api/memory/<id>.
+    forgetMemory(entry.id, "forgotten from the mission view")
+      .then(() => setReloads((n) => n + 1))
+      .catch((e) => setError((e as Error).message));
+  }
 
   async function handleStatusChange(status: MissionStatus) {
     try {
@@ -135,6 +302,8 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
             .catch((e) => setError((e as Error).message));
         }}
       />
+
+      {memory && <MissionMemoryCard memory={memory} onForget={handleForget} />}
 
       {pendingApprovals.length > 0 && (
         <section className="mission-section mission-pending">

@@ -558,6 +558,40 @@ export function fetchMission(id: string): Promise<MissionDetail> {
   return getJson<MissionDetail>(`/api/missions/${encodeURIComponent(id)}`);
 }
 
+/** One entry of the mission-memory view (P4a). Scope-shaped, not store-shaped. */
+export type MissionMemoryEntry = {
+  id: string;
+  scope: string;
+  scopeKind: string;
+  kind: string;
+  text: string;
+  origin: string;
+  confidence: number;
+  firstSeenAt: string;
+  lastVerifiedAt: string;
+  stale: boolean;
+  ageMs: number;
+  confirmations: number;
+  origins: string[];
+};
+
+/** GET /api/missions/<id>/memory — everything this mission can read, in one view. */
+export type MissionMemory = {
+  missionId: string;
+  scopeId: string;
+  visibleScopes: string[];
+  counts: Record<string, number>;
+  entries: MissionMemoryEntry[];
+  /** The five most recently written entries, newest first. */
+  recent: MissionMemoryEntry[];
+  /** P0.5: a newer kaprek wrote here — display only, no writes offered. */
+  readOnly: boolean;
+};
+
+export function fetchMissionMemory(id: string): Promise<MissionMemory> {
+  return getJson<MissionMemory>(`/api/missions/${encodeURIComponent(id)}/memory`);
+}
+
 export function setMissionStatus(id: string, status: MissionStatus): Promise<Mission> {
   return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/status`, { status }).then((r) => r.mission);
 }

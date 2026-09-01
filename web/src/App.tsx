@@ -48,7 +48,7 @@ export type Route =
   | { name: "plans" }
   | { name: "council" }
   | { name: "setup" }
-  | { name: "memory" }
+  | { name: "memory"; scopeId?: string }
   | { name: "home" }
   | { name: "experiments" };
 
@@ -87,7 +87,10 @@ export function parseRoute(hash: string): Route {
     return { name: "home" };
   }
   if (parts[0] === "memory") {
-    return { name: "memory" };
+    // A mission's memory card deep-links in with the scope filter preset,
+    // the same way #/search carries its query.
+    const params = new URLSearchParams(queryPart ?? "");
+    return { name: "memory", scopeId: params.get("scope") ?? undefined };
   }
   if (parts[0] === "setup") {
     return { name: "setup" };
@@ -199,6 +202,11 @@ export function navigateToHome() {
 
 export function navigateToMemory() {
   window.location.hash = "#/memory";
+}
+
+/** Memory with the scope filter already set — the mission card's way in. */
+export function navigateToMemoryWithScope(scopeId: string) {
+  window.location.hash = `#/memory?scope=${encodeURIComponent(scopeId)}`;
 }
 
 export function navigateToSetup() {
@@ -376,7 +384,7 @@ export default function App() {
         ) : route.name === "home" ? (
           <Home />
         ) : route.name === "memory" ? (
-          <Memory />
+          <Memory initialScopeId={route.scopeId} />
         ) : route.name === "setup" ? (
           <Setup />
         ) : route.name === "council" ? (
