@@ -462,6 +462,10 @@ The core rule: a task can only be marked done once it carries a complete 7-field
 
 A receipt is an ed25519-signed snapshot of a completed task: its doc plus its linked sessions, signed at the moment you ask for one. It proves that a given key signed this exact state at this time — it does not prove the work is good, and the agent name is self-declared, not a verified identity. The verify view shows valid/invalid; editing the doc after signing invalidates the receipt, because verification always re-checks against the task's current state, not a stored snapshot.
 
+## Start (the Leitstand)
+
+`#/start` is the landing page once kaprek is already running: a dark operations console showing what the machine is doing RIGHT NOW — turns in flight (with an abort button where the server can actually reach the run), the questions waiting on you with inline Allow/Deny, the runs since local midnight grouped by mission with their costs (summed only over the values the harnesses actually reported — an unreported figure counts as `unknown`, never as 0), degraded triggers, stale grants, and the last few answered questions. The page only reads and aggregates one route, `GET /api/leitstand` — nothing is stored, nothing is invented, and the only write paths it offers are the same `POST /api/approvals/<id>` answer and `POST /api/chat/<id>/cancel` abort the rest of the UI uses. The navigation is down to five entries (Start, Chat, Inbox, Missions, Sessions) with everything else behind "more"; `#/home` stays what it was — the guided assistant for a first visit — and an empty address bar lands on the Leitstand.
+
 ## Make something (`#/home`)
 
 Four things you might want, three questions each, and a result you can point

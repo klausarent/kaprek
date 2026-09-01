@@ -166,6 +166,108 @@ export type Digest = {
 };
 
 // ---------------------------------------------------------------------------
+// Leitstand (GET /api/leitstand — the one read-only aggregation behind #/start)
+// ---------------------------------------------------------------------------
+
+/** One currently running turn. `abortable` is the server's own word on whether POST /api/chat/<id>/cancel can reach it — a trigger turn reports false, and the UI shows a link instead of a button that could not keep its promise. */
+export type LeitstandRunning = {
+  chatId: string;
+  title: string | null;
+  engine: string | null;
+  origin: string | null;
+  triggerId: string | null;
+  missionId: string | null;
+  abortable: boolean;
+};
+
+/** One open approval, as the leitstand narrows it for a list row. Answered through the SAME POST /api/approvals/<id> the inbox uses. */
+export type LeitstandPending = {
+  id: string;
+  chatId: string;
+  toolName: string | null;
+  displayName: string | null;
+  inputPreview: string | null;
+  source: ApprovalSource | null;
+  requestedAt: number;
+  deadlineAt: number | null;
+  /** Against deadlineAt; null when the record carries no deadline. */
+  remainingMs: number | null;
+  mode?: "interactive" | "deferred";
+  kind?: string | null;
+  triggerId?: string | null;
+  askedCount?: number;
+};
+
+/** Run counters for one window. Sums cover only KNOWN values; the `*Unknown` counters say how many runs reported nothing — the UI renders "$1.12 + 1 unknown", never 0 for unknown. */
+export type LeitstandCounts = {
+  ran: number;
+  skippedCondition: number;
+  skippedConditionError: number;
+  failed: number;
+  costUsd: number;
+  costKnown: number;
+  costUnknown: number;
+  tokens: number;
+  tokensKnown: number;
+  tokensUnknown: number;
+};
+
+/** One mission (or trigger without a mission) bucket of the overnight window. Runs attributable to neither appear only in totals. */
+export type LeitstandGroup = LeitstandCounts & {
+  missionId: string | null;
+  triggerId: string | null;
+  title: string | null;
+};
+
+/** The last few finished approvals, exactly as the approval store's history keeps them. */
+export type LeitstandHistory = {
+  id: string;
+  chatId: string;
+  toolName: string | null;
+  displayName: string | null;
+  inputPreview: string | null;
+  source: ApprovalSource | null;
+  requestedAt: number;
+  status: "decided" | "lapsed" | "cancelled" | "expired";
+  decision: { behavior: "allow" | "deny"; message?: string } | null;
+  decidedAt: number | null;
+  decidedVia: "web" | "phone-token" | "auto-deny" | null;
+  waitMs: number | null;
+};
+
+/** One active standing grant, list-row shape. */
+export type LeitstandGrant = {
+  id: string;
+  toolName: string | null;
+  scope: string;
+  match: "exact" | "shape";
+  useCount: number;
+  lastUsedAt: string | null;
+};
+
+export type LeitstandResponse = {
+  /** The window's lower bound (epoch ms) — local midnight, or the ?since= the caller sent. */
+  since: number;
+  running: LeitstandRunning[];
+  pending: LeitstandPending[];
+  overnight: { totals: LeitstandCounts; byMission: LeitstandGroup[] };
+  attention: {
+    degradedTriggers: { id: string; type: string; degraded: boolean; conditionErrorStreak: number; condition: { kind: string; path: string } | null }[];
+    staleGrants: { id: string; toolName: string | null; scope: string; match: "exact" | "shape" }[];
+    grantsActive: number;
+    /** Present only when the search index was written by a newer kaprek — absent means nothing to report, never a guess. */
+    searchReadOnly?: { reason: string };
+  };
+  history: LeitstandHistory[];
+  grants: LeitstandGrant[];
+};
+
+/** One fetch for the whole Start page. Read-only; the page refreshes it after its own actions instead of polling. */
+export function fetchLeitstand(): Promise<LeitstandResponse> {
+  return getJson<LeitstandResponse>("/api/leitstand");
+}
+
+// ---------------------------------------------------------------------------
 // Instance token (src/server/token.mjs)
 //
 // Every /api/* route — GET included — is a 401 without the `x-kaprek-token`
