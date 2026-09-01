@@ -11,6 +11,9 @@ import {
   fetchChat,
   fetchEngines,
   mintGrant,
+  mintShapeGrant,
+  previewShapeGrant,
+  type ShapeGrantPreview,
   streamChatTurn,
   toDigestEvent,
   type ApprovalMode,
@@ -102,6 +105,9 @@ export default function Chat({ chatId: initialChatId, missionId }: { chatId?: st
   const [approvals, setApprovals] = useState<PendingApproval[]>([]);
   const [deciding, setDeciding] = useState(false);
   const [decideError, setDecideError] = useState<string | null>(null);
+  // P6b: open shape-grant preview (the second dialog stage) and its checkbox.
+  const [shapePreview, setShapePreview] = useState<{ approvalId: string; nonce: string; chatId: string; agentId: string | null; preview: ShapeGrantPreview } | null>(null);
+  const [shapeConfirmed, setShapeConfirmed] = useState(false);
   const [agentPanel, setAgentPanel] = useState(initialAgentPanel);
   const [panelExpanded, setPanelExpanded] = useState(false);
   // One shared clock for the approval countdown and the turn duration, ticked
@@ -586,6 +592,73 @@ Is this the right approach?`,
     }
   };
 
+  /**
+   * "Always for this form of call" (P6b): allow this call AND seed a SHAPE
+   * standing grant — a pattern the server derives from this very question.
+   * Three steps, on purpose: the answer (allow + grant intent, nonce), the
+   * preview (the server's derived pattern sentence plus concrete examples),
+   * and only after the dialog rendered those and the person confirmed, the
+   * mint. The allow is never held hostage to the grant's bookkeeping — if
+   * the input is not derivable, only the "always" half is lost and the
+   * dialog says so.
+   */
+  const handleGrantShape = async (entry: PendingApproval) => {
+    if (deciding) return;
+    setDeciding(true);
+    setDecideError(null);
+    try {
+      const { outcome, nonce } = await answerApprovalWithGrant(entry.id, { chatId: entry.chatId, grantMatch: "shape" });
+      if (outcome === "ok" && nonce !== null) {
+        const nonceValue = nonce;
+        try {
+          const { preview } = await previewShapeGrant(`${entry.chatId}:${entry.id}`, nonceValue);
+          setShapePreview({ approvalId: `${entry.chatId}:${entry.id}`, nonce: nonceValue, chatId: entry.chatId, agentId: entry.agentId, preview });
+          setShapeConfirmed(false);
+          return; // the dialog stays open on the preview step; removeApproval happens at save/skip
+        } catch (e) {
+          setDecideError(
+            `Your allow went through, but this input cannot be turned into a safe pattern (${(e as Error).message}). It stays exact-only.`,
+          );
+        }
+      }
+      setApprovals((prev) => removeApproval(prev, entry.chatId, entry.id));
+      setAgentPanel((prev) => clearAwaitingApproval(prev, entry.agentId));
+    } catch (e) {
+      setDecideError(`Could not send your answer (${(e as Error).message}). Try again.`);
+    } finally {
+      setDeciding(false);
+    }
+  };
+
+  const handleShapeSave = async () => {
+    if (!shapePreview || deciding) return;
+    setDeciding(true);
+    try {
+      await mintShapeGrant(shapePreview.approvalId, shapePreview.nonce);
+      setApprovals((prev) => removeApproval(prev, shapePreview.chatId, shapePreview.approvalId.split(":")[1]));
+      setAgentPanel((prev) => clearAwaitingApproval(prev, shapePreview.agentId));
+      setShapePreview(null);
+      setShapeConfirmed(false);
+      setDecideError(null);
+    } catch (e) {
+      setDecideError(`Could not save the standing grant (${(e as Error).message}).`);
+    } finally {
+      setDeciding(false);
+    }
+  };
+
+  const handleShapeSkip = () => {
+    // The allow already happened; only the grant is skipped. The pending
+    // question leaves the dialog like any answered one.
+    if (shapePreview) {
+      const { chatId, agentId } = shapePreview;
+      setApprovals((prev) => removeApproval(prev, chatId, shapePreview.approvalId.split(":")[1]));
+      setAgentPanel((prev) => clearAwaitingApproval(prev, agentId));
+    }
+    setShapePreview(null);
+    setShapeConfirmed(false);
+  };
+
   const handleStop = async () => {
     if (!chatId) {
       // No chat-id frame has arrived yet — abort the fetch locally, there is
@@ -688,6 +761,12 @@ Is this the right approach?`,
         // Only a mission chat can mint (P6a): the server refuses anything
         // broader, so the button simply does not exist elsewhere.
         onGrant={missionId ? handleGrant : undefined}
+        onGrantShape={missionId ? handleGrantShape : undefined}
+        shapePreview={shapePreview?.preview ?? null}
+        shapeConfirmed={shapeConfirmed}
+        onShapeConfirmToggle={() => setShapeConfirmed((prev) => !prev)}
+        onShapeSave={() => void handleShapeSave()}
+        onShapeSkip={handleShapeSkip}
       />
 
       <AgentPanel

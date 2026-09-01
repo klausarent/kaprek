@@ -127,6 +127,18 @@ export function formatGrantScope(grant: Pick<StandingGrant, "scope">): string {
  * WAS revoked rather than a silent disappearance. There is no expiry column
  * because grants have none: visibility replaces lifetime.
  */
+/**
+ * P6b — the shape grant's reach in one short clause: the command head, or
+ * the directory prefix the pattern allows. The full pattern stays on the
+ * record; this is the readable line.
+ */
+function shapeReach(grant: StandingGrant): string | null {
+  if (grant.match !== "shape" || !grant.pattern) return null;
+  if (grant.pattern.type === "command-head") return `command starts with "${grant.pattern.head}"`;
+  if (grant.pattern.type === "path-prefix") return `files under ${grant.pattern.prefix}`;
+  return null;
+}
+
 export function GrantItem({
   grant,
   busy = false,
@@ -141,15 +153,22 @@ export function GrantItem({
   const revoked = grant.revokedAt !== null;
   const superseded = grant.supersededBy !== null;
   const lastUsed = grant.lastUsedAt ? Date.parse(grant.lastUsedAt) : null;
+  const reach = shapeReach(grant);
   return (
     <div className="approval-dialog approval-inbox-item">
       <div className="approval-dialog-head">
         <span className="approval-dialog-title">
-          {revoked ? "🚫" : "✅"} {grant.toolName ?? "a tool"} — always, for this exact form
+          {revoked ? "🚫" : "✅"} {grant.toolName ?? "a tool"} —{" "}
+          {grant.match === "shape" ? `always, for this form of call${reach ? ` (${reach})` : ""}` : "always, for this exact form"}
         </span>
         <span className="badge badge-muted">{formatGrantScope(grant)}</span>
+        <span className="badge badge-muted" title="The authorities this grant is bound to: the posture at confirmation, the hard-denials list, the mission, and the pattern-derivation rule version. Any of them changing puts the grant to sleep.">
+          {grant.match}/{grant.postureAtGrant}
+          {grant.match === "shape" ? `/d${grant.derivationVersion ?? "?"}` : ""}
+        </span>
         {revoked && <span className="badge">revoked ({grant.revokedReason ?? "unknown reason"})</span>}
         {superseded && !revoked && <span className="badge badge-muted">superseded</span>}
+        {grant.reconfirmPending && !revoked && !superseded && <span className="badge">stale: asks once before it acts again</span>}
       </div>
       <p className="approval-dialog-note">
         Granted {relativeTime(Date.parse(grant.createdAt) || nowMs, nowMs)} · used {grant.useCount ?? 0}{" "}

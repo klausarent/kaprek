@@ -1132,7 +1132,21 @@ export type StandingGrant = {
   /** `mission:<id>` — the only mintable scope in this phase. */
   scope: string;
   toolName: string | null;
-  match: "exact";
+  /** 'exact' (P6a: one hashed call) or 'shape' (P6b: a derived pattern). */
+  match: "exact" | "shape";
+  /** P6b, shape only: the derived pattern (command head, or a directory prefix under the mission cwd). */
+  pattern?: {
+    v: number;
+    toolName: string;
+    type: "command-head" | "path-prefix";
+    keys: string[];
+    head?: string;
+    prefix?: string;
+  } | null;
+  /** P6b, shape only: which version of the derivation rule produced the pattern. */
+  derivationVersion?: number | null;
+  /** P6b: set when a loosened ceiling owes this grant its one reactivation question. */
+  reconfirmPending?: boolean;
   postureAtGrant: string;
   confirmedPosture?: string;
   hardDenialsHash: string;
@@ -1160,6 +1174,35 @@ export function mintGrant(approvalId: string, nonce: string): Promise<{ ok: bool
   return postJson<{ ok: boolean; grant: StandingGrant }>("/api/grants", { approvalId, nonce });
 }
 
+/** P6b — the server-side preview of a shape grant: the rendered pattern sentence plus CONCRETE example inputs (labelled hit/miss). The dialog must render these before a shape grant can be saved; the server refuses the unconfirmed mint. */
+export type ShapeGrantPreview = {
+  match: "shape";
+  toolName: string | null;
+  pattern: StandingGrant["pattern"];
+  sentence: string;
+  examples: { input: Record<string, unknown>; matches: boolean }[];
+  fingerprint: { posture: string; hardDenialsHash: string; missionId: string | null; derivationVersion: number };
+};
+
+/**
+ * P6b — asks the server what a shape grant for this question WOULD allow:
+ * the pattern sentence and the mandatory examples. Peeks only — the nonce
+ * stays live for the confirming mint. A 409 'not-derivable' means the input
+ * cannot be safely generalised (only the error carries; nothing is stored).
+ */
+export function previewShapeGrant(approvalId: string, nonce: string): Promise<{ ok: boolean; preview: ShapeGrantPreview }> {
+  return postJson<{ ok: boolean; preview: ShapeGrantPreview }>("/api/grants", { approvalId, nonce, match: "shape", preview: true });
+}
+
+/**
+ * P6b — saves the shape grant. The confirm field is the client's statement
+ * that the preview (sentence + examples) was rendered and confirmed; the
+ * server refuses the mint without it (409 'examples-not-shown').
+ */
+export function mintShapeGrant(approvalId: string, nonce: string): Promise<{ ok: boolean; grant: StandingGrant }> {
+  return postJson<{ ok: boolean; grant: StandingGrant }>("/api/grants", { approvalId, nonce, match: "shape", confirm: true });
+}
+
 /** Revokes a grant. Revocation is an event: the record stays in the list, marked. */
 export async function revokeGrant(id: string): Promise<void> {
   const res = await apiFetch(`/api/grants/${encodeURIComponent(id)}`, { method: "DELETE", headers: APP_HEADERS });
@@ -1176,12 +1219,12 @@ export async function revokeGrant(id: string): Promise<void> {
  */
 export async function answerApprovalWithGrant(
   id: string,
-  { chatId }: { chatId: string },
+  { chatId, grantMatch = "exact" }: { chatId: string; grantMatch?: "exact" | "shape" },
 ): Promise<{ outcome: "ok" | "gone"; nonce: string | null }> {
   const res = await apiFetch(`/api/approvals/${encodeURIComponent(id)}`, {
     method: "POST",
     headers: { ...APP_HEADERS, "Content-Type": "application/json" },
-    body: JSON.stringify({ chatId, behavior: "allow", grant: true }),
+    body: JSON.stringify({ chatId, behavior: "allow", grant: true, grantMatch }),
   });
   if (res.status === 404 || res.status === 409 || res.status === 410) return { outcome: "gone", nonce: null };
   await throwOnError(res);

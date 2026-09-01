@@ -10,7 +10,13 @@
 // sentence — always (it stops asking) and FOR THIS FORM (the grant carries a
 // hash of the exact input, and anything else still asks).
 //
-// THE SHAPE (P6a, exact only):
+// P6b adds the second half's generalisation, under its own guard: a 'shape'
+// grant matches a DERIVED pattern (the versioned rule below) instead of one
+// hashed input, is bound to the fingerprint {posture, hardDenialsHash,
+// missionId, derivationVersion}, and cannot be minted without the mint
+// preview (pattern sentence + concrete examples) having been confirmed.
+//
+// THE SHAPE (P6a exact, P6b shape beside it):
 //
 //   A grant is an append-only JSONL log at <dataDir>/grants.jsonl with an
 //   in-memory projection, built like src/memory/store.mjs. Every event —
@@ -51,6 +57,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { canonicalInput, MAX_STORED_INPUT_BYTES } from '../server/approval-store.mjs';
+import { stricterPosture } from './guards.mjs';
 
 const FILE_NAME = 'grants.jsonl';
 const SALT_FILE_NAME = 'grants.salt';
@@ -58,8 +65,225 @@ const SALT_FILE_NAME = 'grants.salt';
 /** P0.5: this binary writes and understands version 1. Higher → read-only. */
 const SCHEMA_VERSION = 1;
 
-/** Grant kinds. 6a ships exactly one; the field is on the record because P6b adds 'shape' beside it, not instead of it. */
-export const GRANT_MATCH_KINDS = ['exact'];
+/** Grant kinds. 'shape' (P6b) matches a DERIVED pattern, not one hashed input — see DERIVATION_RULE below. */
+export const GRANT_MATCH_KINDS = ['exact', 'shape'];
+
+// ---------------------------------------------------------------------------
+// P6b — THE SHAPE-DERIVATION RULE (versioned spec, H1)
+//
+// DERIVATION_VERSION = 1. This block IS the specification: what a concrete
+// tool input may be generalised into, and nothing else. A change to ANY of
+// these paragraphs must bump DERIVATION_VERSION — an old grant's pattern was
+// derived under the old rule, and only the version number lets a future
+// binary know that matching it against inputs derived under a new rule would
+// be comparing two different languages. A bump stales every existing shape
+// grant (fingerprint check in server.mjs's makeGrantCheck); exact grants are
+// unaffected, they never derived anything.
+//
+// THE RULE (v1): given a toolName, a raw (pre-redaction, K1) input object and
+// the mission cwd, derivePattern() returns a pattern ONLY when the input is
+// safely generalisable, and null otherwise — never a guess:
+//
+//   1. The input must be a plain object with EXACTLY ONE own enumerable key.
+//      A form with several arguments has semantics between them (flags,
+//      order, which arg is the target) that v1 does not pretend to
+//      understand, so it derives nothing.
+//   2. COMMAND FORM: that one key is `command`, its value a string of at most
+//      512 characters. The pattern is the COMMAND HEAD: the first
+//      whitespace-delimited token. The head must be a bare word — no path
+//      separators, no quotes, no shell metacharacters (`; & | < > $ \` " '`),
+//      no globs — because generalising "runs ./scripts/x" or "runs a`b" is
+//      generalising something v1 cannot see. Every command whose head equals
+//      this head matches (`npm test`, `npm run build`, `npm install …`).
+//   3. PATH FORM: that one key is one of PATH_INPUT_KEYS ('file_path',
+//      'path', 'notebook_path'), its value an ABSOLUTE path whose
+//      normalised form lies inside the mission cwd (lexical containment —
+//      no symlink resolution; see README for that honest limit). The pattern
+//      is the containing directory: every file inside that directory (at any
+//      depth) matches.
+//
+//   Anything else — relative paths, paths outside the mission, several keys,
+//   non-string values, oversized commands — returns null, and the caller
+//   refuses to mint with 409 'not-derivable'. The derivation NARROWS: it may
+//   decline everything it cannot be sure about, because the fallback is the
+//   question that would have been asked anyway.
+//
+// Derivation is deterministic: the same (toolName, input, cwd) always yields
+// the same pattern, so an incoming call is judged by deriving ITS pattern
+// under the same rule and comparing it structurally to the stored one.
+// ---------------------------------------------------------------------------
+export const DERIVATION_VERSION = 1;
+
+/** Input keys whose string value v1 treats as a file path (rule 3). */
+export const PATH_INPUT_KEYS = ['file_path', 'path', 'notebook_path'];
+
+const MAX_COMMAND_LENGTH = 512;
+
+/** Characters that make a command head something v1 refuses to generalise (paths, quoting, shell syntax, globs). */
+const UNSAFE_HEAD_CHARS = /[\\/:;"'`$<>|&;\s*?]/;
+
+/**
+ * Normalises a path for comparison. Purely lexical; on Windows the comparison
+ * is case-insensitive (NTFS is), elsewhere case-sensitive.
+ */
+function normalizeForCompare(p) {
+  const normalized = path.normalize(p);
+  return process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+}
+
+function isInside(child, ancestor) {
+  const c = normalizeForCompare(child);
+  const a = normalizeForCompare(ancestor);
+  const withSep = a.endsWith(path.sep) ? a : a + path.sep;
+  return c === a || c.startsWith(withSep);
+}
+
+function isStrictlyInside(child, ancestor) {
+  const c = normalizeForCompare(child);
+  const a = normalizeForCompare(ancestor);
+  const withSep = a.endsWith(path.sep) ? a : a + path.sep;
+  return c.startsWith(withSep);
+}
+
+/**
+ * The v1 derivation rule (see the block above). Returns
+ * `{ v, toolName, type, keys, head? , prefix? }` or null.
+ *
+ * @param {{ toolName: string, input: unknown, cwd: string }} args
+ */
+export function derivePattern({ toolName, input, cwd }) {
+  if (typeof toolName !== 'string' || toolName === '') return null;
+  if (typeof cwd !== 'string' || cwd === '') return null;
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) return null;
+  const keys = Object.keys(input).sort();
+  if (keys.length !== 1) return null; // rule 1: one key, or nothing
+  const value = input[keys[0]];
+  if (typeof value !== 'string' || value === '') return null;
+
+  if (keys[0] === 'command') {
+    // rule 2: the command head.
+    if (value.length > MAX_COMMAND_LENGTH) return null;
+    const trimmed = value.trim();
+    if (trimmed === '') return null;
+    const head = trimmed.split(/\s+/)[0];
+    if (head === '' || UNSAFE_HEAD_CHARS.test(head)) return null;
+    return { v: DERIVATION_VERSION, toolName, type: 'command-head', keys, head };
+  }
+
+  if (PATH_INPUT_KEYS.includes(keys[0])) {
+    // rule 3: the containing directory of an absolute path inside the mission cwd.
+    if (!path.isAbsolute(value)) return null;
+    const normalized = path.normalize(value);
+    if (!isInside(normalized, cwd)) return null;
+    return { v: DERIVATION_VERSION, toolName, type: 'path-prefix', keys, prefix: path.dirname(normalized) };
+  }
+
+  return null; // unknown single key: not derivable, never guessed
+}
+
+/** Structural equality of two patterns — same rule version, tool, type, key set and head/prefix. */
+export function patternEquals(a, b) {
+  if (a === b) return true;
+  if (!a || !b || a.type !== b.type || a.v !== b.v || a.toolName !== b.toolName) return false;
+  if (JSON.stringify(a.keys ?? []) !== JSON.stringify(b.keys ?? [])) return false;
+  if (a.type === 'command-head') return a.head === b.head;
+  if (a.type === 'path-prefix') return normalizeForCompare(a.prefix ?? '') === normalizeForCompare(b.prefix ?? '');
+  return false;
+}
+
+/**
+ * Whether one incoming call is covered by a stored pattern: same tool, same
+ * key set, and — command form — the same head, or — path form — the incoming
+ * prefix INSIDE the stored one (a pattern for `<cwd>/src` covers a call
+ * derived for `<cwd>/src/deep`: the same rule derived a narrower
+ * generalisation of a call the broader one already allows). The comparison
+ * is STRUCTURAL even across rule versions (a v0 command head and a v1
+ * command head are the same shape) — but a cross-version match is only ever
+ * allowed to STALE the grant, never to act: the fingerprint verdict
+ * (shapeFingerprintVerdict below) checks `derivationVersion` and refuses.
+ * That is why the version is deliberately NOT part of this comparison: a
+ * version mismatch must surface as a stale-hit with its reason, not as
+ * silence. The incoming pattern is passed pre-derived (the caller derives at
+ * question time, from the raw input — K1); this only compares.
+ */
+export function patternCovers(grant, { toolName, inputPattern }) {
+  if (!grant || grant.match !== 'shape') return false;
+  if (grant.toolName !== toolName) return false;
+  const stored = grant.pattern ?? null;
+  const incoming = inputPattern ?? null;
+  if (!stored || !incoming || stored.type !== incoming.type || stored.toolName !== incoming.toolName) return false;
+  if (JSON.stringify(stored.keys ?? []) !== JSON.stringify(incoming.keys ?? [])) return false;
+  if (stored.type === 'command-head') return stored.head === incoming.head;
+  if (stored.type === 'path-prefix') {
+    const a = normalizeForCompare(stored.prefix ?? '');
+    const c = normalizeForCompare(incoming.prefix ?? '');
+    const withSep = a.endsWith(path.sep) ? a : a + path.sep;
+    return c === a || c.startsWith(withSep);
+  }
+  return false;
+}
+
+/**
+ * The rendered reach of a pattern, for the dialog's mandatory sentence
+ * ("would also allow: …") and the grants list.
+ */
+export function describePattern(pattern, cwd) {
+  if (!pattern) return 'an unknown pattern';
+  if (pattern.type === 'command-head') {
+    return `every ${pattern.toolName} call whose command starts with "${pattern.head}"`;
+  }
+  if (pattern.type === 'path-prefix') {
+    const rel = (() => {
+      try {
+        const r = path.relative(cwd, pattern.prefix);
+        return r === '' ? '<mission cwd>' : `<mission cwd>/${r.split(path.sep).join('/')}`;
+      } catch {
+        return pattern.prefix;
+      }
+    })();
+    return `every ${pattern.toolName} call touching a file under ${rel}/**`;
+  }
+  return 'an unknown pattern';
+}
+
+/**
+ * The mint-preview's mandatory examples (P6b dialog duty): two to three
+ * CONCRETE inputs, each labelled with whether the pattern would cover it.
+ * The server generates these — the client renders them, it never invents
+ * them — and a shape grant cannot be saved until they were shown.
+ */
+export function shapeExamples(pattern, cwd) {
+  if (!pattern) return [];
+  if (pattern.type === 'command-head') {
+    const key = pattern.keys[0];
+    const hitA = { [key]: `${pattern.head} --help` };
+    const hitB = { [key]: `${pattern.head} test` };
+    const other = pattern.head === 'git' ? 'npm' : 'git';
+    const miss = { [key]: `${other} status` };
+    return [
+      { input: hitA, matches: true },
+      { input: hitB, matches: true },
+      { input: miss, matches: false },
+    ];
+  }
+  if (pattern.type === 'path-prefix') {
+    const key = pattern.keys[0];
+    const hitA = { [key]: path.join(pattern.prefix, 'example-one.ts') };
+    const hitB = { [key]: path.join(pattern.prefix, 'sub', 'example-two.md') };
+    // A miss just outside the pattern's directory — but still a plausible
+    // absolute path (inside the cwd when the prefix is not the cwd itself).
+    const missPath = isStrictlyInside(path.join(path.dirname(pattern.prefix), 'outside-example.ts'), cwd)
+      ? path.join(path.dirname(pattern.prefix), 'outside-example.ts')
+      : path.join(path.dirname(cwd), 'outside-example.ts');
+    const miss = { [key]: missPath };
+    return [
+      { input: hitA, matches: true },
+      { input: hitB, matches: true },
+      { input: miss, matches: false },
+    ];
+  }
+  return [];
+}
 
 /** How a grant names its reach. 6a mints ONLY mission scopes; 'global' exists as a word so the reader can see what is NOT there yet. */
 export const GRANT_SCOPES = ['mission'];
@@ -115,6 +339,12 @@ function applyEvent(state, event) {
         toolName: data.toolName,
         inputHash: data.inputHash,
         match: data.match ?? 'exact',
+        // P6b, shape only (null on exact): the derived pattern (see
+        // DERIVATION_VERSION above) and the rule version it was derived
+        // under. The fingerprint's other parts are postureAtGrant,
+        // hardDenialsHash and missionId — already on every record.
+        pattern: data.pattern ?? null,
+        derivationVersion: data.derivationVersion ?? null,
         postureAtGrant: data.postureAtGrant,
         // The posture the grant was LAST confirmed under; starts as the mint
         // posture. Loosening the ceiling past this is what triggers the
@@ -148,6 +378,46 @@ function applyEvent(state, event) {
   } else if (event.type === 'grant.superseded') {
     grants.set(data.id, { ...grant, supersededBy: data.by ?? null, reconfirmPending: false });
   }
+}
+
+/**
+ * The FINGERPRINT verdict (P6b) for a SHAPE grant at hit time. The
+ * fingerprint is deliberately narrow — {posture, hardDenialsHash, missionId,
+ * derivationVersion} — and NOT the whole policy hash: policyVersion also
+ * covers mode and rules like requireTaskDoc, so a totally unrelated rule
+ * edit would stale every shape grant at once and re-educate people into
+ * clicking through the re-asks (see DESIGN-SPEC, Änderung 2).
+ *
+ * @param {object} grant - the matched shape grant (projected record)
+ * @param {{ ceiling: string, denialsHash: string, missionId: string|null, derivationVersion: number }} current
+ *   - the values NOW, at the moment the grant would act
+ * @returns {{ ok: true } | { ok: false, kind: 'stale', why: string } | { ok: false, kind: 'reactivation', why: string }}
+ *   stale/reactivation use the same mechanics as P6a: neither lifts the
+ *   question; 'reactivation' asks the one owed re-confirmation question.
+ */
+export function shapeFingerprintVerdict(grant, { ceiling, denialsHash, missionId = null, derivationVersion = DERIVATION_VERSION }) {
+  if (grant.hardDenialsHash !== denialsHash) {
+    return { ok: false, kind: 'stale', why: 'the hard-denials list changed since this grant was made' };
+  }
+  if ((grant.missionId ?? null) !== (missionId ?? null)) {
+    return { ok: false, kind: 'stale', why: 'this grant belongs to another mission' };
+  }
+  if ((grant.derivationVersion ?? null) !== derivationVersion) {
+    return {
+      ok: false,
+      kind: 'stale',
+      why: `the pattern-derivation rule changed (version ${grant.derivationVersion ?? 'unknown'} → ${derivationVersion}); this grant's pattern was derived under the old rule`,
+    };
+  }
+  const binding = grant.confirmedPosture ?? grant.postureAtGrant;
+  if (binding && ceiling !== binding) {
+    const stricter = stricterPosture(ceiling, binding);
+    if (stricter === ceiling) {
+      return { ok: false, kind: 'stale', why: `the posture ceiling tightened to "${ceiling}" since this grant was made` };
+    }
+    return { ok: false, kind: 'reactivation', why: 'the posture loosened; this question reactivates the standing grant' };
+  }
+  return { ok: true };
 }
 
 /**
@@ -277,24 +547,37 @@ export function createGrantStore({ dataDir, now = Date.now, log = (message) => c
     /**
      * Mints a grant from a just-answered question. The CALLER (server.mjs's
      * grant-mint route) has already verified the approval, its nonce and the
-     * scope; this only writes and projects. Minting an exact twin (same
-     * scope, tool, input hash) supersedes the older active ones — one
-     * question, one grant; the old record stays readable, pointed at its
-     * successor via supersededBy.
+     * scope; this only writes and projects. Minting a twin (same scope, tool,
+     * match kind, and — exact — input hash / — shape — pattern) supersedes
+     * the older active ones — one question, one grant; the old record stays
+     * readable, pointed at its successor via supersededBy.
+     *
+     * P6b: `match: 'shape'` stores a DERIVED pattern (derivePattern above)
+     * plus `derivationVersion` beside the usual fingerprint fields. The
+     * inputHash stays on the record even for shape grants: it is the
+     * provenance (the concrete call the person was answering), only the
+     * MATCHING ignores it.
      *
      * @returns {object} the new grant's projected record
      */
-    mint({ scope, toolName, inputHash, postureAtGrant, hardDenialsHash, missionId = null, createdFromApprovalId = null }) {
+    mint({ scope, toolName, inputHash, match = 'exact', pattern = null, derivationVersion = null, postureAtGrant, hardDenialsHash, missionId = null, createdFromApprovalId = null }) {
       if (typeof scope !== 'string' || !scope.includes(':')) throw new Error(`grant scope must be "<kind>:<id>", got: ${scope}`);
       if (typeof toolName !== 'string' || toolName === '') throw new Error('grant needs a toolName');
       if (typeof inputHash !== 'string' || inputHash.length !== 64) throw new Error('grant needs a valid inputHash');
+      if (!GRANT_MATCH_KINDS.includes(match)) throw new Error(`grant match must be one of ${GRANT_MATCH_KINDS.join(', ')}`);
+      if (match === 'shape') {
+        if (!pattern || typeof pattern !== 'object' || patternEquals(pattern, null)) throw new Error('a shape grant needs a derived pattern');
+        if (!Number.isInteger(derivationVersion) || derivationVersion < 1) throw new Error('a shape grant needs its derivationVersion');
+      }
       const id = crypto.randomUUID();
       append('grant.minted', {
         id,
         scope,
         toolName,
         inputHash,
-        match: 'exact',
+        match,
+        pattern,
+        derivationVersion,
         postureAtGrant,
         hardDenialsHash,
         missionId,
@@ -302,9 +585,9 @@ export function createGrantStore({ dataDir, now = Date.now, log = (message) => c
         createdFromApprovalId,
       });
       for (const twin of grants.values()) {
-        if (twin.id !== id && isActive(twin) && twin.scope === scope && twin.toolName === toolName && twin.inputHash === inputHash) {
-          append('grant.superseded', { id: twin.id, by: id });
-        }
+        if (twin.id === id || !isActive(twin) || twin.scope !== scope || twin.toolName !== toolName || twin.match !== match) continue;
+        const sameTwin = match === 'exact' ? twin.inputHash === inputHash : patternEquals(twin.pattern ?? null, pattern);
+        if (sameTwin) append('grant.superseded', { id: twin.id, by: id });
       }
       return project(id);
     },
@@ -365,6 +648,26 @@ export function createGrantStore({ dataDir, now = Date.now, log = (message) => c
             grant.scope === scope,
         )
         .sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1))
+        .map((grant) => ({ ...grant }));
+    },
+
+    /**
+     * Active SHAPE matches (P6b) for one incoming call: same scope and tool,
+     * and a stored pattern that covers the freshly derived input pattern.
+     * OLDEST FIRST, and the caller takes the first — when several shape
+     * grants cover the same form, the oldest one wins. Rationale: the oldest
+     * is the one the person has been living with longest (its useCount tells
+     * the story); newest-first would make a freshly minted twin silently
+     * take over the counting of an established grant, and a visible audit
+     * trail beats a tidy-looking list. A shape twin minted over an older
+     * grant supersedes it anyway, so true multiplicity is rare — this rule
+     * is the deterministic tiebreak for the rest.
+     */
+    matchShape({ toolName, inputPattern, scope }) {
+      if (!inputPattern || typeof inputPattern !== 'object') return [];
+      return [...grants.values()]
+        .filter((grant) => isActive(grant) && patternCovers(grant, { toolName, inputPattern }) && grant.scope === scope)
+        .sort((a, b) => (a.createdAt > b.createdAt ? 1 : -1))
         .map((grant) => ({ ...grant }));
     },
 
