@@ -29,13 +29,14 @@ Das Dokument ist Arbeitsgrundlage, keine Spezifikation. Pro Punkt steht: Ziel, A
 - `scope` ist `mission:<id>`, `project:<label>` oder `global`. Sichtbarkeit läuft **nicht** aufwärts wie beim Memory: ein Mission-Grant gilt nur in dieser Mission. Ein globaler Grant wird beim Anlegen ausdrücklich als solcher bestätigt.
 - `match` in zwei Stufen: `exact` (kanonisches Input byte-gleich, das ist der heutige Vergleich) und `shape` (gleicher Werkzeugname, gleiche Schlüsselmenge, Werte gegen ein beim Anlegen aus der konkreten Anfrage abgeleitetes Muster — zum Beispiel Pfad-Präfix unter dem Mission-cwd, Kommando-Kopf bis zum ersten Argument). `shape` wird beim Anlegen als gerenderter Satz gezeigt („immer erlauben: `Write` unter `<mission-cwd>/src/**`"), sonst weiß niemand, was er zusagt.
 - Prüfreihenfolge im Approval-Pfad von `src/server/server.mjs`: Hard Denial → Posture-Decke → Grant → Frage. Ein Grant hebt weder ein Hard Denial noch die Posture-Decke auf; unter Posture `auto` ist er wirkungslos, weil dort ohnehin nicht gefragt wird.
+- Grants entstehen ausschließlich aus einer beantworteten Frage — der Knopf im Approval-Dialog ist der einzige Anlage-Weg, `POST /api/grants` existiert nur für ihn. Unter Posture `auto` wird nie gefragt, also kann dort kein Grant entstehen und es gibt auch keinen Weg, einen von Hand anzulegen; die Fragen-Antwort „immer für diese Form" fehlt im Dialog schlicht, wenn keine Frage vor ihr liegt. Entstandene Grants bleiben gespeichert: wird die Posture-Decke später gesenkt, werden sie wieder wirksam — sichtbar am Trefferzähler, nicht still.
 - `_truncated`-Inputs und Inputs über der 1-MB-Kappung erzeugen nie einen Grant.
 - Jede Grant-Nutzung wird im Approval-Log als `status: 'granted'` mit `grantId` sichtbar, sonst verschwindet die Freigabe aus der Historie und Punkt 2 wird wertlos.
 - Web: `web/src/components/ApprovalDialog.tsx` bekommt neben Allow/Deny den Knopf „immer für diese Form", `web/src/pages/Approvals.tsx` einen Abschnitt „Stehende Freigaben" mit Widerruf, Trefferzähler und Datum der letzten Nutzung. Routen `GET /api/grants`, `POST /api/grants`, `DELETE /api/grants/<id>`.
 
 **Aufwand.** M.
 
-**Risiko.** Der `shape`-Matcher ist die gefährliche Hälfte. Ein zu weites Muster ist eine dauerhaft offene Tür, die niemand mehr sieht. Deshalb: Ablaufdatum ist Pflichtfeld mit Vorgabe (30 Tage), Grants ohne Nutzung laufen leise aus, und die Setup-Seite (`#/setup`) zeigt die Zahl aktiver Grants.
+**Risiko.** Der `shape`-Matcher ist die gefährliche Hälfte. Ein zu weites Muster ist eine dauerhaft offene Tür, die niemand mehr sieht. Die Absicherung ist Sichtbarkeit, keine Lebensdauer: kein Ablaufdatum, kein stilles Auslaufen — ein Grant, der sich von selbst abschaltet, wäre genau die stille Verhaltensänderung, die kaprek überall sonst ausschließt, und ein Lauf, der sich auf ihn berufen hat, sähe sein Versprechen ohne Meldung enden. Dafür zeigen `#/setup` und der Approvals-Abschnitt Trefferzähler, `lastUsedAt` und Widerruf an jedem Grant, und `kaprek doctor` meldet Grants mit längerer Nichtnutzung als Aufräum-Kandidat — entscheiden tut der Operator, nicht die Uhr.
 
 ### 2. Kanonischer Approval-Lebenszyklus
 
@@ -148,7 +149,7 @@ Dazu: `RELAY_ROUNDS_PER_GATE = 2`, `RELAY_MAX_TURNS = 12`; ein Kanten-Voucher ka
 **Skizze.**
 
 - `src/missions/digest.mjs` baut je Mission ein Markdown-Dokument für ein Zeitfenster: Trigger-Ergebnisse (gelaufen, übersprungen nach Punkt 4, fehlgeschlagen), offene Fragen mit Restlaufzeit, Kosten und Tokens des Fensters, dazu die Liste der berührten Dateien aus dem Tape.
-- Die Zusammenfassung in drei Sätzen braucht eine Engine. Regel: höchstens ein Turn je Mission und Tag, kleinstes verfügbares Modell, abschaltbar. Ohne Engine oder bei abgeschaltetem Feld erscheint der Digest trotzdem — dann nur mit Zahlen. Der Digest darf nie teurer sein als das, worüber er berichtet.
+- Die Zusammenfassung in drei Sätzen braucht eine Engine — und ist darum **Opt-in, nicht Vorgabe**. Der Digest erscheint default ohne jeden Modellaufruf, nur mit Zahlen; die Zusammenfassung wird je Mission (oder global) ausdrücklich eingeschaltet, und der Schalter sagt, was das kostet (höchstens ein Turn je Mission und Tag, kleinstes verfügbares Modell). Der Turn läuft über den vorhandenen Harness — kein neuer Netz-Client im Node-Code, das „kein Netz außer Update"-Versprechen bleibt unberührt; der README-Absatz zum Digest nennt den Schalter trotzdem namentlich. Der Digest darf nie teurer sein als das, worüber er berichtet.
 - Auslieferung: Karte oben in der Mission-Ansicht, Route `GET /api/missions/<id>/digest?since=`, optional ein Trigger vom Typ `schedule`, der den Digest über `notify.json` rausschickt.
 - Der Digest wird als Datei unter `<dataDir>/missions/<id>/digests/<datum>.md` abgelegt, damit man ihn später noch lesen kann, wenn `runs.jsonl` schon rotiert ist.
 
