@@ -140,11 +140,59 @@ describe('legacy datadir fixtures', () => {
     expect(readContextState(dataDir, 'stale-session')).toBeNull();
   });
 
-  // SKIPPED ON PURPOSE — this is a finding, not a flaky test. Opening the
-  // copied data dir MUTATES approvals.json: createApprovalStore()'s
-  // loadFromDisk() marks the pending interactive entry 'expired' in memory
-  // and persists that marking on the first store operation. See the module
-  // report ("mutation on open — finding, see report").
+  // P0.5, case (a): a file with a HIGHER schema version than this binary
+  // writes was written by a NEWER kaprek. The approval store opens it
+  // READ-ONLY: reading works, every mutation refuses with an honest message,
+  // and — the acceptance criterion — opening it writes NOTHING back, prunes
+  // nothing, marks nothing: the bytes on disk stay exactly the committed
+  // fixture's bytes.
+  it('opens a newer-schema approvals.json READ-ONLY: reads work, nothing is written back, mutations refuse (P0.5 case a)', async () => {
+    const dataDir = copyFixture();
+    // The store reads exactly one file name; the downgrade fixture (version
+    // 99) is laid down AS approvals.json in the tmpdir copy.
+    const downgrade = fs.readFileSync(path.join(FIXTURE_DIR, 'approvals.downgrade.json'));
+    fs.writeFileSync(path.join(dataDir, 'approvals.json'), downgrade);
+
+    const log = [];
+    const store = createApprovalStore({ dataDir, log: (m) => log.push(m) });
+
+    // Reading works, and nothing was reinterpreted: the deferred pending
+    // entry stays pending (NOT marked 'expired: process gone'), the decided
+    // entry stays decided.
+    const decided = await store.get('downgrade-chat:2');
+    expect(decided?.status).toBe('decided');
+    const pending = await store.get('downgrade-chat:1');
+    expect(pending?.status).toBe('pending');
+    expect(pending).toEqual(JSON.parse(downgrade.toString('utf8')).approvals[0]);
+    expect((await store.listPending()).map((e) => e.id)).toEqual(['downgrade-chat:1']);
+
+    // Every mutating path refuses with the honest "newer kaprek" message.
+    const newerSchema = /newer kaprek version \(schema version 99 > 1\)/;
+    await expect(store.put({ id: 'downgrade-chat:3', mode: 'deferred' })).rejects.toThrow(newerSchema);
+    await expect(store.decide('downgrade-chat:1', { behavior: 'allow' })).rejects.toThrow(newerSchema);
+    await expect(store.reopen('downgrade-chat:2')).rejects.toThrow(newerSchema);
+    expect(log.join('\n')).toMatch(/READ-ONLY/);
+
+    // The acceptance: the file on disk is still byte-identical to the
+    // fixture — no write-back, no retention prune, nothing deleted.
+    expect(fs.readFileSync(path.join(dataDir, 'approvals.json'))).toEqual(downgrade);
+    // Not even temp-file cleanup ran: nothing under the data dir was touched.
+    expect(fs.readdirSync(dataDir).filter((n) => n.includes('.tmp-'))).toEqual([]);
+  });
+
+  // SKIPPED ON PURPOSE — and since P0.5 this is a DOCUMENTED decision, not
+  // an open finding. Decision (b) of the P0.5 schema-gate work: this fixture
+  // is a LEGACY file with the SAME schema version (version: 1) today's code
+  // writes. A newer binary opening it is free to understand it fully — and
+  // the write-back of `expired: 'process gone'` on open is documented,
+  // spec-wanted behavior (approval-store.mjs loadFromDisk/persist): the
+  // marking is how the file stops claiming a wait exists that no process
+  // owns. The P0.5 read-only gate applies only to case (a) — a HIGHER
+  // schemaVersion than the code knows (see the next test) — and must not
+  // freeze this documented bookkeeping. So the byte-equality check would
+  // still fail here BY DESIGN, and the skip stays, with this comment as the
+  // why. See also manifest.json ("Der pending-interactive-Eintrag wird beim
+  // Oeffnen ... zurueckgeschrieben — dokumentiertes Verhalten").
   it.skip('does not mutate the fixture dir on open (byte-equality) — mutation on open — finding, see report', async () => {
     const dataDir = copyFixture();
     const store = createApprovalStore({ dataDir });
