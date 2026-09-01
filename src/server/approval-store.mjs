@@ -784,6 +784,14 @@ export function createApprovalStore({
             nonce: crypto.randomBytes(24).toString('hex'),
             createdAt: now(),
             consumedAt: null,
+            // P6b: WHICH standing grant this intent may become. 'exact'
+            // (P6a default) or 'shape' — plus, for shape, the pattern
+            // derived at QUESTION time from the raw input and the rule
+            // version it was derived under. Null pattern + match 'shape'
+            // means the mint route will refuse with 'not-derivable'.
+            match: decision.grantIntent.match === 'shape' ? 'shape' : 'exact',
+            pattern: decision.grantIntent.pattern ?? null,
+            derivationVersion: decision.grantIntent.derivationVersion ?? null,
           }
         : null;
     const decided = {
@@ -821,6 +829,23 @@ export function createApprovalStore({
     }
     return decided;
     });
+  }
+
+  /**
+   * What a redeemed (or previewed) intent hands to the mint route: the tool
+   * name, the raw-input hash (K1), and — P6b — the chosen match kind with
+   * the question-time pattern and its derivation version. NEVER the input.
+   */
+  function intentPayload(entry, id) {
+    return {
+      toolName: entry.toolName ?? null,
+      inputHash: entry.grantIntent.inputHash,
+      match: entry.grantIntent.match ?? 'exact',
+      pattern: entry.grantIntent.pattern ?? null,
+      derivationVersion: entry.grantIntent.derivationVersion ?? null,
+      chatId: entry.chatId ?? null,
+      approvalId: id,
+    };
   }
 
   /**
@@ -869,12 +894,32 @@ export function createApprovalStore({
         // ownedIds/decided checks still refuse to double-redeem THIS process.
         log(`approvals: the grant intent for ${id} was consumed but the record could not be written (${err.message})`);
       }
-      return {
-        toolName: consumed.toolName ?? null,
-        inputHash: consumed.grantIntent.inputHash,
-        chatId: consumed.chatId ?? null,
-        approvalId: id,
-      };
+      return intentPayload(consumed, id);
+    });
+  }
+
+  /**
+   * P6b — the mint PREVIEW: every check consumeGrantIntent() makes, but the
+   * nonce is NOT burned. POST /api/grants calls this with match:'shape' and
+   * preview:true to get the derived pattern sentence plus the mandatory
+   * concrete examples BEFORE anything is stored; the person must have seen
+   * them (and confirmed) before the real mint redeems the nonce.
+   */
+  function peekGrantIntent(id, nonce) {
+    return serialized(async () => {
+      if (readOnly) throw new Error(newerSchemaMessage(readOnlyVersion));
+      const entry = entries.get(id);
+      if (!entry) throw alreadyError('unknown', `unknown approval: ${id}`);
+      if (!ownedIds.has(id)) throw alreadyError('not-owned', `approval ${id} was not filed by this kaprek process`);
+      if (entry.status !== 'decided') throw alreadyError(entry.status, `approval ${id} is ${entry.status}, not decided`);
+      if (entry.decision?.behavior !== 'allow') throw alreadyError('denied', `approval ${id} was denied; a deny mints no grant`);
+      if (typeof entry.grantIntent?.inputHash !== 'string') throw alreadyError('no-intent', `approval ${id} carries no grant intent`);
+      if (entry.input?._truncated === true) throw alreadyError('truncated', `approval ${id}'s input was too large to keep in full; it mints no grant`);
+      const given = typeof nonce === 'string' ? nonce : '';
+      const expected = entry.grantIntent.nonce;
+      const matches = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));
+      if (!matches) throw alreadyError('bad-nonce', `grant intent nonce for ${id} is wrong`);
+      return intentPayload(entry, id);
     });
   }
 
@@ -1068,5 +1113,5 @@ export function createApprovalStore({
     return serialized(async () => entries.get(id) ?? null);
   }
 
-  return { put, decide, cancel, cancelOpen, reopen, consumeGrantIntent, listPending, listHistory, get };
+  return { put, decide, cancel, cancelOpen, reopen, consumeGrantIntent, peekGrantIntent, listPending, listHistory, get };
 }

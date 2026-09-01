@@ -94,7 +94,15 @@ import {
   APPROVAL_DEADLINE_INTERACTIVE_MS,
   APPROVAL_INBOX_TTL_MS,
 } from './approval-store.mjs';
-import { createGrantStore, inputHashOf } from '../policy/grants.mjs';
+import {
+  createGrantStore,
+  inputHashOf,
+  derivePattern,
+  describePattern,
+  shapeExamples,
+  shapeFingerprintVerdict,
+  DERIVATION_VERSION,
+} from '../policy/grants.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
 
 // The apps/ directory shipped with kaprek, resolved the same way
@@ -946,8 +954,7 @@ function makeGrantCheck({ grantStore, dataDir, mission, scope }) {
     if (ceiling === 'auto') return null;
     const denialsHash = hardDenialsHashOf(policy);
     const [grant] = grantStore.match({ toolName: request.toolName, inputHash: request.inputHash, scope });
-    if (!grant) return null;
-
+    if (grant) {
     // Authority binding (K2). The grant acts only under the authorities its
     // person saw when they confirmed it.
     if (grant.hardDenialsHash !== denialsHash) {
@@ -978,6 +985,45 @@ function makeGrantCheck({ grantStore, dataDir, mission, scope }) {
       return { kind: 'stale', grantId: grant.id, why: 'the grant log could not be written' };
     }
     return { kind: 'grant', grantId: grant.id };
+    } // end: an exact grant matched and decided the call
+
+  // ---- P6b: shape, SECOND (never instead). The order at this gate is
+    // exact first (above), then shape, then the question — a form covered by
+    // both is answered by the exact grant, whose reach is the narrower
+    // statement of what the person actually allowed. When SEVERAL shape
+    // grants match, the OLDEST wins (matchShape sorts oldest-first; the why
+    // is documented there).
+
+  // The SHAPE half. Needs the freshly derived input pattern (computed in
+  // run.mjs from the RAW input, beside the hash — a pattern derived from the
+  // redacted copy would be a pattern about redacted values, K1 again). No
+  // pattern on the request: no shape match, plain question.
+  const [shapeGrant] = grantStore.matchShape({ toolName: request.toolName, inputPattern: request.inputPattern ?? null, scope });
+  if (!shapeGrant) return null;
+
+  // The fingerprint: {posture, hardDenialsHash, missionId, derivationVersion}
+  // — every component checked, any single deviation means the grant may not
+  // act: stale (asks, flagged) or reactivation (asks the one owed question).
+  const missionId = mission?.id ?? scope.slice('mission:'.length);
+  const verdict = shapeFingerprintVerdict(shapeGrant, { ceiling, denialsHash, missionId, derivationVersion: DERIVATION_VERSION });
+  if (!verdict.ok) {
+    if (verdict.kind !== 'reactivation') {
+      return { kind: 'stale', grantId: shapeGrant.id, why: verdict.why };
+    }
+    try {
+      grantStore.markReactivation(shapeGrant.id);
+    } catch {
+      return null; // cannot even record the owed question — ask plain
+    }
+    return { kind: 'reactivation', grantId: shapeGrant.id, why: verdict.why };
+  }
+
+  try {
+    grantStore.use(shapeGrant.id);
+  } catch {
+    return { kind: 'stale', grantId: shapeGrant.id, why: 'the grant log could not be written' };
+  }
+  return { kind: 'grant', grantId: shapeGrant.id };
   };
 }
 
@@ -1077,6 +1123,8 @@ function makeApprovalHandler({
       // hash rides on the map entry so handleApprovalDecision can hand it to
       // decide() as the grant intent without any raw input ever returning.
       inputHash: typeof request.inputHash === 'string' ? request.inputHash : null,
+      // P6b: the derived shape pattern (or null — exact-only question).
+      inputPattern: request.inputPattern ?? null,
       standingGrant: standingGrant ? { id: standingGrant.grantId, state: standingGrant.kind, why: standingGrant.why ?? null } : null,
     });
 
@@ -1104,6 +1152,11 @@ function makeApprovalHandler({
           // and the grant context, so a decided record can mint a grant and
           // the inbox can show why an existing grant did not act.
           inputHash: typeof request.inputHash === 'string' ? request.inputHash : null,
+          // P6b: the shape pattern rides along like the hash, so a decided
+          // record can mint a shape grant without the raw input ever
+          // returning. The pattern is derived data (a directory prefix under
+          // the mission cwd, or a command head), not the input itself.
+          inputPattern: request.inputPattern ?? null,
           standingGrantId: standingGrant?.grantId ?? null,
           standingGrantState: standingGrant?.kind ?? null,
         });
@@ -1351,6 +1404,11 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   clearTimeout(entry.timer);
   const message = typeof body.data?.message === 'string' ? body.data.message : undefined;
   const wantsGrant = behavior === 'allow' && body.data?.grant === true;
+  // P6b: WHICH kind of standing grant the person chose. 'exact' is the P6a
+  // default (one hashed call); 'shape' mints from the derived pattern. The
+  // choice lands in the grant intent and is only honoured at MINT time —
+  // the answer itself (allow) is identical either way.
+  const grantMatch = body.data?.grantMatch === 'shape' ? 'shape' : 'exact';
   const decision = behavior === 'allow' ? { behavior: 'allow' } : { behavior: 'deny', message: message ?? 'denied by user' };
 
   // P6a, reactivation (K2): the question was asked because a standing grant's
@@ -1376,7 +1434,16 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
   // grant's bookkeeping.
   if (wantsGrant && typeof entry.inputHash === 'string' && approvalStore) {
     try {
-      const decided = await approvalStore.decide(key, { ...decision, via: decidedVia, grantIntent: { inputHash: entry.inputHash } });
+      const decided = await approvalStore.decide(key, {
+        ...decision,
+        via: decidedVia,
+        grantIntent: {
+          inputHash: entry.inputHash,
+          match: grantMatch,
+          pattern: entry.inputPattern ?? null,
+          derivationVersion: entry.inputPattern ? DERIVATION_VERSION : null,
+        },
+      });
       entry.resolve({ behavior: 'allow' });
       sendJson(res, 200, { ok: true, grantNonce: decided?.grantIntent?.nonce ?? null });
     } catch (err) {
@@ -1774,6 +1841,18 @@ async function handleGrantMint(req, res, { approvalStore, grantStore, getChats, 
     sendJson(res, 400, { error: 'nonce is required' });
     return;
   }
+  // P6b: WHICH grant to mint from this intent, and how the request is
+  // staged. 'exact' (default, P6a) mints directly. 'shape' goes through the
+  // preview: the server derives the pattern and its concrete examples, the
+  // dialog MUST have shown them, and the real mint carries confirm:true —
+  // server-enforced, not a UI courtesy.
+  const grantMatchKind = body.data?.match === 'shape' ? 'shape' : 'exact';
+  const preview = body.data?.preview === true;
+  const confirm = body.data?.confirm === true;
+  if (body.data?.match !== undefined && body.data?.match !== 'exact' && body.data?.match !== 'shape') {
+    sendJson(res, 400, { error: "match must be 'exact' or 'shape'" });
+    return;
+  }
   const ro = grantStore.isReadOnly();
   if (ro.readOnly) {
     sendJson(res, 409, { error: `grants were written by a newer kaprek version (schema version ${ro.version}); this process opens the store READ-ONLY and cannot mint` });
@@ -1782,7 +1861,9 @@ async function handleGrantMint(req, res, { approvalStore, grantStore, getChats, 
 
   let intent;
   try {
-    intent = await approvalStore.consumeGrantIntent(approvalId, nonce);
+    // The preview PEEKS (the nonce survives so the confirmed mint can redeem
+    // it); the real mint consumes it.
+    intent = preview ? await approvalStore.peekGrantIntent(approvalId, nonce) : await approvalStore.consumeGrantIntent(approvalId, nonce);
   } catch (err) {
     if (err.already === 'unknown') {
       sendJson(res, 404, { error: err.message });
@@ -1809,11 +1890,73 @@ async function handleGrantMint(req, res, { approvalStore, grantStore, getChats, 
   } catch {
     missionPosture = null;
   }
+
+  // P6b — the shape preview: the rendered pattern sentence and the mandatory
+  // concrete examples (two the pattern WOULD cover, one it would NOT), plus
+  // the fingerprint this grant would be bound to. Nothing is stored; the
+  // nonce is still live for the confirming mint.
+  if (grantMatchKind === 'shape' && preview) {
+    if (!intent.pattern) {
+      sendJson(res, 409, {
+        error:
+          'this input cannot be safely generalised into a pattern (only a single command or a single path under the mission cwd is derivable); nothing to preview',
+        already: 'not-derivable',
+      });
+      return;
+    }
+    let missionCwd = null;
+    try {
+      missionCwd = getMissions().get(missionId)?.cwd ?? null;
+    } catch {
+      missionCwd = null;
+    }
+    sendJson(res, 200, {
+      ok: true,
+      preview: {
+        match: 'shape',
+        toolName: intent.toolName,
+        pattern: intent.pattern,
+        sentence: describePattern(intent.pattern, missionCwd ?? dataDir),
+        examples: shapeExamples(intent.pattern, missionCwd ?? dataDir),
+        fingerprint: {
+          posture: effectivePosture({ global: policy.posture, mission: missionPosture }),
+          hardDenialsHash: hardDenialsHashOf(policy),
+          missionId,
+          derivationVersion: DERIVATION_VERSION,
+        },
+      },
+    });
+    return;
+  }
+
+  // A shape mint WITHOUT the shown-examples confirmation is refused before
+  // anything else happens — even a valid nonce cannot save an invisible
+  // generalisation. Server-enforced (the check lives here, not in the UI).
+  if (grantMatchKind === 'shape') {
+    if (!confirm) {
+      sendJson(res, 409, {
+        error: 'a shape grant may only be saved after the mint preview (pattern sentence and examples) was shown and confirmed',
+        already: 'examples-not-shown',
+      });
+      return;
+    }
+    if (!intent.pattern) {
+      sendJson(res, 409, {
+        error: 'this input cannot be safely generalised into a pattern; only exact grants are possible for it',
+        already: 'not-derivable',
+      });
+      return;
+    }
+  }
+
   const postureAtGrant = effectivePosture({ global: policy.posture, mission: missionPosture });
   const grant = grantStore.mint({
     scope,
     toolName: intent.toolName,
     inputHash: intent.inputHash,
+    match: grantMatchKind,
+    pattern: grantMatchKind === 'shape' ? intent.pattern : null,
+    derivationVersion: grantMatchKind === 'shape' ? DERIVATION_VERSION : null,
     postureAtGrant,
     hardDenialsHash: hardDenialsHashOf(policy),
     missionId,
@@ -2987,6 +3130,14 @@ async function handleChatTurn(
       // P6a: the grant hash is computed over the RAW input, before
       // redaction, exactly where the raw request still exists (K1).
       computeInputHash: getGrantStore ? (rawInput) => inputHashOf(getGrantStore().salt, rawInput) : null,
+      // P6b: the shape pattern is derived from the RAW input under the SAME
+      // boundary rule (only the derived pattern — cwd-relative, narrowed —
+      // crosses, never the raw values). Only chat turns in a mission derive:
+      // grants never apply elsewhere anyway.
+      computeInputPattern:
+        getGrantStore && mission?.id
+          ? (toolName, rawInput) => derivePattern({ toolName, input: rawInput, cwd: turnCwd })
+          : null,
       signal: controller.signal,
     });
     if (result?.stopReason === 'error') turnFailed = true;

@@ -146,3 +146,68 @@ test("no error line when there is no error", () => {
   const tree = render(<ApprovalDialog approvals={stack(frame())} nowMs={0} onDecide={() => {}} />);
   expect(findAll(tree, (node) => (node.props.className as string | undefined) === "error-box")).toHaveLength(0);
 });
+
+// ---------------------------------------------------------------------------
+// P6b — the shape preview step: pattern sentence, mandatory examples
+// (labelled hit/miss), and the confirm-gated save button.
+// ---------------------------------------------------------------------------
+
+const SHAPE_PREVIEW = {
+  match: "shape" as const,
+  toolName: "Bash",
+  pattern: { v: 1, toolName: "Bash", type: "command-head" as const, keys: ["command"], head: "npm" },
+  sentence: 'every Bash call whose command starts with "npm"',
+  examples: [
+    { input: { command: "npm --help" }, matches: true },
+    { input: { command: "npm test" }, matches: true },
+    { input: { command: "git status" }, matches: false },
+  ],
+  fingerprint: { posture: "ask", hardDenialsHash: "b".repeat(64), missionId: CHAT_ID, derivationVersion: 1 },
+};
+
+test("shape preview step: renders the pattern sentence and the examples, hit and miss labelled; save is disabled until confirmed", () => {
+  const onSave = vi.fn();
+  const tree = render(
+    <ApprovalDialog
+      approvals={stack(frame())}
+      nowMs={0}
+      onDecide={() => {}}
+      shapePreview={SHAPE_PREVIEW}
+      shapeConfirmed={false}
+      onShapeConfirmToggle={() => {}}
+      onShapeSave={onSave}
+      onShapeSkip={() => {}}
+    />,
+  );
+  const text = textOf(tree);
+  expect(text).toContain("Would also allow:");
+  expect(text).toContain('every Bash call whose command starts with "npm"');
+  expect(text).toContain("would be allowed:");
+  expect(text).toContain("would NOT be allowed:");
+  expect(text).toContain('"command": "git status"');
+
+  // The confirm gate: without the checkbox, Save cannot be pressed.
+  const save = findOneByText(tree, "button", "Save standing grant");
+  expect(() => click(save)).toThrow();
+});
+
+test("shape preview step: the labelled examples are TRUE — a miss example never says it would be allowed", () => {
+  const tree = render(
+    <ApprovalDialog
+      approvals={stack(frame())}
+      nowMs={0}
+      onDecide={() => {}}
+      shapePreview={SHAPE_PREVIEW}
+      shapeConfirmed
+      onShapeConfirmToggle={() => {}}
+      onShapeSave={() => {}}
+      onShapeSkip={() => {}}
+    />,
+  );
+  const items = findAll(tree, (n) => n.type === "li");
+  const hits = items.filter((n) => textOf(n).includes("would be allowed:"));
+  const misses = items.filter((n) => textOf(n).includes("would NOT be allowed:"));
+  expect(hits).toHaveLength(2);
+  expect(misses).toHaveLength(1);
+  expect(textOf(misses[0])).toContain("git status");
+});

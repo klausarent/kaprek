@@ -269,6 +269,13 @@ export async function runTurn({
   // passes this so a grant can match, a trigger/relay turn leaves it off so
   // grants never apply there.
   computeInputHash = null,
+  // P6b: derives the SHAPE pattern from the RAW (pre-redaction) tool input
+  // under the versioned derivation rule (grants.mjs, DERIVATION_VERSION).
+  // Like the hash, only derived data crosses the redaction boundary — a
+  // directory prefix under the mission cwd or a command head, never the
+  // values themselves. Null (triggers, relay): no pattern, shape grants
+  // never apply there.
+  computeInputPattern = null,
   signal,
   maxTextLen = DEFAULT_MAX_TEXT_LEN,
   maxToolLen = DEFAULT_MAX_TOOL_LEN,
@@ -491,6 +498,10 @@ export async function runTurn({
         // over-cap form mints nothing and matches nothing, mirroring the
         // truncated approval record exactly).
         const rawInputHash = computeInputHash ? computeInputHash(request.input) : null;
+        // P6b: the shape pattern, derived beside the hash from the same raw
+        // input (null when the rule declines — see derivePattern: only what
+        // is safely generalisable gets a pattern at all).
+        const rawInputPattern = computeInputPattern ? computeInputPattern(request.toolName, request.input) : null;
         const sanitizedRequest = {
           ...request,
           toolName: sanitizedToolName,
@@ -500,6 +511,7 @@ export async function runTurn({
           reason: sanitizedReason,
           suggestions: sanitizedSuggestions,
           ...(rawInputHash ? { inputHash: rawInputHash } : {}),
+          ...(rawInputPattern ? { inputPattern: rawInputPattern } : {}),
         };
 
         // Hard denials first: what no turn may do on this machine is not a

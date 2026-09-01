@@ -10,6 +10,7 @@ import {
   shortAgentId,
   type PendingApproval,
 } from "../lib/approvals";
+import type { ShapeGrantPreview } from "../lib/api";
 
 /** The proposed tool input, pretty-printed. Rendered in a scrollable <pre> — a Write call's input can be a whole file. */
 function formatInput(input: Record<string, unknown> | null): string {
@@ -24,6 +25,57 @@ function formatInput(input: Record<string, unknown> | null): string {
   }
 }
 
+/**
+ * P6b — the second stage of the shape flow: the server-derived pattern
+ * sentence and the mandatory concrete examples, one labelled hit/miss each.
+ * The Save button stays disabled until the checkbox confirms these were
+ * actually rendered — and the server refuses the mint without the confirm
+ * anyway, so this is a doubled lock, not the only one.
+ */
+function ShapePreviewStep({
+  preview,
+  confirmed,
+  busy,
+  onToggle,
+  onSave,
+  onSkip,
+}: {
+  preview: ShapeGrantPreview;
+  confirmed: boolean;
+  busy: boolean;
+  onToggle: () => void;
+  onSave: () => void;
+  onSkip: () => void;
+}) {
+  return (
+    <div className="approval-dialog-shape">
+      <p className="approval-dialog-note">
+        Would also allow: <strong>{preview.sentence}</strong>
+      </p>
+      <ul className="approval-dialog-shape-examples">
+        {preview.examples.map((example, i) => (
+          <li key={i} className={example.matches ? "shape-example-hit" : "shape-example-miss"}>
+            {example.matches ? "✓ would be allowed:" : "✗ would NOT be allowed:"}{" "}
+            <code>{JSON.stringify(example.input)}</code>
+          </li>
+        ))}
+      </ul>
+      <label className="approval-dialog-shape-confirm">
+        <input type="checkbox" checked={confirmed} onChange={onToggle} disabled={busy} />
+        I have read what this pattern would allow
+      </label>
+      <div className="approval-dialog-actions">
+        <button type="button" className="btn" disabled={busy || !confirmed} onClick={onSave}>
+          Save standing grant
+        </button>
+        <button type="button" className="btn" disabled={busy} onClick={onSkip}>
+          Allow once only
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function ApprovalDialog({
   approvals,
   nowMs,
@@ -32,6 +84,12 @@ export default function ApprovalDialog({
   error = null,
   onDecide,
   onGrant,
+  onGrantShape,
+  shapePreview = null,
+  shapeConfirmed = false,
+  onShapeConfirmToggle,
+  onShapeSave,
+  onShapeSkip,
 }: {
   approvals: PendingApproval[];
   nowMs: number;
@@ -47,6 +105,18 @@ export default function ApprovalDialog({
    * mint (a mission chat); when absent, the button simply does not exist.
    */
   onGrant?: (entry: PendingApproval) => void;
+  /**
+   * P6b: "always, for this form of call" — allow AND seed a SHAPE grant.
+   * The dialog then moves to the preview step (pattern + examples) before
+   * anything is saved. Optional like onGrant.
+   */
+  onGrantShape?: (entry: PendingApproval) => void;
+  /** P6b: set while the shape preview step is open (the answer already happened; only the grant is pending). */
+  shapePreview?: ShapeGrantPreview | null;
+  shapeConfirmed?: boolean;
+  onShapeConfirmToggle?: () => void;
+  onShapeSave?: () => void;
+  onShapeSkip?: () => void;
 }) {
   const entry = oldestApproval(approvals);
   if (!entry) return null;
@@ -93,19 +163,41 @@ export default function ApprovalDialog({
 
       {error && <div className="error-box">{error}</div>}
 
-      <div className="approval-dialog-actions">
-        <button type="button" className="btn" disabled={busy} onClick={() => onDecide(entry, "allow")}>
-          Allow
-        </button>
-        {onGrant && (
-          <button type="button" className="btn" disabled={busy} onClick={() => onGrant(entry)} title="Allow this call, and stop asking for this exact form in this mission">
-            Always for this form
+      {shapePreview && onShapeSave && onShapeSkip && onShapeConfirmToggle ? (
+        <ShapePreviewStep
+          preview={shapePreview}
+          confirmed={shapeConfirmed}
+          busy={busy}
+          onToggle={onShapeConfirmToggle}
+          onSave={onShapeSave}
+          onSkip={onShapeSkip}
+        />
+      ) : (
+        <div className="approval-dialog-actions">
+          <button type="button" className="btn" disabled={busy} onClick={() => onDecide(entry, "allow")}>
+            Allow
           </button>
-        )}
-        <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onDecide(entry, "deny")}>
-          Deny
-        </button>
-      </div>
+          {onGrant && (
+            <button type="button" className="btn" disabled={busy} onClick={() => onGrant(entry)} title="Allow this call, and stop asking for this exact form in this mission">
+              Always for this form
+            </button>
+          )}
+          {onGrantShape && (
+            <button
+              type="button"
+              className="btn"
+              disabled={busy}
+              onClick={() => onGrantShape(entry)}
+              title="Allow this call, and stop asking for this shape of call in this mission — the server shows you first what the pattern would and would not allow"
+            >
+              Always for this form of call
+            </button>
+          )}
+          <button type="button" className="btn btn-danger" disabled={busy} onClick={() => onDecide(entry, "deny")}>
+            Deny
+          </button>
+        </div>
+      )}
     </div>
   );
 }
