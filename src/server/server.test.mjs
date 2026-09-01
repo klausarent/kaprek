@@ -4589,3 +4589,121 @@ test('GET /api/usage reads the latest subscription-window signal per harness bac
   expect(usage[0].summary).toMatchObject({ usedPercent: 80, window: 'five_hour', status: 'allowed_warning' });
   expect(usage[0].info).toMatchObject({ utilization: 0.8 });
 });
+
+// ------------------------------------------------- approval lifecycle wiring (P1)
+//
+// A harness whose turn raises one approval, walks away from it, and ends.
+// The unattended shape: filed to the inbox, nothing waiting on it.
+function abandoningHarnessFor(id) {
+  return {
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      onApprovalRequest({ id, toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      await Promise.resolve();
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: false });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'result', error: null };
+    },
+  };
+}
+
+//
+// The five callers that withdraw a question without an answer, and the
+// history route that shows what happened to it. The STORE-level behaviour
+// (race orders, retention from cancelledAt) is pinned in
+// approval-store.test.mjs; these pin that the WIRING records the honest
+// reason on each real path.
+
+test('lifecycle: a FAILED turn records its open approval as cancelled with reason run-failed', async () => {
+  const failingHarness = {
+    async startTurn({ onEvent, onApprovalRequest } = {}) {
+      onEvent?.({ type: 'init', sessionId: 's1', tools: [], model: 'm', permissionMode: 'default' });
+      // Raised and not awaited: the turn dies before anyone could answer.
+      onApprovalRequest({ id: 'doomed-1', toolName: 'Bash', displayName: 'Bash', input: { command: 'ls' } });
+      await Promise.resolve();
+      onEvent?.({ type: 'result', sessionId: 's1', costUsd: 0, usage: {}, isError: true });
+      return { sessionId: 's1', costUsd: 0, usage: {}, stopReason: 'error', error: { message: 'boom' } };
+    },
+  };
+  const { url } = await boot({ harness: failingHarness, harnessName: 'fake' });
+  await readSse(await postJson(`${url}/api/chat/turn`, { text: 'fail while asking' }));
+
+  const entries = await settledApprovalsFile(url);
+  expect(entries).toHaveLength(1);
+  expect(entries[0]).toMatchObject({ status: 'cancelled', cancelledReason: 'run-failed' });
+  expect(entries[0].decision).toBeNull();
+});
+
+test('lifecycle: deleting a trigger cancels its open filed questions, and the history route says so', async () => {
+  // The abandoning harness: the trigger's turn files its question and ends,
+  // which is the unattended case the inbox exists for.
+  const { url, runner } = await boot({ harness: abandoningHarnessFor('doomed-question'), harnessName: 'fake' });
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+  const scheduled = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect(scheduled.fired).toBe(true);
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
+
+  const removed = await deleteRequest(`${url}/api/triggers/ask-me`);
+  expect(removed.status).toBe(200);
+
+  // The pending list is empty again; the history carries the withdrawal.
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toEqual([]);
+  const history = (await (await fetch(`${url}/api/approvals?status=all`)).json()).approvals;
+  const cancelled = history.find((e) => e.triggerId === 'ask-me');
+  expect(cancelled).toMatchObject({ status: 'cancelled', cancelledReason: 'trigger-deleted' });
+  expect(typeof cancelled.cancelledAt).toBe('number');
+  expect(typeof cancelled.waitMs).toBe('number');
+});
+
+test('lifecycle: archiving a mission cancels the open questions of its chats, and the history route filters by since', async () => {
+  const harness = parkingApprovalHarness();
+  const { url } = await boot({ harness, harnessName: 'fake' });
+  const created = await fetch(`${url}/api/missions`, {
+    method: 'POST',
+    headers: APP_JSON_HEADERS,
+    body: JSON.stringify({ title: 'Ship it' }),
+  });
+  const { mission } = await created.json();
+
+  // The turn parks on its question (the harness's `asked` promise tells us
+  // the store has it) and stays parked until the test cancels the chat.
+  const chatRes = postJson(`${url}/api/chat/turn`, { text: 'ask me something', missionId: mission.id });
+  await harness.asked;
+
+  const archived = await postJson(`${url}/api/missions/${mission.id}/status`, { status: 'archived' });
+  expect(archived.status).toBe(200);
+
+  const entries = await settledApprovalsFile(url);
+  const cancelled = entries.find((e) => e.status === 'cancelled');
+  expect(cancelled).toMatchObject({ status: 'cancelled', cancelledReason: 'mission-archived' });
+
+  // since=now: the cancellation finished BEFORE this instant, so the
+  // filtered history view holds nothing of it.
+  const history = (await (await fetch(`${url}/api/approvals?status=all&since=${Date.now()}`)).json()).approvals;
+  expect(history.filter((e) => e.status === 'cancelled')).toEqual([]);
+
+  // The turn is still parked on the withdrawn question; cancelling the chat
+  // resolves the harness (no deadlock) even though the record is already
+  // cancelled — the second cancellation honestly changes nothing.
+  const chatId = (await (await fetch(`${url}/api/approvals?status=all`)).json()).approvals.find((e) => e.status === 'cancelled').chatId;
+  await postJson(`${url}/api/chat/${chatId}/cancel`);
+  const frames = await readSse(await chatRes);
+  expect(frames.at(-1)).toMatchObject({ type: 'turn-complete' });
+});
+
+test('lifecycle: a graceful shutdown cancels every open question on the record', async () => {
+  const started = await boot({ harness: abandoningHarnessFor('shutdown-question'), harnessName: 'fake' });
+  const { url, runner } = started;
+  await postJson(`${url}/api/triggers`, everyMinutesTrigger({ id: 'ask-me', escalation: 'question' }));
+  await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
+  expect((await (await fetch(`${url}/api/approvals`)).json()).approvals).toHaveLength(1);
+
+  // Take this server OUT of the shared teardown so the test owns the close.
+  servers.splice(servers.indexOf(started), 1);
+  await new Promise((resolve) => started.server.close(resolve));
+  // 'close' fires synchronously; give the store's queued write a beat.
+  await new Promise((resolve) => setTimeout(resolve, 50));
+
+  const onDisk = readApprovalsFile();
+  expect(onDisk).toHaveLength(1);
+  expect(onDisk[0]).toMatchObject({ status: 'cancelled', cancelledReason: 'shutdown' });
+});
