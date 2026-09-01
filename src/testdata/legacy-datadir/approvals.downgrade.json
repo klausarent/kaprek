@@ -1,0 +1,58 @@
+{
+  "version": 99,
+  "approvals": [
+    {
+      "id": "downgrade-chat:1",
+      "chatId": "downgrade-chat",
+      "requestId": "1",
+      "triggerId": null,
+      "mode": "deferred",
+      "askedCount": 1,
+      "toolName": "Bash",
+      "displayName": null,
+      "input": {
+        "command": "npm test"
+      },
+      "inputPreview": "{\"command\":\"npm test\"}",
+      "description": null,
+      "reason": null,
+      "agentId": null,
+      "source": null,
+      "deadlineAt": 1893456000000,
+      "requestedAt": 1788177600000,
+      "pid": 4242,
+      "status": "pending",
+      "decision": null,
+      "decidedAt": null,
+      "expired": null
+    },
+    {
+      "id": "downgrade-chat:2",
+      "chatId": "downgrade-chat",
+      "requestId": "2",
+      "triggerId": null,
+      "mode": "interactive",
+      "askedCount": 1,
+      "toolName": "Write",
+      "displayName": null,
+      "input": {
+        "file_path": "C:\\tmp\\demo\\future.txt",
+        "content": "hello from a future schema"
+      },
+      "inputPreview": "{\"file_path\":\"C:\\\\tmp\\\\demo\\\\future.txt\",\"content\":\"hello from a future schema\"}",
+      "description": null,
+      "reason": null,
+      "agentId": null,
+      "source": null,
+      "deadlineAt": 1788177600000,
+      "requestedAt": 1788177600000,
+      "pid": 4242,
+      "status": "decided",
+      "decision": {
+        "behavior": "allow"
+      },
+      "decidedAt": 1788177650000,
+      "expired": null
+    }
+  ]
+}

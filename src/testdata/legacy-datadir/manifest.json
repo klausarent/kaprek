@@ -32,6 +32,11 @@
     "context/stale-session.json": {
       "fields": "cwd, ts",
       "legacyBecause": "verwaiste State-Datei; das Test-Setzen des mtimes (>7 Tage, STATE_MAX_AGE_MS) passiert im Test an der tmpdir-Kopie, nicht an dieser Datei"
+    },
+    "approvals.downgrade.json": {
+      "fields": "version: 99 (hoeher als die heute geschriebene 1), approvals[] im heutigen Format mit einem deferred-pending- und einem decided-Eintrag",
+      "legacyBecause": "Downgrade-Fixture (P0.5): simuliert einen Bestand, den eine NEUERE kaprek-Version geschrieben hat — diese (aeltere) Binary muss die Datei read-only oeffnen: Lesen funktioniert, aber kein Write-back, kein Retention-Prune, keine 'expired: process gone'-Markierung, nichts geloescht. Feldname ist 'version', weil approval-store.mjs genau dieses Feld schreibt und seit P0.5 auch liest.",
+      "note": "Wird im Test als approvals.json in die tmpdir-Kopie gelegt (der Store liest nur diesen Dateinamen) und byte-genau gegen die Fixture-Datei geprueft."
     }
   }
 }

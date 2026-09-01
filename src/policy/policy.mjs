@@ -130,6 +130,101 @@ export function loadPolicy(dataDir) {
 }
 
 /**
+ * The fail-closed fallback for a policy.json this binary does not fully
+ * understand (unknown field, unknown version — anything validatePolicyShape()
+ * rejects on a STRUCTURALLY READABLE document). P0.5: the old fail-open
+ * loader fell back to DEFAULT_POLICY here, i.e. `posture: 'auto'` with no
+ * hard denials — a field written by a newer kaprek silently lifted the
+ * ceiling and the denials. Now the ceiling drops to 'ask' instead, and what
+ * can still be recognized from the fields present is kept.
+ *
+ * Never throws: every field is salvaged individually, anything unreadable
+ * falls back to the DEFAULT_POLICY value for that field.
+ */
+function failClosedPolicy(parsed, reason) {
+  const salvage = (value, validate) => {
+    try {
+      return validate(value);
+    } catch {
+      return null;
+    }
+  };
+  const mode = VALID_MODES.includes(parsed?.mode) ? parsed.mode : DEFAULT_POLICY.mode;
+  const rules = {
+    requireTaskDoc:
+      salvage(parsed?.rules?.requireTaskDoc, (v) => {
+        if (typeof v !== 'boolean') throw new Error();
+        return v;
+      }) ?? DEFAULT_POLICY.rules.requireTaskDoc,
+    requireCommitTask:
+      salvage(parsed?.rules?.requireCommitTask, (v) => {
+        if (typeof v !== 'boolean') throw new Error();
+        return v;
+      }) ?? DEFAULT_POLICY.rules.requireCommitTask,
+  };
+  // Hard denials "soweit erkennbar": keep every entry that still validates
+  // on its own, drop the rest — a denial from a newer schema is a floor, and
+  // keeping the recognizable ones is strictly safer than dropping them all.
+  // validateHardDenials() takes the whole array, so each rule is probed in a
+  // single-entry array.
+  let hardDenials = [];
+  if (Array.isArray(parsed?.hardDenials)) {
+    hardDenials = parsed.hardDenials
+      .map((rule) => {
+        const kept = salvage([rule], validateHardDenials);
+        return Array.isArray(kept) ? kept[0] : null;
+      })
+      .filter((rule) => rule !== null);
+  }
+  return {
+    version: typeof parsed?.version === 'number' ? parsed.version : DEFAULT_POLICY.version,
+    mode,
+    rules,
+    posture: 'ask',
+    hardDenials,
+    reason,
+  };
+}
+
+/**
+ * Same as loadPolicy(), but never throws. TWO different fallbacks, by what
+ * went wrong (P0.5):
+ *
+ *   - Missing file, unreadable file, invalid JSON: as before, DEFAULT_POLICY
+ *     (fail-open to 'observe'/'auto') — an EMPTY file says nothing, so there
+ *     is nothing newer to defer to.
+ *   - A structurally readable document this binary does not fully understand
+ *     (unknown field, unsupported version, invalid value): FAIL-CLOSED to
+ *     `posture: 'ask'` (never 'auto'), keeping every hard denial still
+ *     recognizable from the fields present. The validation error is logged
+ *     to policy.log with the reason and carried in the `reason` field.
+ */
+export function loadPolicyFailOpen(dataDir) {
+  try {
+    return loadPolicy(dataDir);
+  } catch (err) {
+    if (!(err instanceof PolicyValidationError)) {
+      return { ...clonePolicy(DEFAULT_POLICY), reason: `invalid policy.json, falling back to observe: ${err.message}` };
+    }
+    // Schema error on a readable document. Re-parse (loadPolicy threw only
+    // AFTER a successful parse) and degrade fail-closed.
+    let parsed = null;
+    try {
+      parsed = JSON.parse(fs.readFileSync(policyPathFor(dataDir), 'utf8').replace(/^﻿/, ''));
+    } catch {
+      // Cannot happen in practice (loadPolicy parsed it a moment ago); the
+      // null case below still degrades safely.
+    }
+    const reason = `policy.json failed schema validation, loading fail-closed to posture 'ask': ${err.message}`;
+    const policy = parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? failClosedPolicy(parsed, reason)
+      : { ...clonePolicy(DEFAULT_POLICY), posture: 'ask', reason };
+    logPolicy(dataDir, { event: 'policy-load', outcome: 'fail-closed', reason });
+    return policy;
+  }
+}
+
+/**
  * A short, stable fingerprint of the loaded policy — what a receipt can
  * name as "the rules this was done under". Same input, same string.
  */
@@ -142,15 +237,6 @@ export function policyVersion(policy) {
     hardDenials: policy?.hardDenials ?? [],
   });
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
-}
-
-/** Same as loadPolicy(), but never throws — a schema error also falls back to observe. */
-export function loadPolicyFailOpen(dataDir) {
-  try {
-    return loadPolicy(dataDir);
-  } catch (err) {
-    return { ...clonePolicy(DEFAULT_POLICY), reason: `invalid policy.json, falling back to observe: ${err.message}` };
-  }
 }
 
 /** Appends one JSONL line to <dataDir>/policy.log. Errors are swallowed — logging must never break the hook. */
