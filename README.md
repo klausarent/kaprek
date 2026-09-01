@@ -68,6 +68,11 @@ works from all of those anyway:
 npx kaprek@latest
 ```
 
+kaprek reads data directories written by older versions without complaint —
+a missing field means the old behavior, never a crash. The fixtures pinning
+those older formats live in `src/testdata/legacy-datadir/`, and every change
+to a file format extends them.
+
 ## Flags
 
 | Flag | Default | Description |
