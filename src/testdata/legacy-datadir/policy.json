@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "mode": "observe",
+  "rules": {
+    "requireTaskDoc": true,
+    "requireCommitTask": true
+  }
+}
