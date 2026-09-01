@@ -2086,6 +2086,9 @@ async function handleMemoryRoutes(req, res, segments, url, { dataDir }) {
           text: body.data?.text,
           kind: body.data?.kind ?? 'fact',
           origin: body.data?.origin ?? 'person',
+          // P4b: a hand-written entry has no thread and no file behind it —
+          // sourceKind 'manual' says so on the record.
+          sourceKind: 'manual',
           ...(typeof body.data?.confidence === 'number' ? { confidence: body.data.confidence } : {}),
         }),
       });

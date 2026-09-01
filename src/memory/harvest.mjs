@@ -194,7 +194,10 @@ export function harvestRemember({
             skipped++;
             continue;
           }
-          memory.remember({ scopeId, text: entry.text, kind: entry.kind, confidence: entry.confidence, origin: `terminal:${sessionId}` });
+          // P4b: harvested from a terminal session's transcript — same
+          // 'turn' provenance as kaprek's own chat turns, with the session
+          // id as the chat pointer.
+          memory.remember({ scopeId, text: entry.text, kind: entry.kind, confidence: entry.confidence, origin: `terminal:${sessionId}`, sourceKind: 'turn', chatId: sessionId });
           known.add(hash);
           written++;
         }

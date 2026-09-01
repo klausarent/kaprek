@@ -1560,6 +1560,9 @@ export async function fetchEnvironment(): Promise<EnvironmentReport> {
 
 export type MemoryScope = { id: string; kind: string; label: string; parent: string | null };
 
+/** Where a memory was learned (P4b). Absent/null on lines written before provenance existed — valid, marked, never hidden. */
+export type MemorySourceKind = "turn" | "file" | "import" | "manual";
+
 export type MemoryEntry = {
   id: string;
   scopeId: string;
@@ -1568,7 +1571,8 @@ export type MemoryEntry = {
   origin: string;
   confidence: number;
   createdAt: string;
-  lastVerifiedAt: string;
+  /** Null on an imported entry: believed, checked by nobody until "Still true". */
+  lastVerifiedAt: string | null;
   evidenceRef: { sessionId: string; eventIndex: number } | null;
   forgotten: boolean;
   forgottenReason?: string | null;
@@ -1579,6 +1583,15 @@ export type MemoryEntry = {
   confirmations?: number;
   /** Every distinct origin that learned it, oldest first (bounded). */
   origins?: string[];
+  /** Provenance (P4b): where this was learned, rendered as a link when it points anywhere. */
+  sourceKind?: MemorySourceKind | null;
+  chatId?: string | null;
+  runId?: string | null;
+  /** Redacted like every other text; the file's contents are never copied. */
+  path?: string | null;
+  pathRange?: { from: number; to: number } | null;
+  /** True while lastVerifiedAt is null — shown at the top, marked unconfirmed. */
+  unverified?: boolean;
 };
 
 export async function fetchMemoryScopes(): Promise<MemoryScope[]> {

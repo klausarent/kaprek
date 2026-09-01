@@ -21,6 +21,10 @@
       "legacyBecause": "user_version 1 < SCHEMA_VERSION 2 (v2 hat 'mentioned' hinzugefuegt)",
       "note": "ACHTUNG, by design: openSearchDb() droppt beim Oeffnen einer Datei mit niedrigerer user_version saemtliche Tabellen und setzt user_version = 2 (src/search/index.mjs). Diese Datei ist beim ersten Oeffnen bewusst weg — der Byte-Gleichheits-Check im Test schliesst sie aus. WAL-Modus erzeugt zusaetzlich search.db-wal/-shm."
     },
+    "memory/events.jsonl": {
+      "fields": "scope.created- und memory.remembered-Events ohne schemaVersion (P0.5: zaehlt als Version 1) und ohne Herkunfts-Felder (P4b: sourceKind/chatId/runId/path/pathRange)",
+      "legacyBecause": "Altbestand ohne Herkunft — openMemory() liest ihn gueltig; die Oberflaeche kennzeichnet solche Eintraege ('ohne Herkunft'), versteckt sie nie"
+    },
     "presets/nightly-refactor.json": {
       "fields": "id, title, description, goalTemplate, firstPrompt",
       "legacyBecause": "gueltiges Nutzer-Preset im heutigen Format (loadPresets-Kontrast zum kaputten Nachbarn)"

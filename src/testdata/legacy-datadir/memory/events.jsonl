@@ -1,0 +1,3 @@
+{"id":"legacy-mem-1","ts":"2026-08-24T08:00:00.000Z","type":"scope.created","data":{"id":"person:local","kind":"person","label":"local","parent":null}}
+{"id":"legacy-mem-2","ts":"2026-08-24T08:00:01.000Z","type":"scope.created","data":{"id":"project:legacy","kind":"project","label":"legacy","parent":"person:local"}}
+{"id":"legacy-mem-3","ts":"2026-08-24T08:05:00.000Z","type":"memory.remembered","memoryId":"legacy-fact-1","data":{"scopeId":"project:legacy","text":"the legacy fixture's deploy runs nightly at 03:00 UTC","kind":"fact","origin":"chat:legacy-chat:1","confidence":0.8,"evidenceRef":null,"createdAt":"2026-08-24T08:05:00.000Z","lastVerifiedAt":"2026-08-24T08:05:00.000Z"}}

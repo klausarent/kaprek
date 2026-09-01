@@ -235,7 +235,9 @@ function syncOneFile({ memoryDir, name, files, scopeMap, existingScopeIds, memor
 
   const kind = frontmatter.type === 'user' ? 'profile' : 'fact';
   try {
-    const outcome = memory.remember({ scopeId, text, kind, origin: `memory-sync:${name}`, confidence: 0.9 });
+    // P4b: the memory file itself is the source — remembered with its path
+    // (redacted by the store before the write), never with its contents.
+    const outcome = memory.remember({ scopeId, text, kind, origin: `memory-sync:${name}`, confidence: 0.9, sourceKind: 'file', path: fullPath });
     files[name] = state;
     return outcome.confirmed ? 'confirmed' : 'written';
   } catch {

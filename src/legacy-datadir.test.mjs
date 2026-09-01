@@ -24,6 +24,7 @@ import { loadPolicyFailOpen } from './policy/policy.mjs';
 import { readLedgerIndex, readSessionEvents } from './ledger/sessions.mjs';
 import { openSearchDb } from './search/index.mjs';
 import { loadPresets } from './missions/presets.mjs';
+import { openMemory } from './memory/store.mjs';
 import { STATE_MAX_AGE_MS, readContextState, sweepOldContextState } from './policy/prompt-context-state.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -117,6 +118,27 @@ describe('legacy datadir fixtures', () => {
     } finally {
       db.close();
     }
+  });
+
+  // P4b: a memory event written BEFORE provenance existed — no schemaVersion
+  // (counts as version 1 per the P0.5 gate) and no
+  // sourceKind/chatId/runId/path. Reading it must not crash and must not
+  // invent provenance: the entry stays valid, the UI marks it "ohne
+  // Herkunft" instead of hiding it.
+  it('reads a memory event without provenance fields — marked as without origin, never crashed on', () => {
+    const dataDir = copyFixture();
+    const memory = openMemory(dataDir);
+    const entries = memory.list();
+    expect(entries.map((e) => e.id)).toContain('legacy-fact-1');
+    const legacy = entries.find((e) => e.id === 'legacy-fact-1');
+    expect(legacy.text).toBe("the legacy fixture's deploy runs nightly at 03:00 UTC");
+    expect(legacy.sourceKind).toBeUndefined();
+    expect(legacy.chatId).toBeUndefined();
+    expect(legacy.path).toBeUndefined();
+    // A legacy line carries its old verification stamp — it is not treated
+    // as an unconfirmed import.
+    expect(legacy.lastVerifiedAt).toBe('2026-08-24T08:05:00.000Z');
+    expect(legacy.unverified).toBe(false);
   });
 
   it('loads presets: the valid one lands, the broken one is skipped without a throw', () => {

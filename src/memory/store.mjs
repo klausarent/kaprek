@@ -25,6 +25,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { validateScope, visibleScopes } from './scopes.mjs';
+import { redactSecrets } from '../parser/parse.mjs';
 
 /**
  * The three layers, read in this order (the L0–L3 shape TencentDB describes:
@@ -35,6 +36,9 @@ import { validateScope, visibleScopes } from './scopes.mjs';
  *   evidence  where a fact came from, as a reference
  */
 export const MEMORY_KINDS = ['profile', 'fact', 'evidence'];
+
+/** Where a memory was learned. ALM 1.2: every line is quotable back to its source. */
+export const SOURCE_KINDS = ['turn', 'file', 'import', 'manual'];
 
 /** After this long without a verify, a fact comes back marked stale. */
 export const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
@@ -114,14 +118,18 @@ function applyEvent(state, event) {
   // A second agent (or a later turn) learning the same thing: not a second
   // entry, a confirmation — the count, the sources and the clock move. That
   // is what makes a fact carry its own weight: "3 sessions, last week"
-  // rather than one line that could be anyone's guess.
+  // rather than one line that could be anyone's guess. The clock only moves
+  // when the confirming write is itself a checked source: an import that
+  // re-states an unverified fact is still nobody's verification, so it
+  // passes `touchVerified: false` and the entry stays unconfirmed.
   else if (event.type === 'memory.confirmed') {
     const origins = existing.origins ?? [existing.origin];
     const origin = typeof event.data?.origin === 'string' ? event.data.origin : null;
+    const touchVerified = event.data?.touchVerified !== false;
     facts.set(event.memoryId, {
       ...existing,
       confirmations: (existing.confirmations ?? 1) + 1,
-      lastVerifiedAt: event.ts,
+      lastVerifiedAt: touchVerified ? event.ts : existing.lastVerifiedAt ?? null,
       confidence: Math.max(existing.confidence ?? 0, typeof event.data?.confidence === 'number' ? event.data.confidence : 0),
       origins: origin && !origins.includes(origin) ? [...origins, origin].slice(-MAX_ORIGINS) : origins,
     });
@@ -168,7 +176,18 @@ export function openMemory(dataDir, { now = Date.now } = {}) {
   /** A fact plus the two things a reader has to know about it before using it. */
   function decorate(fact) {
     const age = now() - Date.parse(fact.lastVerifiedAt ?? fact.createdAt);
-    return { confirmations: 1, origins: [fact.origin], ...JSON.parse(JSON.stringify(fact)), stale: age > MAX_AGE_MS, ageMs: age };
+    // An imported fact starts with lastVerifiedAt: null — believed by a file,
+    // checked by nobody. It is shown like everything else, marked
+    // "unconfirmed", until a human presses "Still true".
+    const unverified = fact.lastVerifiedAt == null;
+    return {
+      confirmations: 1,
+      origins: [fact.origin],
+      ...JSON.parse(JSON.stringify(fact)),
+      stale: !unverified && age > MAX_AGE_MS,
+      unverified,
+      ageMs: age,
+    };
   }
 
   return {
@@ -192,26 +211,57 @@ export function openMemory(dataDir, { now = Date.now } = {}) {
      * @param {string} options.origin - how it was learned (a chat id, a run, a person)
      * @param {number} [options.confidence] - 0..1
      * @param {{sessionId: string, eventIndex: number}} [options.evidenceRef] - a pointer, never an excerpt
+     * @param {'turn'|'file'|'import'|'manual'} [options.sourceKind] - where this came from (P4b); absent on legacy lines, which is a valid state, not an error
+     * @param {string} [options.chatId] - the chat this turn belongs to
+     * @param {string} [options.runId] - the relay/agent run this turn belongs to
+     * @param {string} [options.path] - the file this was learned from; redacted like any other text, contents never copied
+     * @param {{from: number, to: number}} [options.pathRange] - the line range inside `path`
+     * @param {boolean} [options.unverified] - write lastVerifiedAt as null: believed, checked by nobody (imports)
      */
-    remember({ scopeId, text, kind = 'fact', origin, confidence = 0.8, evidenceRef = null }) {
+    remember({ scopeId, text, kind = 'fact', origin, confidence = 0.8, evidenceRef = null, sourceKind = null, chatId = null, runId = null, path: sourcePath = null, pathRange = null, unverified = false }) {
       if (!state.scopes.has(scopeId)) throw new InvalidMemoryError('scopeId', `unknown scope: ${scopeId} — a memory with no owner would be visible to nobody`);
       if (typeof text !== 'string' || text.trim() === '') throw new InvalidMemoryError('text', 'a memory needs text');
       if (!MEMORY_KINDS.includes(kind)) throw new InvalidMemoryError('kind', `kind must be one of ${MEMORY_KINDS.join(', ')}`);
       if (typeof origin !== 'string' || origin.trim() === '') throw new InvalidMemoryError('origin', 'a memory needs an origin — a fact nobody can trace is a rumour');
       if (typeof confidence !== 'number' || confidence < 0 || confidence > 1) throw new InvalidMemoryError('confidence', 'confidence must be between 0 and 1');
+      if (sourceKind !== null && !SOURCE_KINDS.includes(sourceKind)) throw new InvalidMemoryError('sourceKind', `sourceKind must be one of ${SOURCE_KINDS.join(', ')}`);
+      if (pathRange != null && (typeof pathRange !== 'object' || !Number.isInteger(pathRange.from) || !Number.isInteger(pathRange.to))) {
+        throw new InvalidMemoryError('pathRange', 'pathRange needs integer from/to');
+      }
+
+      // Herkunft is text too. A secret that surfaced inside a file path goes
+      // through the same redaction pass as the fact itself — the path yes,
+      // the file's contents never (evidence is a pointer, not a copy).
+      const cleanSourcePath = typeof sourcePath === 'string' && sourcePath !== '' ? redactSecrets(sourcePath) : null;
 
       // The same thing, already known in this scope and not withdrawn: a
       // confirmation, not a twin. The stale clock resets on its own when
       // work re-learns a fact — which is the honest way to keep it fresh.
+      // An unverified write (an import) does not reset it: restating a guess
+      // is not checking it.
       const twin = [...state.facts.values()].find((fact) => fact.scopeId === scopeId && fact.kind === kind && !fact.forgotten && sameText(fact.text, text));
       if (twin) {
-        commit('memory.confirmed', twin.id, { origin, confidence });
+        commit('memory.confirmed', twin.id, { origin, confidence, ...(unverified ? { touchVerified: false } : {}) });
         return { ...decorate(state.facts.get(twin.id)), confirmed: true };
       }
 
       const id = crypto.randomUUID();
       const ts = new Date(now()).toISOString();
-      commit('memory.remembered', id, { scopeId, text: text.trim(), kind, origin, confidence, evidenceRef, createdAt: ts, lastVerifiedAt: ts });
+      commit('memory.remembered', id, {
+        scopeId,
+        text: text.trim(),
+        kind,
+        origin,
+        confidence,
+        evidenceRef,
+        createdAt: ts,
+        lastVerifiedAt: unverified ? null : ts,
+        sourceKind,
+        chatId,
+        runId,
+        path: cleanSourcePath,
+        pathRange: cleanSourcePath === null ? null : pathRange,
+      });
       return decorate(state.facts.get(id));
     },
 

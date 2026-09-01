@@ -117,6 +117,30 @@ describe('facts', () => {
     expect(scope).toBeDefined();
     expect(scope.parent).toBe('person:local');
   });
+
+  // P4b: the import names its source instead of discarding it, and writes
+  // what it learned UNVERIFIED — an import that stamped its guesses as
+  // checked facts would poison the memory faster than a person can correct
+  // it. Only "Still true" sets the verification stamp.
+  test('imported facts carry their source and start unverified', () => {
+    importManifest({
+      dataDir,
+      scopeMap: SCOPE_MAP,
+      facts: [{ scopeId: 'project:ccview', kind: 'fact', text: 'Aus einer alten Notiz übernommen.', origin: 'import:test', path: 'C:\\notes\\alt.md' }],
+      now,
+    });
+    const memory = openMemory(dataDir, { now });
+    const stored = memory.list({ scopeId: 'project:ccview' })[0];
+    expect(stored.sourceKind).toBe('import');
+    expect(stored.path).toBe('C:\\notes\\alt.md');
+    expect(stored.lastVerifiedAt).toBe(null);
+    expect(stored.unverified).toBe(true);
+
+    // "Still true" — the ordinary verify path — is what turns it into a
+    // checked fact.
+    memory.verify(stored.id);
+    expect(memory.get(stored.id)).toMatchObject({ lastVerifiedAt: new Date(now()).toISOString(), unverified: false });
+  });
 });
 
 describe('missions', () => {
