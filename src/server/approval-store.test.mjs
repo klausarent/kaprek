@@ -771,3 +771,184 @@ test('deferred: an entry inside its deadline is untouched by the sweep', async (
   clock += 9_999;
   expect(await store.listPending()).toHaveLength(1);
 });
+
+// ------------------------------------------------------- approval lifecycle (P1)
+//
+// `cancelled` — a question withdrawn without an answer, by the run that asked
+// it, the trigger that lost it, the mission that archived it, or the server
+// shutting down. With its own cancelledAt, so the retention clock starts at
+// the withdrawal, not at the question.
+
+test('cancel: a pending entry becomes cancelled with its reason and its own cancelledAt', async () => {
+  let clock = 5_000;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), now: () => clock });
+  await store.put(deferredEntry({ requestedAt: 1_000 }));
+
+  const result = await store.cancel('chat-1:req-1', { reason: 'trigger-deleted' });
+  expect(result).toMatchObject({ ok: true });
+  expect(result.entry).toMatchObject({ status: 'cancelled', cancelledAt: 5_000, cancelledReason: 'trigger-deleted' });
+  // Gone from the inbox, present in the record.
+  expect(await store.listPending()).toEqual([]);
+  expect(await store.get('chat-1:req-1')).toMatchObject({ status: 'cancelled' });
+});
+
+test('cancel: only a pending entry can be cancelled, and the response says what beat it', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'd1', toolName: 'Bash', requestedAt: 0 });
+  // Real deadlines: the sweep runs against the store's own (real) clock, so
+  // an epoch-era deadline is "past" the moment it is written.
+  const soon = Date.now() + 1;
+  const late = Date.now() + 600_000;
+  await store.put({ id: 'l1', toolName: 'Bash', mode: 'deferred', requestedAt: 0, deadlineAt: soon });
+  await store.put({ id: 'c1', toolName: 'Bash', mode: 'deferred', requestedAt: 0, deadlineAt: late });
+
+  await store.decide('d1', { behavior: 'allow' });
+  await expect(store.cancel('d1', { reason: 'shutdown' })).resolves.toMatchObject({ ok: false, already: 'decided' });
+  // The sweep runs at the head of the next operation, so the short-deadline
+  // entry is lapsed by the time this cancel is served.
+  await expect(store.cancel('l1', { reason: 'shutdown' })).resolves.toMatchObject({ ok: false, already: 'lapsed' });
+  // Unknown id: refused without pretending.
+  await expect(store.cancel('never-there', { reason: 'shutdown' })).resolves.toMatchObject({ ok: false, error: 'unknown' });
+  // cancelled is idempotent: ok, but no second event — cancelledAt unchanged.
+  await store.cancel('c1', { reason: 'shutdown' });
+  const firstAt = (await store.get('c1')).cancelledAt;
+  await expect(store.cancel('c1', { reason: 'shutdown' })).resolves.toMatchObject({ ok: true, already: 'cancelled' });
+  expect((await store.get('c1')).cancelledAt).toBe(firstAt);
+});
+
+test('cancel: a reason outside CANCELLED_REASONS is refused, not silently accepted', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'a1', toolName: 'Bash', requestedAt: 0 });
+  await expect(store.cancel('a1', { reason: 'because' })).rejects.toThrow(/CANCELLED_REASONS/);
+  await expect(store.cancel('a1', {})).rejects.toThrow(/CANCELLED_REASONS/);
+  // Still pending — a refused cancel must not have consumed the entry.
+  expect((await store.listPending()).map((e) => e.id)).toEqual(['a1']);
+});
+
+test('M6 race, order decide->cancel: the decision wins, the cancel reports it honestly', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'r1', toolName: 'Bash', requestedAt: 0 });
+  // Same tick: both queued before either runs, so ARRIVAL order decides.
+  const [decided, cancelled] = await Promise.all([
+    store.decide('r1', { behavior: 'allow', via: 'web' }),
+    store.cancel('r1', { reason: 'run-aborted' }),
+  ]);
+  expect(decided.status).toBe('decided');
+  expect(cancelled).toMatchObject({ ok: false, already: 'decided' });
+  expect(await store.get('r1')).toMatchObject({ status: 'decided', decision: { behavior: 'allow' } });
+});
+
+test('M6 race, order cancel->decide: the cancellation wins, the decide is refused with already', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'r2', toolName: 'Bash', requestedAt: 0 });
+  const [cancelled, decided] = await Promise.all([
+    store.cancel('r2', { reason: 'run-aborted' }),
+    store.decide('r2', { behavior: 'allow' }).catch((err) => err),
+  ]);
+  expect(cancelled).toMatchObject({ ok: true });
+  expect(decided).toBeInstanceOf(Error);
+  expect(decided.already).toBe('cancelled');
+  expect(await store.get('r2')).toMatchObject({ status: 'cancelled', cancelledReason: 'run-aborted' });
+});
+
+test('M6: cancel after the sweep deadline hits lapsed, and decide on cancelled is refused with already', async () => {
+  let clock = 1_000;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog(), now: () => clock });
+  await store.put(deferredEntry({ requestedAt: clock, deadlineAt: clock + 5_000 }));
+
+  clock += 5_001; // past the deadline: the sweep runs at the head of cancel()
+  await expect(store.cancel('chat-1:req-1', { reason: 'run-aborted' })).resolves.toMatchObject({ ok: false, already: 'lapsed' });
+
+  // And the mirror case: cancel first, then someone clicks Allow anyway.
+  await store.put(deferredEntry({ id: 'chat-1:req-2', requestId: 'req-2', requestedAt: clock, deadlineAt: clock + 5_000 }));
+  await store.cancel('chat-1:req-2', { reason: 'run-aborted' });
+  await expect(store.decide('chat-1:req-2', { behavior: 'allow' })).rejects.toMatchObject({ already: 'cancelled' });
+});
+
+test('H4 retention: a cancelled entry is kept until cancelledAt + 7d, not requestedAt + 7d', async () => {
+  let clock = 0;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), now: () => clock, log: collectingLog() });
+  // A question asked three days before it was cancelled — counting from
+  // requestedAt would prune it three days early.
+  // Deadline beyond the cancel instant (3d), so the sweep never gets there
+  // first — this test is about the RETENTION clock, not the lapse one.
+  await store.put({ id: 'old-question', toolName: 'Bash', mode: 'deferred', requestedAt: 0, deadlineAt: APPROVAL_HISTORY_RETENTION_MS });
+  clock = 3 * 24 * 60 * 60_000;
+  await store.cancel('old-question', { reason: 'mission-archived' });
+
+  // Just before cancelledAt + 7d: kept. One millisecond past: pruned.
+  clock = 3 * 24 * 60 * 60_000 + APPROVAL_HISTORY_RETENTION_MS - 1;
+  await store.put({ id: 'tickle-1', toolName: 'Bash', requestedAt: clock });
+  expect(await store.get('old-question')).toMatchObject({ status: 'cancelled' });
+
+  clock = 3 * 24 * 60 * 60_000 + APPROVAL_HISTORY_RETENTION_MS + 1;
+  await store.put({ id: 'tickle-2', toolName: 'Bash', requestedAt: clock });
+  expect(await store.get('old-question')).toBeNull();
+});
+
+test("cancelOpen: trigger deletion cancels exactly that trigger's open questions, over the store's own id list", async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  // Distinct inputs: the dedupe would otherwise file these two as ONE
+  // repeated question (same trigger, same tool, same input).
+  await store.put(deferredEntry({ id: 'c1:req-1', requestId: 'req-1', chatId: 'c1', triggerId: 'nightly', input: { command: 'a' } }));
+  await store.put(deferredEntry({ id: 'c2:req-2', requestId: 'req-2', chatId: 'c2', triggerId: 'nightly', input: { command: 'b' } }));
+  await store.put(deferredEntry({ id: 'c3:req-3', requestId: 'req-3', chatId: 'c3', triggerId: 'other' }));
+
+  await store.put({ id: 'c4:req-4', requestId: 'req-4', chatId: 'c4', toolName: 'Bash', requestedAt: Date.now(), deadlineAt: Date.now() + 600_000 });
+
+  const result = await store.cancelOpen({ reason: 'trigger-deleted', match: (entry) => entry.triggerId === 'nightly' });
+  expect(result.cancelled.sort()).toEqual(['c1:req-1', 'c2:req-2']);
+  expect((await store.listPending()).map((e) => e.id).sort()).toEqual(['c3:req-3', 'c4:req-4']);
+  expect(await store.get('c1:req-1')).toMatchObject({ status: 'cancelled', cancelledReason: 'trigger-deleted' });
+});
+
+test("cancelOpen: mission archive cancels by the mission's chat ids; shutdown cancels every open question", async () => {
+  const dataDir = await tmpDataDir();
+  const store = createApprovalStore({ dataDir, log: collectingLog() });
+  await store.put(deferredEntry({ id: 'm1:req-1', requestId: 'req-1', chatId: 'm1', triggerId: 't' }));
+  await store.put({ id: 'm2:req-2', requestId: 'req-2', chatId: 'm2', toolName: 'Bash', requestedAt: Date.now(), deadlineAt: Date.now() + 600_000 });
+
+  const missionChats = new Set(['m1']);
+  await store.cancelOpen({ reason: 'mission-archived', match: (entry) => entry.chatId !== null && missionChats.has(entry.chatId) });
+  expect(await store.get('m1:req-1')).toMatchObject({ status: 'cancelled', cancelledReason: 'mission-archived' });
+  expect((await store.listPending()).map((e) => e.id)).toEqual(['m2:req-2']);
+
+  await store.cancelOpen({ reason: 'shutdown' });
+  expect(await store.listPending()).toEqual([]);
+  expect(await store.get('m2:req-2')).toMatchObject({ status: 'cancelled', cancelledReason: 'shutdown', cancelledAt: expect.any(Number) });
+  // The shutdown cancellation is on disk, so a restart does not resurrect it.
+  const second = createApprovalStore({ dataDir, log: collectingLog() });
+  expect(await second.listPending()).toEqual([]);
+  expect(await second.get('m1:req-1')).toMatchObject({ status: 'cancelled' });
+});
+
+test('history: listHistory returns finished entries newest-first, and pending ones never', async () => {
+  let clock = 0;
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), now: () => clock, log: collectingLog() });
+  await store.put({ id: 'first', toolName: 'Bash', requestedAt: 0 });
+  clock = 100;
+  await store.decide('first', { behavior: 'deny', message: 'nope', via: 'phone-token' });
+  await store.put({ id: 'second', toolName: 'Write', mode: 'deferred', requestedAt: clock, deadlineAt: clock + 10_000 });
+  clock = 200;
+  await store.cancel('second', { reason: 'run-aborted' });
+  await store.put({ id: 'still-open', toolName: 'Bash', requestedAt: clock });
+
+  const history = await store.listHistory();
+  expect(history.map((e) => e.id)).toEqual(['second', 'first']);
+  expect(history[0]).toMatchObject({ status: 'cancelled', cancelledReason: 'run-aborted' });
+  // The recorded channel survives: WHO answered is part of the record.
+  expect(history[1]).toMatchObject({ status: 'decided', decidedVia: 'phone-token', decision: { behavior: 'deny', message: 'nope' } });
+  // Filters: since on the entry's end, limit on the sorted list.
+  expect((await store.listHistory({ since: 150 })).map((e) => e.id)).toEqual(['second']);
+  expect((await store.listHistory({ limit: 1 })).map((e) => e.id)).toEqual(['second']);
+});
+
+test('runId: an entry put with one keeps it, and one without simply has no such field', async () => {
+  const store = createApprovalStore({ dataDir: await tmpDataDir(), log: collectingLog() });
+  await store.put({ id: 'relay:abc:rounds-1', toolName: 'relay', mode: 'deferred', requestedAt: 0, deadlineAt: 10_000, runId: 'abc' });
+  await store.put({ id: 'plain', toolName: 'Bash', requestedAt: 0 });
+
+  expect(await store.get('relay:abc:rounds-1')).toMatchObject({ runId: 'abc' });
+  // Never a null invented to fill a column: the field is absent.
+  expect((await store.get('plain')).runId).toBeUndefined();
+});
