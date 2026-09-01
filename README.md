@@ -101,8 +101,13 @@ to a file format extends them.
 - Guided planning: say what you want to build and answer a few cards instead of a wall of questions; the plan lands at a path kaprek chose and shows up under [Plans](#plans) — with its full path, so you never go hunting through folders for it.
 - Council: put your engines in four roles (lead, thinker, worker, peer) and ask the ones you are not using for a second opinion — kaprek shows where they disagree rather than smoothing it over. See [Council](#council).
 - Recipes: a relay run's shape is a file, not code — who takes part, which handoff asks you first, which step may touch files. See [Relays and recipes](#relays-and-recipes).
-- Memory with scopes: what one agent learned is there for the next one, and a scope that is not on your path upwards is invisible — see [Memory](#memory).
-- Setup page (`#/setup`): which agent CLIs are installed and signed in on this machine, where their config lives, which MCP servers they have, and which keys your `.env` defines — paths and names only, never a value.
+- Memory with scopes: what one agent learned is there for the next one, and a scope that is not on your path upwards is invisible — see [Memory](#memory). Every entry carries its provenance (turn, file, import, manual) as a link; imported facts start unconfirmed.
+- Standing grants: answer a question with **Always for this form** and kaprek stops asking for that one exact call — bound to the authorities you saw when you confirmed, reactivation asked once when those change, no expiry, revocable — see [Standing grants](#standing-grants).
+- Approval history: every filed question that is no longer waiting shows what became of it — decision, who answered, how long it waited — and a run that died cancels its open questions instead of leaving them looking answerable — see [Approvals](#approvals).
+- Skip-if conditions on triggers: a schedule whose precondition is false skips without a turn, a cost, or a notify; a broken condition skips too, loudly, and says `degraded` after five errors in a row.
+- Morning digest per mission: one Markdown page of what ran at night, what is asking, and what it cost — numbers only, no model call — see [Missions](#missions).
+- `kaprek doctor`: one command that checks transcript drift, hook installs, search-index and policy versions, presets, the ledger, and standing grants — and fixes only the two things that are safe to fix — see [kaprek doctor](#kaprek-doctor).
+- Setup page (`#/setup`): which agent CLIs are installed and signed in on this machine, where their config lives, which MCP servers they have, which keys your `.env` defines — paths and names only, never a value — and how many standing grants are active.
 
 ## Missions
 
