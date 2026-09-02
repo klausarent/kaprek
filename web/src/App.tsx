@@ -305,6 +305,98 @@ function StatusDot() {
 }
 
 /**
+ * Die linke Rail der Shell — auf JEDER Seite sichtbar, im Variant-B-Stil
+ * (wireframes/variant-b.html): Logo, die fünf Haupteinträge, darunter die
+ * "more"-Sektion, unten Platz für Statusanzeige und globale Suche.
+ *
+ * Hook-frei und nach außen exportiert, damit Render-Tests sie ohne DOM
+ * begehen können (siehe src/test/tree.tsx — dieses Repo hat keine
+ * Web-Test-Abhängigkeiten und soll auch keine bekommen). Alles Zuständliche
+ * (aktive Route, Inbox-Zähler, Fußzeile) kommt als Prop von App.
+ */
+export function Rail({
+  route,
+  pendingCount,
+  footer,
+}: {
+  route: Route;
+  pendingCount: number;
+  footer?: React.ReactNode;
+}) {
+  return (
+    <nav className="rail" aria-label="Hauptnavigation">
+      <a
+        href="#/start"
+        className="rail-logo"
+        onClick={(e) => {
+          e.preventDefault();
+          navigateToStart();
+        }}
+      >
+        kaprek
+      </a>
+      {NAV_ITEMS.map((item) => (
+        <a
+          key={item.href}
+          href={item.href}
+          className={item.isActive(route) ? "on" : ""}
+          onClick={(e) => {
+            e.preventDefault();
+            item.navigate();
+          }}
+        >
+          {item.label}
+          {/* Der einzige Zähler der Rail: offene Fragen. Eine Nummer hier
+              ist der Grund, die Inbox heute zu öffnen — nichts anderes wird
+              erfunden. */}
+          {item.label === "Inbox" && pendingCount > 0 && <span className="rail-badge">{pendingCount}</span>}
+        </a>
+      ))}
+      <div className="rail-sect">more</div>
+      {MORE_ITEMS.map((item) => (
+        <a
+          key={item.href}
+          href={item.href}
+          className={item.href === "#/search" && route.name === "search" ? "on" : ""}
+          onClick={(e) => {
+            e.preventDefault();
+            item.navigate();
+          }}
+        >
+          {item.label}
+        </a>
+      ))}
+      {footer && <div className="rail-foot">{footer}</div>}
+    </nav>
+  );
+}
+
+/**
+ * Die dauerhafte Shell um ALLE Seiten: Rail links, Arbeitsfläche rechts —
+ * auf #/start zusätzlich die Feed-Spalte ganz rechts (Start liefert sie als
+ * zweites Fragment-Kind, damit sie eine echte Grid-Spalte der Shell ist und
+ * keine schmale Box im Inhalt). Hook-frei, gleiches Test-Prinzip wie Rail.
+ */
+export function AppShell({
+  route,
+  pendingCount,
+  footer,
+  children,
+}: {
+  route: Route;
+  pendingCount: number;
+  footer?: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={`shell${route.name === "start" ? " shell-has-feed" : ""}`}>
+      <Rail route={route} pendingCount={pendingCount} footer={footer} />
+      {children}
+    </div>
+  );
+}
+
+/**
  * Shown instead of the app when index.html carried no instance-token meta tag
  * (see lib/api.ts). Every /api/* call would be a 401, so there is nothing
  * useful to render — and no way for the page to recover on its own.
@@ -338,10 +430,9 @@ export const NAV_ITEMS: { href: string; label: string; navigate: () => void; isA
 ];
 
 /**
- * The rest of the surface, one click behind "more" — every one an existing
- * page, none needed to answer "what is the machine doing right now" (see
- * ALMANAC-PLAN §1.1). Data, not inline JSX, for the same testability reason
- * as NAV_ITEMS above.
+ * Die MORE-Sektion der Rail — der alte Header-Dropdown entfällt; dieselben
+ * Einträge, jetzt dauerhaft sichtbar. Data, not inline JSX, for the same
+ * testability reason as NAV_ITEMS above.
  */
 export const MORE_ITEMS: { href: string; label: string; navigate: () => void }[] = [
   { href: "#/triggers", label: "Triggers", navigate: navigateToTriggers },
@@ -364,102 +455,75 @@ export const MORE_ITEMS: { href: string; label: string; navigate: () => void }[]
 
 export default function App() {
   const { route, navCount } = useHashRoute();
+  const status = useAppStatus();
 
   if (!hasInstanceToken()) return <MissingTokenScreen />;
 
   return (
-    <div className="app-shell">
-      <header className="app-header">
-        <a
-          href="#/start"
-          className="app-title"
-          onClick={(e) => {
-            e.preventDefault();
-            navigateToStart();
-          }}
-        >
-          kaprek
-        </a>
-        <nav className="app-nav">
-          {NAV_ITEMS.map((item) => (
-            <a
-              key={item.href}
-              href={item.href}
-              className={item.isActive(route) ? "active" : ""}
-              onClick={(e) => {
-                e.preventDefault();
-                item.navigate();
-              }}
-            >
-              {item.label}
-            </a>
-          ))}
-          {/* Plain <details>, not a menu component: no dependency, and a
-              keyboard user gets the browser's own toggle for free. */}
-          <details className="nav-more">
-            <summary>more</summary>
-            <div className="nav-more-menu">
-              {MORE_ITEMS.map((item) => (
-                <a
-                  key={item.href}
-                  href={item.href}
-                  onClick={(e) => {
-                    e.preventDefault();
-                    item.navigate();
-                  }}
-                >
-                  {item.label}
-                </a>
-              ))}
-            </div>
-          </details>
-        </nav>
-        <StatusDot />
-        <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
-      </header>
-      <main className="app-main">
+    <>
+      {/* Die Shell steht auf JEDER Route — kein Design-Sprung mehr beim
+          Klick auf einen Navigationslink. Statusanzeige und die globale
+          Suche wohnen unten in der Rail (der alte helle Kopfzeilen-Header
+          ist entfalle; "more" ist jetzt die Rail-Sektion). */}
+      <AppShell
+        route={route}
+        pendingCount={status.approvalsOpen}
+        footer={
+          <>
+            <StatusDot />
+            <HeaderSearch initialQuery={route.name === "search" ? route.query : ""} />
+          </>
+        }
+      >
         {route.name === "start" ? (
+          /* Start bringt seine eigenen Shell-Kinder mit: Arbeitsfläche plus
+             Feed-Spalte als Fragment — dadurch ist der Feed eine echte
+             Grid-Spalte der Shell, nicht eine Box im Seiteninhalt. */
           <Start />
-        ) : route.name === "thread" ? (
-          <Thread project={route.project} sessionId={route.sessionId} />
-        ) : route.name === "search" ? (
-          <Search query={route.query} />
-        ) : route.name === "board" ? (
-          <Board />
-        ) : route.name === "triggers" ? (
-          <Triggers />
-        ) : route.name === "approvals" ? (
-          <Approvals />
-        ) : route.name === "home" ? (
-          <Home />
-        ) : route.name === "memory" ? (
-          <Memory initialScopeId={route.scopeId} />
-        ) : route.name === "setup" ? (
-          <Setup />
-        ) : route.name === "council" ? (
-          <CouncilPage />
-        ) : route.name === "plans" ? (
-          <Plans />
-        ) : route.name === "apps" ? (
-          <Apps />
-        ) : route.name === "experiments" ? (
-          <Experiments />
-        ) : route.name === "chats" ? (
-          <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
-        ) : route.name === "missions" ? (
-          <Missions />
-        ) : route.name === "mission" ? (
-          <MissionDetail missionId={route.missionId} />
-        ) : route.name === "list" ? (
-          <SessionList project={route.project} />
         ) : (
-          <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} missionId={route.missionId} />
+          <main className="shell-main">
+            {route.name === "thread" ? (
+              <Thread project={route.project} sessionId={route.sessionId} />
+            ) : route.name === "search" ? (
+              <Search query={route.query} />
+            ) : route.name === "board" ? (
+              <Board />
+            ) : route.name === "triggers" ? (
+              <Triggers />
+            ) : route.name === "approvals" ? (
+              <Approvals />
+            ) : route.name === "home" ? (
+              <Home />
+            ) : route.name === "memory" ? (
+              <Memory initialScopeId={route.scopeId} />
+            ) : route.name === "setup" ? (
+              <Setup />
+            ) : route.name === "council" ? (
+              <CouncilPage />
+            ) : route.name === "plans" ? (
+              <Plans />
+            ) : route.name === "apps" ? (
+              <Apps />
+            ) : route.name === "experiments" ? (
+              <Experiments />
+            ) : route.name === "chats" ? (
+              <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
+            ) : route.name === "missions" ? (
+              <Missions />
+            ) : route.name === "mission" ? (
+              <MissionDetail missionId={route.missionId} />
+            ) : route.name === "list" ? (
+              <SessionList project={route.project} />
+            ) : (
+              <Chat key={chatInstanceKey(route, navCount)} chatId={route.chatId} missionId={route.missionId} />
+            )}
+          </main>
         )}
-      </main>
+      </AppShell>
       {/* Global on purpose: a question an unattended agent filed at 3am has to
           be visible on whatever page you open at 9am, not only on #/approvals
           (which you would have to think to visit). */}
       <QuestionBox />
-    </div>
+    </>
   );
 }

@@ -32,6 +32,7 @@ import {
   type LeitstandRunning,
 } from "../lib/api";
 import { approvalSourceLabel } from "../lib/approvals";
+import { setStatus } from "../lib/status";
 
 /** „22 h left" / „4 min left" — grob, wie eine Person liest; null bleibt null statt einer erfundenen Frist. */
 export function remainingLabel(remainingMs: number | null): string | null {
@@ -204,6 +205,9 @@ export function RunningRow({
  * ohnehin mitbringt — Run-Abschlüsse des Fensters und beantwortete Fragen,
  * neueste zuerst. Was der Server heute nicht hergibt (Zeilen aus einem fremd
  * laufenden Turn), steht hier nicht, statt es zu synthetisieren.
+ *
+ * Die Feed-Spalte ist eine echte Spalte der Shell (drittes Grid-Feld neben
+ * Rail und Arbeitsfläche), kein Kästchen im Seiteninhalt.
  */
 export type FeedEntry = { when: number; text: string; detail: string; tone: "run" | "decision" };
 
@@ -235,10 +239,10 @@ export function feedFrom(data: LeitstandResponse): FeedEntry[] {
   return entries.sort((a, b) => b.when - a.when).slice(0, 12);
 }
 
-function Feed({ data }: { data: LeitstandResponse }) {
+export function Feed({ data }: { data: LeitstandResponse }) {
   const entries = feedFrom(data);
   return (
-    <aside className="lk-side">
+    <aside className="shell-feed">
       <h2>Letzte Ereignisse</h2>
       {entries.length === 0 && (
         <p className="lk-empty-note">Noch nichts gelogen: keine Run-Abschlüsse und keine Antworten im Fenster — der Feed folgt dem, was auf Platte liegt, kein Stream.</p>
@@ -260,109 +264,36 @@ function Feed({ data }: { data: LeitstandResponse }) {
   );
 }
 
-/** Die linke Rail — nur auf #/start; die übrigen Seiten behalten ihr bestehendes Layout (kleinerer Diff als ein globaler Umbau). */
-function Rail({ pendingCount }: { pendingCount: number }) {
-  const more: { href: string; label: string }[] = [
-    { href: "#/triggers", label: "Triggers" },
-    { href: "#/plans", label: "Plans" },
-    { href: "#/council", label: "Council" },
-    { href: "#/memory", label: "Memory" },
-    { href: "#/apps", label: "Apps" },
-    { href: "#/board", label: "Board" },
-    { href: "#/search", label: "Search" },
-    { href: "#/setup", label: "Setup" },
-    { href: "#/experiments", label: "Experimente" },
-    { href: "#/home", label: "Home-Assistent" },
-  ];
-  return (
-    <nav className="lk-rail" aria-label="Hauptnavigation">
-      <div className="lk-logo">kaprek</div>
-      <a href="#/start" className="lk-on">
-        Start
-      </a>
-      <a href="#/chat">Chat</a>
-      <a href="#/approvals">
-        Inbox {pendingCount > 0 && <span className="lk-n">{pendingCount}</span>}
-      </a>
-      <a href="#/missions">Missions</a>
-      <a href="#/list">Sessions</a>
-      <div className="lk-sect">more</div>
-      {more.map((item) => (
-        <a key={item.href} href={item.href}>
-          {item.label}
-        </a>
-      ))}
-    </nav>
-  );
-}
-
-export default function Start() {
-  const [data, setData] = useState<LeitstandResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busyId, setBusyId] = useState<string | null>(null);
-  const [nowMs, setNowMs] = useState(() => Date.now());
-
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      setData(await fetchLeitstand());
-      setNowMs(Date.now());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
-
-  useEffect(() => {
-    void load();
-  }, [load]);
-
-  const decide = async (pending: LeitstandPending, behavior: "allow" | "deny") => {
-    setBusyId(pending.id);
-    setError(null);
-    try {
-      // 'gone' ist keine Meldung wert: dass die Zeile nach dem Refresh weg
-      // ist, IST die Antwort (Turn beendet, schon entschieden, Prozess weg).
-      await answerApproval(pending.id, { chatId: pending.chatId, behavior });
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  const abort = async (run: LeitstandRunning) => {
-    setBusyId(run.chatId);
-    setError(null);
-    try {
-      await cancelChatTurn(run.chatId);
-      await load();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusyId(null);
-    }
-  };
-
-  if (data === null) {
-    return (
-      <div className="lk-shell">
-        <Rail pendingCount={0} />
-        <main className="lk-center">
-          {error ? <div className="lk-empty-note">Der Leitstand konnte nicht geladen werden: {error}</div> : <div className="lk-empty-note">Lädt…</div>}
-        </main>
-      </div>
-    );
-  }
-
+/**
+ * Der Leitstand-Inhalt: Arbeitsfläche (Mitte) plus Feed-Spalte (rechts) als
+ * Fragment — die Shell (App.tsx) legt links die Rail davor, so entsteht die
+ * Dreispaltung aus wireframes/variant-b.html. Die Rail selbst wohnt in der
+ * Shell und wird hier NICHT noch einmal gerendert (keine doppelte
+ * Navigation). Hook-frei und exportiert, damit Render-Tests ohne DOM
+ * begehen können, dass hier keine zweite Rail auftaucht.
+ */
+export function StartContent({
+  data,
+  error,
+  busyId,
+  nowMs,
+  onDecide,
+  onAbort,
+}: {
+  data: LeitstandResponse;
+  error: string | null;
+  busyId: string | null;
+  nowMs: number;
+  onDecide: (pending: LeitstandPending, behavior: "allow" | "deny") => void;
+  onAbort: (run: LeitstandRunning) => void;
+}) {
   const { totals, byMission } = data.overnight;
   const degradedNames = data.attention.degradedTriggers.map((t) => t.id);
   const grantsUsed = data.grants.reduce((sum, grant) => sum + (grant.useCount ?? 0), 0);
 
   return (
-    <div className="lk-shell">
-      <Rail pendingCount={data.pending.length} />
-      <main className="lk-center">
+    <>
+      <main className="shell-main">
         <h1 className="lk-title">
           Start {data.running.length > 0 && <span className="lk-bdg lk-live">{data.running.length} laufen</span>}
         </h1>
@@ -389,7 +320,7 @@ export default function Start() {
               </div>
               {data.pending.length === 0 && <div className="lk-empty-note">Nichts wartet auf eine Antwort — offene Fragen landen hier, bis sie beantwortet werden oder nach 24 h verfallen.</div>}
               {data.pending.map((pending) => (
-                <PendingRow key={`${pending.chatId}:${pending.id}`} pending={pending} nowMs={nowMs} busy={busyId === pending.id} onDecide={(p, b) => void decide(p, b)} />
+                <PendingRow key={`${pending.chatId}:${pending.id}`} pending={pending} nowMs={nowMs} busy={busyId === pending.id} onDecide={onDecide} />
               ))}
             </section>
 
@@ -417,7 +348,7 @@ export default function Start() {
               <div className="lk-hd">Running</div>
               {data.running.length === 0 && <div className="lk-empty-note">Gerade läuft kein Turn — Chat und Trigger starten hier welche.</div>}
               {data.running.map((run) => (
-                <RunningRow key={run.chatId} run={run} busy={busyId === run.chatId} onAbort={(r) => void abort(r)} />
+                <RunningRow key={run.chatId} run={run} busy={busyId === run.chatId} onAbort={onAbort} />
               ))}
             </section>
 
@@ -465,6 +396,80 @@ export default function Start() {
         </div>
       </main>
       <Feed data={data} />
-    </div>
+    </>
+  );
+}
+
+export default function Start() {
+  const [data, setData] = useState<LeitstandResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  const load = useCallback(async () => {
+    setError(null);
+    try {
+      const fresh = await fetchLeitstand();
+      setData(fresh);
+      setNowMs(Date.now());
+      // Derselbe Zähler, den der Chat schreibt (lib/status.ts): die Rail
+      // zeigt das Badge auf JEDER Seite, also muss der Leitstand seinen
+      // Stand hier ebenfalls melden — und beim Verlassen wieder räumen.
+      setStatus({ approvalsOpen: fresh.pending.length });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+    return () => setStatus({ approvalsOpen: 0 });
+  }, [load]);
+
+  const decide = async (pending: LeitstandPending, behavior: "allow" | "deny") => {
+    setBusyId(pending.id);
+    setError(null);
+    try {
+      // 'gone' ist keine Meldung wert: dass die Zeile nach dem Refresh weg
+      // ist, IST die Antwort (Turn beendet, schon entschieden, Prozess weg).
+      await answerApproval(pending.id, { chatId: pending.chatId, behavior });
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const abort = async (run: LeitstandRunning) => {
+    setBusyId(run.chatId);
+    setError(null);
+    try {
+      await cancelChatTurn(run.chatId);
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  if (data === null) {
+    return (
+      <main className="shell-main">
+        {error ? <div className="lk-empty-note">Der Leitstand konnte nicht geladen werden: {error}</div> : <div className="lk-empty-note">Lädt…</div>}
+      </main>
+    );
+  }
+
+  return (
+    <StartContent
+      data={data}
+      error={error}
+      busyId={busyId}
+      nowMs={nowMs}
+      onDecide={(p, b) => void decide(p, b)}
+      onAbort={(r) => void abort(r)}
+    />
   );
 }

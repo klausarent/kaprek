@@ -61,7 +61,9 @@ test("an empty (or unrecognized) hash lands on the Leitstand, not a menu and not
 // The nav is data (App.tsx's NAV_ITEMS), not inline JSX, precisely so this
 // assertion does not need a DOM: this repo has none (see vitest.config.ts —
 // environment 'node', no jsdom/happy-dom/@testing-library dependency).
-test("the primary nav is the five-entry surface; everything else sits behind \"more\"", () => {
+// Die MORE-Sektion ist seit dem Shell-Umbau ein fester Teil der Rail, kein
+// Dropdown mehr — die Reihenfolge bleibt die Behauptung.
+test("the primary nav is the five-entry surface; everything else sits in the rail's MORE section", () => {
   expect(NAV_ITEMS.map((item) => item.label)).toEqual(["Start", "Chat", "Inbox", "Missions", "Sessions"]);
   expect(MORE_ITEMS.map((item) => item.label)).toEqual([
     "Triggers",

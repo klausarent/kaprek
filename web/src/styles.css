@@ -1,31 +1,24 @@
+/* Die Variant-B-Palette (wireframes/variant-b.html) ist DIE Palette der App:
+   eine dunkle Operations-Konsole, ohne Media-Query-Ausnahme. Die bisherigen
+   Variablennamen (--surface, --border, …) bleiben bestehen, damit der Swap
+   alle Seiten auf einmal umfärbt; --warn und --blue kommen neu dazu. */
 :root {
-  --bg: #f7f7f8;
-  --surface: #ffffff;
-  --surface-solid: #f1f1f4;
-  --border: #dcdce2;
-  --text: #17171b;
-  --muted: #6b6b76;
-  --accent: #4f46e5;
-  --accent-contrast: #ffffff;
-  --danger-bg: rgba(220, 38, 38, 0.1);
-  --danger-text: #dc2626;
-  --success-bg: rgba(22, 163, 74, 0.15);
-  --success-text: #16a34a;
-  color-scheme: light;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #121214;
-    --surface: #1b1b1f;
-    --surface-solid: #232328;
-    --border: #2e2e35;
-    --text: #e7e7ea;
-    --muted: #9494a0;
-    --accent: #818cf8;
-    --accent-contrast: #14141a;
-    color-scheme: dark;
-  }
+  --bg: #14161a;
+  --surface: #1c1f25;
+  --surface-solid: #22262d;
+  --border: #2b303a;
+  --text: #dcdce2;
+  --muted: #8a8f99;
+  --accent: #4cc38a;
+  --accent-contrast: #10131a;
+  --danger-bg: #3a2024;
+  --danger-text: #e06c75;
+  --success-bg: #1d3328;
+  --success-text: #4cc38a;
+  --warn: #e0a458;
+  --warn-bg: #3a2c1a;
+  --blue: #6ca0e8;
+  color-scheme: dark;
 }
 
 * {
@@ -59,64 +52,124 @@ pre,
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 }
 
+/* Notfall-Seite (fehlender Instanz-Token) — kein Teil der Shell. */
 .app-shell {
-  max-width: 900px;
-  margin: 0 auto;
-  padding: 16px 20px 48px;
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
+  padding: 24px;
   min-height: 100%;
 }
 
-.app-header {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding-bottom: 8px;
-  border-bottom: 1px solid var(--border);
-}
-
-.app-title {
-  font-weight: 700;
-  font-size: 18px;
-  letter-spacing: -0.02em;
-}
-
-.app-subtitle {
-  color: var(--muted);
-  font-size: 12px;
-  flex-shrink: 0;
-}
-
-.app-nav {
-  display: flex;
-  gap: 12px;
+/* ---------------------------------------------------------------------------
+   Die globale Shell (Variant B, wireframes/variant-b.html): links die Rail,
+   rechts die Arbeitsfläche in VOLLER Breite — kein zentrierter
+   max-width-Container mehr. Auf #/start kommt als drittes Grid-Feld die
+   Feed-Spalte hinzu (Start liefert Arbeitsfläche + Feed als Fragment-Kinder).
+   --------------------------------------------------------------------------- */
+.shell {
+  display: grid;
+  grid-template-columns: 190px minmax(0, 1fr);
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--text);
   font-size: 13px;
 }
 
-.app-nav a {
-  color: var(--muted);
+.shell-has-feed {
+  grid-template-columns: 190px minmax(0, 1fr) 320px;
 }
 
-.app-nav a:hover {
+/* Arbeitsfläche: volle Breite neben der Rail. Wo Lesen im Vordergrund steht
+   (Chat, Thread), begrenzt der INHALT sich selbst — nicht die Fläche. */
+.shell-main {
+  min-width: 0;
+  padding: 20px 24px 48px;
+}
+
+/* Rechte Feed-Spalte der Shell (nur #/start): Panelfläche, linke Kante als
+   Trennung, über die volle Höhe — bleibt wie die Rail stehen. */
+.shell-feed {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  background: var(--surface);
+  border-left: 1px solid var(--border);
+  overflow-y: auto;
+  padding: 14px;
+}
+.shell-feed h2 {
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 0 0 10px;
+}
+
+/* ---- Rail (jede Seite) ----
+   Sticky: die Konsole behält ihre Navigation, auch wenn die Arbeitsfläche
+   weit scrollt. */
+.rail {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  padding: 16px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.rail-logo {
+  font-weight: 700;
+  padding: 0 10px 14px;
+  letter-spacing: 0.5px;
   color: var(--text);
 }
-
-.app-nav a.active {
-  color: var(--accent);
-  font-weight: 600;
+.rail a {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 7px 10px;
+  border-radius: 6px;
+  color: var(--muted);
+}
+.rail a:hover {
+  color: var(--text);
+}
+.rail a.on {
+  background: var(--surface-solid);
+  color: var(--text);
+}
+.rail-badge {
+  background: var(--accent);
+  color: var(--accent-contrast);
+  border-radius: 99px;
+  font-size: 11px;
+  padding: 0 7px;
+  font-weight: 700;
+}
+.rail-sect {
+  margin: 14px 10px 6px;
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.rail-foot {
+  margin-top: auto;
+  padding: 12px 2px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
 }
 
+/* Die globale Suche wohnt jetzt unten in der Rail. */
 .header-search-input {
-  margin-left: auto;
-  width: 240px;
-  max-width: 40vw;
-  background: var(--surface);
+  width: 100%;
+  background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 6px 10px;
-  font-size: 13px;
+  font-size: 12px;
   color: var(--text);
 }
 
@@ -125,8 +178,26 @@ pre,
   outline-offset: -1px;
 }
 
-.app-main {
-  flex: 1;
+/* Schmale Screens (die --lan-Phone-Inbox): Rail stapelt sich oberhalb,
+   Feed unterhalb — die Inbox bleibt voll breit nutzbar. */
+@media (max-width: 640px) {
+  .shell,
+  .shell-has-feed {
+    grid-template-columns: 1fr;
+  }
+  .rail,
+  .shell-feed {
+    position: static;
+    height: auto;
+  }
+  .rail {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .shell-feed {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
 }
 
 .page {
@@ -289,7 +360,7 @@ pre,
   font-size: 11px;
   padding: 2px 8px;
   border-radius: 999px;
-  background: rgba(79, 70, 229, 0.15);
+  background: rgba(76, 195, 138, 0.15);
   color: var(--accent);
   white-space: nowrap;
 }
@@ -315,7 +386,7 @@ pre,
 }
 
 .search-snippet mark {
-  background: rgba(129, 140, 248, 0.3);
+  background: rgba(76, 195, 138, 0.32);
   color: var(--text);
   border-radius: 3px;
   padding: 0 1px;
@@ -375,6 +446,13 @@ pre,
   gap: 3px 10px;
   color: var(--muted);
   font-size: 12px;
+}
+
+/* Lesegrenze für den Thread-INHALT — die Fläche selbst bleibt vollbreit. */
+.thread-header,
+.thread-events,
+.thread-unmatched {
+  max-width: 980px;
 }
 
 .thread-events {
@@ -535,7 +613,7 @@ pre,
   justify-content: center;
   font-size: 10px;
   font-weight: 600;
-  background: rgba(79, 70, 229, 0.15);
+  background: rgba(76, 195, 138, 0.15);
   color: var(--accent);
 }
 
@@ -596,7 +674,7 @@ pre,
 }
 
 .event-subagent {
-  background: rgba(79, 70, 229, 0.06);
+  background: rgba(76, 195, 138, 0.06);
   border: 1px solid var(--border);
   border-left: 3px solid var(--accent);
   border-radius: 10px;
@@ -868,7 +946,7 @@ pre,
   font-size: 11px;
   padding: 4px 10px;
   border-radius: 999px;
-  background: rgba(79, 70, 229, 0.15);
+  background: rgba(76, 195, 138, 0.15);
   color: var(--accent);
   border: none;
   cursor: pointer;
@@ -908,10 +986,12 @@ pre,
   color: var(--danger-text);
 }
 
+/* Lesegrenze für den Chat-INHALT — die Fläche selbst bleibt vollbreit. */
 .chat-page {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  max-width: 980px;
 }
 
 .chat-events {
@@ -965,7 +1045,7 @@ pre,
   justify-content: flex-end;
 }
 
-/* --- Status dot (header) ------------------------------------------------ */
+/* --- Status dot (jetzt unten in der Rail) ------------------------------- */
 
 .status-dot {
   display: inline-flex;
@@ -973,7 +1053,6 @@ pre,
   gap: 6px;
   font-size: 12px;
   color: var(--muted);
-  margin-left: 12px;
 }
 
 .status-dot-mark {
@@ -993,7 +1072,7 @@ pre,
 }
 
 .status-dot-waiting .status-dot-mark {
-  background: #d97706;
+  background: var(--warn);
 }
 
 .status-dot-offline .status-dot-mark {
@@ -1443,7 +1522,7 @@ pre,
 
 .question-box-toggle {
   background: var(--accent);
-  color: #fff;
+  color: var(--accent-contrast);
   border: none;
   border-radius: 999px;
   padding: 8px 14px;
@@ -1623,9 +1702,6 @@ pre,
   display: flex;
   gap: 24px;
   align-items: flex-start;
-  max-width: 960px;
-  margin: 0 auto;
-  padding: 16px;
 }
 
 .missions-list {
@@ -1731,9 +1807,6 @@ pre,
 }
 
 .mission-detail {
-  max-width: 760px;
-  margin: 0 auto;
-  padding: 16px;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -1828,8 +1901,8 @@ pre,
   font-size: 0.85rem;
 }
 .chat-approval-select-auto {
-  border-color: #c0392b;
-  color: #c0392b;
+  border-color: var(--danger-text);
+  color: var(--danger-text);
 }
 
 /* --- simple view: folded work runs --- */
@@ -2159,7 +2232,7 @@ pre,
   font-size: 0.9rem;
 }
 .council-panel-dissent {
-  border-color: #d08b2c;
+  border-color: var(--warn);
 }
 .council-headline {
   font-weight: 600;
@@ -2541,80 +2614,10 @@ pre,
 }
 
 /* ---------------------------------------------------------------------------
-   #/start — der Leitstand (Variant B: dunkle Operations-Konsole).
-   Diese Seite trägt ihr EIGENES Layout (Rail / Arbeitsfläche / Feed) und ihre
-   eigenen Farbvariablen; der Rest der App bleibt im bestehenden Theme.
+   #/start — der Leitstand-Inhalt (Variant B: dunkle Operations-Konsole).
+   Nur noch der INHALT: Rail und Feed-Gerüst liefert die Shell (App.tsx),
+   die Farben kommen aus den globalen Variablen.
    --------------------------------------------------------------------------- */
-.lk-shell {
-  --lk-bg: #14161a;
-  --lk-panel: #1c1f25;
-  --lk-panel2: #22262d;
-  --lk-ink: #dcdce2;
-  --lk-mut: #8a8f99;
-  --lk-line: #2b303a;
-  --lk-acc: #4cc38a;
-  --lk-warn: #e0a458;
-  --lk-bad: #e06c75;
-  display: grid;
-  grid-template-columns: 190px 1fr 320px;
-  min-height: 100vh;
-  background: var(--lk-bg);
-  color: var(--lk-ink);
-  font-size: 13px;
-  color-scheme: dark;
-}
-
-/* ---- Rail ---- */
-.lk-rail {
-  background: var(--lk-panel);
-  border-right: 1px solid var(--lk-line);
-  padding: 16px 10px;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-}
-.lk-logo {
-  font-weight: 700;
-  padding: 0 10px 14px;
-  letter-spacing: 0.5px;
-}
-.lk-rail a {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  padding: 7px 10px;
-  border-radius: 6px;
-  color: var(--lk-mut);
-}
-.lk-rail a:hover {
-  color: var(--lk-ink);
-}
-.lk-rail a.lk-on {
-  background: var(--lk-panel2);
-  color: var(--lk-ink);
-}
-.lk-n {
-  background: var(--lk-acc);
-  color: #10131a;
-  border-radius: 99px;
-  font-size: 11px;
-  padding: 0 7px;
-  font-weight: 700;
-}
-.lk-sect {
-  margin: 14px 10px 6px;
-  font-size: 11px;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--lk-mut);
-}
-
-/* ---- Arbeitsfläche ---- */
-.lk-center {
-  overflow-y: auto;
-  padding: 20px 24px;
-  min-width: 0;
-}
 .lk-title {
   font-size: 17px;
   margin: 0 0 2px;
@@ -2623,7 +2626,7 @@ pre,
   gap: 10px;
 }
 .lk-sub {
-  color: var(--lk-mut);
+  color: var(--muted);
   font-size: 12px;
   margin: 0 0 16px;
 }
@@ -2633,8 +2636,8 @@ pre,
   gap: 14px;
 }
 .lk-panel {
-  background: var(--lk-panel);
-  border: 1px solid var(--lk-line);
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: 8px;
   margin-bottom: 14px;
   overflow: hidden;
@@ -2644,18 +2647,18 @@ pre,
   justify-content: space-between;
   align-items: center;
   padding: 9px 14px;
-  border-bottom: 1px solid var(--lk-line);
+  border-bottom: 1px solid var(--border);
   font-size: 11px;
   letter-spacing: 1px;
   text-transform: uppercase;
-  color: var(--lk-mut);
+  color: var(--muted);
 }
 .lk-r {
   display: flex;
   gap: 10px;
   align-items: baseline;
   padding: 7px 14px;
-  border-bottom: 1px solid var(--lk-line);
+  border-bottom: 1px solid var(--border);
 }
 .lk-r:last-child {
   border-bottom: 0;
@@ -2669,7 +2672,7 @@ pre,
   display: block;
 }
 .lk-b {
-  color: var(--lk-mut);
+  color: var(--muted);
   font-size: 12px;
   display: block;
   white-space: nowrap;
@@ -2684,21 +2687,21 @@ pre,
   font-size: 11px;
   padding: 1px 7px;
   border-radius: 4px;
-  background: var(--lk-panel2);
-  color: var(--lk-mut);
+  background: var(--surface-solid);
+  color: var(--muted);
   white-space: nowrap;
 }
 .lk-live {
-  background: #1d3328;
-  color: var(--lk-acc);
+  background: var(--success-bg);
+  color: var(--accent);
   font-weight: 700;
 }
 .lk-warn {
-  background: #3a2c1a;
-  color: var(--lk-warn);
+  background: var(--warn-bg);
+  color: var(--warn);
 }
 .lk-link {
-  color: var(--lk-acc);
+  color: var(--accent);
   white-space: nowrap;
   font-size: 12px;
 }
@@ -2706,33 +2709,33 @@ pre,
   display: flex;
   gap: 14px;
   padding: 8px 14px;
-  border: 1px solid var(--lk-line);
+  border: 1px solid var(--border);
   border-radius: 8px;
-  background: var(--lk-panel2);
+  background: var(--surface-solid);
   font-size: 12px;
-  color: var(--lk-mut);
+  color: var(--muted);
   flex-wrap: wrap;
   margin-bottom: 14px;
 }
 .lk-strip b {
-  color: var(--lk-ink);
+  color: var(--text);
   font-variant-numeric: tabular-nums;
 }
 .lk-empty-note {
   padding: 12px 14px;
-  color: var(--lk-mut);
+  color: var(--muted);
   font-style: italic;
   font-size: 12px;
 }
 .lk-error {
-  color: var(--lk-bad);
+  color: var(--danger-text);
 }
 .lk-dot {
   display: inline-block;
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: var(--lk-acc);
+  background: var(--accent);
   margin-right: 5px;
   animation: lk-pulse 1.2s infinite;
 }
@@ -2744,92 +2747,38 @@ pre,
 .lk-panel button {
   font: inherit;
   font-size: 12px;
-  background: var(--lk-panel2);
-  color: var(--lk-ink);
-  border: 1px solid var(--lk-line);
+  background: var(--surface-solid);
+  color: var(--text);
+  border: 1px solid var(--border);
   border-radius: 5px;
   padding: 3px 10px;
   cursor: pointer;
 }
 .lk-panel button.lk-pri {
-  background: var(--lk-acc);
+  background: var(--accent);
   color: #10131a;
-  border-color: var(--lk-acc);
+  border-color: var(--accent);
   font-weight: 700;
 }
 .lk-panel button.lk-danger {
-  color: var(--lk-bad);
+  color: var(--danger-text);
 }
 .lk-panel button:disabled {
   opacity: 0.5;
   cursor: default;
 }
 
-/* ---- Feed ---- */
-.lk-side {
-  background: var(--lk-panel);
-  border-left: 1px solid var(--lk-line);
-  overflow-y: auto;
-  padding: 14px;
-}
-.lk-side h2 {
-  font-size: 11px;
-  letter-spacing: 1px;
-  text-transform: uppercase;
-  color: var(--lk-mut);
-  margin: 0 0 10px;
-}
+/* ---- Feed-Einträge (die Spalte selbst gehört der Shell: .shell-feed) ---- */
 .lk-evt {
-  border-left: 2px solid var(--lk-line);
+  border-left: 2px solid var(--border);
   padding: 4px 0 4px 12px;
   margin-bottom: 10px;
   font-size: 12px;
 }
 .lk-evt.lk-evt-live {
-  border-left-color: var(--lk-acc);
+  border-left-color: var(--accent);
 }
 .lk-when {
-  color: var(--lk-mut);
+  color: var(--muted);
   font-size: 11px;
-}
-
-/* ---- "more" im globalen Header (alle Seiten) ---- */
-.nav-more {
-  position: relative;
-}
-.nav-more summary {
-  cursor: pointer;
-  list-style: none;
-  color: var(--muted);
-  padding: 2px 4px;
-}
-.nav-more summary::marker {
-  content: "";
-}
-.nav-more[open] summary {
-  color: var(--text);
-}
-.nav-more-menu {
-  position: absolute;
-  right: 0;
-  top: calc(100% + 4px);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.15);
-  display: flex;
-  flex-direction: column;
-  min-width: 160px;
-  padding: 4px;
-  z-index: 30;
-}
-.nav-more-menu a {
-  padding: 6px 10px;
-  border-radius: 6px;
-  color: var(--muted);
-  white-space: nowrap;
-}
-.nav-more-menu a:hover {
-  background: var(--surface-solid);
-  color: var(--text);
 }
