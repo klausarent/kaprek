@@ -178,6 +178,28 @@ pre,
   outline-offset: -1px;
 }
 
+/* Schmale Screens (die --lan-Phone-Inbox): Rail stapelt sich oberhalb,
+   Feed unterhalb — die Inbox bleibt voll breit nutzbar. */
+@media (max-width: 640px) {
+  .shell,
+  .shell-has-feed {
+    grid-template-columns: 1fr;
+  }
+  .rail,
+  .shell-feed {
+    position: static;
+    height: auto;
+  }
+  .rail {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+  .shell-feed {
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+}
+
 .page {
   display: flex;
   flex-direction: column;
