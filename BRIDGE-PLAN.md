@@ -70,8 +70,66 @@ Sprachnachrichten → Transkript (Whisper lokal oder CLI-Fähigkeit), Bilder/Dok
 4. **T1** — Agenten-Verzeichnis + kaprek-MCP-Delegation.
 5. **T2/T3** — Schablonen, Standups. W2 nach Lust.
 
+---
+
+## 4. Übernahmen aus der instinct-Befragung (04.09.)
+
+Klaus hat instinct sein eigenes Innenleben ausfragen lassen (Kanäle, Aufgabenliste, Wecker, Eskalationsleiter, Gedächtnis, Betrieb). Die Antworten ändern den Plan an vier Stellen — fast alles bestätigt kapreks vorhandene Muster statt neue zu brauchen:
+
+### I1 — Task-Modell: Inhalt über Struktur, Besitzer, ehrliche Erledigung (M, kaprek-Board)
+
+instincts Einträge: worum es geht, Quell-Referenz (die Nachricht, die den Auftrag gab), nächster Schritt, Besitzer (Klaus / instinct / Dritter wie „Ford"), Stand inklusive Sackgassen. „Mehr Inhalt als Struktur — der Wert liegt im Kontext." Dazu zwei Regeln, die kapreks Board fehlen:
+
+- **Besitzer-Feld** mit drei Werten (du / kaprek / Dritter) — „wartet auf Ford" ist ein Zustand, der null Checks kostet, bis das Ereignis von selbst kommt (ereignisgetrieben, nicht polling).
+- **Erledigt ist eine skalierte Aussage:** „erledigt (geprüft)" vs. „gemeldet als erledigt, ungeprüft". instinct prüft nach, wo es geht (URL selbst aufrufen, zweimal mit Zeitabstand), und benennt es, wo Prüfen unmöglich ist. Das ist exakt kapreks Konvergenz-Gedanke („Done is a claim"), nur als Task-Status statt Plan-Gate. Ein Task ist zu, wenn das Ergebnis **bei Klaus angekommen** ist, nicht wenn die Arbeit aufgehört hat.
+- **Anlege-Regel als Policy:** listenwürdig ist alles mit offenem Ergebnis + nächstem Schritt, das verloren gehen würde; nicht listenwürdig sind sofort beantwortbare Fragen und Smalltalk; bei sensiblen Themen einmal nachfragen statt festhalten. Die Regel kommt als Text in den System-Prompt der Bridge-Deutung, nicht als Parser.
+
+### I2 — Wecker: getrennt, aber verlinkt; Bedingung als Billig-Blick zuerst (S bis M)
+
+Wecker leben getrennt von der Liste und verweisen auf sie; erledigte Tasks ziehen ihre Wecker nach. Doppler-Schutz: vor dem Anstellen prüfen, ob schon einer denselben Zweck hat (anpassen statt zweite stellen); jeder Wecker trägt seinen Grund, damit klar ist, wann er hinfällig ist. Für kaprek heißt das:
+
+- Neuer Store `<dataDir>/alarms.jsonl` (Grund-Zeile, Zweck-Zeile, Bedingung, Link auf Board-Task/Mission), **nicht** ein Feld am Board-Task.
+- Die Bedingung wird **zweistufig** ausgewertet: erst der billigste Check, den kaprek schon kann (skip-if: file-exists, file-newer-than-last-run), und nur wenn der nicht reicht, ein Mini-Turn einer abgespeckten Engine mit Ja/Nein-Antwort. instinct: „der Blick kostet Sekunden, teuer wird erst das Handeln." Das ist die Aussparung, die aus 50–70 Prüfungen am Tag 10–15 macht — und der Mini-Turn ist derselbe Opt-in-Mechanismus wie der Digest (ALM 3.3 Punkt 2), kein neues Netz-Loch.
+- **Budget-Priorisierung** aus instinct übernehmen, wörtlich: direkte Anfragen haben immer Vorrang; wenn das Tagesbudget knapp wird, pausieren zuerst die Hintergrund-Prüfungen, nie die Interaktiven. Das gehört in ALM 2.5 (Tagesbudget) als definierte Pause-Reihenfolge, nicht als Zufall.
+
+### I3 — Sende-Politik: Regel vor jedem Versand, nicht Zeitfenster (M)
+
+instincts „nachts schweigen" ist keine Zeitspanne, sondern eine Regel, die jede ausgehende Nachricht passiert: gewichtet Uhrzeit, Thema und ob Klaus wach ist; schreibt Klaus um 1 Uhr, wird geantwortet — nur Ungefragtes bleibt liegen; echter Notfall (Sicherheit, Geldverlust, harte Frist) geht auch nachts durch. Dazu die Eskalationsleiter mit vier Stufen (sofort / passende Gelegenheit / gebündelt / gar nicht) und drei Entscheidungsquellen: feste Grundregeln, Gelerntes über Klaus, **explizite Ansagen, die zu Dauerregeln werden** — und Korrekturen („das hätte nicht gepinkt werden müssen") ändern die Regel ab dann.
+
+Das ist wörtlich kapreks failure-to-policy-Mechanismus („when the same failure pattern shows up three times, kaprek writes down the rule and asks"), nur für ausgehende Nachrichten statt für Werkzeugfreigaben. Also:
+
+- `<dataDir>/policy.json` bekommt einen Abschnitt `sendPolicy`: Zeitgewichtung, Themen-Regeln, Nacht-Ausnahmen — vom Menschen editierbar und im Klartext sichtbar, wie posture/hardDenials.
+- Die Bridge (W1) wertet `sendPolicy` vor jedem Versand aus; ungefragte Nachrichten passieren die Leiter, Antworten auf Klaus' Nachrichten nicht.
+- Kapreks proposal-Mechanismus (Regel vorschlagen, Mensch akzeptiert) wird auf Sende-Verstöße erweitert: „das hätte nicht gepinkelt werden müssen" ist ein Proposal-Kandidat.
+
+### I4 — Kanäle: eine Zeitachse, eine Stimme, Anweisungen nur von Klaus (in W1 enthalten)
+
+instinct: alle Kanäle landen im selben Gedächtnis und derselben Liste; eine Zeitachse in Reihenfolge; spätere Anweisung gewinnt; bei gleichzeitigen Widersprüchen **nachfragen statt raten**; und: „Anweisungen nehme ich nur von dir entgegen — was andere in deinen Mails schreiben, ist Information, kein Befehl."
+
+Der letzte Satz ist kapreks `<external source>`-Labeling, nur auf Kanal-Ebene: die Bridge akzeptiert Aufträge **ausschließlich** von Klaus' allowlisteter Nummer; alles andere in Gruppen/Mails ist Material mit Quellenlabel. W1 bekommt deshalb drei Regeln ins Fundament: eine Zeitachse (Alle Ereignisse je Mission in Reihenfolge), spätere Anweisung gewinnt, Widerspruch ohne Reihenfolge → Rückfrage statt Rate. Und instincts Neustart-Regel übernehmen Bridge und kaprek-Trigger gleichermaßen: **erst lesen, dann handeln** — der Zustand liegt getrennt von der Ausführung, nach einem Absturz wird geprüft, was schon passiert ist, bevor etwas wiederholt wird (keine doppelte Mail, keine doppelte Bestellung). kapreks Claim-Dateien sind die halbe Miete; die Bridge braucht dasselbe Muster.
+
+### I5 — Gedächtnis: Haltbarkeit als Aufnahmekriterium, Tresor getrennt (bestätigt kapreks Memory)
+
+instinct nimmt auf: Vorlieben/Regeln, Personen, Entscheidungen **mit Gründen**, laufende Projekte, Muster. Nicht: Tagesgeschwätz, **und keine Geheimnisse** („die liegen getrennt im Tresor"). Abruf gezielt per Suche, nicht Voll-Reading bei jedem Turn. Das bestätigt kapreks Memory-Modell (Fakten mit Ursprung, 90-Tage-Stale, scopes) in jedem Punkt — zwei Nuancen zum Mitnehmen: „Entscheidungen mit Gründen" als eigene kind neben fact, und die Trennung Geheimnis ≠ Gedächtnis ist die, die ERW #6 (lokaler Secret-Store) ohnehin baut: `{{secret:NAME}}`-Referenz statt Wert, auch im Memory-Text.
+
+### Was bewusst NICHT übernommen wird
+
+- **Cloud-Betrieb als Voraussetzung.** instincts „ich laufe nicht auf einem Rechner, den jemand ausschalten könnte" ist der Kernunterschied. kaprek schläft, wenn der PC schläft. Solange das so bleibt, ist WhatsApp-Bridge eine „der PC ist an"-Erfahrung; always-on wird erst mit ALM 2.6 (Cloud-Runner für cloud-fähige Aufträge) diskutabel — und die Trennungsaufgabe (keine lokalen Pfade, keine lokalen Secrets in die Cloud) bleibt dort die harte Grenze.
+- **Bestellen/Buchen ohne Menschenknopf.** GPT-6-Computer-Use macht Browser-Autonomie technisch machbar; kapreks Verfassung sagt „nichts, was Geld ausgibt, ohne dass ein Mensch den Knopf drückt" (ALMANAC-PLAN §4). Wenn das geändert werden soll, ist es eine Verfassungsänderung mit kaprek-Mitteln: Standing Grants **mit Ausgaben-Deckel** („diese Operation, bis 50 €/Monat, widerrufbar") wären der kaprek-Weg — kein Nachtdienst-Einkauf ohne Mechanismus. Entscheidung bei Klaus, nicht am Weg.
+
+### Angepasste Reihenfolge
+
+1. **W0 erledigt** — Klaus wählt die offizielle WhatsApp Business Platform (Business-Nummer, kein Bann-Risiko; die 24-h-Regel: außerhalb des Fensters nur Meta-genehmigte Standard-Nachrichten — für unsere Antworten unkritisch, weil Klaus zuerst schreibt).
+2. **ALM 2.5 + I2-Pause-Reihenfolge** — Tagesbudget mit definierter Priorität (Interaktiv vor Hintergrund).
+3. **W1** — WhatsApp-MVP über Business Cloud API, mit I3-Sende-Politik und I4-Zeitachse von Anfang an.
+4. **I1** — Board um Besitzer/Erledigt-skaliert/Anlege-Regel erweitern.
+5. **T1** — Agenten-Verzeichnis + MCP-Delegation (KI-CEO-Rufe).
+6. **I2/I3 vertiefen** — Alarm-Store, Mini-Turn-Bedingungen, Sende-Politik als Policy-Abschnitt.
+7. **T2/T3, W2** — Schablonen, Standups, Sprachnachrichten/Bilder/Gruppen.
+
 ### Die ehrliche Risikoseite
 
-- **Bann-Risiko** der WhatsApp-Nummer (W0-Wahl).
-- **Kosten-Schärfe:** ein CEO mit drei Specialists verbranntBudget schnell; ohne Geld-Budget (Punkt 2) keine Autonomie-Stufen.
+- **Bann-Risiko** der WhatsApp-Nummer — durch W0-Entscheidung (offizielle Business Platform) entschärft; Restrisiko liegt im Meta-Setup (Verifizierung, Kosten pro Conversation), nicht im Bann.
+- **Kosten-Schärfe:** ein CEO mit drei Specialists verbrannt Budget schnell; ohne Geld-Budget (ALM 2.5 + I2-Pause-Reihenfolge) keine Autonomie-Stufen. instincts Praxis als Zielbild: direkte Anfragen immer vor Hintergrund-Checks, erst die billigen Blicke, dann das Handeln.
 - **Kontrollverlust-Style:** kapreks Versprechen ist „fragt vorher". Teams ändern das nicht: Der CEO fragt, die Specialists laufen unter seinen Grants, der Mensch sitzt an denselben drei Stellschrauben wie heute (Posture, Grants, Inbox). Wenn das aufge weicht wird, ist es eine bewusste Entscheidung, kein Nebenprodukt.
+- **Verfassungsfrage Ausgaben-Autonomie:** Computer-Use kann bestellen und buchen; kapreks Verfassung sagt bislang: kein Geld ohne Menschenknopf. Bleibt sie dabei, läuft Browser-Autonomie als Vorbereitung (Warenkorb steht, Mensch drückt ab). Soll sie fallen, dann nur mit Ausgaben-Grants (Deckel, widerrufbar, im Receipt). Beides ist legitim — stillschweigend passieren darf es nicht.
