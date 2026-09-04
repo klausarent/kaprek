@@ -2,12 +2,25 @@
 //
 // Verified against the installed CLI (Grok Build 0.2.117). The exact call:
 //
-//   grok --prompt-file <file> --output-format json
+//   grok --prompt-file <file> --verbatim --output-format json
 //        --json-schema '{"type":"object", ... status/message ... }'
-//        --tools "" --disable-web-search --no-subagents --no-memory
+//        --tools "" --disallowed-tools <file, shell, web and task tools>
+//        --disable-web-search --no-subagents --no-memory
 //        --no-plan --permission-mode plan --max-turns 1 --cwd <cwd>
 //
 // Every flag on that line is doing a specific job:
+//   --verbatim       the prompt reaches the model as written. Without it the
+//                    CLI (0.2.117 and 1.0.13 alike) offloads anything above
+//                    ~24 KB into <session>/prompts/prompt_0.txt, shows the
+//                    model 20,000 characters plus "read that file first", and
+//                    on Windows the percent-encoded session path makes that
+//                    read fail — the turn dies as "max turns reached".
+//                    Verified 04.09.2026: 155 KB verbatim, one turn, answer.
+//   --disallowed-tools  --tools "" does NOT empty the toolset (the log shows
+//                    24 tools either way); this list actually removes the
+//                    file, shell, web and task tools. Without it a peer that
+//                    wants to check something runs python — plan mode cancels
+//                    the call, and the cancelled turn is the answer.
 //   --prompt-file    the prompt goes through a FILE, never argv. A relay
 //                    prompt carries whole drafts; argv has length limits and
 //                    quoting rules that differ per platform and shell, and a
@@ -41,21 +54,32 @@ import {
 /**
  * The biggest prompt this driver will hand the CLI, in UTF-8 bytes.
  *
- * Grok Build 0.2.117 silently offloads a long prompt: the model sees the
- * first and last ~10,000 characters, a note that "the full request" sits in
- * <session>/prompts/prompt_0.txt, and an instruction to read_file it before
- * answering. Measured 04.09.2026: 23,971 bytes went through untouched,
- * 25,442 bytes were offloaded. On Windows the session directory name is
- * percent-encoded (C%3A%5CUsers…) and read_file cannot open that path —
- * with --tools "" the tool is still there (24 tools, the empty allowlist is
- * ignored), so the model spends its one turn on a read that fails and the
- * CLI exits "max turns reached". Ten of twelve council runs on 03./04.09.
- * died exactly so, every one of them a --diff. More turns do not help (three
- * turns, three failed reads); only a prompt below the threshold does. The
- * council trims its package for this peer down to this limit
- * (src/council/consult.mjs::fitPackage) and says so in the answer.
+ * History: Grok Build 0.2.117 silently offloaded a long prompt — the model
+ * saw the first and last ~10,000 characters, a note that "the full request"
+ * sits in <session>/prompts/prompt_0.txt, and an instruction to read_file it
+ * before answering. Measured 04.09.2026: 23,971 bytes went through, 25,442
+ * were offloaded. On Windows the session directory name is percent-encoded
+ * (C%3A%5CUsers…) and read_file cannot open it, so the model spent its one
+ * turn on a read that failed and the CLI exited "max turns reached" — ten of
+ * twelve council runs on 03./04.09., every one a --diff. 1.0.13 behaves the
+ * same. `--verbatim` is the switch: the prompt is sent as written, no
+ * offload, and 155,574 bytes came back answered in one turn (1.0.13).
+ *
+ * So this is no longer the offload threshold but a sanity cap: the largest
+ * prompt verified end to end. Above it the council still trims the package
+ * for this peer (src/council/consult.mjs::fitPackage) and says so, rather
+ * than finding out at answer time what the model does with more.
  */
-export const GROK_MAX_PROMPT_BYTES = 22_000;
+export const GROK_MAX_PROMPT_BYTES = 150_000;
+
+/**
+ * What `--disallowed-tools` strips for a text-only turn. The documented tool
+ * ids (README "Tool Filtering") plus `run_terminal_command`, the id the
+ * session log actually shows for the shell, and `Agent` (no subagents).
+ * `--tools ""` alone leaves all 24 tools in place — verified in the CLI's
+ * own log (shell.turn.tool_prep_done tool_count=24) on 0.2.117 and 1.0.13.
+ */
+export const GROK_TEXT_ONLY_DISALLOWED = 'run_terminal_cmd,run_terminal_command,read_file,grep,list_dir,search_replace,web_search,web_fetch,todo_write,task,Agent';
 
 /**
  * Resolves an npm .cmd shim to the node script it wraps, so the driver can
@@ -155,12 +179,16 @@ export function buildGrokArgs({ promptPath, cwd, maxTurns = 1, tools = '', schem
   return [
     '--prompt-file',
     promptPath,
+    '--verbatim',
     '--output-format',
     'json',
     '--json-schema',
     JSON.stringify(schema),
     '--tools',
     tools,
+    // An explicit allowlist is the caller's choice; only the text-only
+    // default gets the denylist (the allowlist alone does not take).
+    ...(tools ? [] : ['--disallowed-tools', GROK_TEXT_ONLY_DISALLOWED]),
     '--disable-web-search',
     '--no-subagents',
     '--no-memory',

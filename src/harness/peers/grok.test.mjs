@@ -65,6 +65,14 @@ test('the flag line pins text-only: no tools, no web, no subagents, no memory, o
   // An EMPTY tool set, not an omitted flag: omitting it would hand the peer
   // the CLI's default tools, which is the opposite of what it asks for.
   expect(flag('--tools')).toBe('');
+  // …and the empty allowlist alone does not take (24 tools stay), so the
+  // text-only turn also strips file, shell, web and task tools by name.
+  for (const tool of ['read_file', 'run_terminal_cmd', 'run_terminal_command', 'grep', 'search_replace', 'web_fetch', 'task', 'Agent']) {
+    expect(flag('--disallowed-tools').split(',')).toContain(tool);
+  }
+  // The prompt goes to the model as written — without --verbatim the CLI
+  // offloads a long prompt into a file the model cannot read back.
+  expect(args).toContain('--verbatim');
   expect(flag('--max-turns')).toBe('1');
   expect(flag('--permission-mode')).toBe('plan');
   // And the answer is schema-constrained, so `status` is data rather than
@@ -273,13 +281,21 @@ test('a shell shim plus an empty tool list fails loudly before anything runs', a
   }
 });
 
-test('the driver declares a prompt limit below the CLI offload threshold', () => {
-  // Measured on 0.2.117 (04.09.2026): 23,971 bytes went through, 25,442 bytes
-  // were offloaded to prompts/prompt_0.txt (20,000 chars shown, rest in a
-  // file grok cannot read on Windows). The limit keeps a margin below that.
-  expect(GROK_MAX_PROMPT_BYTES).toBeLessThanOrEqual(23_000);
-  expect(GROK_MAX_PROMPT_BYTES).toBeGreaterThanOrEqual(16_000);
+test('the driver declares a prompt limit no larger than what was verified', () => {
+  // Without --verbatim the CLI offloaded anything above ~24 KB (23,971 bytes
+  // passed, 25,442 were offloaded, 0.2.117 and 1.0.13). With --verbatim the
+  // largest prompt answered end to end was 155,574 bytes (1.0.13, 04.09.2026);
+  // the cap must not outgrow what a live turn has proven.
+  expect(GROK_MAX_PROMPT_BYTES).toBeLessThanOrEqual(155_574);
+  expect(GROK_MAX_PROMPT_BYTES).toBeGreaterThanOrEqual(100_000);
   expect(grokDriver.maxPromptBytes).toBe(GROK_MAX_PROMPT_BYTES);
+});
+
+test('an explicit allowlist is not undone by the text-only denylist', () => {
+  const args = buildGrokArgs({ promptPath: 'p.txt', cwd: 'C:/work', tools: 'read_file,grep' });
+  expect(args[args.indexOf('--tools') + 1]).toBe('read_file,grep');
+  expect(args).not.toContain('--disallowed-tools');
+  expect(args).toContain('--verbatim');
 });
 
 test('a prompt above the limit is refused before anything is spawned', async () => {
