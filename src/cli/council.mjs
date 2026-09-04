@@ -48,6 +48,11 @@ function render(result, stdout) {
     for (const risk of d.risks ?? []) stdout(`         · ${risk}`);
   }
   for (const u of result.unreachable) stdout(`${u.peerId.padEnd(8)} unreachable${u.error ? ` — ${u.error}` : ''}`);
+  // A verdict on less material is still a verdict, but the reader has to
+  // know it was on less (grok's CLI cannot take the whole package).
+  for (const a of result.answers ?? []) {
+    if (a.trimmed > 0) stdout(`${a.peerId.padEnd(8)} saw a package trimmed by ${a.trimmed} characters (its CLI's prompt limit)`);
+  }
   if (result.empty) stdout('no peer answered');
   else stdout(result.consensus ? '\nconsensus: yes' : '\nconsensus: no');
 }

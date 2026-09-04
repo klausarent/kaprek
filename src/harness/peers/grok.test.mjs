@@ -10,7 +10,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { buildGrokArgs, parseGrokStdout, resolveGrokCli, runGrokTurn } from './grok.mjs';
+import { GROK_MAX_PROMPT_BYTES, buildGrokArgs, grokDriver, parseGrokStdout, resolveGrokCli, runGrokTurn } from './grok.mjs';
 import { PEER_MAX_STDOUT_BYTES, PEER_OUTPUT_SCHEMA, parsePeerAnswer } from './driver.mjs';
 
 const dirs = [];
@@ -271,4 +271,13 @@ test('a shell shim plus an empty tool list fails loudly before anything runs', a
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('the driver declares a prompt limit below the CLI offload threshold', () => {
+  // Measured on 0.2.117 (04.09.2026): 23,971 bytes went through, 25,442 bytes
+  // were offloaded to prompts/prompt_0.txt (20,000 chars shown, rest in a
+  // file grok cannot read on Windows). The limit keeps a margin below that.
+  expect(GROK_MAX_PROMPT_BYTES).toBeLessThanOrEqual(23_000);
+  expect(GROK_MAX_PROMPT_BYTES).toBeGreaterThanOrEqual(16_000);
+  expect(grokDriver.maxPromptBytes).toBe(GROK_MAX_PROMPT_BYTES);
 });

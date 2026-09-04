@@ -1,5 +1,5 @@
 import { describe, test, expect, vi } from 'vitest';
-import { buildPackage, parseVerdict, summarize, consultPeers } from './consult.mjs';
+import { buildPackage, fitPackage, parseVerdict, summarize, consultPeers } from './consult.mjs';
 
 const ask = (answers) => vi.fn(async (peerId) => {
   const answer = answers[peerId];
@@ -245,6 +245,56 @@ describe('a peer that keeps failing', () => {
     const skipped = result.unreachable.find((entry) => entry.peerId === 'grok');
     expect(skipped.error).toMatch(/did not answer 2 times/);
     expect(result.agreed).toEqual(['codex']);
+    expect(result.consensus).toBe(true);
+  });
+});
+
+describe('a peer with a prompt limit', () => {
+  // grok 0.2.117 offloads prompts above ~24 KB into a file it then cannot
+  // read on Windows and burns its single turn trying (10 of 12 council runs
+  // on 03./04.09.2026 died as "max turns reached"). The package is trimmed
+  // for that peer alone; everyone else still sees everything.
+  const big = 'x'.repeat(30_000);
+  const parts = {
+    question: 'Is the rewrite safe?',
+    snapshots: [
+      { path: 'small.mjs', content: 'const a = 1;', truncated: false },
+      { path: 'big.diff', content: big, truncated: false },
+    ],
+  };
+
+  test('fitPackage trims the largest snapshot until the package fits', () => {
+    const fitted = fitPackage(parts, 20_000);
+    const text = buildPackage(fitted.parts);
+    expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(20_000);
+    expect(fitted.trimmed).toBeGreaterThan(0);
+    expect(text).toContain('const a = 1;');
+    expect(text).toContain('big.diff (truncated)');
+    expect(text).toContain('[truncated:');
+    // the caller's parts are not mutated
+    expect(parts.snapshots[1].content).toHaveLength(30_000);
+    expect(parts.snapshots[1].truncated).toBe(false);
+  });
+
+  test('fitPackage leaves a package that already fits alone', () => {
+    const small = { question: 'q', snapshots: [{ path: 'a', content: 'b', truncated: false }] };
+    const fitted = fitPackage(small, 20_000);
+    expect(fitted.trimmed).toBe(0);
+    expect(buildPackage(fitted.parts)).toBe(buildPackage(small));
+  });
+
+  test('consultPeers hands the limited peer a trimmed package and the others the full one', async () => {
+    const seen = {};
+    const askPeer = vi.fn(async (peerId, prompt) => {
+      seen[peerId] = prompt;
+      return verdict('agree');
+    });
+    askPeer.promptLimit = (peerId) => (peerId === 'grok' ? 20_000 : null);
+    const result = await consultPeers({ peers: ['grok', 'codex'], askPeer, ...parts });
+    expect(Buffer.byteLength(seen.grok, 'utf8')).toBeLessThanOrEqual(20_000);
+    expect(seen.codex).toContain(big);
+    expect(result.answers.find((a) => a.peerId === 'grok').trimmed).toBeGreaterThan(0);
+    expect(result.answers.find((a) => a.peerId === 'codex').trimmed).toBe(0);
     expect(result.consensus).toBe(true);
   });
 });

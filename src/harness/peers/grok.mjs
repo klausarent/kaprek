@@ -39,6 +39,25 @@ import {
 } from './driver.mjs';
 
 /**
+ * The biggest prompt this driver will hand the CLI, in UTF-8 bytes.
+ *
+ * Grok Build 0.2.117 silently offloads a long prompt: the model sees the
+ * first and last ~10,000 characters, a note that "the full request" sits in
+ * <session>/prompts/prompt_0.txt, and an instruction to read_file it before
+ * answering. Measured 04.09.2026: 23,971 bytes went through untouched,
+ * 25,442 bytes were offloaded. On Windows the session directory name is
+ * percent-encoded (C%3A%5CUsers…) and read_file cannot open that path —
+ * with --tools "" the tool is still there (24 tools, the empty allowlist is
+ * ignored), so the model spends its one turn on a read that fails and the
+ * CLI exits "max turns reached". Ten of twelve council runs on 03./04.09.
+ * died exactly so, every one of them a --diff. More turns do not help (three
+ * turns, three failed reads); only a prompt below the threshold does. The
+ * council trims its package for this peer down to this limit
+ * (src/council/consult.mjs::fitPackage) and says so in the answer.
+ */
+export const GROK_MAX_PROMPT_BYTES = 22_000;
+
+/**
  * Resolves an npm .cmd shim to the node script it wraps, so the driver can
  * spawn `node <entry> <args>` directly and never needs `shell: true`.
  *
@@ -333,4 +352,5 @@ export const grokDriver = registerPeerDriver({
     return path.isAbsolute(command) ? fs.existsSync(command) : true;
   },
   runTurn: runGrokTurn,
+  maxPromptBytes: GROK_MAX_PROMPT_BYTES,
 });

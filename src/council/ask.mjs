@@ -61,10 +61,15 @@ const VERDICT_SCHEMA = {
  * snapshot, so standing among the real files grants nothing a review needs
  * and everything a leak does.
  *
+ * The returned function also carries `promptLimit(peerId)`: the most bytes
+ * that peer's CLI can take in one prompt, or null for no limit. consultPeers
+ * reads it to trim the package for that peer alone (grok offloads anything
+ * bigger into a file it cannot read back — see GROK_MAX_PROMPT_BYTES).
+ *
  * @returns {(peerId: string, prompt: string, opts: {signal: AbortSignal}) => Promise<string>}
  */
 export function makeAskPeer({ timeoutMs } = {}) {
-  return async function askPeer(peerId, prompt, { signal } = {}) {
+  async function askPeer(peerId, prompt, { signal } = {}) {
     const scratchCwd = makeScratchDir();
     try {
       return await askInScratch({ peerId, prompt, signal, timeoutMs, cwd: scratchCwd });
@@ -75,7 +80,12 @@ export function makeAskPeer({ timeoutMs } = {}) {
         // a leftover empty temp dir is not worth failing a verdict over
       }
     }
+  }
+  askPeer.promptLimit = (peerId) => {
+    const limit = getPeerDriver(peerId)?.maxPromptBytes;
+    return Number.isFinite(limit) && limit > 0 ? limit : null;
   };
+  return askPeer;
 }
 
 async function askInScratch({ peerId, prompt, signal, timeoutMs, cwd }) {

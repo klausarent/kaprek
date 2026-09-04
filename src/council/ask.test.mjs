@@ -1,6 +1,7 @@
-import { test, expect, vi } from 'vitest';
+import { describe, test, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import { availablePeerIds, makeAskPeer } from './ask.mjs';
+import { GROK_MAX_PROMPT_BYTES } from '../harness/peers/grok.mjs';
 import { getEngine } from '../harness/registry.mjs';
 
 vi.mock('../harness/registry.mjs', () => ({ getEngine: vi.fn() }));
@@ -39,4 +40,14 @@ test('a peer driver only shows up when it says it is installed', () => {
 test('nothing is listed twice', () => {
   const ids = availablePeerIds({ engineIds: ['codex', 'codex'] });
   expect(ids.filter((id) => id === 'codex')).toHaveLength(1);
+});
+
+describe('prompt limits per peer', () => {
+  test('the askPeer function knows which peer cannot take a big package', () => {
+    const askPeer = makeAskPeer({ timeoutMs: 1_000 });
+    expect(typeof askPeer.promptLimit).toBe('function');
+    expect(askPeer.promptLimit('grok')).toBe(GROK_MAX_PROMPT_BYTES);
+    expect(askPeer.promptLimit('codex')).toBeNull();
+    expect(askPeer.promptLimit('claude-code')).toBeNull();
+  });
 });
