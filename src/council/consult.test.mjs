@@ -295,6 +295,51 @@ describe('a peer with a prompt limit', () => {
     expect(seen.codex).toContain(big);
     expect(result.answers.find((a) => a.peerId === 'grok').trimmed).toBeGreaterThan(0);
     expect(result.answers.find((a) => a.peerId === 'codex').trimmed).toBe(0);
-    expect(result.consensus).toBe(true);
+    // both agreed, but one of them on less — that is not consensus
+    expect(result.agreed.sort()).toEqual(['codex', 'grok']);
+    expect(result.consensus).toBe(false);
+  });
+});
+
+describe('fitPackage keeps its promise or says so', () => {
+  const limit = 20_000;
+  const bytes = (parts) => Buffer.byteLength(buildPackage(parts), 'utf8');
+
+  test('many medium snapshots fit, not just one big one', () => {
+    const snapshots = Array.from({ length: 40 }, (_, i) => ({ path: `f${i}.mjs`, content: 'y'.repeat(1_000), truncated: false }));
+    const fitted = fitPackage({ question: 'q', snapshots }, limit);
+    expect(fitted.fits).toBe(true);
+    expect(bytes(fitted.parts)).toBeLessThanOrEqual(limit);
+  });
+
+  test('multibyte text is measured in bytes, not characters', () => {
+    const fitted = fitPackage({ question: 'q', snapshots: [{ path: 'u.md', content: 'ä'.repeat(30_000), truncated: false }] }, limit);
+    expect(fitted.fits).toBe(true);
+    expect(bytes(fitted.parts)).toBeLessThanOrEqual(limit);
+  });
+
+  test('fixed material above the limit is reported, never sent as if it fit', async () => {
+    const parts = { question: 'q'.repeat(25_000), snapshots: [{ path: 'a', content: 'b'.repeat(500), truncated: false }] };
+    const fitted = fitPackage(parts, limit);
+    expect(fitted.fits).toBe(false);
+
+    const askPeer = vi.fn(async () => verdict('agree'));
+    askPeer.promptLimit = (peerId) => (peerId === 'grok' ? limit : null);
+    const result = await consultPeers({ peers: ['grok', 'codex'], askPeer, ...parts });
+    expect(askPeer.mock.calls.map(([peerId]) => peerId)).toEqual(['codex']);
+    const grok = result.answers.find((a) => a.peerId === 'grok');
+    expect(grok.verdict).toBeNull();
+    expect(grok.error).toMatch(/cannot be trimmed/);
+    expect(result.unreachable.map((u) => u.peerId)).toEqual(['grok']);
+  });
+
+  test('an agree on a trimmed package does not make consensus', async () => {
+    const parts = { question: 'q', snapshots: [{ path: 'big', content: 'x'.repeat(30_000), truncated: false }] };
+    const askPeer = vi.fn(async () => verdict('agree'));
+    askPeer.promptLimit = (peerId) => (peerId === 'grok' ? limit : null);
+    const result = await consultPeers({ peers: ['grok', 'codex'], askPeer, ...parts });
+    expect(result.agreed.sort()).toEqual(['codex', 'grok']);
+    expect(result.consensus).toBe(false);
+    expect(result.trimmed).toEqual([{ peerId: 'grok', chars: expect.any(Number) }]);
   });
 });

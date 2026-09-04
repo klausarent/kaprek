@@ -281,3 +281,8 @@ test('the driver declares a prompt limit below the CLI offload threshold', () =>
   expect(GROK_MAX_PROMPT_BYTES).toBeGreaterThanOrEqual(16_000);
   expect(grokDriver.maxPromptBytes).toBe(GROK_MAX_PROMPT_BYTES);
 });
+
+test('a prompt above the limit is refused before anything is spawned', async () => {
+  const spawnFn = () => { throw new Error('must not spawn'); };
+  await expect(runGrokTurn({ cwd: tmpDir(), prompt: 'p'.repeat(GROK_MAX_PROMPT_BYTES + 1), spawnFn })).rejects.toThrow(/offloads/);
+});

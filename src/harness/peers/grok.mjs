@@ -246,6 +246,13 @@ function killTree(child) {
  */
 export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, signal, logDir = null, spawnFn = spawn, env = process.env, maxTurns, tools, schema, validate = true } = {}) {
   if (typeof prompt !== 'string' || prompt.trim().length === 0) throw new Error('a peer turn needs a prompt');
+  // Refused here, not left to the CLI: above the threshold grok offloads the
+  // prompt into a file it cannot read back and the turn dies as "max turns
+  // reached" — an error that says nothing about its cause.
+  const promptBytes = Buffer.byteLength(prompt, 'utf8');
+  if (promptBytes > GROK_MAX_PROMPT_BYTES) {
+    throw new Error(`the prompt is ${promptBytes} bytes; grok 0.2.117 offloads anything above ~24 KB into a file it cannot read back on Windows — keep it under ${GROK_MAX_PROMPT_BYTES} bytes (GROK_MAX_PROMPT_BYTES)`);
+  }
 
   const { command, argsPrefix = [], useShell } = resolveGrokCli(env);
   // The empty --tools '' argument — the default, and what a text-only

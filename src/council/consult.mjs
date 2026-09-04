@@ -199,8 +199,14 @@ export function summarize(answers) {
   const unreachable = answers.filter((answer) => answer.verdict === null);
   const byVerdict = Object.fromEntries(VERDICTS.map((verdict) => [verdict, answered.filter((answer) => answer.verdict === verdict)]));
 
+  // A peer that saw a trimmed package agreed to less than the others saw;
+  // that is a verdict worth reading, not a vote for "everyone agrees" —
+  // the cut end of a diff is exactly where the defect may sit (Grok's own
+  // objection, council 04.09.2026).
+  const trimmed = answered.filter((answer) => answer.trimmed > 0).map((answer) => ({ peerId: answer.peerId, chars: answer.trimmed }));
   return {
-    consensus: answered.length > 0 && byVerdict.agree.length === answered.length,
+    consensus: answered.length > 0 && byVerdict.agree.length === answered.length && trimmed.length === 0,
+    trimmed,
     agreed: byVerdict.agree.map((answer) => answer.peerId),
     dissenting: [...byVerdict.concerns, ...byVerdict.disagree].map((answer) => ({
       peerId: answer.peerId,
@@ -233,29 +239,35 @@ const TRAILING_TRUNCATION = /\n… \[truncated: (\d+) more characters[^\]]*\]$/;
  */
 export function fitPackage(parts, maxBytes) {
   const current = { ...parts, snapshots: (parts.snapshots ?? []).map((snapshot) => ({ ...snapshot })) };
+  const size = () => Buffer.byteLength(buildPackage(current), 'utf8');
   let trimmed = 0;
-  if (!(maxBytes > 0)) return { parts: current, trimmed };
-  // Bounded: every round cuts at least the excess, so this ends long before
-  // the bound — the bound only guards against a marker that never shrinks.
-  for (let round = 0; round < 64; round += 1) {
-    const excess = Buffer.byteLength(buildPackage(current), 'utf8') - maxBytes;
-    if (excess <= 0) break;
-    const candidates = current.snapshots.filter((snapshot) => snapshot.content.length > 0);
-    if (candidates.length === 0) break;
-    const largest = candidates.reduce((a, b) => (b.content.length > a.content.length ? b : a));
+  if (!(maxBytes > 0)) return { parts: current, trimmed, fits: true };
+  const split = (snapshot) => {
     // A snapshot that snapshot.mjs already truncated ends in the same kind
     // of marker; fold its count into ours instead of stacking two markers.
-    const prior = TRAILING_TRUNCATION.exec(largest.content);
-    const body = prior ? largest.content.slice(0, prior.index) : largest.content;
-    const priorCut = prior ? Number(prior[1]) : 0;
-    // The excess plus room for the marker; a multibyte character weighs more
-    // than one byte, so the next round re-measures rather than trusting this.
+    const prior = TRAILING_TRUNCATION.exec(snapshot.content);
+    return { body: prior ? snapshot.content.slice(0, prior.index) : snapshot.content, priorCut: prior ? Number(prior[1]) : 0 };
+  };
+  // Every round takes the whole excess (plus marker room) out of the snapshot
+  // with the most body left; a snapshot whose body is gone is no longer a
+  // candidate, so the loop ends after at most one round per snapshot — plus
+  // re-measuring rounds, because a multibyte character weighs more than one
+  // byte and the cut is counted in characters. Council (Codex and Grok,
+  // 04.09.2026): the first version cut one snapshot per round with a fixed
+  // round cap and never checked the result, so forty medium snapshots could
+  // leave the package oversize and the offload it exists to avoid reachable.
+  for (let guard = 0; guard < current.snapshots.length * 4 + 8; guard += 1) {
+    const excess = size() - maxBytes;
+    if (excess <= 0) break;
+    const candidates = current.snapshots.map((snapshot) => ({ snapshot, ...split(snapshot) })).filter((c) => c.body.length > 0);
+    if (candidates.length === 0) break;
+    const { snapshot, body, priorCut } = candidates.reduce((a, b) => (b.body.length > a.body.length ? b : a));
     const cut = Math.min(body.length, excess + 120);
     trimmed += cut;
-    largest.content = `${body.slice(0, body.length - cut)}\n… [truncated: ${priorCut + cut} more characters, trimmed to fit this peer's prompt limit]`;
-    largest.truncated = true;
+    snapshot.content = `${body.slice(0, body.length - cut)}\n… [truncated: ${priorCut + cut} more characters, trimmed to fit this peer's prompt limit]`;
+    snapshot.truncated = true;
   }
-  return { parts: current, trimmed };
+  return { parts: current, trimmed, fits: size() <= maxBytes };
 }
 
 /**
@@ -273,9 +285,13 @@ export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PE
   const prompt = buildPackage(packageParts);
   const promptFor = (peerId) => {
     const limit = typeof askPeer?.promptLimit === 'function' ? askPeer.promptLimit(peerId) : null;
-    if (!(limit > 0) || Buffer.byteLength(prompt, 'utf8') <= limit) return { prompt, trimmed: 0 };
+    if (!(limit > 0) || Buffer.byteLength(prompt, 'utf8') <= limit) return { prompt, trimmed: 0, tooBig: null };
     const fitted = fitPackage(packageParts, limit);
-    return { prompt: buildPackage(fitted.parts), trimmed: fitted.trimmed };
+    const fittedPrompt = buildPackage(fitted.parts);
+    // Never send what does not fit: the peer would fail the same way the
+    // limit exists to prevent, and quietly. Say why instead.
+    const tooBig = fitted.fits ? null : `the package cannot be trimmed to this peer's ${limit}-byte prompt limit (${Buffer.byteLength(fittedPrompt, 'utf8')} bytes left with every snapshot cut — the question, constraints and tried list alone are too long)`;
+    return { prompt: fittedPrompt, trimmed: fitted.trimmed, tooBig };
   };
 
   const answers = await Promise.all(
@@ -286,7 +302,11 @@ export async function consultPeers({ peers = [], askPeer, timeoutMs = DEFAULT_PE
       // into a sentence about one.
       const state = health?.check(peerId) ?? { ask: true };
       if (!state.ask) return { peerId, verdict: null, summary: null, risks: [], error: state.reason, raw: null, skipped: true, trimmed: 0 };
-      const { prompt: peerPrompt, trimmed } = promptFor(peerId);
+      const { prompt: peerPrompt, trimmed, tooBig } = promptFor(peerId);
+      if (tooBig) {
+        health?.failed(peerId);
+        return { peerId, verdict: null, summary: null, risks: [], error: tooBig, raw: null, trimmed };
+      }
       const controller = new AbortController();
       const onAbort = () => controller.abort();
       signal?.addEventListener('abort', onAbort, { once: true });
