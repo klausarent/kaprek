@@ -63,6 +63,7 @@ test('loadPolicy returns the parsed policy for a well-formed file', () => {
     rules: { requireTaskDoc: false, requireCommitTask: true },
     posture: 'auto',
     hardDenials: [],
+    budget: { defaultDailyUsd: null },
   });
 });
 
@@ -74,13 +75,14 @@ test('loadPolicy fills in missing fields with DEFAULT_POLICY values', () => {
     rules: DEFAULT_POLICY.rules,
     posture: 'auto',
     hardDenials: [],
+    budget: { defaultDailyUsd: null },
   });
 });
 
 test('loadPolicy strips a leading BOM before parsing', () => {
   const bom = '﻿';
   fs.writeFileSync(path.join(dataDir, 'policy.json'), `${bom}${JSON.stringify({ mode: 'warn' })}`, 'utf8');
-  expect(loadPolicy(dataDir)).toEqual({ version: 1, mode: 'warn', rules: DEFAULT_POLICY.rules, posture: 'auto', hardDenials: [] });
+  expect(loadPolicy(dataDir)).toEqual({ version: 1, mode: 'warn', rules: DEFAULT_POLICY.rules, posture: 'auto', hardDenials: [], budget: { defaultDailyUsd: null } });
 });
 
 test('loadPolicy falls back to observe (with a reason) for corrupt JSON, without throwing', () => {

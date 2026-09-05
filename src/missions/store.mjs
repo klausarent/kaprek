@@ -14,7 +14,7 @@ import crypto from 'node:crypto';
 
 export const MISSION_STATUSES = ['active', 'waiting', 'done', 'archived'];
 
-const UPDATABLE_FIELDS = ['title', 'goal', 'posture'];
+const UPDATABLE_FIELDS = ['title', 'goal', 'posture', 'budgetUsd'];
 
 export class MissionNotFoundError extends Error {
   constructor(missionId) {
@@ -62,6 +62,21 @@ export class InvalidGoalError extends Error {
   }
 }
 
+/**
+ * The mission's own daily budget in USD (ALMANAC-PLAN §2.5), or null for
+ * "no mission budget" — which is not 0 and never a limit by itself. Under a
+ * policy default (budget.defaultDailyUsd) it only ever TIGHTENS the ceiling
+ * in effect, same posture semantics as the mission's own posture dial — see
+ * src/budget/budget.mjs.
+ */
+export class InvalidBudgetError extends Error {
+  constructor(budgetUsd) {
+    super(`budgetUsd must be null or a finite number >= 0, got: ${JSON.stringify(budgetUsd)}`);
+    this.name = 'InvalidBudgetError';
+    this.budgetUsd = budgetUsd;
+  }
+}
+
 export class InvalidLinkError extends Error {
   constructor(kind) {
     super(`${kind} id must be a non-empty string`);
@@ -93,6 +108,9 @@ function applyEvent(missions, event) {
         // The mission's own posture ceiling, or null for "the global one".
         // Only ever stricter than global in effect — see policy/guards.mjs.
         posture: data.posture ?? null,
+        // The mission's own daily budget in USD, or null for "no mission
+        // budget" (see InvalidBudgetError above and src/budget/budget.mjs).
+        budgetUsd: data.budgetUsd ?? null,
         status: 'active',
         createdAt: ts,
         updatedAt: ts,
@@ -211,6 +229,13 @@ export function openMissions(dataDir) {
     if (posture !== null && !isPosture(posture)) throw new InvalidPostureError(posture);
   }
 
+  function assertBudget(budgetUsd) {
+    if (budgetUsd === null) return;
+    if (typeof budgetUsd !== 'number' || !Number.isFinite(budgetUsd) || budgetUsd < 0) {
+      throw new InvalidBudgetError(budgetUsd);
+    }
+  }
+
   function assertCwd(cwd) {
     if (cwd === null) return;
     if (typeof cwd !== 'string' || !path.isAbsolute(cwd)) throw new InvalidCwdError(cwd);
@@ -229,7 +254,7 @@ export function openMissions(dataDir) {
       return clone(requireMission(missionId));
     },
 
-    create({ title, goal = null, cwd = null, preset = null, posture = null } = {}) {
+    create({ title, goal = null, cwd = null, preset = null, posture = null, budgetUsd = null } = {}) {
       assertTitle(title);
       if (goal !== null && typeof goal !== 'string') throw new InvalidGoalError();
       assertCwd(cwd);
@@ -238,7 +263,8 @@ export function openMissions(dataDir) {
       }
       const missionId = crypto.randomUUID();
       assertPosture(posture);
-      commit('mission.created', missionId, { title, goal, cwd, preset, posture });
+      assertBudget(budgetUsd);
+      commit('mission.created', missionId, { title, goal, cwd, preset, posture, budgetUsd });
       return clone(requireMission(missionId));
     },
 
@@ -253,6 +279,7 @@ export function openMissions(dataDir) {
         throw new InvalidGoalError();
       }
       if ('posture' in fields) assertPosture(fields.posture);
+      if ('budgetUsd' in fields) assertBudget(fields.budgetUsd);
       commit('mission.updated', missionId, fields);
       return clone(requireMission(missionId));
     },
