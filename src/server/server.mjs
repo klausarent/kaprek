@@ -1825,6 +1825,9 @@ async function handleApprovalsList(res, approvalStore, query = null) {
     // (see relay/dispatcher.mjs). The UI needs it to label the card, and a
     // gate is answered through a different path on the way back in.
     kind: entry.kind ?? null,
+    // The mission the question belongs to (the daily-budget question files
+    // it, ALM 2.5) — a card can name the mission without resolving the chat.
+    missionId: entry.missionId ?? null,
     triggerId: entry.triggerId ?? null,
     // How often the trigger has asked this same question (see the store's
     // dedupe). Worth showing: a question asked five times is a different kind
@@ -1958,6 +1961,7 @@ async function handleLeitstand(res, { dataDir, getChats, getMissions, getApprova
     remainingMs: entry.deadlineAt !== null && entry.deadlineAt !== undefined ? Math.max(0, entry.deadlineAt - now) : null,
     mode: entry.mode ?? 'interactive',
     kind: entry.kind ?? null,
+    missionId: entry.missionId ?? null,
     triggerId: entry.triggerId ?? null,
     askedCount: entry.askedCount ?? 1,
   }));
@@ -3277,9 +3281,11 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
  * the block until the next LOCAL midnight — no cron, the day keys decide.
  *
  * `decompose`/`compose` are digest's injected local-day decomposition
- * (DST-safe: a 23 h or 25 h day is still exactly one window).
+ * (DST-safe: a 23 h or 25 h day is still exactly one window). Exported for
+ * the budget tests, which pin a timezone and a `now` exactly like the digest
+ * tests do (see src/budget/budget.test.mjs).
  */
-function dailyBudgetCheck({
+export function dailyBudgetCheck({
   dataDir,
   policy,
   mission = null,
@@ -3559,28 +3565,6 @@ async function handleChatTurn(
   // the harness are talking about the same turn start.
   const turnStartedAt = Date.now();
 
-  const controller = new AbortController();
-  chatAbortControllers.set(chatId, controller);
-  // Listens on `res`, not `req`: by the time this handler runs, the request
-  // body has already been fully read by readJsonBody() above, so `req`'s own
-  // 'close' event has typically already fired (or never fires again) and a
-  // closed browser tab / killed fetch would NOT reliably reach this turn —
-  // `res` is the SSE response actually still streaming to the client, so its
-  // 'close' event is what actually reflects the client going away mid-turn.
-  const onClientClose = () => controller.abort();
-  res.on('close', onClientClose);
-
-  // DEADLOCK GUARD: a pending approval must be resolved the MOMENT abort is
-  // requested (cancel route or client disconnect, both call
-  // controller.abort()), not only once `await runTurn(...)` below returns —
-  // the harness is itself AWAITING that approval's decision, so it would
-  // never return in the first place if cleanup waited for it. The `finally`
-  // block's own cleanupApprovalsForChat() call further down stays as a
-  // second, idempotent pass for any approval that outlives the turn without
-  // ever going through abort (e.g. it resolves on its own right as the turn
-  // is wrapping up for some other reason).
-  controller.signal.addEventListener('abort', () => cancelApprovalsForChat(pendingApprovals, chatId, approvalStore, 'run-aborted'));
-
   // The posture ceiling: the global dial, tightened by the mission's own.
   // A stance past it is refused with the reason — never clamped, because a
   // picker that says "auto" while the turn runs "edits" would be lying.
@@ -3673,6 +3657,29 @@ async function handleChatTurn(
       return;
     }
   }
+
+  const controller = new AbortController();
+  chatAbortControllers.set(chatId, controller);
+  // Listens on `res`, not `req`: by the time this handler runs, the request
+  // body has already been fully read by readJsonBody() above, so `req`'s own
+  // 'close' event has typically already fired (or never fires again) and a
+  // closed browser tab / killed fetch would NOT reliably reach this turn —
+  // `res` is the SSE response actually still streaming to the client, so its
+  // 'close' event is what actually reflects the client going away mid-turn.
+  const onClientClose = () => controller.abort();
+  res.on('close', onClientClose);
+
+  // DEADLOCK GUARD: a pending approval must be resolved the MOMENT abort is
+  // requested (cancel route or client disconnect, both call
+  // controller.abort()), not only once `await runTurn(...)` below returns —
+  // the harness is itself AWAITING that approval's decision, so it would
+  // never return in the first place if cleanup waited for it. The `finally`
+  // block's own cleanupApprovalsForChat() call further down stays as a
+  // second, idempotent pass for any approval that outlives the turn without
+  // ever going through abort (e.g. it resolves on its own right as the turn
+  // is wrapping up for some other reason).
+  controller.signal.addEventListener('abort', () => cancelApprovalsForChat(pendingApprovals, chatId, approvalStore, 'run-aborted'));
+
 
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
