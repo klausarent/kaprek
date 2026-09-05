@@ -283,3 +283,34 @@ describe('fmtDuration', () => {
     expect(fmtDuration(null)).toBe('unknown');
   });
 });
+
+describe('renderDigest — Tagesbudget-Zeile (ALM 2.5)', () => {
+  const mission = { id: 'm1', title: 'Zaehler-Service' };
+
+  test('eine Mission MIT Budget bekommt die Zeile: Stand, unknown-Zähler, Gnaden-Status', () => {
+    const runs = [run({ costUsd: 3.4 }), run({ costUsd: null })];
+    const md = renderDigest({ mission, window: WINDOW, runs, openQuestions: [], nowMs: 0, budget: { budgetUsd: 10, graceToday: false } });
+    expect(md).toContain('## Tagesbudget');
+    expect(md).toContain('- Budget: $3.4000 von $10.0000 · 1 Läufe ohne Kostendaten (zählen nicht mit)');
+    expect(md).toContain('- Gnaden-Status: keine Freigabe heute');
+  });
+
+  test('ein Tag NUR unbekannter Kosten behauptet keine 0 — die Zeile sagt, dass das Budget nicht ausgereizt sein kann', () => {
+    const runs = [run({ costUsd: null }), run({ costUsd: null })];
+    const md = renderDigest({ mission, window: WINDOW, runs, openQuestions: [], nowMs: 0, budget: { budgetUsd: 10, graceToday: true } });
+    expect(md).toContain('bekannt ist nichts von $10.0000 — 2 Läufe ohne Kostendaten');
+    expect(md).toContain('- Gnaden-Status: Budget überschritten, heute freigegeben');
+  });
+
+  test('ein skipped-Budget-Run ist weder Kosten noch unknown, sondern seine eigene Zeile', () => {
+    const runs = [run({ origin: 'trigger', triggerId: 't1', skipped: 'budget', durationMs: 0 }), run({ costUsd: 1 })];
+    const md = renderDigest({ mission, window: WINDOW, runs, openQuestions: [], nowMs: 0, budget: { budgetUsd: 10, graceToday: false } });
+    expect(md).toContain('- übersprungen (Budget) — Tagesbudget erreicht, Dauer 0 ms');
+    expect(md).toContain('- Budget: $1.0000 von $10.0000');
+  });
+
+  test('eine Mission OHNE Budget bekommt keine Zeile — kein Fake-Limit', () => {
+    const md = renderDigest({ mission, window: WINDOW, runs: [run()], openQuestions: [], nowMs: 0, budget: null });
+    expect(md).not.toContain('Tagesbudget');
+  });
+});

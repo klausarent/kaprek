@@ -15,6 +15,7 @@ import {
   InvalidCwdError,
   InvalidLinkError,
   InvalidPostureError,
+  InvalidBudgetError,
 } from './store.mjs';
 
 function tmpDataDir() {
@@ -147,6 +148,19 @@ test('list filters by status', () => {
   store.setStatus(a.id, 'done');
   expect(store.list({ status: 'done' }).map((m) => m.title)).toEqual(['a']);
   expect(store.list({ status: 'active' }).map((m) => m.title)).toEqual(['b']);
+});
+
+test('a mission may carry its own daily budget in USD, cleared with null, and refuses anything else (ALM 2.5)', () => {
+  const store = openMissions(tmpDataDir());
+  const plain = store.create({ title: 'plain' });
+  expect(plain.budgetUsd).toBeNull(); // kein Budget ist null, nie 0
+  const capped = store.create({ title: 'capped', budgetUsd: 10 });
+  expect(capped.budgetUsd).toBe(10);
+  expect(store.update(capped.id, { budgetUsd: 2.5 }).budgetUsd).toBe(2.5);
+  expect(store.update(capped.id, { budgetUsd: null }).budgetUsd).toBeNull();
+  expect(() => store.create({ title: 'x', budgetUsd: -1 })).toThrow(InvalidBudgetError);
+  expect(() => store.create({ title: 'x', budgetUsd: '10' })).toThrow(InvalidBudgetError);
+  expect(() => store.update(plain.id, { budgetUsd: Number.NaN })).toThrow(InvalidBudgetError);
 });
 
 test('a mission may carry its own posture ceiling, cleared with null, and refuses anything else', () => {
