@@ -7,6 +7,8 @@ import {
   RunningRow,
   OvernightRow,
   HistoryRow,
+  StartContent,
+  budgetStripText,
   costLabel,
   remainingLabel,
   tokensLabel,
@@ -212,4 +214,64 @@ test("an empty fetch yields an empty feed — the page says its reason instead o
     grants: [],
   };
   expect(feedFrom(data)).toEqual([]);
+});
+
+// ------------------------------------------------------------- Tagesbudget (ALM 2.5)
+
+test("budgetStripText zeigt den bekannten Stand von der Summe der Kappen — mit unknown-Zähler, ehrlich", () => {
+  expect(
+    budgetStripText({
+      missions: [{ missionId: "m-1", title: "m", budgetUsd: 4, spentKnownUsd: 1.1, unknownRuns: 0, graceToday: false, exceeded: false },
+                  { missionId: "m-2", title: "n", budgetUsd: 6, spentKnownUsd: 0.02, unknownRuns: 1, graceToday: false, exceeded: false }],
+      totals: { knownUsd: 1.12, budgetUsd: 10, unknownRuns: 1 },
+    }),
+  ).toBe("$1.12 von $10.00 · 1 unknown");
+  expect(
+    budgetStripText({
+      missions: [{ missionId: "m-1", title: "m", budgetUsd: 4, spentKnownUsd: 0, unknownRuns: 0, graceToday: false, exceeded: false }],
+      totals: { knownUsd: 0, budgetUsd: 4, unknownRuns: 0 },
+    }),
+  ).toBe("$0.00 von $4.00");
+});
+
+test("ohne Mission mit Budget gibt es keine Budget-Zeile — kein Fake-Limit", () => {
+  expect(budgetStripText({ missions: [], totals: null })).toBeNull();
+});
+
+function leitstandData(overrides: Partial<LeitstandResponse> = {}): LeitstandResponse {
+  return {
+    since: NOW,
+    running: [],
+    pending: [],
+    overnight: { totals: group({ ran: 0, costUsd: 0, costKnown: 0, tokens: 0, tokensKnown: 0 }), byMission: [] },
+    attention: { degradedTriggers: [], staleGrants: [], grantsActive: 0 },
+    history: [],
+    grants: [],
+    ...overrides,
+  };
+}
+
+test("der Streifen zeigt die Tagesbudget-Zeile, wenn Missionen ein Budget haben — und schweigt ohne", () => {
+  const withBudget = render(
+    <StartContent
+      data={leitstandData({
+        budget: {
+          missions: [{ missionId: "m-1", title: "m", budgetUsd: 4, spentKnownUsd: 1.1, unknownRuns: 2, graceToday: false, exceeded: false }],
+          totals: { knownUsd: 1.1, budgetUsd: 4, unknownRuns: 2 },
+        },
+      })}
+      error={null}
+      busyId={null}
+      nowMs={NOW}
+      onDecide={() => {}}
+      onAbort={() => {}}
+    />,
+  );
+  expect(textOf(withBudget)).toContain("Tagesbudget");
+  expect(textOf(withBudget)).toContain("$1.10 von $4.00 · 2 unknown");
+
+  const withoutBudget = render(
+    <StartContent data={leitstandData()} error={null} busyId={null} nowMs={NOW} onDecide={() => {}} onAbort={() => {}} />,
+  );
+  expect(textOf(withoutBudget)).not.toContain("Tagesbudget");
 });

@@ -311,22 +311,34 @@ export function budgetDetailLine(budget: NonNullable<MissionDetailData["budget"]
   return (budget.unknownRuns ?? 0) > 0 ? `${stand} · ${budget.unknownRuns} Läufe ohne Kostendaten` : stand;
 }
 
+/** Die Speichern-Semantik des Budget-Felds: leer (oder nur Leerzeichen) heißt KEIN Budget (null) — nie ein Fake-0-Limit. Unsinn wird zur Seite gelassen (NaN), das Feld ist type="number". */
+export function parseBudgetInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : null;
+}
+
 export function MissionBudgetCardBody({
   budget,
+  inputValue,
   saving,
+  onInputChange,
   onSave,
 }: {
   budget: NonNullable<MissionDetailData["budget"]>;
+  inputValue: string;
   saving: boolean;
+  onInputChange: (value: string) => void;
   onSave: (budgetUsd: number | null) => void;
 }) {
-  const [input, setInput] = useState<string>("");
   const hasBudget = budget.effectiveUsd !== null && budget.effectiveUsd !== undefined;
-  const source = budget.missionBudgetUsd !== null && budget.policyDefaultUsd !== null && budget.missionBudgetUsd < budget.policyDefaultUsd
-    ? "eigenes Mission-Budget unter der policy-Decke"
-    : budget.missionBudgetUsd !== null
-      ? "eigenes Mission-Budget"
-      : "Decke aus policy.json (budget.defaultDailyUsd)";
+  const source =
+    budget.missionBudgetUsd !== null && budget.policyDefaultUsd !== null && budget.missionBudgetUsd < budget.policyDefaultUsd
+      ? "eigenes Mission-Budget unter der policy-Decke"
+      : budget.missionBudgetUsd !== null
+        ? "eigenes Mission-Budget"
+        : "Decke aus policy.json (budget.defaultDailyUsd)";
   return (
     <section className="mission-section mission-budget" aria-label="Daily budget">
       <h3>Daily budget</h3>
@@ -345,23 +357,22 @@ export function MissionBudgetCardBody({
             min="0"
             step="0.01"
             aria-label="Mission daily budget in dollars"
-            value={input}
-            onChange={(e) => setInput(e.target.value)}
+            value={inputValue}
+            onChange={(e) => onInputChange(e.target.value)}
           />
         </label>{" "}
         <button
           type="button"
           className="mission-budget-save"
           disabled={saving}
-          onClick={() => {
-            const trimmed = input.trim();
-            onSave(trimmed === "" ? null : Number(trimmed));
-          }}
+          onClick={() => onSave(parseBudgetInput(inputValue))}
         >
           {saving ? "Speichern…" : "Budget setzen"}
         </button>
         <span className="plan-note mission-budget-note">
-          {hasBudget ? `wirksam: ${source} — ein eigenes Budget darf die policy-Decke nur verschärfen (Minimum)` : "eine Decke aus policy.json (budget.defaultDailyUsd) gilt auch ohne eigenes Feld"}
+          {hasBudget
+            ? `wirksam: ${source} — ein eigenes Budget darf die policy-Decke nur verschärfen (Minimum)`
+            : "eine Decke aus policy.json (budget.defaultDailyUsd) gilt auch ohne eigenes Feld"}
         </span>
       </p>
     </section>
@@ -397,6 +408,9 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
   const [memory, setMemory] = useState<MissionMemoryData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloads, setReloads] = useState(0);
+  // Der eigene Eingabestand des Budget-Felds (kontrolliert — die Card selbst
+  // bleibt hook-frei, damit die Element-Tree-Tests sie direkt rufen können).
+  const [budgetInput, setBudgetInput] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -440,6 +454,7 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
   async function handleBudgetChange(budgetUsd: number | null) {
     try {
       await setMissionBudget(missionId, budgetUsd);
+      setBudgetInput("");
       setReloads((n) => n + 1);
     } catch (e) {
       setError((e as Error).message);
@@ -475,7 +490,13 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
       {memory && <MissionMemoryCard memory={memory} onForget={handleForget} />}
 
       {detail.budget && (
-        <MissionBudgetCardBody key={`${missionId}:${reloads}`} budget={detail.budget} saving={false} onSave={handleBudgetChange} />
+        <MissionBudgetCardBody
+          budget={detail.budget}
+          inputValue={budgetInput}
+          saving={false}
+          onInputChange={setBudgetInput}
+          onSave={handleBudgetChange}
+        />
       )}
 
       <MissionDigestCard missionId={missionId} onError={(message) => setError(message)} />
