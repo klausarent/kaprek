@@ -41,9 +41,10 @@ import {
   InvalidGoalError,
   InvalidLinkError,
   InvalidPostureError,
+  InvalidBudgetError as MissionInvalidBudgetError,
 } from '../missions/store.mjs';
 import { loadPresets } from '../missions/presets.mjs';
-import { buildDigest, listDigests } from '../missions/digest.mjs';
+import { buildDigest, listDigests, localDayBounds } from '../missions/digest.mjs';
 import { InvalidWorkflowError, buildWorkflow, importSummary, loadWorkflows, saveWorkflow, validateWorkflow } from '../missions/workflow.mjs';
 import { HOME_MISSIONS, buildHomePrompt, homeMission } from '../missions/home.mjs';
 import { getEngine, listEngines } from '../harness/registry.mjs';
@@ -106,6 +107,17 @@ import {
   DERIVATION_VERSION,
 } from '../policy/grants.mjs';
 import { ABSOLUTE_MS } from '../harness/timeout.mjs';
+import {
+  BUDGET_QUESTION_KIND,
+  GLOBAL_BUDGET_KEY,
+  budgetStandText,
+  dayKeyOf,
+  effectiveDailyBudget,
+  hasGrace,
+  readGraces,
+  recordGrace,
+  spendOfRuns,
+} from '../budget/budget.mjs';
 
 // The apps/ directory shipped with kaprek, resolved the same way
 // src/apps/mcp-server.mjs resolves it (this file lives in src/server/).
@@ -1335,7 +1347,7 @@ function cancelApprovalsForChat(pendingApprovals, chatId, approvalStore = null, 
  * from the browser, only the CLI's own proposed input is ever allowed
  * through).
  */
-async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null, { decidedVia = 'web', grants = null } = {}) {
+async function handleApprovalDecision(req, res, id, pendingApprovals, approvalStore = null, getRunner = null, getRelay = null, { decidedVia = 'web', grants = null, recordBudgetGrace = null } = {}) {
   if (!isSafeId(id)) {
     sendJson(res, 400, { error: 'invalid approval id' });
     return;
@@ -1366,6 +1378,10 @@ async function handleApprovalDecision(req, res, id, pendingApprovals, approvalSt
     const filed = approvalStore ? await approvalStore.get(key) : null;
     if (filed?.kind === RELAY_GATE_KIND && filed.status === 'pending') {
       await decideRelayGate(res, { key, entry: filed, behavior, approvalStore, getRelay, decidedVia });
+      return;
+    }
+    if (filed?.kind === BUDGET_QUESTION_KIND && filed.status === 'pending') {
+      await decideBudgetQuestion(res, { key, entry: filed, behavior, message: body.data?.message, approvalStore, decidedVia, recordGrace: recordBudgetGrace });
       return;
     }
     if (filed?.mode === 'deferred' && filed.status === 'pending') {
@@ -1512,6 +1528,51 @@ async function decideDeferredApproval(res, { key, entry, behavior, message, appr
   // response (which is long sent by the time the turn ends).
   runner.fireFollowUp({ entry }).catch(() => {});
   sendJson(res, 200, { ok: true, followUp: true });
+}
+
+/**
+ * Answers a BUDGET question (ALM 2.5, I2): unlike a deferred tool approval
+ * there is no action to replay, so an allow records a GRACE DAY and starts
+ * nothing — the next turn submission in this mission (or, for the global
+ * bucket, any missionless turn) simply passes until the next local midnight.
+ * A deny records the refusal; the mission stays capped and the next
+ * submission asks again (only an allow suppresses re-asking — I2 names the
+ * grace, not the refusal).
+ *
+ * The grace is written AFTER the decision is recorded, so a grace-write
+ * failure can never spend a question on nothing: the entry would read
+ * decided/allow while the next ask re-questions — annoying, never wrong.
+ */
+async function decideBudgetQuestion(res, { key, entry, behavior, message, approvalStore, decidedVia = 'web', recordGrace: recordGraceFn = null }) {
+  if (behavior === 'deny') {
+    try {
+      await approvalStore.decide(key, { behavior: 'deny', message: typeof message === 'string' ? message : 'denied by user', via: decidedVia });
+    } catch (err) {
+      sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
+      return;
+    }
+    sendJson(res, 200, { ok: true, budget: 'denied' });
+    return;
+  }
+
+  if (typeof recordGraceFn !== 'function') {
+    // Wiring bug, never a user error: granting without a place to record the
+    // grace would look allowed and question again on the very next turn.
+    sendJson(res, 503, { error: 'the grace record is not available in this server' });
+    return;
+  }
+  try {
+    await approvalStore.decide(key, { behavior: 'allow', via: decidedVia });
+  } catch (err) {
+    sendJson(res, 409, { error: err.message, ...(err.already ? { already: err.already } : {}) });
+    return;
+  }
+  try {
+    recordGraceFn(entry.missionId ?? null);
+  } catch {
+    // The decision stands; the next submission will simply ask again.
+  }
+  sendJson(res, 200, { ok: true, budget: 'grace' });
 }
 
 /**
@@ -1824,6 +1885,10 @@ async function handleApprovalsList(res, approvalStore, query = null) {
  *     byMission: [{ missionId, triggerId, title, ...same counters }],  // only runs attributable via the run's chat's mission
  *                                       // or the run's own triggerId; unattributable runs sit only in totals
  *   },
+ *   budget: {                           // ALM 2.5 — only missions WITH an effective budget appear; no budget, no row
+ *     missions: [{ missionId, title, budgetUsd, spentKnownUsd, unknownRuns, graceToday, exceeded }],
+ *     totals: { knownUsd, budgetUsd, unknownRuns } | null,  // the strip's aggregate, null when no mission has a budget
+ *   },
  *   attention: {
  *     degradedTriggers: [{ id, type, degraded, conditionErrorStreak, condition }],
  *     staleGrants: [{ id, toolName, scope, match }],   // active grants asleep because their authorities changed (reconfirmPending)
@@ -1957,6 +2022,34 @@ async function handleLeitstand(res, { dataDir, getChats, getMissions, getApprova
     }
   }
 
+  // Daily budgets (ALM 2.5): one aggregate for the Start page's status
+  // strip. ONLY missions with an effective budget appear here — a mission
+  // (and a day) without a budget is no data point, and inventing "$0 of $0"
+  // for it would be the fake limit this page refuses to show.
+  const policyForBudget = loadPolicyFailOpen(dataDir);
+  const budgetChatList = getChats().list();
+  const budgetMissionList = getMissions().list();
+  const budgetMissions = [];
+  const budgetTotals = { knownUsd: 0, budgetUsd: 0, unknownRuns: 0 };
+  for (const owned of budgetMissionList) {
+    if (owned.status === 'archived') continue;
+    const verdict = dailyBudgetCheck({ dataDir, policy: policyForBudget, mission: owned, chatList: budgetChatList, missions: budgetMissionList });
+    if (!verdict.applies) continue;
+    budgetMissions.push({
+      missionId: owned.id,
+      title: owned.title,
+      budgetUsd: verdict.budgetUsd,
+      spentKnownUsd: verdict.knownUsd,
+      unknownRuns: verdict.unknownRuns,
+      graceToday: verdict.grace,
+      exceeded: verdict.exceeded,
+    });
+    budgetTotals.knownUsd += verdict.knownUsd;
+    budgetTotals.budgetUsd += verdict.budgetUsd;
+    budgetTotals.unknownRuns += verdict.unknownRuns;
+  }
+  const budget = { missions: budgetMissions, totals: budgetMissions.length > 0 ? budgetTotals : null };
+
   // Attention: degraded triggers, stale grants, a read-only search index.
   // Each list is computed defensively — an attention panel that cannot be
   // computed must be empty, never a broken route.
@@ -2037,6 +2130,7 @@ async function handleLeitstand(res, { dataDir, getChats, getMissions, getApprova
       totals,
       byMission: [...groups.values()],
     },
+    budget,
     attention: {
       degradedTriggers,
       staleGrants,
@@ -2285,6 +2379,7 @@ function missionErrorStatus(err) {
     err instanceof InvalidCwdError ||
     err instanceof InvalidGoalError ||
     err instanceof InvalidPostureError ||
+    err instanceof MissionInvalidBudgetError ||
     err instanceof InvalidLinkError
   ) {
     return 400;
@@ -2903,7 +2998,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         sendJson(res, body.status, { error: body.error });
         return;
       }
-      const { title, goal = null, cwd = null, preset = null, posture = null } = body.data ?? {};
+      const { title, goal = null, cwd = null, preset = null, posture = null, budgetUsd = null } = body.data ?? {};
       // Existence is a route concern, shape is a store concern: the store
       // validates "absolute path", but only this process can ask the disk.
       // Checked BEFORE create() so a mission with a dead cwd never enters
@@ -2925,7 +3020,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         }
       }
       try {
-        const mission = missions.create({ title, goal, cwd, preset, posture });
+        const mission = missions.create({ title, goal, cwd, preset, posture, budgetUsd });
         sendJson(res, 201, { mission });
       } catch (err) {
         const status = missionErrorStatus(err);
@@ -2964,7 +3059,20 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
       .filter((task) => mission.tasks.includes(task.id));
     const pendingApprovals = (await getApprovalStore().listPending())
       .filter((entry) => entry.chatId && chats.some((chat) => chat.id === entry.chatId));
-    sendJson(res, 200, { mission, chats, tasks, pendingApprovals });
+    // The daily-budget view (ALM 2.5): the mission's own figure, the policy
+    // ceiling it tightens, the effective minimum, today's stand — and, when
+    // no budget applies at all, nulls instead of a fake limit.
+    const policyForBudget = loadPolicyFailOpen(dataDir);
+    const budgetVerdict = dailyBudgetCheck({ dataDir, policy: policyForBudget, mission, chatList: chats, missions: missions.list() });
+    const budget = {
+      missionBudgetUsd: mission.budgetUsd ?? null,
+      policyDefaultUsd: policyForBudget.budget?.defaultDailyUsd ?? null,
+      effectiveUsd: budgetVerdict.applies ? budgetVerdict.budgetUsd : null,
+      spentKnownUsd: budgetVerdict.applies ? budgetVerdict.knownUsd : null,
+      unknownRuns: budgetVerdict.applies ? budgetVerdict.unknownRuns : null,
+      graceToday: budgetVerdict.applies ? budgetVerdict.grace : false,
+    };
+    sendJson(res, 200, { mission, chats, tasks, pendingApprovals, budget });
     return;
   }
 
@@ -3019,6 +3127,17 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     const pendingQuestions = (await getApprovalStore().listPending()).filter(
       (entry) => entry.mode === 'deferred' && entry.chatId != null && chatIds.has(entry.chatId),
     );
+    // The budget line (ALM 2.5): only for a mission with an effective
+    // budget; the spend itself is rendered from the same window runs the
+    // rest of the document uses. graceToday is the CURRENT grace state.
+    const policyForDigestBudget = loadPolicyFailOpen(dataDir);
+    const digestBudgetVerdict = dailyBudgetCheck({
+      dataDir,
+      policy: policyForDigestBudget,
+      mission,
+      chatList: getChats().list(),
+      missions: missions.list(),
+    });
     let built;
     try {
       built = buildDigest({
@@ -3028,6 +3147,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         pendingQuestions,
         since: url.searchParams.get('since'),
         until: url.searchParams.get('until'),
+        budget: digestBudgetVerdict.applies ? { budgetUsd: digestBudgetVerdict.budgetUsd, graceToday: digestBudgetVerdict.grace } : null,
       });
     } catch (err) {
       // A bad since/until is the caller's error, not a server fault.
@@ -3057,8 +3177,8 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     return;
   }
 
-  // /api/missions/<id>/status | /api/missions/<id>/link
-  if (segments.length === 4 && (segments[3] === 'status' || segments[3] === 'link' || segments[3] === 'posture')) {
+  // /api/missions/<id>/status | /api/missions/<id>/link | /api/missions/<id>/posture | /api/missions/<id>/budget
+  if (segments.length === 4 && (segments[3] === 'status' || segments[3] === 'link' || segments[3] === 'posture' || segments[3] === 'budget')) {
     if (req.method !== 'POST') {
       sendJson(res, 405, { error: 'method not allowed' });
       return;
@@ -3102,6 +3222,19 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
         sendJson(res, 200, { mission: missions.update(segments[2], { posture }) });
         return;
       }
+      // The mission's own daily budget in USD (null clears it). Same
+      // semantics as the posture dial: under a policy default it only ever
+      // tightens the ceiling in effect — a number above the default changes
+      // nothing, and the min() in budget.mjs is where that lives.
+      if (segments[3] === 'budget') {
+        const budgetUsd = body.data?.budgetUsd ?? null;
+        if (budgetUsd !== null && (typeof budgetUsd !== 'number' || !Number.isFinite(budgetUsd) || budgetUsd < 0)) {
+          sendJson(res, 400, { error: 'budgetUsd must be null or a finite number >= 0' });
+          return;
+        }
+        sendJson(res, 200, { mission: missions.update(segments[2], { budgetUsd }) });
+        return;
+      }
       const { chatId, taskId } = body.data ?? {};
       const givenBoth = chatId !== undefined && taskId !== undefined;
       if (givenBoth || (chatId === undefined && taskId === undefined)) {
@@ -3121,6 +3254,72 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
   }
 
   sendJson(res, 404, { error: 'not found' });
+}
+
+/**
+ * ALM 2.5 — the daily-budget verdict for one TURN START, computed before any
+ * turn begins (never mid-run: a hard cap in flight would leave a half state
+ * behind — see ALMANAC-PLAN §2.5's trap). Runs beside the posture ceiling,
+ * which is evaluated in the same call paths, never inside a running turn.
+ *
+ * Two buckets, one attribution rule (the chat union the detail and digest
+ * routes already use — chat.missionId or mission.chats):
+ *   - a MISSION turn (mission != null): effective budget = min of the
+ *     mission's own budgetUsd and policy.json's budget.defaultDailyUsd —
+ *     posture semantics, a mission may only tighten. Spend = today's KNOWN
+ *     costUsd over the mission's chats.
+ *   - a missionless turn (mission == null): only the policy default applies,
+ *     over every chat no mission owns (missionless chats, trigger turns —
+ *     triggers have no mission binding in the data model; relay runs share
+ *     this bucket).
+ * Unknown costs (costUsd null) never count as money; they ride along as a
+ * count (see spendOfRuns). A grace day (an answered budget question) lifts
+ * the block until the next LOCAL midnight — no cron, the day keys decide.
+ *
+ * `decompose`/`compose` are digest's injected local-day decomposition
+ * (DST-safe: a 23 h or 25 h day is still exactly one window).
+ */
+function dailyBudgetCheck({
+  dataDir,
+  policy,
+  mission = null,
+  chatList = [],
+  missions = [],
+  now = Date.now(),
+  decompose,
+  compose,
+  graces = readGraces(dataDir),
+}) {
+  const policyDefaultUsd = policy?.budget?.defaultDailyUsd ?? null;
+  const bounds = localDayBounds(now, { decompose, compose });
+  const todayKey = dayKeyOf(now, decompose);
+  const runs = readRuns(dataDir);
+
+  const verdictOf = (budgetUsd, graceKey, spend) => {
+    if (hasGrace(graces, graceKey, todayKey)) {
+      return { applies: true, budgetUsd, graceKey, grace: true, exceeded: false, ...spend };
+    }
+    return { applies: true, budgetUsd, graceKey, grace: false, exceeded: spend.knownUsd >= budgetUsd, ...spend };
+  };
+
+  if (mission) {
+    const budgetUsd = effectiveDailyBudget({ missionBudgetUsd: mission.budgetUsd ?? null, policyDefaultUsd });
+    if (budgetUsd === null) return { applies: false, policyDefaultUsd };
+    const chatIds = new Set(mission.chats ?? []);
+    for (const chat of chatList) if (chat.missionId === mission.id) chatIds.add(chat.id);
+    return verdictOf(budgetUsd, mission.id, spendOfRuns({ runs, bounds, chatIds }));
+  }
+
+  // The global bucket: only a set policy default governs it — without one,
+  // missionless runs sit under no budget at all, and nothing here pretends
+  // otherwise.
+  if (typeof policyDefaultUsd !== 'number' || !Number.isFinite(policyDefaultUsd) || policyDefaultUsd < 0) {
+    return { applies: false, policyDefaultUsd: null };
+  }
+  const excludeChatIds = new Set();
+  for (const owned of missions) for (const id of owned.chats ?? []) excludeChatIds.add(id);
+  for (const chat of chatList) if (chat.missionId != null) excludeChatIds.add(chat.id);
+  return verdictOf(policyDefaultUsd, GLOBAL_BUDGET_KEY, spendOfRuns({ runs, bounds, excludeChatIds }));
 }
 
 async function handleChatTurn(
@@ -3390,6 +3589,87 @@ async function handleChatTurn(
     if (!postureAllows(ceiling, approvalMode)) {
       const setBy = mission?.posture && postureAllows(loadPolicyFailOpen(dataDir).posture, approvalMode) ? `the mission "${mission.title}"` : 'policy.json';
       sendJson(res, 400, { error: `approvalMode "${approvalMode}" is above the posture ceiling "${ceiling}" set by ${setBy}`, posture: ceiling });
+      return;
+    }
+  }
+
+  // ALM 2.5 — the daily budget, checked in the SAME path as the posture
+  // ceiling above, BEFORE any turn starts (never mid-run). This route is the
+  // INTERACTIVE path, so the I2 rule applies in its question form: an
+  // over-budget turn is not started and not silently dropped either — a
+  // deferred question is filed to the inbox ("Tagesbudget … Heute
+  // weiterfahren?") and the submission is refused with an honest message
+  // naming the budget and the stand. Allow answers a grace day (until the
+  // next local midnight this mission is not asked again); Deny records the
+  // refusal and the mission stays capped until the day turns. Background
+  // turns get the other half of the rule — skip, never ask — in the trigger
+  // runner (see runner.mjs's checkBudget).
+  {
+    const budgetVerdict = dailyBudgetCheck({
+      dataDir,
+      policy: loadPolicyFailOpen(dataDir),
+      mission,
+      chatList: getChats().list(),
+      missions: getMissions().list(),
+    });
+    if (budgetVerdict.applies && budgetVerdict.exceeded) {
+      const stand = budgetStandText({ spentKnownUsd: budgetVerdict.knownUsd, budgetUsd: budgetVerdict.budgetUsd, unknownRuns: budgetVerdict.unknownRuns });
+      const lead = mission ? `Tagesbudget der Mission "${mission.title}" erreicht` : 'Tagesbudget erreicht';
+      // One question per mission and day: an already-pending one is reused
+      // (its numbers say when it was asked), not stacked as a second card.
+      let question = null;
+      try {
+        const pending = await approvalStore.listPending();
+        question = pending.find((entry) => entry.kind === BUDGET_QUESTION_KIND && (entry.missionId ?? null) === (mission?.id ?? null)) ?? null;
+      } catch {
+        question = null; // a store that cannot be read still refuses the turn, just without a card
+      }
+      if (!question) {
+        const requestedAt = Date.now();
+        const requestId = `budget-${dayKeyOf(requestedAt)}`;
+        try {
+          question = await approvalStore.put({
+            id: approvalKey(chatId, requestId),
+            requestId,
+            chatId,
+            triggerId: null,
+            mode: 'deferred',
+            kind: BUDGET_QUESTION_KIND,
+            source: { kind: 'budget', missionId: mission?.id ?? null, title: mission?.title ?? null },
+            toolName: null,
+            displayName: 'Tagesbudget',
+            // Distinct per mission and day, so the store's deferred dedupe
+            // (same trigger/tool/input = same question) can never merge two
+            // missions' budget questions into one entry.
+            input: { budget: true, missionId: mission?.id ?? null, dayKey: dayKeyOf(requestedAt) },
+            description: `${lead} — ${stand}. Heute weiterfahren?`,
+            reason: 'daily budget reached before turn start (ALM 2.5, I2: interactive asks, background skips)',
+            agentId: null,
+            requestedAt,
+            deadlineAt: requestedAt + APPROVAL_INBOX_TTL_MS,
+            missionId: mission?.id ?? null,
+            budgetUsd: budgetVerdict.budgetUsd,
+            spentKnownUsd: budgetVerdict.knownUsd,
+            unknownRuns: budgetVerdict.unknownRuns,
+          });
+        } catch (err) {
+          // The refusal stands even when the card could not be filed — the
+          // turn is over budget whether or not the inbox took the question.
+          question = null;
+        }
+      }
+      sendJson(res, 409, {
+        error: `${lead} — ${stand}. Der Turn wurde nicht gestartet. Die Frage liegt in der Inbox${
+          question ? ` (Frage ${question.requestId})` : ''
+        }: Allow = Gnaden-Tag bis Mitternacht, Deny = heute kein weiterer Turn.`,
+        budget: {
+          budgetUsd: budgetVerdict.budgetUsd,
+          spentKnownUsd: budgetVerdict.knownUsd,
+          unknownRuns: budgetVerdict.unknownRuns,
+          questionId: question?.requestId ?? null,
+          chatId,
+        },
+      });
       return;
     }
   }
@@ -4465,6 +4745,11 @@ async function handleRequest(
       await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay, {
         decidedVia: viaPhoneToken ? 'phone-token' : 'web',
         grants: { store: getGrantStore(), resolveStanding },
+        // The grace-day writer for budget questions (ALM 2.5): today's local
+        // day key decides validity, so no timer and no cron — the record
+        // simply stops matching tomorrow (see budget.mjs::hasGrace).
+        recordBudgetGrace: (missionId) =>
+          recordGrace(dataDir, missionId ?? GLOBAL_BUDGET_KEY, { dayKey: dayKeyOf(Date.now()), decidedAt: Date.now(), decision: 'allow' }),
       });
       return;
     }
@@ -4939,6 +5224,24 @@ export function startServer({
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
         releaseApprovals: (chatId) => cancelApprovalsForChat(pendingApprovals, chatId, getApprovalStore(), 'run-aborted'),
         makeUiApprovalHandler: uiApprovalHandlerFor,
+        // ALM 2.5 + I2: a trigger turn is BACKGROUND. When the daily budget
+        // is spent, this closure's verdict makes the runner SKIP the run
+        // (runs.jsonl line with skipped: 'budget') — no question at 3am,
+        // never a mid-run cap. Trigger runs have no mission binding, so only
+        // the GLOBAL default (policy.json budget.defaultDailyUsd) can bound
+        // them here.
+        checkBudget: () => {
+          const policyForBudget = loadPolicyFailOpen(dataDir);
+          const verdict = dailyBudgetCheck({ dataDir, policy: policyForBudget, mission: null, chatList: getChats().list(), missions: getMissions().list() });
+          if (!verdict.applies || !verdict.exceeded) return { allowed: true };
+          return {
+            allowed: false,
+            reason: budgetStandText({ spentKnownUsd: verdict.knownUsd, budgetUsd: verdict.budgetUsd, unknownRuns: verdict.unknownRuns }),
+            budgetUsd: verdict.budgetUsd,
+            spentKnownUsd: verdict.knownUsd,
+            unknownRuns: verdict.unknownRuns,
+          };
+        },
       });
     }
     return runner;
