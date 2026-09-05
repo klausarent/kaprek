@@ -159,6 +159,11 @@ function runLine(run) {
     const cause = run.conditionError ? String(run.conditionError).split('\n')[0].slice(0, 120) : 'unknown';
     return `- übersprungen (condition-error) — Bedingung ${kind} konnte nicht geprüft werden: ${cause}${duration}`;
   }
+  // ALM 2.5: a budget skip is normal scarcity, said plainly — never "gelaufen
+  // ohne Kosten" (it never became a turn) and never a failure (it is not one).
+  if (run.skipped === 'budget') {
+    return `- übersprungen (Budget) — Tagesbudget erreicht${duration}`;
+  }
   const failed = run.stopReason === 'error' || run.error != null;
   const state = failed ? 'fehlgeschlagen' : 'gelaufen';
   const stop = failed && run.stopReason ? ` (stopReason: ${run.stopReason})` : '';
@@ -180,8 +185,17 @@ function filesOf(run) {
  * Renders the digest document. Pure: same inputs, same bytes — that is what
  * makes a second build on the same day byte-identical (overwrite, no
  * revisions). `nowMs` only enters the open questions' remaining time.
+ *
+ * `budget` (optional) is the mission's daily budget line:
+ * `{budgetUsd, graceToday}` — graceToday says the mission answered today's
+ * budget question with a grace day ("Budget überschritten, heute
+ * freigegeben"). The SPEND itself is computed here from the same `runs` the
+ * rest of the document uses, so the budget line can never disagree with the
+ * cost section of its own window (same honesty rule: known sum + unknown
+ * counter, never 0 for unknown). Null — missions without a budget — renders
+ * nothing: no fake limit.
  */
-export function renderDigest({ mission, window, runs, openQuestions, nowMs = Date.now() }) {
+export function renderDigest({ mission, window, runs, openQuestions, nowMs = Date.now(), budget = null }) {
   const title = mission?.title ?? mission?.id ?? 'Mission';
   const lines = [];
 
@@ -249,6 +263,34 @@ export function renderDigest({ mission, window, runs, openQuestions, nowMs = Dat
   }
   lines.push('');
 
+  // (c2) The daily budget line (ALM 2.5) — only for a mission that HAS a
+  // budget. Spend = this window's known sum, same numbers as the section
+  // above; skipped runs are neither cost nor unknown (they never became a
+  // turn). A day of ONLY unknown costs cannot exhaust the budget, and the
+  // line says so instead of claiming $0.00.
+  if (budget && typeof budget.budgetUsd === 'number' && Number.isFinite(budget.budgetUsd) && budget.budgetUsd >= 0) {
+    const budgetSpend = runs
+      .filter((run) => !run.skipped)
+      .reduce(
+        (acc, run) => {
+          if (typeof run.costUsd === 'number' && Number.isFinite(run.costUsd)) return { known: acc.known + run.costUsd, unknown: acc.unknown };
+          return { known: acc.known, unknown: acc.unknown + 1 };
+        },
+        { known: 0, unknown: 0 },
+      );
+    lines.push('## Tagesbudget');
+    lines.push('');
+    const stand =
+      budgetSpend.unknown > 0 && budgetSpend.known === 0
+        ? `bekannt ist nichts von ${fmtCost(budget.budgetUsd)} — ${budgetSpend.unknown} Läufe ohne Kostendaten, das Budget kann dadurch nicht ausgereizt sein`
+        : `${fmtCost(budgetSpend.known)} von ${fmtCost(budget.budgetUsd)}${
+            budgetSpend.unknown > 0 ? ` · ${budgetSpend.unknown} Läufe ohne Kostendaten (zählen nicht mit)` : ''
+          }`;
+    lines.push(`- Budget: ${stand}`);
+    lines.push(`- Gnaden-Status: ${budget.graceToday ? 'Budget überschritten, heute freigegeben' : 'keine Freigabe heute'}`);
+    lines.push('');
+  }
+
   // (d) Files the window's run records themselves name. Nothing is indexed
   // here; if the records carry no file list, the digest says so.
   const files = [...new Set(runs.flatMap(filesOf))].sort();
@@ -302,6 +344,7 @@ export function buildDigest({
   decompose = defaultDecompose,
   compose = defaultCompose,
   runs: runsOverride = null,
+  budget = null,
 }) {
   const windowBase = resolveWindow({ since, until, now, decompose, compose });
   const spanHours = Math.round((windowBase.spanMs / HOUR_MS) * 10) / 10;
@@ -315,7 +358,7 @@ export function buildDigest({
   };
 
   const runs = runsOverride ?? selectRuns(readRuns(dataDir), window, chatIds);
-  const markdown = renderDigest({ mission, window, runs, openQuestions: pendingQuestions, nowMs: now });
+  const markdown = renderDigest({ mission, window, runs, openQuestions: pendingQuestions, nowMs: now, budget });
 
   const dir = digestsDir(dataDir, mission.id);
   fs.mkdirSync(dir, { recursive: true });

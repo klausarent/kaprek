@@ -1,7 +1,7 @@
 import { test, expect, vi } from "vitest";
-import { AppScopePicker, ClipboardConsentPanel, DeleteConfirmPanel, TriggerForm, TriggerRow } from "./Triggers";
+import { AppScopePicker, ClipboardConsentPanel, DeleteConfirmPanel, TriggerForm, TriggerRow, triggerRunLabel } from "./Triggers";
 import { emptyTriggerForm, formToTrigger } from "../lib/triggerForm";
-import type { AppSummary, TriggerStatus } from "../lib/api";
+import type { AppSummary, TriggerRun, TriggerStatus } from "../lib/api";
 import { click, findAll, findByType, findOneByText, render, textOf } from "../test/tree";
 
 function triggerStatus(overrides: Partial<TriggerStatus> = {}): TriggerStatus {
@@ -334,4 +334,14 @@ test("the id field is locked while editing an existing trigger", () => {
   const idInput = findAll(tree, (node) => node.props.name === "id")[0];
   expect(idInput.props.disabled).toBe(true);
   expect(textOf(tree)).toContain("Edit nightly-sync");
+});
+
+// --------------------------------------------------- Tagesbudget (ALM 2.5 + I2)
+
+test("ein Budget-Skip heißt übersprungen (Budget) — Verknappung, kein Fehler", () => {
+  const base: TriggerRun = { ts: "2026-09-04T03:00:00.000Z", skipped: null, conditionKind: null, conditionError: null, costUsd: null, stopReason: null };
+  expect(triggerRunLabel({ ...base, skipped: "budget" })).toBe("übersprungen (Budget)");
+  expect(triggerRunLabel({ ...base, skipped: "condition" })).toBe("übersprungen (Bedingung)");
+  expect(triggerRunLabel({ ...base, costUsd: 0.5, stopReason: "result" })).toBe("gelaufen");
+  expect(triggerRunLabel({ ...base, stopReason: "error" })).toBe("fehlgeschlagen");
 });

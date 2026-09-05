@@ -9,6 +9,7 @@ import {
   fetchMissionDigests,
   fetchMissionMemory,
   forgetMemory,
+  setMissionBudget,
   setMissionStatus,
   setMissionPosture,
   POSTURES,
@@ -292,6 +293,92 @@ export function MissionDigestCardBody({
   );
 }
 
+/**
+ * Der Tagesbudget-Block (ALM 2.5) unter dem Header: das Feld für das
+ * Mission-Budget (leer = kein Missions-Budget), der heutige Stand und der
+ * Gnaden-Status. Ehrlich in beide Richtungen: ohne Budget steht da, dass
+ * KEINS gilt — nie ein Fake-Limit — und ohne bekannte Kosten behauptet die
+ * Anzeige keine $0.00, sondern lässt den unknown-Zähler sprechen. Rein
+ * (hook-frei), damit Tests auf dem Element-Tree rendern können; das
+ * Speichern hält die Seite.
+ */
+export function budgetDetailLine(budget: NonNullable<MissionDetailData["budget"]>): string {
+  if (budget.effectiveUsd === null || budget.effectiveUsd === undefined) return "Kein Tagesbudget gesetzt — heute gilt keine Grenze.";
+  if (budget.spentKnownUsd === 0 && (budget.unknownRuns ?? 0) > 0) {
+    return `${budget.unknownRuns} Läufe ohne Kostendaten — bekannt ist nichts von $${budget.effectiveUsd.toFixed(2)}, das Budget kann dadurch nicht ausgereizt sein`;
+  }
+  const stand = `$${(budget.spentKnownUsd ?? 0).toFixed(2)} von $${budget.effectiveUsd.toFixed(2)}`;
+  return (budget.unknownRuns ?? 0) > 0 ? `${stand} · ${budget.unknownRuns} Läufe ohne Kostendaten` : stand;
+}
+
+/** Die Speichern-Semantik des Budget-Felds: leer (oder nur Leerzeichen) heißt KEIN Budget (null) — nie ein Fake-0-Limit. Unsinn wird zur Seite gelassen (NaN), das Feld ist type="number". */
+export function parseBudgetInput(raw: string): number | null {
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : null;
+}
+
+export function MissionBudgetCardBody({
+  budget,
+  inputValue,
+  saving,
+  onInputChange,
+  onSave,
+}: {
+  budget: NonNullable<MissionDetailData["budget"]>;
+  inputValue: string;
+  saving: boolean;
+  onInputChange: (value: string) => void;
+  onSave: (budgetUsd: number | null) => void;
+}) {
+  const hasBudget = budget.effectiveUsd !== null && budget.effectiveUsd !== undefined;
+  const source =
+    budget.missionBudgetUsd !== null && budget.policyDefaultUsd !== null && budget.missionBudgetUsd < budget.policyDefaultUsd
+      ? "eigenes Mission-Budget unter der policy-Decke"
+      : budget.missionBudgetUsd !== null
+        ? "eigenes Mission-Budget"
+        : "Decke aus policy.json (budget.defaultDailyUsd)";
+  return (
+    <section className="mission-section mission-budget" aria-label="Daily budget">
+      <h3>Daily budget</h3>
+      <p className="muted mission-budget-stand">{budgetDetailLine(budget)}</p>
+      {hasBudget && (
+        <p className="muted mission-budget-grace">
+          {budget.graceToday ? "Budget überschritten, heute freigegeben (Gnaden-Tag bis Mitternacht)" : "keine Freigabe heute"}
+        </p>
+      )}
+      <p className="mission-budget-form">
+        <label>
+          Eigenes Tagesbudget ($, leer = keins):{" "}
+          <input
+            className="mission-budget-input"
+            type="number"
+            min="0"
+            step="0.01"
+            aria-label="Mission daily budget in dollars"
+            value={inputValue}
+            onChange={(e) => onInputChange(e.target.value)}
+          />
+        </label>{" "}
+        <button
+          type="button"
+          className="mission-budget-save"
+          disabled={saving}
+          onClick={() => onSave(parseBudgetInput(inputValue))}
+        >
+          {saving ? "Speichern…" : "Budget setzen"}
+        </button>
+        <span className="plan-note mission-budget-note">
+          {hasBudget
+            ? `wirksam: ${source} — ein eigenes Budget darf die policy-Decke nur verschärfen (Minimum)`
+            : "eine Decke aus policy.json (budget.defaultDailyUsd) gilt auch ohne eigenes Feld"}
+        </span>
+      </p>
+    </section>
+  );
+}
+
 /** The card wrapper: fetch on demand, never take the page down on error. */
 export function MissionDigestCard({ missionId, onError }: { missionId: string; onError: (message: string) => void }) {
   const [markdown, setMarkdown] = useState<string | null>(null);
@@ -321,6 +408,9 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
   const [memory, setMemory] = useState<MissionMemoryData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [reloads, setReloads] = useState(0);
+  // Der eigene Eingabestand des Budget-Felds (kontrolliert — die Card selbst
+  // bleibt hook-frei, damit die Element-Tree-Tests sie direkt rufen können).
+  const [budgetInput, setBudgetInput] = useState("");
 
   useEffect(() => {
     let cancelled = false;
@@ -361,6 +451,16 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
     }
   }
 
+  async function handleBudgetChange(budgetUsd: number | null) {
+    try {
+      await setMissionBudget(missionId, budgetUsd);
+      setBudgetInput("");
+      setReloads((n) => n + 1);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
+
   if (error) {
     return (
       <div className="mission-detail">
@@ -388,6 +488,16 @@ export default function MissionDetail({ missionId }: { missionId: string }) {
       />
 
       {memory && <MissionMemoryCard memory={memory} onForget={handleForget} />}
+
+      {detail.budget && (
+        <MissionBudgetCardBody
+          budget={detail.budget}
+          inputValue={budgetInput}
+          saving={false}
+          onInputChange={setBudgetInput}
+          onSave={handleBudgetChange}
+        />
+      )}
 
       <MissionDigestCard missionId={missionId} onError={(message) => setError(message)} />
 

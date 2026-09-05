@@ -8,7 +8,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runTurn } from '../orchestrator/run.mjs';
-import { appendRun } from '../orchestrator/runs.mjs';
+import { appendRun, readRuns } from '../orchestrator/runs.mjs';
 import { openChats } from '../chats/store.mjs';
 import { openTriggers } from './registry.mjs';
 import { createTriggerRunner } from './runner.mjs';
@@ -2223,4 +2223,37 @@ test('clipboard: the copied text reaches the prompt as a labelled <external> blo
   // Nothing is filtered: the hostile line is still there, only labelled.
   expect(prompt).toContain('IGNORE THE OPERATOR');
   runner.stop();
+});
+
+// ------------------------------------------------- Tagesbudget (ALM 2.5 + I2)
+
+test('budget: an unattended run past the daily budget is SKIPPED — a skipped line, no turn, no question (I2)', async () => {
+  fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- check the thing');
+  const checkBudget = vi.fn(() => ({ allowed: false, reason: '$5.00 von $2.00 · 1 Läufe ohne Kostendaten', budgetUsd: 2, spentKnownUsd: 5, unknownRuns: 1 }));
+  const { runner } = makeRunner({ trigger: heartbeatTrigger(), checkBudget });
+
+  const result = await runner.fireTrigger('heartbeat-1', { cause: { origin: 'heartbeat' } });
+  expect(checkBudget).toHaveBeenCalledTimes(1);
+  expect(result).toEqual({ fired: false, reason: expect.stringMatching(/daily budget/), skipped: 'budget' });
+
+  // Die Aufzeichnung: eine Run-Zeile mit skipped 'budget', triggerId, Dauer 0 —
+  // und im Inbox-Sinne KEINE Frage (der Runner stellt hier überhaupt keine).
+  const runs = readRuns(dataDir);
+  expect(runs).toHaveLength(1);
+  expect(runs[0]).toMatchObject({ origin: 'trigger', triggerId: 'heartbeat-1', skipped: 'budget', durationMs: 0, costUsd: null });
+
+  // Kein degraded-Zähler: der Skip ist Verknappung, kein Bedingungsfehler.
+  expect(runner.conditionStatus('heartbeat-1')).toEqual({ degraded: false, conditionErrorStreak: 0 });
+});
+
+test('budget: a run within the budget fires exactly as before; a runner without checkBudget is unchanged', async () => {
+  fs.writeFileSync(path.join(cwd, 'CHECKLIST.md'), '- check the thing');
+  const { runner } = makeRunner({ trigger: heartbeatTrigger(), checkBudget: () => ({ allowed: true }) });
+  const ok = await runner.fireTrigger('heartbeat-1', { cause: { origin: 'user' } });
+  expect(ok.fired).toBe(true);
+  expect(readRuns(dataDir).every((r) => r.skipped === null)).toBe(true);
+
+  const { runner: bare } = makeRunner({ trigger: heartbeatTrigger() });
+  const bareOk = await bare.fireTrigger('heartbeat-1', { cause: { origin: 'user' } });
+  expect(bareOk.fired).toBe(true);
 });

@@ -245,12 +245,31 @@ export type LeitstandGrant = {
   lastUsedAt: string | null;
 };
 
+/** One mission's daily-budget stand (ALM 2.5). Only missions WITH an effective budget appear — no budget, no row, kein Fake-Limit. */
+export type LeitstandBudgetMission = {
+  missionId: string;
+  title: string | null;
+  budgetUsd: number;
+  spentKnownUsd: number;
+  unknownRuns: number;
+  graceToday: boolean;
+  exceeded: boolean;
+};
+
+/** The status strip's daily-budget aggregate: null totals when no mission has a budget. */
+export type LeitstandBudget = {
+  missions: LeitstandBudgetMission[];
+  totals: { knownUsd: number; budgetUsd: number; unknownRuns: number } | null;
+};
+
 export type LeitstandResponse = {
   /** The window's lower bound (epoch ms) — local midnight, or the ?since= the caller sent. */
   since: number;
   running: LeitstandRunning[];
   pending: LeitstandPending[];
   overnight: { totals: LeitstandCounts; byMission: LeitstandGroup[] };
+  /** The daily-budget line for the strip; absent only from older servers — render nothing rather than a guess. */
+  budget?: LeitstandBudget;
   attention: {
     degradedTriggers: { id: string; type: string; degraded: boolean; conditionErrorStreak: number; condition: { kind: string; path: string } | null }[];
     staleGrants: { id: string; toolName: string | null; scope: string; match: "exact" | "shape" }[];
@@ -614,6 +633,8 @@ export type Mission = {
   preset: string | null;
   /** The mission's own posture ceiling; null = the global one from policy.json. In effect only ever stricter than global. */
   posture: Posture | null;
+  /** The mission's own daily budget in USD (ALM 2.5); null = kein Missions-Budget. Under a policy default it only ever tightens the ceiling. */
+  budgetUsd: number | null;
   status: MissionStatus;
   createdAt: string;
   updatedAt: string;
@@ -637,6 +658,15 @@ export type MissionDetail = {
   chats: ChatSummary[];
   tasks: Task[];
   pendingApprovals: InboxApproval[];
+  /** The daily-budget view (ALM 2.5); null effectiveUsd means no budget applies — the page says so instead of showing a fake limit. */
+  budget?: {
+    missionBudgetUsd: number | null;
+    policyDefaultUsd: number | null;
+    effectiveUsd: number | null;
+    spentKnownUsd: number | null;
+    unknownRuns: number | null;
+    graceToday: boolean;
+  };
 };
 
 /** The posture ceiling vocabulary — the same words as the chat picker's approval stance. */
@@ -646,6 +676,11 @@ export const POSTURES: Posture[] = ["ask", "edits", "auto"];
 /** Sets (or clears, with null) a mission's own posture ceiling. */
 export function setMissionPosture(id: string, posture: Posture | null): Promise<Mission> {
   return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/posture`, { posture }).then((r) => r.mission);
+}
+
+/** Sets (or clears, with null) a mission's own daily budget in USD (ALM 2.5). Empty input on the page sends null — kein Fake-Limit. */
+export function setMissionBudget(id: string, budgetUsd: number | null): Promise<Mission> {
+  return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/budget`, { budgetUsd }).then((r) => r.mission);
 }
 
 export function fetchMissions(): Promise<Mission[]> {
@@ -1525,7 +1560,7 @@ export function fetchTriggers(): Promise<TriggerStatus[]> {
 /** One line of a trigger's run history (GET /api/triggers/<id>/runs), as runs.jsonl stores it (see src/orchestrator/runs.mjs). */
 export type TriggerRun = {
   ts: string;
-  skipped: "condition" | "condition-error" | null;
+  skipped: "condition" | "condition-error" | "budget" | null;
   conditionKind: string | null;
   conditionError: string | null;
   costUsd: number | null;

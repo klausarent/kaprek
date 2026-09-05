@@ -172,6 +172,56 @@ curl -s -H "x-kaprek-token: <token>" -H "x-app-request: 1" \
 No digest trigger is created for you — kaprek does not send anything you did
 not ask it to send.
 
+**Daily budget.** A mission can carry a daily budget in dollars
+(`budgetUsd` on the mission, a number field on its detail page — empty means
+no mission budget), and `policy.json` can carry a global default under
+`"budget": {"defaultDailyUsd": …}`. Same posture semantics as the posture
+dial: the policy default is a **ceiling**, and a mission may only ever
+tighten it — the budget in effect is the **minimum** of the two set values
+(`$5` on the mission under a `$10` default spends under `$5`; `$20` on the
+mission under a `$10` default still spends under `$10`). With no value set
+anywhere there is no limit, and the UI says exactly that instead of showing
+a fake `$0.00 of $0.00`.
+
+What counts is money, honestly: the sum of the cost figures the harnesses
+actually reported for today's runs of the mission's chats (the same local-day
+window as the digest — a DST day is 23 or 25 hours, the boundary is still
+local midnight). Runs whose cost is unknown count on neither side of the
+comparison: they are never treated as money, but they are not hidden either —
+wherever a budget is shown the unknown count rides along, as in
+"$3.40 von $10.00 · 2 Läufe ohne Kostendaten". A day with only unknown costs
+cannot exhaust the budget, and the display says so instead of claiming $0.00.
+
+The check runs **before a turn starts**, on the same path as the posture
+ceiling, for every origin — never mid-run (a hard cap in flight would leave
+half a turn's state behind). What happens past the budget depends on who is
+asking (the I2 rule — direct requests always have priority, background work
+pauses first):
+
+- **Interactive (you typed it):** the turn is not started and not silently
+  dropped either — kaprek files a deferred question to the inbox ("Tagesbudget
+  der Mission erreicht — bekannt: $X von $Y, N Läufe ohne Kostendaten. Heute
+  weiterfahren?"), answerable for 24 hours. **Allow** grants a grace day: until
+  the next local midnight this mission is not asked again (the decision is
+  recorded with its date; the day boundary — not a timer — retires it, and the
+  mission's page shows "Budget überschritten, heute freigegeben"). **Deny**
+  keeps the mission capped; the turn is refused with the budget and the stand
+  named.
+- **Triggers (background):** no question — nobody should be woken at 3 a.m.
+  for a background check. The run is not started at all; it is recorded as
+  `skipped: 'budget'` in the run log, shows up as "übersprungen (Budget)" in
+  the trigger's run history and the digest, and does **not** count towards the
+  trigger's degraded streak — this is normal scarcity, the same stance as the
+  skip-if condition being false, not a fault.
+
+Triggers have no mission binding in the data model, so their runs (and any
+turn of a chat no mission owns) fall under the **global** default alone: with
+`budget.defaultDailyUsd` set in policy.json they are bounded by it, without it
+they sit under no budget at all. The run-count limits of the unattended
+runner (count per hour, concurrent turns) are unchanged and sit beside this —
+one counts runs, the other money. Changing `budget` in policy.json changes the
+policy fingerprint (`policyVersion`), so receipts signed under it record the
+cap they ran under, exactly as for a posture change.
 
 ## Advanced
 

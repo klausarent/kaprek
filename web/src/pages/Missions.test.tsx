@@ -11,6 +11,7 @@ function mission(overrides: Partial<Mission> = {}): Mission {
     goal: "A working widget with tests",
     cwd: "C:\\projects\\widget",
     posture: null,
+    budgetUsd: null,
     preset: null,
     status: "active",
     createdAt: "2026-08-01T10:00:00.000Z",

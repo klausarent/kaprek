@@ -14,8 +14,9 @@ import { openBoard } from '../board/store.mjs';
 import { POSTURES, validateHardDenials, HardDenialValidationError } from './guards.mjs';
 
 const VALID_MODES = ['observe', 'warn', 'block'];
-const KNOWN_TOP_FIELDS = ['version', 'mode', 'rules', 'posture', 'hardDenials'];
+const KNOWN_TOP_FIELDS = ['version', 'mode', 'rules', 'posture', 'hardDenials', 'budget'];
 const KNOWN_RULE_FIELDS = ['requireTaskDoc', 'requireCommitTask'];
+const KNOWN_BUDGET_FIELDS = ['defaultDailyUsd'];
 
 export const DEFAULT_POLICY = Object.freeze({
   version: 1,
@@ -27,6 +28,13 @@ export const DEFAULT_POLICY = Object.freeze({
   // Rules a person added on top of guards.mjs's built-ins. The built-ins
   // are not listed here because they cannot be switched off from here.
   hardDenials: Object.freeze([]),
+  // The default DAILY budget in USD (ALMANAC-PLAN §2.5). null = no limit —
+  // which is what every install before this section had. It is a CEILING,
+  // not a spend: a mission may only tighten it with its own budgetUsd
+  // (posture semantics — src/budget/budget.mjs). Budget is part of the
+  // policy fingerprint (policyVersion): changing the cap stales receipts'
+  // "rules this was done under" exactly like a posture change does.
+  budget: Object.freeze({ defaultDailyUsd: null }),
 });
 
 export class PolicyValidationError extends Error {
@@ -69,6 +77,20 @@ function validatePolicyShape(raw) {
     } catch (err) {
       if (err instanceof HardDenialValidationError) throw new PolicyValidationError(err.message);
       throw err;
+    }
+  }
+  if (raw.budget !== undefined) {
+    if (raw.budget === null || typeof raw.budget !== 'object' || Array.isArray(raw.budget)) {
+      throw new PolicyValidationError('budget must be an object');
+    }
+    for (const key of Object.keys(raw.budget)) {
+      if (!KNOWN_BUDGET_FIELDS.includes(key)) {
+        throw new PolicyValidationError(`unknown budget field: "${key}" (expected one of ${KNOWN_BUDGET_FIELDS.join(', ')})`);
+      }
+      const value = raw.budget[key];
+      if (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) {
+        throw new PolicyValidationError('budget.defaultDailyUsd must be null or a finite number >= 0');
+      }
     }
   }
   if (raw.rules !== undefined) {
@@ -126,6 +148,9 @@ export function loadPolicy(dataDir) {
     },
     posture: parsed.posture ?? DEFAULT_POLICY.posture,
     hardDenials: validateHardDenials(parsed.hardDenials),
+    budget: {
+      defaultDailyUsd: parsed.budget?.defaultDailyUsd ?? DEFAULT_POLICY.budget.defaultDailyUsd,
+    },
   };
 }
 
@@ -176,12 +201,20 @@ function failClosedPolicy(parsed, reason) {
       })
       .filter((rule) => rule !== null);
   }
+  // Budget "soweit erkennbar": a salvageable defaultDailyUsd is kept — a
+  // money ceiling from a newer schema is a floor the same way a denial is
+  // (dropping it would LIFT the cap this binary could still honour).
+  const budgetDefaultDailyUsd = salvage(parsed?.budget?.defaultDailyUsd, (v) => {
+    if (v !== null && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) throw new Error();
+    return v;
+  });
   return {
     version: typeof parsed?.version === 'number' ? parsed.version : DEFAULT_POLICY.version,
     mode,
     rules,
     posture: 'ask',
     hardDenials,
+    budget: { defaultDailyUsd: budgetDefaultDailyUsd ?? DEFAULT_POLICY.budget.defaultDailyUsd },
     reason,
   };
 }
@@ -235,6 +268,11 @@ export function policyVersion(policy) {
     rules: policy?.rules ?? null,
     posture: policy?.posture ?? null,
     hardDenials: policy?.hardDenials ?? [],
+    // Part of the fingerprint since the budget section exists: a changed
+    // cap is a changed set of rules, and a receipt must not be able to say
+    // "done under $10/day" about a policy that capped $1/day. Always
+    // included (null default), so the hash stays deterministic.
+    budget: policy?.budget ?? { defaultDailyUsd: null },
   });
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
 }

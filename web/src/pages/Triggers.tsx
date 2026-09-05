@@ -60,6 +60,8 @@ function approvalPathLabel(path: "policy" | "ui" | "inbox"): string {
 export function triggerRunLabel(run: TriggerRun): string {
   if (run.skipped === "condition") return "übersprungen (Bedingung)";
   if (run.skipped === "condition-error") return `übersprungen (Bedingungsfehler: ${run.conditionError ?? "unbekannt"})`;
+  // ALM 2.5 + I2: kein Hintergrund-Lauf über Budget — verknappung, kein Fehler.
+  if (run.skipped === "budget") return "übersprungen (Budget)";
   if (run.stopReason === "error") return "fehlgeschlagen";
   return "gelaufen";
 }

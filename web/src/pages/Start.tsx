@@ -24,6 +24,7 @@ import {
   answerApproval,
   cancelChatTurn,
   fetchLeitstand,
+  type LeitstandBudget,
   type LeitstandCounts,
   type LeitstandGroup,
   type LeitstandHistory,
@@ -60,6 +61,21 @@ export function tokensLabel(counts: Pick<LeitstandCounts, "tokens" | "tokensUnkn
   const thousands = counts.tokens >= 1000 ? `${Math.round(counts.tokens / 100) / 10}k` : String(counts.tokens);
   if (counts.tokensUnknown === 0) return thousands;
   return `${thousands} + ${counts.tokensUnknown} unknown`;
+}
+
+/**
+ * Die Budget-Zeile des Status-Streifens (ALM 2.5). Ehrlich in beide
+ * Richtungen: ohne Mission mit Budget erscheint sie gar nicht (kein
+ * Fake-Limit), und ohne bekannte Kosten behauptet sie keine $0.00 — der
+ * unknown-Zähler spricht. Gnade geht aus den Einzeltask-Zeilen hervor; hier
+ * steht der aggregierte Stand.
+ */
+export function budgetStripText(budget: LeitstandBudget): string | null {
+  const totals = budget.totals;
+  if (!totals || budget.missions.length === 0) return null;
+  const known = `$${totals.knownUsd.toFixed(2)} von $${totals.budgetUsd.toFixed(2)}`;
+  if (totals.unknownRuns > 0) return `${known} · ${totals.unknownRuns} unknown`;
+  return known;
 }
 
 /** Eine Zeile des Status-Streifens. */
@@ -290,6 +306,7 @@ export function StartContent({
   const { totals, byMission } = data.overnight;
   const degradedNames = data.attention.degradedTriggers.map((t) => t.id);
   const grantsUsed = data.grants.reduce((sum, grant) => sum + (grant.useCount ?? 0), 0);
+  const budgetLine = data.budget ? budgetStripText(data.budget) : null;
 
   return (
     <>
@@ -309,6 +326,7 @@ export function StartContent({
           <StripItem label="tokens">{tokensLabel(totals)}</StripItem>
           <StripItem label="skipped (condition)">{totals.skippedCondition}</StripItem>
           <StripItem label="skipped (condition-error)">{totals.skippedConditionError}</StripItem>
+          {budgetLine && <StripItem label="Tagesbudget">{budgetLine}</StripItem>}
           <StripItem label="grants">{data.attention.grantsActive} aktiv · {grantsUsed}× genutzt</StripItem>
         </div>
 
