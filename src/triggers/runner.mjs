@@ -368,6 +368,16 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   same cleanup a chat turn gets from its own route's finally block). Without
  *   it, an approval whose turn died some other way would keep its auto-deny
  *   timer armed for the full unattended deadline — hours, with the inbox.
+ * @param {() => {allowed: boolean, reason?: string, budgetUsd?: number, spentKnownUsd?: number, unknownRuns?: number}} [options.checkBudget] -
+ *   the DAILY-BUDGET check for unattended turns (ALMANAC-PLAN §2.5 +
+ *   BRIDGE-PLAN I2): the server wires a closure over policy.json's
+ *   budget.defaultDailyUsd and runs.jsonl (src/budget/budget.mjs). Triggers
+ *   have no mission binding, so only the GLOBAL default applies to them. The
+ *   I2 rule is decided HERE, not per trigger: a background run over budget is
+ *   SKIPPED (runs.jsonl line with skipped: 'budget', no turn, no question) —
+ *   nobody is woken at 3am for a background check, and direct requests always
+ *   have priority. Null (a runner built without it — tests, isolated use)
+ *   keeps every gate below exactly as it was.
  */
 export function createTriggerRunner({
   dataDir,
@@ -392,6 +402,8 @@ export function createTriggerRunner({
   // P7: the condition-error notification, seam-injected so tests never spawn
   // a real notifier. Fire-and-forget by contract (see notify.mjs).
   notify = defaultNotify,
+  // Daily budget (ALM 2.5 + I2) — server-wired, see the doc comment above.
+  checkBudget = null,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
   // in fireTrigger() itself): a trigger already running must not be started
@@ -1089,6 +1101,39 @@ export function createTriggerRunner({
     if (!globalCheck.allowed) {
       log(`trigger ${id}: rejected (${globalCheck.reason})`);
       return { fired: false, reason: globalCheck.reason };
+    }
+
+    // Daily budget (ALM 2.5 + I2-Pause-Reihenfolge). A trigger turn is
+    // BACKGROUND: when the budget is spent, this run is skipped — never
+    // asked about (nobody is woken at 3am for a background check), never
+    // half-started (the check runs BEFORE any claim, any prompt, any
+    // subprocess; a turn is never capped mid-flight, which would leave a
+    // half state behind). The runs.jsonl line with skipped: 'budget' is the
+    // record: visible in the trigger's run history and the digest, and —
+    // like a plain condition skip — deliberately NOT a degraded-counting
+    // fault (conditionErrorStreak only counts condition-error lines; this is
+    // normal scarcity, P7's condition-skip is the model). Trigger runs have
+    // no mission binding, so the server's closure answers for the GLOBAL
+    // default only. Checked before the type-specific block below on
+    // purpose: a budget skip must not spend a schedule/heartbeat window
+    // claim — the budget can be raised (policy.json) mid-window and the
+    // window should not have been silently burned while it was.
+    if (typeof checkBudget === 'function') {
+      const budgetCheck = checkBudget();
+      if (!budgetCheck.allowed) {
+        try {
+          appendRun(dataDir, {
+            origin: 'trigger',
+            triggerId: id,
+            skipped: 'budget',
+            durationMs: 0,
+          });
+        } catch (err) {
+          log(`trigger ${id}: could not record the skipped run: ${err?.message ?? String(err)}`);
+        }
+        log(`trigger ${id}: skipped (budget: ${budgetCheck.reason ?? 'daily budget reached'})`);
+        return { fired: false, reason: `daily budget: ${budgetCheck.reason ?? 'reached'}`, skipped: 'budget' };
+      }
     }
 
     // Platform gate: a trigger whose type cannot work on this machine at all
