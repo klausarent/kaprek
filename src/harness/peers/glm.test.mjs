@@ -3,7 +3,7 @@
 // No real CLI is ever spawned: a peer turn costs a Coding Plan turn and needs
 // an account, so every test here drives a node script standing in for
 // zcode.cjs, the same way grok.test.mjs fakes the grok binary.
-import { test, expect, vi, beforeEach, afterEach } from 'vitest';
+import { test, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -28,9 +28,9 @@ import {
   killTree,
   parseGlmStdout,
   providerConfigPathFor,
-  resetGlmPreflightCacheForTests,
   resolveZcodeCli,
   runGlmTurn,
+  scanSessionLogFile,
   toolNamesForSession,
 } from './glm.mjs';
 import { PEER_MAX_STDOUT_BYTES, PEER_OUTPUT_SCHEMA, parsePeerAnswer } from './driver.mjs';
@@ -41,13 +41,6 @@ function tmpDir() {
   dirs.push(dir);
   return dir;
 }
-
-beforeEach(() => {
-  // A pre-flight cached by an EARLIER test would otherwise silently decide
-  // a LATER one — the cache is per-process, and vitest runs a file's tests
-  // in one process.
-  resetGlmPreflightCacheForTests();
-});
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -73,9 +66,30 @@ function fakeCli(script) {
 const envelope = (status, message, extra = {}) =>
   JSON.stringify({ response: JSON.stringify({ status, message }), usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 }, sessionId: 'sess_x', turnId: 1, ...extra });
 
-/** A `plugins list`/turn-agnostic fake CLI: whatever it is asked (metadata call or real turn), it answers the same clean envelope — the pre-flight's own parser finds zero plugin blocks in that text, which passes trivially. */
+/** Answers a real turn (the `-p ...` invocation) with a clean {status, message} envelope. */
 function fakeCliAnswering(status, message, extra = {}) {
   return fakeCli(`process.stdout.write(${JSON.stringify(envelope(status, message, extra))})`);
+}
+
+/**
+ * The exact text `zcode plugins list` prints — a `Plugins (N)` header
+ * followed by one two-line block per plugin. parsePluginsList() is now
+ * strict about this shape (council review round 3): anything else, INCLUDING
+ * a plain JSON envelope, is refused as "unrecognized output" rather than
+ * silently read as "zero plugins".
+ */
+function fakePluginsListOutput(blocks = []) {
+  const lines = [`Plugins (${blocks.length})`, ''];
+  for (const block of blocks) {
+    lines.push(`- ${block.name}@${block.source ?? 'src'} [${block.enabled ? 'enabled' : 'disabled'}]`);
+    lines.push(`  skills: ${block.skills ?? 0}, commands: ${block.commands ?? 0}, hooks: ${block.hooks ?? 0}, mcp: ${block.mcp ?? 'none'}`);
+  }
+  return lines.join('\n');
+}
+
+/** Stands in for `zcode plugins list` (the pre-flight's own spawn) with a well-formed, empty-by-default plugin listing. */
+function fakePluginsListSpawn(blocks = []) {
+  return fakeCli(`process.stdout.write(${JSON.stringify(fakePluginsListOutput(blocks))})`);
 }
 
 /** A safe ZCode CLI config: no plugins enabled, no user-level MCP servers. */
@@ -164,7 +178,7 @@ test('the actually spawned child env is the minimal allowlist, not process.env',
   const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: JSON.stringify(Object.keys(process.env).sort()) }), sessionId: 'sess_x' }));`;
   let seenOptions = null;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'plugins-list-noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     seenOptions = options;
     return fakeCli(script)(command, args, options);
   };
@@ -185,12 +199,9 @@ test('the actually spawned child env is the minimal allowlist, not process.env',
 
 test('parsePluginsList / auditPluginsList: an enabled plugin with a non-none MCP id not in KNOWN_SAFE_MCP refuses the turn', async () => {
   const dir = tmpDir();
-  const pluginsListing = [
-    '- android-emulator@zcode-plugins-official [enabled]',
-    '  skills: 1, commands: 1, hooks: 0, mcp: plugin:android-emulator:android-emulator',
-  ].join('\n');
+  const blocks = [{ name: 'android-emulator', source: 'zcode-plugins-official', enabled: true, skills: 1, commands: 1, hooks: 0, mcp: 'plugin:android-emulator:android-emulator' }];
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn(blocks)(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   await expect(
@@ -200,9 +211,9 @@ test('parsePluginsList / auditPluginsList: an enabled plugin with a non-none MCP
 
 test('an enabled plugin with hooks > 0 refuses the turn even with mcp: none', async () => {
   const dir = tmpDir();
-  const pluginsListing = ['- some-plugin@src [enabled]', '  skills: 0, commands: 0, hooks: 2, mcp: none'].join('\n');
+  const blocks = [{ name: 'some-plugin', source: 'src', enabled: true, hooks: 2, mcp: 'none' }];
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn(blocks)(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/pre-flight refused.*some-plugin.*hook/s);
@@ -210,9 +221,9 @@ test('an enabled plugin with hooks > 0 refuses the turn even with mcp: none', as
 
 test('a disabled plugin with mcp and hooks is not inspected — nothing enabled can run it', async () => {
   const dir = tmpDir();
-  const pluginsListing = ['- android-emulator@zcode-plugins-official [disabled]', '  skills: 1, commands: 1, hooks: 3, mcp: plugin:android-emulator:android-emulator'].join('\n');
+  const blocks = [{ name: 'android-emulator', source: 'zcode-plugins-official', enabled: false, hooks: 3, mcp: 'plugin:android-emulator:android-emulator' }];
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn(blocks)(command, args, options);
     return fakeCliAnswering('done', 'ok')(command, args, options);
   };
   const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn });
@@ -222,35 +233,124 @@ test('a disabled plugin with mcp and hooks is not inspected — nothing enabled 
 test('KNOWN_SAFE_MCP is empty by default, and an explicitly allowed mcp id passes', async () => {
   expect(KNOWN_SAFE_MCP).toEqual([]);
   const dir = tmpDir();
-  const pluginsListing = ['- vetted-plugin@src [enabled]', '  skills: 1, commands: 0, hooks: 0, mcp: plugin:vetted:vetted'].join('\n');
+  const blocks = [{ name: 'vetted-plugin', source: 'src', enabled: true, hooks: 0, mcp: 'plugin:vetted:vetted' }];
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn(blocks)(command, args, options);
     return fakeCliAnswering('done', 'ok')(command, args, options);
   };
   const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn, knownSafeMcp: ['plugin:vetted:vetted'] });
   expect(result.status).toBe('done');
 });
 
-test('the pre-flight is cached for the process — two turns within the cache window spawn "plugins list" only once', async () => {
+// ---- pre-flight parser: fail closed on unrecognized output (round 3, P1) ----
+
+test('plugins-list output without the "Plugins (N)" header refuses the turn rather than being read as zero plugins', async () => {
+  const dir = tmpDir();
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'this is a turn-shaped envelope, not a plugin listing')(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/unrecognized `zcode plugins list` output.*header/s);
+});
+
+test('a "Plugins (N)" header whose count does not match the parsed blocks refuses the turn', async () => {
+  const dir = tmpDir();
+  const output = ['Plugins (2)', '', '- only-one@src [disabled]', '  skills: 0, commands: 0, hooks: 0, mcp: none'].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(output)})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/unrecognized `zcode plugins list` output.*Plugins \(2\)/s);
+});
+
+test('an enabled plugin block with no recognized stats line refuses the turn', async () => {
+  const dir = tmpDir();
+  const output = ['Plugins (1)', '', '- headless@src [enabled]', '  (no stats line at all)'].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(output)})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/unrecognized `zcode plugins list` output.*headless/s);
+});
+
+test('an empty plugins list ("Plugins (0)") is well-formed and passes', async () => {
+  const dir = tmpDir();
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn });
+  expect(result.status).toBe('done');
+});
+
+// ---- no cache: every turn re-checks, and a failure/abort never sticks (round 3, P1 + P2) ----
+
+test('the pre-flight runs on EVERY turn, uncached — two turns spawn "plugins list" twice', async () => {
   const dir = tmpDir();
   let pluginsListCalls = 0;
   const spawnFn = (command, args, options) => {
     if (args.includes('plugins')) {
       pluginsListCalls += 1;
-      return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+      return fakePluginsListSpawn()(command, args, options);
     }
     return fakeCliAnswering('done', 'ok')(command, args, options);
   };
   const opts = happyOptions(dir);
   await runGlmTurn({ cwd: dir, prompt: 'go 1', logDir: dir, ...opts, spawnFn });
   await runGlmTurn({ cwd: dir, prompt: 'go 2', logDir: dir, ...opts, spawnFn });
-  expect(pluginsListCalls).toBe(1);
+  expect(pluginsListCalls).toBe(2);
 });
 
-test('a refusal from config.json (not from plugins list) still surfaces even after a passing plugins-list cache entry from a DIFFERENT config path', async () => {
+test('a plugin enabled BETWEEN two turns is caught by the second turn — nothing is trusted from the first', async () => {
+  const dir = tmpDir();
+  let call = 0;
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) {
+      call += 1;
+      // First turn: nothing enabled. Second turn: the SAME process now
+      // reports an unsafe plugin — no cache may hide this from it.
+      const blocks = call === 1 ? [] : [{ name: 'late-plugin', source: 'src', enabled: true, hooks: 0, mcp: 'plugin:late:late' }];
+      return fakePluginsListSpawn(blocks)(command, args, options);
+    }
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const opts = happyOptions(dir);
+  const first = await runGlmTurn({ cwd: dir, prompt: 'go 1', logDir: dir, ...opts, spawnFn });
+  expect(first.status).toBe('done');
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go 2', logDir: dir, ...opts, spawnFn })).rejects.toThrow(/pre-flight refused.*late-plugin/s);
+});
+
+test('an aborted pre-flight fails only THAT turn — a later, unrelated turn is unaffected', async () => {
+  const dir = tmpDir();
+  const controller = new AbortController();
+  let firstPluginsSpawnStarted = false;
+  const spawnFnForFirst = (command, args, options) => {
+    if (args.includes('plugins')) {
+      firstPluginsSpawnStarted = true;
+      return fakeCli('setTimeout(() => {}, 30000)')(command, args, options); // never answers on its own
+    }
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  const opts = happyOptions(dir);
+  const firstTurn = runGlmTurn({ cwd: dir, prompt: 'go 1', logDir: dir, signal: controller.signal, ...opts, spawnFn: spawnFnForFirst });
+  controller.abort();
+  await expect(firstTurn).rejects.toThrow(/stopped/);
+  expect(firstPluginsSpawnStarted).toBe(true);
+
+  // A second, independent call — fresh signal, fresh process for "plugins
+  // list" — must not inherit the first turn's abort in any way.
+  const spawnFnForSecond = (command, args, options) => {
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const second = await runGlmTurn({ cwd: dir, prompt: 'go 2', logDir: dir, ...opts, spawnFn: spawnFnForSecond });
+  expect(second.status).toBe('done');
+});
+
+test('a refusal from config.json (not from plugins list) surfaces even with an otherwise-empty plugin listing', async () => {
   const dir = tmpDir();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   const unsafeConfig = path.join(dir, 'unsafe-config.json');
@@ -265,7 +365,7 @@ test('config.json defining mcpServers nested under an arbitrary key still refuse
   const nested = path.join(dir, 'nested-config.json');
   fs.writeFileSync(nested, JSON.stringify({ some: { deeply: { nested: { mcpServers: { evil: {} } } } } }), 'utf8');
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   await expect(
@@ -277,7 +377,7 @@ test('an unreadable config.json fails the pre-flight closed', async () => {
   const dir = tmpDir();
   const missing = path.join(dir, 'does-not-exist.json');
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   await expect(
@@ -290,7 +390,7 @@ test('a malformed config.json fails the pre-flight closed', async () => {
   const malformed = path.join(dir, 'malformed-config.json');
   fs.writeFileSync(malformed, '{not json', 'utf8');
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'should not be reached')(command, args, options);
   };
   await expect(
@@ -403,7 +503,7 @@ test('the provider config path sits next to the entry, one level up from resourc
 test('a well-formed turn comes back as status, message, usage and a null (never zero) cost', async () => {
   const dir = tmpDir();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'plugins-list-noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('handoff', 'here is the draft')(command, args, options);
   };
   const result = await runGlmTurn({ cwd: dir, prompt: 'write something', logDir: dir, ...happyOptions(dir), spawnFn });
@@ -418,7 +518,7 @@ test('a well-formed turn comes back as status, message, usage and a null (never 
 test('the attachment files are cleaned up, so a draft does not linger in temp — the raw log is kept', async () => {
   const dir = tmpDir();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok')(command, args, options);
   };
   const result = await runGlmTurn({ cwd: dir, prompt: 'secret draft', logDir: dir, ...happyOptions(dir), spawnFn });
@@ -432,7 +532,7 @@ test('the provider config env var is injected for the child unless the caller al
   const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || '' }), sessionId: 'sess_x' }));`;
   const entryPath = 'C:/fake/resources/glm/zcode.cjs';
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli(script)(command, args, options);
   };
   const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir, { KAPREK_ZCODE_PATH: entryPath }), spawnFn });
@@ -443,7 +543,7 @@ test('an env var the caller already set is never overwritten', async () => {
   const dir = tmpDir();
   const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || '' }), sessionId: 'sess_x' }));`;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli(script)(command, args, options);
   };
   const result = await runGlmTurn({
@@ -461,7 +561,7 @@ test('the actual spawned argv pins plan mode, json, the full disallowed-tools li
   let seenArgs = null;
   let seenOptions = null;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     seenArgs = args;
     seenOptions = options;
     return fakeCliAnswering('done', 'ok')(command, args, options);
@@ -486,7 +586,7 @@ test('KAPREK_GLM_EXTRA_DISALLOWED reaches the actual argv', async () => {
   const dir = tmpDir();
   let seenArgs = null;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     seenArgs = args;
     return fakeCliAnswering('done', 'ok')(command, args, options);
   };
@@ -511,7 +611,7 @@ test('a multibyte character split across two data events decodes correctly inste
   const splitAt = emojiByteIndex + 2; // inside the emoji's 4-byte UTF-8 sequence
 
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return child;
   };
 
@@ -585,7 +685,7 @@ test('stdout past the cap ends the turn cleanly instead of buffering a runaway C
   const dir = tmpDir();
   const script = `process.stdout.write('x'.repeat(2 * 1024 * 1024)); setInterval(() => {}, 1000);`;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli(script)(command, args, options);
   };
   await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(new RegExp(`more than ${PEER_MAX_STDOUT_BYTES} bytes`));
@@ -594,7 +694,7 @@ test('stdout past the cap ends the turn cleanly instead of buffering a runaway C
 test('a peer that never answers is killed at the timeout rather than held forever', async () => {
   const dir = tmpDir();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli('setInterval(() => {}, 1000)')(command, args, options);
   };
   await expect(runGlmTurn({ cwd: dir, prompt: 'go', timeoutMs: 1_000, logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/did not answer within 1000ms/);
@@ -604,7 +704,7 @@ test('an abort signal ends the turn at once', async () => {
   const dir = tmpDir();
   const controller = new AbortController();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli('setTimeout(() => {}, 30000)')(command, args, options);
   };
   const pending = runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn });
@@ -629,7 +729,7 @@ test('an already-aborted signal is refused before any scratch directory is creat
 test('a non-zero exit is reported with what the CLI said on stderr', async () => {
   const dir = tmpDir();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli('process.stderr.write("not authenticated"); process.exit(3)')(command, args, options);
   };
   await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/exited with code 3.*not authenticated/s);
@@ -703,7 +803,7 @@ test('an abort that beats a short timeout keeps "stopped" as the reason, even on
   const dir = tmpDir();
   const controller = new AbortController();
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli('setTimeout(() => {}, 30000)')(command, args, options);
   };
   const pending = runGlmTurn({ cwd: dir, prompt: 'go', timeoutMs: 50, logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn });
@@ -730,7 +830,7 @@ test('overflow and abort arriving together only terminate once — no second kil
     resolveSpawned = resolve;
   });
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     resolveSpawned();
     return child;
   };
@@ -770,7 +870,7 @@ test('a failure writing the 2nd attachment leaves nothing behind — the 1st is 
         attachmentMaxBytes: GLM_ATTACHMENT_MIN_BYTES,
         ...happyOptions(dir),
         spawnFn: (command, args, options) => {
-          if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+          if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
           throw new Error('must not spawn — the 2nd attachment write fails before any spawn for the main turn');
         },
       }),
@@ -794,7 +894,7 @@ test('a clean session (log has a line for it, none with a toolName) passes the p
     { sessionId: 'sess_other', toolName: 'Bash' }, // a different session's tool call must not taint this one
   ]);
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_clean' })(command, args, options);
   };
   const result = await runGlmTurn({
@@ -817,7 +917,7 @@ test('a session whose log shows a tool call fails the turn — the answer is dis
     { sessionId: 'sess_bad', toolName: 'ExitPlanMode' },
   ]);
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_bad' })(command, args, options);
   };
   await expect(
@@ -838,7 +938,7 @@ test('a log file that exists but never mentions this sessionId fails closed — 
   const logDir = tmpDir();
   writeSessionLog(logDir, [{ sessionId: 'sess_someone_else', event: 'turn.start' }]);
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_absent' })(command, args, options);
   };
   await expect(
@@ -862,7 +962,7 @@ test('a malformed JSON line that mentions the sessionId fails the audit closed r
   const d = String(new Date().getDate()).padStart(2, '0');
   fs.writeFileSync(path.join(logDir, `zcode-${y}-${m}-${d}.jsonl`), 'this line mentions sess_garbled but is not json\n', 'utf8');
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_garbled' })(command, args, options);
   };
   await expect(
@@ -882,7 +982,7 @@ test('a missing session log fails the turn closed rather than trusting the answe
   const dir = tmpDir();
   const logDir = tmpDir(); // empty — no log file for either relevant date
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_missing' })(command, args, options);
   };
   await expect(
@@ -905,7 +1005,7 @@ test('a log file over the byte cap fails the audit closed rather than being stre
   fs.appendFileSync(filePath, `${'x'.repeat(200)}\n`.repeat(50), 'utf8');
   const oversizeCap = fs.statSync(filePath).size - 1;
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_big' })(command, args, options);
   };
   await expect(
@@ -929,7 +1029,7 @@ test('an audit that runs out of its time budget fails closed', async () => {
   lines.push({ sessionId: 'sess_slow', event: 'ok' });
   writeSessionLog(logDir, lines);
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_slow' })(command, args, options);
   };
   await expect(
@@ -946,12 +1046,51 @@ test('an audit that runs out of its time budget fails closed', async () => {
   ).rejects.toThrow(/exceeded its .*ms budget/);
 });
 
+// ---- audit deadline and byte cap are ENFORCED, not merely checked between events (round 3, P2) ----
+
+test('scanSessionLogFile enforces an independent deadline timer, destroying the stream, even if it never emits a line or ends', async () => {
+  const dir = tmpDir();
+  const filePath = path.join(dir, 'zcode-fake.jsonl');
+  // No trailing newline: readline never sees a complete line, so the ONLY
+  // way this can ever settle is the independent timer — a check living
+  // inside the `for await` loop body would never run at all.
+  fs.writeFileSync(filePath, 'a line with no newline so it never completes', 'utf8');
+  const fakeStream = new PassThrough();
+  let destroyed = false;
+  const originalDestroy = fakeStream.destroy.bind(fakeStream);
+  fakeStream.destroy = (...args) => {
+    destroyed = true;
+    return originalDestroy(...args);
+  };
+  const toolNames = new Set();
+  await expect(
+    scanSessionLogFile(filePath, 'sess_x', { toolNames, deadlineAt: Date.now() + 50, maxBytes: GLM_AUDIT_LOG_MAX_BYTES, timeBudgetMs: 50, createStream: () => fakeStream }),
+  ).rejects.toThrow(/exceeded its 50ms budget/);
+  // destroy(), not just closing the readline interface — a stuck underlying
+  // read must actually stop, not merely stop being listened to.
+  expect(destroyed).toBe(true);
+});
+
+test('a file that grows past the byte cap WHILE being read fails closed, even though its size at open time was fine', async () => {
+  const dir = tmpDir();
+  const filePath = path.join(dir, 'zcode-growing.jsonl');
+  fs.writeFileSync(filePath, 'small\n', 'utf8'); // tiny on disk — passes the upfront fs.statSync check
+  const fakeStream = new PassThrough();
+  const toolNames = new Set();
+  const cap = 100;
+  const pending = scanSessionLogFile(filePath, 'sess_x', { toolNames, deadlineAt: Date.now() + 5_000, maxBytes: cap, createStream: () => fakeStream });
+  // The file "grows" here: the running byte counter on the stream's own
+  // 'data' event is what catches this, not the one-time fs.statSync result.
+  fakeStream.write(`${'x'.repeat(cap + 50)}\n`);
+  await expect(pending).rejects.toThrow(/grew past the .*-byte audit cap/);
+});
+
 test('an envelope with no sessionId fails the turn closed', async () => {
   const dir = tmpDir();
   const logDir = tmpDir();
   const envelopeWithoutSessionId = JSON.stringify({ response: JSON.stringify({ status: 'done', message: 'ok' }) });
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCli(`process.stdout.write(${JSON.stringify(envelopeWithoutSessionId)})`)(command, args, options);
   };
   await expect(
@@ -971,7 +1110,7 @@ test('KAPREK_GLM_SKIP_TOOL_AUDIT=1 bypasses the audit entirely', async () => {
   const dir = tmpDir();
   const logDir = tmpDir(); // still empty — would fail closed otherwise
   const spawnFn = (command, args, options) => {
-    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    if (args.includes('plugins')) return fakePluginsListSpawn()(command, args, options);
     return fakeCliAnswering('done', 'ok', { sessionId: 'sess_whatever' })(command, args, options);
   };
   const result = await runGlmTurn({

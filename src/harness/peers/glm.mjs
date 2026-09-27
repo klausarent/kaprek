@@ -75,11 +75,14 @@
 // --disallowed-tools list missed.
 //
 // Hardened further after council round 2 (Codex, 27.09.2026):
-//   - A pre-flight (cached 10 min/process) runs `plugins list` and refuses
-//     any ENABLED plugin exposing an MCP tool outside KNOWN_SAFE_MCP or any
-//     hooks at all, and separately refuses if ~/.zcode/cli/config.json
-//     defines a user-level MCP server — fail-closed if that file cannot be
-//     read or parsed (see ensurePluginsPreflight()).
+//   - A pre-flight runs `plugins list` and refuses any ENABLED plugin
+//     exposing an MCP tool outside KNOWN_SAFE_MCP or any hooks at all, and
+//     separately refuses if ~/.zcode/cli/config.json defines a user-level
+//     MCP server — fail-closed if that file cannot be read or parsed (see
+//     ensurePluginsPreflight()). Runs before EVERY turn, uncached (round 3
+//     dropped the original 10-minute cache: a plugin enabled or a config.json
+//     edited between two turns is exactly what a cache would miss, and it
+//     means a turn's own cancellation can only ever fail THAT turn).
 //   - The child's environment is a small allowlist (PATH, TEMP, ZCODE_*,
 //     ...), never process.env wholesale — a peer that inherited the whole
 //     environment would have every secret in it regardless of what its
@@ -311,39 +314,52 @@ export function buildGlmChildEnv(env = process.env) {
  */
 export const KNOWN_SAFE_MCP = Object.freeze([]);
 
-/** How long ensurePluginsPreflight()'s result is trusted before it re-runs `plugins list` — per PROCESS, not per turn, so a long-lived server does not re-spawn it on every single turn. */
-const GLM_PREFLIGHT_CACHE_MS = 10 * 60 * 1000;
-
 /** How long the `plugins list` metadata call may take — short, because unlike a model turn this does no thinking at all. */
 const GLM_PREFLIGHT_TIMEOUT_MS = 30_000;
 
-const glmPreflightCache = new Map();
-
-/** Test-only: clears the module-level pre-flight cache so a test is not at the mercy of what an earlier test already cached. */
-export function resetGlmPreflightCacheForTests() {
-  glmPreflightCache.clear();
-}
-
 /**
- * Parses `zcode plugins list`'s output into one record per plugin block.
+ * Parses `zcode plugins list`'s output into one record per plugin block, or
+ * throws "unrecognized `zcode plugins list` output" — fail closed, on
+ * purpose. A safety check that silently passes on output it does not
+ * understand (an unrelated error message, a future CLI version's reshuffled
+ * format, a truncated stream) is worse than no check at all, because it
+ * LOOKS like the plugin surface was verified when it was not — the exact
+ * defect council review round 3 found: an early version of this parser
+ * quietly treated arbitrary unrelated text as "zero plugins found" and let
+ * the turn through.
  *
  * Verified live shape (27.09.2026):
+ *   Plugins (2)
  *   - android-emulator@zcode-plugins-official [enabled]
  *     skills: 1, commands: 1, hooks: 0, mcp: plugin:android-emulator:android-emulator
  *   - ios-simulator@zcode-plugins-official [disabled]
  *     skills: 1, commands: 1, hooks: 0, mcp: none
+ *
+ * Three things must hold or this refuses outright:
+ *   1. A `Plugins (N)` header line exists at all.
+ *   2. Exactly N plugin blocks were actually found.
+ *   3. Every ENABLED block has its own recognized stats line — a numeric
+ *      `hooks:` and an explicit `mcp:` value, not a default guessed in the
+ *      header's absence.
  */
 function parsePluginsList(text) {
+  const raw = String(text ?? '');
+  const headerMatch = raw.match(/^Plugins\s*\((\d+)\)\s*$/m);
+  if (!headerMatch) {
+    throw new Error('unrecognized `zcode plugins list` output: no "Plugins (N)" header found — refusing rather than guessing what this means');
+  }
+  const expectedCount = Number(headerMatch[1]);
+
   const blocks = [];
   let current = null;
   const headerRe = /^-\s+(.+?)@(\S+)\s+\[(enabled|disabled)\]\s*$/;
   const statsRe = /skills:\s*(\d+)\s*,\s*commands:\s*(\d+)\s*,\s*hooks:\s*(\d+)\s*,\s*mcp:\s*(.+?)\s*$/;
-  for (const rawLine of String(text ?? '').split('\n')) {
+  for (const rawLine of raw.split('\n')) {
     const line = rawLine.replace(/\r$/, '');
     const header = line.match(headerRe);
     if (header) {
       if (current) blocks.push(current);
-      current = { name: header[1], source: header[2], enabled: header[3] === 'enabled', hooks: 0, mcp: 'none' };
+      current = { name: header[1], source: header[2], enabled: header[3] === 'enabled', hooks: null, mcp: null };
       continue;
     }
     const stats = line.match(statsRe);
@@ -353,6 +369,15 @@ function parsePluginsList(text) {
     }
   }
   if (current) blocks.push(current);
+
+  if (blocks.length !== expectedCount) {
+    throw new Error(`unrecognized \`zcode plugins list\` output: header said Plugins (${expectedCount}) but ${blocks.length} plugin block(s) were actually found`);
+  }
+  for (const block of blocks) {
+    if (block.enabled && (block.hooks === null || block.mcp === null)) {
+      throw new Error(`unrecognized \`zcode plugins list\` output: enabled plugin "${block.name}" has no recognized stats line (hooks/mcp)`);
+    }
+  }
   return blocks;
 }
 
@@ -515,28 +540,20 @@ function runZcodeSubcommand({ command, argsPrefix, args, childEnv, spawnFn, cwd,
  *   2. `~/.zcode/cli/config.json` — refuses a user-level MCP server defined
  *      there, and refuses just as hard if the file cannot be read or parsed
  *      (see auditUserConfigMcpServers()).
- * Cached per (command, argsPrefix, configPath, knownSafeMcp) for
- * GLM_PREFLIGHT_CACHE_MS: a long-lived process asks once every ten minutes,
- * not once per turn — the CACHED answer, positive or negative, is what a
- * repeat call within the window gets, no re-spawn either way.
+ *
+ * Runs before EVERY turn, uncached, on purpose (council review round 3): a
+ * plugin can be enabled, or config.json edited, in the ten minutes after a
+ * cached "safe" result was recorded — an install a user does BETWEEN two
+ * turns is exactly when a stale cache would matter most. It also means a
+ * turn's own cancellation (an aborted signal, a timeout) can only ever fail
+ * THAT turn: there is nothing left behind that a later, unrelated turn could
+ * inherit. The cost is one extra short-lived process per turn, which is
+ * cheap next to what it is guarding.
  */
-async function ensurePluginsPreflight({ command, argsPrefix, childEnv, spawnFn, signal, zcodeConfigPath, knownSafeMcp = KNOWN_SAFE_MCP, now = () => Date.now() }) {
-  const cacheKey = JSON.stringify({ command, argsPrefix, zcodeConfigPath, knownSafeMcp });
-  const nowMs = now();
-  const cached = glmPreflightCache.get(cacheKey);
-  if (cached && cached.expiresAt > nowMs) {
-    if (cached.error) throw new Error(cached.error);
-    return;
-  }
-  try {
-    const stdout = await runZcodeSubcommand({ command, argsPrefix, args: ['plugins', 'list'], childEnv, spawnFn, cwd: os.tmpdir(), signal });
-    auditPluginsList(parsePluginsList(stdout), { knownSafeMcp });
-    auditUserConfigMcpServers(zcodeConfigPath);
-  } catch (err) {
-    glmPreflightCache.set(cacheKey, { expiresAt: nowMs + GLM_PREFLIGHT_CACHE_MS, error: err.message });
-    throw err;
-  }
-  glmPreflightCache.set(cacheKey, { expiresAt: nowMs + GLM_PREFLIGHT_CACHE_MS, error: null });
+async function ensurePluginsPreflight({ command, argsPrefix, childEnv, spawnFn, signal, zcodeConfigPath, knownSafeMcp = KNOWN_SAFE_MCP }) {
+  const stdout = await runZcodeSubcommand({ command, argsPrefix, args: ['plugins', 'list'], childEnv, spawnFn, cwd: os.tmpdir(), signal });
+  auditPluginsList(parsePluginsList(stdout), { knownSafeMcp });
+  auditUserConfigMcpServers(zcodeConfigPath);
 }
 
 /**
@@ -845,32 +862,78 @@ function localDateStamp(date) {
  * mentions this session is not proof that nothing ran, only proof that
  * nobody checked the right thing.
  *
- * Fails closed rather than skipping anything ambiguous:
- *   - a file over GLM_AUDIT_LOG_MAX_BYTES is refused outright.
+ * Fails closed rather than skipping anything ambiguous, and does so with
+ * REAL enforcement rather than a check that only fires between events:
+ *   - a file already over `maxBytes` at open time is refused outright
+ *     (fs.statSync, before a stream is even opened) — but a file that GROWS
+ *     past the cap WHILE being read is caught too, by a running counter on
+ *     the underlying stream's own 'data' event (not the readline line count,
+ *     which says nothing about bytes actually read off disk). Council review
+ *     round 3: the upfront size check alone samples the size once and trusts
+ *     it for the rest of the read.
+ *   - `deadlineAt` is enforced by an independent `setTimeout`, not merely
+ *     checked between lines — a stream that never emits a line at all (or
+ *     never ends) would otherwise let `for await` hang forever, since the
+ *     loop body only runs once a line actually arrives. The timer destroys
+ *     the underlying stream (not just the readline interface — closing only
+ *     `rl` leaves a slow or stuck read in flight) so the process actually
+ *     stops, not merely stops being listened to.
  *   - a line that CONTAINS the sessionId substring but does not parse as
  *     JSON might be a truncated or corrupted record hiding a tool call, so
  *     it stops the whole audit rather than being silently ignored.
- *   - `deadlineAt` is checked every line; past it the audit stops rather
- *     than continuing to stream an oversized or slow log indefinitely.
+ *
+ * `createStream` is injectable (default `fs.createReadStream`) so a test can
+ * exercise the deadline and byte-cap enforcement against a stream that never
+ * ends or that grows mid-read, without needing a real 50 MB file or a real
+ * stuck pipe.
  */
-async function scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, maxBytes }) {
-  let size;
+export async function scanSessionLogFile(filePath, sessionId, { toolNames = new Set(), deadlineAt = Date.now() + GLM_AUDIT_TIME_BUDGET_MS, maxBytes = GLM_AUDIT_LOG_MAX_BYTES, timeBudgetMs = GLM_AUDIT_TIME_BUDGET_MS, createStream } = {}) {
+  let initialSize;
   try {
-    size = fs.statSync(filePath).size;
+    initialSize = fs.statSync(filePath).size;
   } catch {
     return { found: false }; // no file for this day — not an error, just nothing to scan
   }
-  if (size > maxBytes) {
-    throw new Error(`glm's session log ${filePath} is ${size} bytes, over the ${maxBytes}-byte audit cap — answer discarded`);
+  if (initialSize > maxBytes) {
+    throw new Error(`glm's session log ${filePath} is ${initialSize} bytes, over the ${maxBytes}-byte audit cap — answer discarded`);
   }
 
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) {
+    throw new Error(`glm's post-turn tool audit exceeded its ${timeBudgetMs}ms budget — answer discarded`);
+  }
+
+  const makeStream = createStream ?? ((p) => fs.createReadStream(p, { encoding: 'utf8' }));
+  const readStream = makeStream(filePath);
+  const rl = readline.createInterface({ input: readStream, crlfDelay: Infinity });
+
+  let bytesRead = 0;
+  let overBudget = false; // the byte cap was exceeded WHILE reading (the file grew)
+  let timedOut = false;
+
+  readStream.on('data', (chunk) => {
+    bytesRead += Buffer.byteLength(chunk, 'utf8');
+    if (bytesRead > maxBytes) {
+      overBudget = true;
+      rl.close();
+      readStream.destroy();
+    }
+  });
+  // An independent timer, not a check inside the line loop: the loop body
+  // only runs when a line actually arrives, so a stream that never emits
+  // one (or never ends) would never trip a deadline that lived only inside
+  // it. destroy(), not just rl.close() — closing the interface stops
+  // READLINE from processing further, but leaves the underlying fs read (or
+  // a stuck pipe) running in the background.
+  const timer = setTimeout(() => {
+    timedOut = true;
+    rl.close();
+    readStream.destroy();
+  }, remainingMs);
+
   let found = false;
-  const rl = readline.createInterface({ input: fs.createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity });
   try {
     for await (const line of rl) {
-      if (Date.now() > deadlineAt) {
-        throw new Error(`glm's post-turn tool audit exceeded its ${GLM_AUDIT_TIME_BUDGET_MS}ms budget — answer discarded`);
-      }
       if (line.trim() === '' || !line.includes(sessionId)) continue;
       let parsed;
       try {
@@ -883,7 +946,16 @@ async function scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, 
       if (typeof parsed?.toolName === 'string') toolNames.add(parsed.toolName);
     }
   } finally {
+    clearTimeout(timer);
     rl.close();
+    readStream.destroy();
+  }
+
+  if (overBudget) {
+    throw new Error(`glm's session log ${filePath} grew past the ${maxBytes}-byte audit cap while being read — answer discarded`);
+  }
+  if (timedOut) {
+    throw new Error(`glm's post-turn tool audit exceeded its ${timeBudgetMs}ms budget — answer discarded`);
   }
   return { found };
 }
@@ -896,7 +968,7 @@ async function scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, 
  * so a turn that starts at 23:59 and ends at 00:01 still gets both of its
  * two files checked, and nothing else is read.
  */
-export async function toolNamesForSession(sessionId, { zcodeLogDir, startedAt, endedAt, maxBytes = GLM_AUDIT_LOG_MAX_BYTES, timeBudgetMs = GLM_AUDIT_TIME_BUDGET_MS }) {
+export async function toolNamesForSession(sessionId, { zcodeLogDir, startedAt, endedAt, maxBytes = GLM_AUDIT_LOG_MAX_BYTES, timeBudgetMs = GLM_AUDIT_TIME_BUDGET_MS, createStream }) {
   const toolNames = new Set();
   const dateStamps = new Set([localDateStamp(startedAt), localDateStamp(endedAt)]);
   const deadlineAt = Date.now() + timeBudgetMs;
@@ -904,7 +976,7 @@ export async function toolNamesForSession(sessionId, { zcodeLogDir, startedAt, e
   for (const stamp of dateStamps) {
     const filePath = path.join(zcodeLogDir, `zcode-${stamp}.jsonl`);
     // eslint-disable-next-line no-await-in-loop -- each day's file must finish (or fail) before the next starts, so the shared deadline and byte cap mean what they say
-    const { found } = await scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, maxBytes });
+    const { found } = await scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, maxBytes, timeBudgetMs, createStream });
     if (found) anyFound = true;
   }
   return { names: [...toolNames], anyFound };
@@ -1044,8 +1116,7 @@ export async function runGlmTurn({
 
   // Prevention before detection: refuses before a turn ever starts if this
   // machine's plugin/MCP surface could let a "text-only" turn reach a tool
-  // anyway. Cached, so this is a real spawn only once per
-  // GLM_PREFLIGHT_CACHE_MS per process, not once per turn.
+  // anyway. Runs every turn, uncached (see ensurePluginsPreflight's note).
   await ensurePluginsPreflight({ command, argsPrefix, childEnv, spawnFn, signal, zcodeConfigPath, knownSafeMcp });
 
   const turnStartedAt = new Date();
