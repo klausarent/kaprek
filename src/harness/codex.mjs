@@ -19,6 +19,7 @@ import { spawn } from 'node:child_process';
 import { createInterface } from 'node:readline';
 import { ABSOLUTE_MS, ACTIVE_TOTAL_MS, IDLE_MS, TOOL_LEASE_MS, createTurnClocks } from './timeout.mjs';
 import { EFFORT_LEVELS } from './claude-code.mjs';
+import { killTree } from './peers/grok.mjs';
 
 /**
  * kaprek's permissionMode → Codex {approvalPolicy, sandbox}.
@@ -49,6 +50,14 @@ const DEFAULT_KILL_GRACE_MS = 3000;
 /** Same 8 MiB line cap as claude-code.mjs: a single runaway line is dropped and counted, never parsed or buffered. */
 const MAX_LINE_BYTES = 8 * 1024 * 1024;
 
+function plainKill(child) {
+  try {
+    child.kill();
+  } catch {
+    // already gone
+  }
+}
+
 export async function startTurn({
   cwd,
   prompt,
@@ -60,6 +69,9 @@ export async function startTurn({
   onApprovalRequest,
   signal,
   spawnFn = spawn,
+  // Real spawn → real tree kill. An injected spawnFn (tests) gets a plain
+  // child.kill() so a fake pid never reaches taskkill.
+  killTreeFn = spawnFn === spawn ? killTree : plainKill,
   killGraceMs = DEFAULT_KILL_GRACE_MS,
   idleMs = IDLE_MS,
   toolLeaseMs = TOOL_LEASE_MS,
@@ -138,11 +150,10 @@ export async function startTurn({
         }
       }, killGraceMs);
       graceTimer.unref?.();
-      try {
-        child.kill();
-      } catch {
-        // already gone
-      }
+      // On win32 the child is cmd.exe (shell: true), so child.kill() alone ends
+      // only the shell and orphans the codex process under it. killTree runs
+      // taskkill /t first, then child.kill() (bridge #465 review, point 9).
+      killTreeFn(child);
     };
 
     const settle = (result) => {

@@ -540,3 +540,16 @@ test('an onEvent consumer that throws is collected as a warning and the turn sti
   expect(result.stopReason).toBe('result');
   expect(result.warnings).toContain('boom in onEvent');
 });
+
+// ---- tree kill (bridge #465 review, point 9) ----
+
+test('ending the turn goes through killTreeFn, so win32 can kill the whole tree', async () => {
+  const child = happyServer();
+  const killed = [];
+  const killTreeFn = (c) => {
+    killed.push(c.pid);
+    c.kill();
+  };
+  await startTurn({ cwd: 'C:/work', prompt: 'hi', spawnFn: () => child, killTreeFn });
+  expect(killed).toEqual([4242]);
+});
