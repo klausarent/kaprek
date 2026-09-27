@@ -5,12 +5,13 @@
 // claude-code.test.mjs fakes the claude CLI. The flag line itself is asserted
 // against buildGrokArgs(), because "the prompt never goes through argv" is a
 // property, not a comment.
-import { test, expect, afterEach } from 'vitest';
+import { test, expect, vi, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import { spawn } from 'node:child_process';
-import { GROK_MAX_PROMPT_BYTES, buildGrokArgs, grokDriver, parseGrokStdout, resolveGrokCli, runGrokTurn } from './grok.mjs';
+import { GROK_MAX_PROMPT_BYTES, buildGrokArgs, grokDriver, killTree, parseGrokStdout, resolveGrokCli, runGrokTurn } from './grok.mjs';
 import { PEER_MAX_STDOUT_BYTES, PEER_OUTPUT_SCHEMA, parsePeerAnswer } from './driver.mjs';
 
 const dirs = [];
@@ -301,4 +302,48 @@ test('an explicit allowlist is not undone by the text-only denylist', () => {
 test('a prompt above the limit is refused before anything is spawned', async () => {
   const spawnFn = () => { throw new Error('must not spawn'); };
   await expect(runGrokTurn({ cwd: tmpDir(), prompt: 'p'.repeat(GROK_MAX_PROMPT_BYTES + 1), spawnFn })).rejects.toThrow(/offloads/);
+});
+
+// Council review (27.09.2026): killTree used to call child.kill() BEFORE
+// taskkill /t, so a child that exited the instant it was signalled left
+// taskkill nothing to enumerate — any grandchild it had spawned was
+// orphaned. These test the fixed order directly, with a fake taskkill
+// (spawnFn) rather than a real one, so the assertion is about ORDER and
+// AWAITING, not about `taskkill.exe` actually existing on the runner.
+test.skipIf(process.platform !== 'win32')('killTree runs taskkill BEFORE child.kill(), windowsHide, and awaits it', async () => {
+  const order = [];
+  const child = { pid: 4242, kill: () => order.push('child.kill') };
+  const taskkillChild = new EventEmitter();
+  const spawnFn = (command, args, options) => {
+    order.push('taskkill.spawn');
+    expect(command).toBe('taskkill');
+    expect(args).toEqual(['/pid', '4242', '/t', '/f']);
+    expect(options.windowsHide).toBe(true);
+    // Resolved asynchronously, like a real process would — otherwise the
+    // ordering assertion below would pass even with the old, buggy order.
+    setImmediate(() => taskkillChild.emit('close', 0));
+    return taskkillChild;
+  };
+  await killTree(child, { spawnFn });
+  expect(order).toEqual(['taskkill.spawn', 'child.kill']);
+});
+
+test.skipIf(process.platform !== 'win32')('killTree still calls child.kill() when the taskkill helper fails to start', async () => {
+  const child = { pid: 4242, kill: vi.fn() };
+  const spawnFn = () => {
+    throw new Error('taskkill.exe not found');
+  };
+  await killTree(child, { spawnFn });
+  expect(child.kill).toHaveBeenCalled();
+});
+
+test.skipIf(process.platform !== 'win32')('killTree still calls child.kill() when the taskkill helper itself errors out', async () => {
+  const child = { pid: 4242, kill: vi.fn() };
+  const taskkillChild = new EventEmitter();
+  const spawnFn = () => {
+    setImmediate(() => taskkillChild.emit('error', new Error('ENOENT')));
+    return taskkillChild;
+  };
+  await killTree(child, { spawnFn });
+  expect(child.kill).toHaveBeenCalled();
 });

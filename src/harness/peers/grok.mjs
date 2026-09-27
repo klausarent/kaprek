@@ -239,27 +239,63 @@ export function parseGrokStdout(stdout, { validate = true } = {}) {
   };
 }
 
-/** Kills a child and, on Windows, the process tree under it — same reasoning as claude-code.mjs::killChildTree(). */
-function killTree(child) {
-  try {
-    child.kill();
-  } catch {
-    // already gone
-  }
-  if (!child.pid) return;
-  if (process.platform === 'win32') {
-    try {
-      spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' }).unref();
-    } catch {
-      // best-effort
+/**
+ * Kills a child and, on Windows, the process tree under it.
+ *
+ * Order matters, and reversing it was a real bug (council review, 27.09.2026):
+ * `taskkill /pid <pid> /t /f` needs the pid to still be a live process when it
+ * runs, because `/t` asks Windows to enumerate that pid's CURRENT children.
+ * Calling `child.kill()` first can make node's own child exit before taskkill
+ * ever looks, and `/pid <an-already-exited-pid> /t` then finds nothing and
+ * kills nothing — orphaning whatever grandchild the CLI had spawned. So on
+ * win32 taskkill runs FIRST, spawned with `windowsHide` and its own `error`
+ * listener (a helper that fails to start must not throw out of here), and is
+ * AWAITED — with a short timeout of its own, so a stuck taskkill cannot hang
+ * the caller — before `child.kill()` runs as the fallback for whatever
+ * taskkill's snapshot missed. Returns a promise so a caller reports the turn
+ * as over only once the kill attempt has actually settled, not merely been
+ * requested.
+ */
+export function killTree(child, { spawnFn = spawn } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    let guard = null;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      if (guard) clearTimeout(guard);
+      try {
+        child.kill();
+      } catch {
+        // already gone
+      }
+      resolve();
+    };
+
+    if (!child.pid || process.platform !== 'win32') {
+      if (child.pid && process.platform !== 'win32') {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+        } catch {
+          // no process group, or already gone
+        }
+      }
+      finish();
+      return;
     }
-    return;
-  }
-  try {
-    process.kill(-child.pid, 'SIGKILL');
-  } catch {
-    // no process group, or already gone
-  }
+
+    let killer;
+    try {
+      killer = spawnFn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
+    } catch {
+      finish();
+      return;
+    }
+    killer.on('error', finish);
+    killer.on('close', finish);
+    guard = setTimeout(finish, 3_000);
+    guard.unref?.();
+  });
 }
 
 /**
@@ -317,6 +353,15 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
     let stderr = '';
     let overflowed = false;
     let settled = false;
+    // Set the moment a DELIBERATE kill starts (timeout/abort/overflow), to
+    // the value that kill must resolve with. Killing the child necessarily
+    // makes it exit, which fires its own 'close' — a race the OLD
+    // fire-and-forget killTree() never had (it called finish() synchronously,
+    // before the kill could possibly have taken effect). Now that killTree()
+    // is properly awaited, the natural 'close'/'error' below has to be told
+    // to stand down rather than racing to resolve with a generic "exited
+    // with code N" that hides the real reason.
+    let killingReason = null;
     const finish = (value) => {
       if (settled) return;
       settled = true;
@@ -325,14 +370,17 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
       resolve(value);
     };
 
+    // Each of these awaits killTree() before reporting completion — the turn
+    // is not "over" merely because a kill was requested, but once the kill
+    // attempt has actually settled (see killTree's own note).
     const timer = setTimeout(() => {
-      killTree(child);
-      finish({ error: `grok did not answer within ${timeoutMs}ms`, stdout, stderr });
+      killingReason = { error: `grok did not answer within ${timeoutMs}ms`, stdout, stderr };
+      killTree(child).then(() => finish(killingReason));
     }, timeoutMs);
 
     const onAbort = () => {
-      killTree(child);
-      finish({ error: 'the relay run was stopped', stdout, stderr });
+      killingReason = { error: 'the relay run was stopped', stdout, stderr };
+      killTree(child).then(() => finish(killingReason));
     };
     signal?.addEventListener?.('abort', onAbort, { once: true });
 
@@ -341,8 +389,8 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
       stdout += chunk;
       if (Buffer.byteLength(stdout, 'utf8') > PEER_MAX_STDOUT_BYTES) {
         overflowed = true;
-        killTree(child);
-        finish({ error: `grok printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr });
+        killingReason = { error: `grok printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr };
+        killTree(child).then(() => finish(killingReason));
       }
     });
     child.stderr?.on('data', (chunk) => {
@@ -350,8 +398,12 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
       if (Buffer.byteLength(stderr, 'utf8') > PEER_MAX_STDOUT_BYTES) stderr = stderr.slice(-4096);
     });
 
-    child.on('error', (err) => finish({ error: `could not start grok: ${err.message}`, stdout, stderr }));
+    child.on('error', (err) => {
+      if (killingReason) return; // the pending kill's own finish() call owns the outcome
+      finish({ error: `could not start grok: ${err.message}`, stdout, stderr });
+    });
     child.on('close', (code) => {
+      if (killingReason) return; // ditto — this close is the kill taking effect, not a new fact
       if (code === 0) finish({ stdout, stderr });
       else finish({ error: `grok exited with code ${code}${stderr ? `: ${stderr.slice(-400).trim()}` : ''}`, stdout, stderr });
     });
