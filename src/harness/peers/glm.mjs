@@ -22,8 +22,8 @@
 //                      --disallowed-tools naming every tool by exact name
 //                      (`mcp__*` wildcards do NOT work — verified live, a
 //                      wildcard still let mcp__node_repl__js run arbitrary
-//                      JS) PLUS the post-turn audit below, because a static
-//                      list can miss a freshly installed plugin.
+//                      JS), the pre-flight plugin/MCP check, and the
+//                      post-turn audit — belt, braces, and a third belt.
 //   --disallowed-tools strips the tool-capable set by exact name (see
 //                      GLM_DISALLOWED_TOOLS).
 //   --attach, not a    ZCode only shows a SINGLE attachment up to ~64 KB
@@ -64,24 +64,42 @@
 // a different, stateful integration than this one-shot `-p` driver — out of
 // scope here, same way grok.mjs does not manage Grok's own model setting.
 //
-// Hardened after council review (Codex + Grok, 27.09.2026): taskkill now
-// runs before child.kill() and is awaited (killTree()); the ZCode process
-// always runs in a fresh, unique per-turn scratch directory this driver
-// creates, never the caller's `cwd`; an already-aborted signal is checked
-// before any artifact is created and again right after the abort listener
-// attaches; stdout/stderr are decoded with setEncoding('utf8') so a
-// multi-byte character split across two data events cannot corrupt the
-// parse; envelope parsing does a real balanced-brace scan instead of
-// slicing from the first '{' to end-of-string; chunkPromptForZcode() refuses
-// an attachment cap below 1024 bytes and guarantees forward progress even
-// on a pathologically small limit; and a post-turn audit reads ZCode's own
-// session log for whatever tool calls the static --disallowed-tools list
-// missed (see auditNoToolsRan()) and fails the turn closed if it finds one,
-// if it cannot find the log at all, or if the envelope carried no sessionId
-// to check in the first place.
+// Hardened after council review round 1 (Codex + Grok, 27.09.2026): taskkill
+// runs before child.kill() and is awaited; the ZCode process always runs in
+// a fresh, unique per-turn scratch directory this driver creates, never the
+// caller's `cwd`; an already-aborted signal is checked before any artifact
+// is created; stdout/stderr are decoded with setEncoding('utf8'); envelope
+// parsing does a balanced-brace scan; chunkPromptForZcode() refuses an
+// attachment cap below 1024 bytes and guarantees forward progress; and a
+// post-turn audit reads ZCode's own session log for tool calls the static
+// --disallowed-tools list missed.
+//
+// Hardened further after council round 2 (Codex, 27.09.2026):
+//   - A pre-flight (cached 10 min/process) runs `plugins list` and refuses
+//     any ENABLED plugin exposing an MCP tool outside KNOWN_SAFE_MCP or any
+//     hooks at all, and separately refuses if ~/.zcode/cli/config.json
+//     defines a user-level MCP server — fail-closed if that file cannot be
+//     read or parsed (see ensurePluginsPreflight()).
+//   - The child's environment is a small allowlist (PATH, TEMP, ZCODE_*,
+//     ...), never process.env wholesale — a peer that inherited the whole
+//     environment would have every secret in it regardless of what its
+//     tools are locked down to (see buildGlmChildEnv()).
+//   - The post-turn audit now requires POSITIVE evidence (at least one log
+//     line naming this exact sessionId), fails closed on a malformed line
+//     that merely mentions the sessionId, streams each day's log file
+//     line-by-line under a byte cap and an overall time budget, and checks
+//     only the turn's own start/end calendar dates rather than a blanket
+//     ±1 day around audit time (see auditNoToolsRan()).
+//   - Attachment paths are registered in the cleanup list BEFORE they are
+//     written, so a failure partway through writing them still gets
+//     cleaned up.
+//   - Termination (timeout/abort/overflow) goes through one idempotent
+//     terminate() — the first trigger's reason wins and no second killTree()
+//     call happens, the same fix applied to grok.mjs.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import readline from 'node:readline';
 import { spawn } from 'node:child_process';
 import {
   PEER_MAX_STDOUT_BYTES,
@@ -135,8 +153,9 @@ export const GLM_ATTACHMENT_MIN_BYTES = 1024;
  * be named rather than pattern-matched. KAPREK_GLM_EXTRA_DISALLOWED extends
  * this list at runtime for a plugin installed after this file was last
  * updated, without a code change (see effectiveDisallowedTools()); the
- * post-turn audit (auditNoToolsRan()) is the actual fail-closed guard for
- * whatever a stale list still misses.
+ * pre-flight (ensurePluginsPreflight()) and the post-turn audit
+ * (auditNoToolsRan()) are the actual fail-closed guards for whatever a
+ * stale list still misses.
  */
 const GLM_DISALLOWED_TOOLS_LIST = [
   // Core tools.
@@ -237,6 +256,287 @@ export const GLM_TOOL_AUDIT_SKIP_ENV = 'KAPREK_GLM_SKIP_TOOL_AUDIT';
 export function effectiveDisallowedTools(env = process.env, base = GLM_DISALLOWED_TOOLS) {
   const extra = String(env?.[GLM_EXTRA_DISALLOWED_ENV] ?? '').trim();
   return extra ? `${base} ${extra}` : base;
+}
+
+/**
+ * Every environment variable NAME passed through to the child verbatim,
+ * plus every `ZCODE_*` one — never process.env wholesale. A peer whose tools
+ * are locked down but whose environment is inherited whole still has
+ * GITHUB_TOKEN, ANTHROPIC_API_KEY and everything else the calling process
+ * carries sitting in its own `process.env`, reachable by anything that ever
+ * gets a foothold (a prompt-injected shell command, a plugin bug, a future
+ * regression in the tool lock) — the allowlist is what actually keeps a
+ * secret out of reach, not a hope that --disallowed-tools covers everything
+ * (council review round 2, 27.09.2026).
+ */
+const GLM_CHILD_ENV_ALLOWLIST = [
+  'PATH',
+  'SystemRoot',
+  'SYSTEMROOT',
+  'windir',
+  'ComSpec',
+  'PATHEXT',
+  'TEMP',
+  'TMP',
+  'USERPROFILE',
+  'HOME',
+  'HOMEDRIVE',
+  'HOMEPATH',
+  'APPDATA',
+  'LOCALAPPDATA',
+  'ProgramData',
+  'NUMBER_OF_PROCESSORS',
+  'PROCESSOR_ARCHITECTURE',
+  'OS',
+  'LANG',
+];
+
+/** Builds the child's ENTIRE environment from `env` — the allowlist above plus every `ZCODE_*` variable (including a caller-set ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, honored by runGlmTurn's own "do not overwrite" logic afterward). Nothing else survives. */
+export function buildGlmChildEnv(env = process.env) {
+  const child = {};
+  for (const key of GLM_CHILD_ENV_ALLOWLIST) {
+    if (env[key] !== undefined) child[key] = env[key];
+  }
+  for (const [key, value] of Object.entries(env)) {
+    if (key.startsWith('ZCODE_')) child[key] = value;
+  }
+  return child;
+}
+
+/**
+ * MCP ids exempted from the pre-flight refusal. Empty by default — a
+ * caller-vetted allowlist, never populated here silently; the whole point
+ * of the pre-flight is that an enabled plugin exposing an MCP tool is
+ * refused unless someone explicitly said it was fine.
+ */
+export const KNOWN_SAFE_MCP = Object.freeze([]);
+
+/** How long ensurePluginsPreflight()'s result is trusted before it re-runs `plugins list` — per PROCESS, not per turn, so a long-lived server does not re-spawn it on every single turn. */
+const GLM_PREFLIGHT_CACHE_MS = 10 * 60 * 1000;
+
+/** How long the `plugins list` metadata call may take — short, because unlike a model turn this does no thinking at all. */
+const GLM_PREFLIGHT_TIMEOUT_MS = 30_000;
+
+const glmPreflightCache = new Map();
+
+/** Test-only: clears the module-level pre-flight cache so a test is not at the mercy of what an earlier test already cached. */
+export function resetGlmPreflightCacheForTests() {
+  glmPreflightCache.clear();
+}
+
+/**
+ * Parses `zcode plugins list`'s output into one record per plugin block.
+ *
+ * Verified live shape (27.09.2026):
+ *   - android-emulator@zcode-plugins-official [enabled]
+ *     skills: 1, commands: 1, hooks: 0, mcp: plugin:android-emulator:android-emulator
+ *   - ios-simulator@zcode-plugins-official [disabled]
+ *     skills: 1, commands: 1, hooks: 0, mcp: none
+ */
+function parsePluginsList(text) {
+  const blocks = [];
+  let current = null;
+  const headerRe = /^-\s+(.+?)@(\S+)\s+\[(enabled|disabled)\]\s*$/;
+  const statsRe = /skills:\s*(\d+)\s*,\s*commands:\s*(\d+)\s*,\s*hooks:\s*(\d+)\s*,\s*mcp:\s*(.+?)\s*$/;
+  for (const rawLine of String(text ?? '').split('\n')) {
+    const line = rawLine.replace(/\r$/, '');
+    const header = line.match(headerRe);
+    if (header) {
+      if (current) blocks.push(current);
+      current = { name: header[1], source: header[2], enabled: header[3] === 'enabled', hooks: 0, mcp: 'none' };
+      continue;
+    }
+    const stats = line.match(statsRe);
+    if (stats && current) {
+      current.hooks = Number(stats[3]);
+      current.mcp = stats[4].trim();
+    }
+  }
+  if (current) blocks.push(current);
+  return blocks;
+}
+
+/**
+ * Refuses (throws) if any ENABLED plugin block exposes an MCP tool whose id
+ * is not in `knownSafeMcp`, or has any hooks at all. A disabled plugin is not
+ * inspected further — it cannot run regardless of what it would expose.
+ */
+function auditPluginsList(blocks, { knownSafeMcp = KNOWN_SAFE_MCP } = {}) {
+  for (const block of blocks) {
+    if (!block.enabled) continue;
+    if (block.hooks > 0) {
+      throw new Error(`glm pre-flight refused: plugin "${block.name}" is enabled with ${block.hooks} hook(s)`);
+    }
+    if (block.mcp && block.mcp !== 'none') {
+      const ids = block.mcp
+        .split(',')
+        .map((id) => id.trim())
+        .filter(Boolean);
+      const unsafe = ids.filter((id) => !knownSafeMcp.includes(id));
+      if (unsafe.length > 0) {
+        throw new Error(`glm pre-flight refused: plugin "${block.name}" exposes MCP tool(s) not in KNOWN_SAFE_MCP: ${unsafe.join(', ')}`);
+      }
+    }
+  }
+}
+
+/** Where ZCode's own CLI config sits — a second surface a user-level MCP server can be defined on, independent of the plugin registry `plugins list` reports. Injectable (runGlmTurn's `zcodeConfigPath` option) so a test never has to touch the real machine's ~/.zcode. */
+export function defaultZcodeConfigPath() {
+  return path.join(os.homedir(), '.zcode', 'cli', 'config.json');
+}
+
+/** Depth-bounded search for the first non-empty value at one of `keys`, anywhere in `node` — config.json's own shape is not documented, so this looks under the exact key names asked for at any nesting rather than assuming they sit at the top level. */
+function findNonEmptyMcpKey(node, keys, depth = 0) {
+  if (depth > 6 || !node || typeof node !== 'object') return null;
+  for (const key of keys) {
+    const value = node[key];
+    if (Array.isArray(value) && value.length > 0) {
+      return { key, names: value.map((entry, idx) => (typeof entry === 'string' ? entry : `#${idx}`)) };
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value) && Object.keys(value).length > 0) {
+      return { key, names: Object.keys(value) };
+    }
+  }
+  for (const value of Object.values(node)) {
+    if (value && typeof value === 'object') {
+      const found = findNonEmptyMcpKey(value, keys, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * Refuses (throws) if `configPath` defines a user-level MCP server anywhere
+ * under a `mcpServers` / `mcp` / `servers` key, and fails closed — same
+ * throw — if the file cannot be read or does not parse as JSON. A config
+ * this driver cannot make sense of is not "probably fine"; it is refused the
+ * same way an actual MCP server entry would be.
+ */
+function auditUserConfigMcpServers(configPath) {
+  let text;
+  try {
+    text = fs.readFileSync(configPath, 'utf8');
+  } catch (err) {
+    throw new Error(`glm pre-flight could not read ${configPath}: ${err.message}`);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    throw new Error(`glm pre-flight found a malformed ${configPath}: ${err.message}`);
+  }
+  const found = findNonEmptyMcpKey(parsed, ['mcpServers', 'mcp', 'servers']);
+  if (found) {
+    throw new Error(`glm pre-flight refused: ${configPath} defines user-level MCP server(s) under "${found.key}": ${found.names.join(', ')}`);
+  }
+}
+
+/**
+ * Runs one ZCode metadata subcommand (`plugins list` today) and returns its
+ * stdout, or throws. Deliberately simpler than the main turn's executor
+ * below — a metadata call does no model thinking, so PEER_TIMEOUT_MS would
+ * be a strange bound for it — but shares the same termination shape: an
+ * idempotent terminate() so an abort and the pre-flight's own timeout
+ * cannot both try to kill the same child.
+ */
+function runZcodeSubcommand({ command, argsPrefix, args, childEnv, spawnFn, cwd, signal, timeoutMs = GLM_PREFLIGHT_TIMEOUT_MS }) {
+  return new Promise((resolve, reject) => {
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let child = null;
+    let timer = null;
+    let terminating = null;
+
+    const finish = (err, value) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener?.('abort', onAbort);
+      if (err) reject(err);
+      else resolve(value);
+    };
+    const terminate = (err) => {
+      if (terminating) return terminating;
+      terminating = (child ? killTree(child) : Promise.resolve()).then(() => finish(err));
+      return terminating;
+    };
+    const onAbort = () => terminate(new Error('the relay run was stopped'));
+    signal?.addEventListener?.('abort', onAbort, { once: true });
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+
+    try {
+      child = spawnFn(command, [...argsPrefix, ...args], {
+        cwd,
+        env: childEnv,
+        windowsHide: true,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (err) {
+      finish(new Error(`could not start glm: ${err.message}`));
+      return;
+    }
+
+    timer = setTimeout(() => terminate(new Error(`glm pre-flight did not answer within ${timeoutMs}ms`)), timeoutMs);
+
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk) => {
+      stdout += chunk;
+      if (Buffer.byteLength(stdout, 'utf8') > PEER_MAX_STDOUT_BYTES) terminate(new Error('glm pre-flight printed too much output'));
+    });
+    child.stderr?.on('data', (chunk) => {
+      stderr += chunk;
+      if (Buffer.byteLength(stderr, 'utf8') > PEER_MAX_STDOUT_BYTES) stderr = stderr.slice(-4096);
+    });
+    child.on('error', (err) => {
+      if (terminating) return;
+      finish(new Error(`could not start glm: ${err.message}`));
+    });
+    child.on('close', (code) => {
+      if (terminating) return;
+      if (code === 0) finish(null, stdout);
+      else finish(new Error(`glm pre-flight exited with code ${code}${stderr ? `: ${stderr.slice(-400).trim()}` : ''}`));
+    });
+  });
+}
+
+/**
+ * Prevention, not only detection: before a turn is allowed to run at all,
+ * checks that nothing on this machine could let a "text-only" turn reach a
+ * tool anyway. Two independent surfaces, both fail-closed:
+ *   1. `plugins list` — refuses an enabled plugin with hooks, or with an MCP
+ *      tool not in `knownSafeMcp` (see auditPluginsList()).
+ *   2. `~/.zcode/cli/config.json` — refuses a user-level MCP server defined
+ *      there, and refuses just as hard if the file cannot be read or parsed
+ *      (see auditUserConfigMcpServers()).
+ * Cached per (command, argsPrefix, configPath, knownSafeMcp) for
+ * GLM_PREFLIGHT_CACHE_MS: a long-lived process asks once every ten minutes,
+ * not once per turn — the CACHED answer, positive or negative, is what a
+ * repeat call within the window gets, no re-spawn either way.
+ */
+async function ensurePluginsPreflight({ command, argsPrefix, childEnv, spawnFn, signal, zcodeConfigPath, knownSafeMcp = KNOWN_SAFE_MCP, now = () => Date.now() }) {
+  const cacheKey = JSON.stringify({ command, argsPrefix, zcodeConfigPath, knownSafeMcp });
+  const nowMs = now();
+  const cached = glmPreflightCache.get(cacheKey);
+  if (cached && cached.expiresAt > nowMs) {
+    if (cached.error) throw new Error(cached.error);
+    return;
+  }
+  try {
+    const stdout = await runZcodeSubcommand({ command, argsPrefix, args: ['plugins', 'list'], childEnv, spawnFn, cwd: os.tmpdir(), signal });
+    auditPluginsList(parsePluginsList(stdout), { knownSafeMcp });
+    auditUserConfigMcpServers(zcodeConfigPath);
+  } catch (err) {
+    glmPreflightCache.set(cacheKey, { expiresAt: nowMs + GLM_PREFLIGHT_CACHE_MS, error: err.message });
+    throw err;
+  }
+  glmPreflightCache.set(cacheKey, { expiresAt: nowMs + GLM_PREFLIGHT_CACHE_MS, error: null });
 }
 
 /**
@@ -374,7 +674,8 @@ export function chunkPromptForZcode(prompt, { attachmentMaxBytes = GLM_ATTACHMEN
  * remember it from training — the dispatcher acts on `status`, so an answer
  * that drifts from {status, message} is a protocol error (see driver.mjs).
  * "Benutze keine Tools" is belt and braces here: the real locks are
- * --disallowed-tools and the post-turn audit, not this sentence.
+ * --disallowed-tools, the pre-flight, and the post-turn audit, not this
+ * sentence.
  */
 export function buildGlmInstruction(schema = PEER_OUTPUT_SCHEMA, partCount = 1) {
   return (
@@ -523,67 +824,111 @@ export function defaultZcodeLogDir() {
   return path.join(os.homedir(), '.zcode', 'cli', 'log');
 }
 
+/** The most one session log file is trusted to weigh. A file heavier than this is refused outright rather than streamed regardless — reading an unbounded log defeats the point of streaming it in the first place. */
+export const GLM_AUDIT_LOG_MAX_BYTES = 50 * 1024 * 1024;
+
+/** The whole post-turn audit — every day's file, every line — gets this long in total before it fails closed. A hung or absurdly slow disk must not hold a turn's result hostage forever. */
+export const GLM_AUDIT_TIME_BUDGET_MS = 10_000;
+
+function localDateStamp(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
 /**
- * Every `toolName` a given session actually invoked, read from ZCode's own
- * JSONL log rather than trusted from stdout. The log is named by local
- * calendar day, not by session, so a session that happens to straddle local
- * midnight would be missed by checking only "today" — the day before and
- * after `now` are checked too. `anyFileRead` distinguishes "checked the log
- * and it says nothing ran" from "could not find the log at all", because
- * auditNoToolsRan() treats those two very differently.
+ * Streams one day's session log looking for `sessionId`, collecting
+ * `toolName`s into the shared `toolNames` set. Returns whether at least one
+ * line actually named this session — the POSITIVE evidence
+ * auditNoToolsRan() requires, because a log file that exists but never
+ * mentions this session is not proof that nothing ran, only proof that
+ * nobody checked the right thing.
+ *
+ * Fails closed rather than skipping anything ambiguous:
+ *   - a file over GLM_AUDIT_LOG_MAX_BYTES is refused outright.
+ *   - a line that CONTAINS the sessionId substring but does not parse as
+ *     JSON might be a truncated or corrupted record hiding a tool call, so
+ *     it stops the whole audit rather than being silently ignored.
+ *   - `deadlineAt` is checked every line; past it the audit stops rather
+ *     than continuing to stream an oversized or slow log indefinitely.
  */
-function toolNamesForSession(sessionId, { zcodeLogDir, now = new Date() } = {}) {
-  const names = new Set();
-  let anyFileRead = false;
-  const fileNames = new Set(
-    [-1, 0, 1].map((offsetDays) => {
-      const d = new Date(now.getTime() + offsetDays * 24 * 60 * 60 * 1000);
-      const y = d.getFullYear();
-      const m = String(d.getMonth() + 1).padStart(2, '0');
-      const day = String(d.getDate()).padStart(2, '0');
-      return `zcode-${y}-${m}-${day}.jsonl`;
-    }),
-  );
-  for (const fileName of fileNames) {
-    let text;
-    try {
-      text = fs.readFileSync(path.join(zcodeLogDir, fileName), 'utf8');
-    } catch {
-      continue;
-    }
-    anyFileRead = true;
-    for (const line of text.split('\n')) {
+async function scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, maxBytes }) {
+  let size;
+  try {
+    size = fs.statSync(filePath).size;
+  } catch {
+    return { found: false }; // no file for this day — not an error, just nothing to scan
+  }
+  if (size > maxBytes) {
+    throw new Error(`glm's session log ${filePath} is ${size} bytes, over the ${maxBytes}-byte audit cap — answer discarded`);
+  }
+
+  let found = false;
+  const rl = readline.createInterface({ input: fs.createReadStream(filePath, { encoding: 'utf8' }), crlfDelay: Infinity });
+  try {
+    for await (const line of rl) {
+      if (Date.now() > deadlineAt) {
+        throw new Error(`glm's post-turn tool audit exceeded its ${GLM_AUDIT_TIME_BUDGET_MS}ms budget — answer discarded`);
+      }
       if (line.trim() === '' || !line.includes(sessionId)) continue;
       let parsed;
       try {
         parsed = JSON.parse(line);
-      } catch {
-        continue;
+      } catch (err) {
+        throw new Error(`glm's session log ${filePath} has a line mentioning the session that is not valid JSON — answer discarded (cannot confirm no tool ran): ${err.message}`);
       }
-      if (parsed?.sessionId === sessionId && typeof parsed?.toolName === 'string') names.add(parsed.toolName);
+      if (parsed?.sessionId !== sessionId) continue; // a substring hit on a DIFFERENT session's id
+      found = true;
+      if (typeof parsed?.toolName === 'string') toolNames.add(parsed.toolName);
     }
+  } finally {
+    rl.close();
   }
-  return { names: [...names], anyFileRead };
+  return { found };
 }
 
 /**
- * The fail-closed guard the static --disallowed-tools list alone cannot be:
- * checks ZCode's OWN log for whatever tools the session actually invoked,
- * rather than trusting --mode plan and --disallowed-tools (verified live
- * that neither is airtight — see the module header). Missing evidence is
- * treated as failure, not as "probably fine": no sessionId in the envelope,
- * or the day's log unreadable, fails the turn the same way an actual tool
- * call would — unless KAPREK_GLM_SKIP_TOOL_AUDIT=1, an escape hatch for a
- * machine where the log genuinely is not where defaultZcodeLogDir() looks.
+ * Every `toolName` a given session actually invoked, read from ZCode's own
+ * JSONL log, PLUS whether the session was actually found at all. Only the
+ * log files for the turn's own start and end LOCAL calendar dates are
+ * opened — not a blanket window around whenever the audit happens to run —
+ * so a turn that starts at 23:59 and ends at 00:01 still gets both of its
+ * two files checked, and nothing else is read.
  */
-function auditNoToolsRan(sessionId, { env = process.env, zcodeLogDir = defaultZcodeLogDir() } = {}) {
+export async function toolNamesForSession(sessionId, { zcodeLogDir, startedAt, endedAt, maxBytes = GLM_AUDIT_LOG_MAX_BYTES, timeBudgetMs = GLM_AUDIT_TIME_BUDGET_MS }) {
+  const toolNames = new Set();
+  const dateStamps = new Set([localDateStamp(startedAt), localDateStamp(endedAt)]);
+  const deadlineAt = Date.now() + timeBudgetMs;
+  let anyFound = false;
+  for (const stamp of dateStamps) {
+    const filePath = path.join(zcodeLogDir, `zcode-${stamp}.jsonl`);
+    // eslint-disable-next-line no-await-in-loop -- each day's file must finish (or fail) before the next starts, so the shared deadline and byte cap mean what they say
+    const { found } = await scanSessionLogFile(filePath, sessionId, { toolNames, deadlineAt, maxBytes });
+    if (found) anyFound = true;
+  }
+  return { names: [...toolNames], anyFound };
+}
+
+/**
+ * The fail-closed guard the static --disallowed-tools list and the
+ * pre-flight alone cannot be: checks ZCode's OWN log for whatever tools the
+ * session actually invoked. Requires POSITIVE evidence — at least one log
+ * line naming this exact sessionId — rather than treating "a log file
+ * exists for today" as good enough; a session that was never logged at all
+ * (crashed, wrong directory, log rotated away) fails exactly like a tool
+ * call would, not like a pass. Unless KAPREK_GLM_SKIP_TOOL_AUDIT=1, an
+ * escape hatch for a machine where the log genuinely is not where
+ * defaultZcodeLogDir() looks.
+ */
+async function auditNoToolsRan(sessionId, { env = process.env, zcodeLogDir = defaultZcodeLogDir(), startedAt, endedAt, maxBytes, timeBudgetMs } = {}) {
   if (String(env?.[GLM_TOOL_AUDIT_SKIP_ENV] ?? '') === '1') return;
   if (typeof sessionId !== 'string' || sessionId === '') {
     throw new Error(`glm answered with no sessionId to audit — answer discarded (cannot confirm no tool ran; set ${GLM_TOOL_AUDIT_SKIP_ENV}=1 to bypass)`);
   }
-  const { names, anyFileRead } = toolNamesForSession(sessionId, { zcodeLogDir });
-  if (!anyFileRead) {
-    throw new Error(`glm's session log was not found under ${zcodeLogDir} — answer discarded (cannot confirm no tool ran; set ${GLM_TOOL_AUDIT_SKIP_ENV}=1 to bypass)`);
+  const { names, anyFound } = await toolNamesForSession(sessionId, { zcodeLogDir, startedAt, endedAt, maxBytes, timeBudgetMs });
+  if (!anyFound) {
+    throw new Error(`glm's session log has no evidence for session ${sessionId} — answer discarded (cannot confirm no tool ran; set ${GLM_TOOL_AUDIT_SKIP_ENV}=1 to bypass)`);
   }
   if (names.length > 0) {
     throw new Error(`glm peer invoked tools: ${names.join(', ')} — answer discarded (text-only contract violated)`);
@@ -670,7 +1015,12 @@ export async function runGlmTurn({
   env = process.env,
   schema = PEER_OUTPUT_SCHEMA,
   validate = true,
+  attachmentMaxBytes = GLM_ATTACHMENT_MAX_BYTES,
   zcodeLogDir = defaultZcodeLogDir(),
+  zcodeConfigPath = defaultZcodeConfigPath(),
+  knownSafeMcp = KNOWN_SAFE_MCP,
+  auditLogMaxBytes = GLM_AUDIT_LOG_MAX_BYTES,
+  auditTimeBudgetMs = GLM_AUDIT_TIME_BUDGET_MS,
 } = {}) {
   // Checked before ANYTHING else — no scratch directory, no attachment file,
   // no spawn — for a signal that was already aborted when this turn was
@@ -684,13 +1034,22 @@ export async function runGlmTurn({
 
   const { command, argsPrefix, entryPath } = resolveZcodeCli(env);
   const providerConfigPath = providerConfigPathFor(entryPath);
-  // Pass the caller's env through, plus this one addition — never overwritten
-  // when it is already set, so a deliberate override still wins. Without it
-  // the CLI aborts before the model ever runs (see the module header).
-  const childEnv = { ...env };
+  // The child's WHOLE environment, built from an allowlist — never
+  // process.env passed through (see buildGlmChildEnv's own note) — plus this
+  // one addition, never overwritten when it is already set (a caller's
+  // ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, picked up by the ZCODE_ prefix rule,
+  // still wins). Without it the CLI aborts before the model ever runs.
+  const childEnv = buildGlmChildEnv(env);
   if (!childEnv.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE) childEnv.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = providerConfigPath;
 
-  const startedAt = Date.now();
+  // Prevention before detection: refuses before a turn ever starts if this
+  // machine's plugin/MCP surface could let a "text-only" turn reach a tool
+  // anyway. Cached, so this is a real spawn only once per
+  // GLM_PREFLIGHT_CACHE_MS per process, not once per turn.
+  await ensurePluginsPreflight({ command, argsPrefix, childEnv, spawnFn, signal, zcodeConfigPath, knownSafeMcp });
+
+  const turnStartedAt = new Date();
+  const startedAt = turnStartedAt.getTime();
   let turnDir = null;
   let rawLogPath = null;
   let attachmentPaths = [];
@@ -707,12 +1066,16 @@ export async function runGlmTurn({
     turnDir = fs.mkdtempSync(path.join(parentDir, 'kaprek-glm-turn-'));
     rawLogPath = path.join(turnDir, 'glm-raw.log');
 
-    const parts = chunkPromptForZcode(prompt);
-    attachmentPaths = parts.map((part, idx) => {
+    const parts = chunkPromptForZcode(prompt, { attachmentMaxBytes });
+    for (let idx = 0; idx < parts.length; idx += 1) {
       const partPath = path.join(turnDir, `glm-prompt-${idx + 1}.txt`);
-      fs.writeFileSync(partPath, part, 'utf8');
-      return partPath;
-    });
+      // Registered BEFORE it is written: a failure writing THIS file (disk
+      // full, permissions) still leaves its path in the cleanup list, so the
+      // finally block below does not skip it just because the write itself
+      // never finished (council review round 2, 27.09.2026).
+      attachmentPaths.push(partPath);
+      fs.writeFileSync(partPath, parts[idx], 'utf8');
+    }
 
     const instruction = buildGlmInstruction(schema, parts.length);
     const args = [
@@ -727,12 +1090,6 @@ export async function runGlmTurn({
       let settled = false;
       let child = null;
       let timer = null;
-      // Set the moment a DELIBERATE kill starts (timeout/abort/overflow), to
-      // the value that kill must resolve with — killing the child
-      // necessarily makes it exit, which fires its own 'close', and that has
-      // to stand down rather than race the deliberate reason with a generic
-      // "exited with code N" (see grok.mjs's killTree for the same fix).
-      let killingReason = null;
 
       const finish = (value) => {
         if (settled) return;
@@ -742,11 +1099,21 @@ export async function runGlmTurn({
         resolve(value);
       };
 
-      const onAbort = () => {
-        killingReason = { error: 'the relay run was stopped', stdout, stderr };
-        if (child) killTree(child).then(() => finish(killingReason));
-        else finish(killingReason);
+      // The single, idempotent path into a deliberate termination.
+      // `terminating` is the lock: the FIRST of timeout/abort/overflow to
+      // fire is the one whose reason wins, committed as that call's own
+      // argument rather than a shared variable a second trigger could
+      // overwrite before the first's callback ever reads it back. A second
+      // trigger here is a no-op: no second killTree() call, no reason swap
+      // (council review round 2, 27.09.2026 — the same fix as grok.mjs's).
+      let terminating = null;
+      const terminate = (reason) => {
+        if (terminating) return terminating;
+        terminating = (child ? killTree(child) : Promise.resolve()).then(() => finish(reason));
+        return terminating;
       };
+
+      const onAbort = () => terminate({ error: 'the relay run was stopped', stdout, stderr });
       signal?.addEventListener?.('abort', onAbort, { once: true });
       // Checked again right here: the signal could only have become aborted
       // between the top-of-function check and this point through something
@@ -773,8 +1140,7 @@ export async function runGlmTurn({
       }
 
       timer = setTimeout(() => {
-        killingReason = { error: `glm did not answer within ${timeoutMs}ms`, stdout, stderr };
-        killTree(child).then(() => finish(killingReason));
+        terminate({ error: `glm did not answer within ${timeoutMs}ms`, stdout, stderr });
       }, timeoutMs);
 
       // Decoded here, not concatenated as raw Buffers: setEncoding buffers an
@@ -790,8 +1156,7 @@ export async function runGlmTurn({
         stdout += chunk;
         if (Buffer.byteLength(stdout, 'utf8') > PEER_MAX_STDOUT_BYTES) {
           overflowed = true;
-          killingReason = { error: `glm printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr };
-          killTree(child).then(() => finish(killingReason));
+          terminate({ error: `glm printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr });
         }
       });
       child.stderr?.on('data', (chunk) => {
@@ -800,11 +1165,11 @@ export async function runGlmTurn({
       });
 
       child.on('error', (err) => {
-        if (killingReason) return; // the pending kill's own finish() call owns the outcome
+        if (terminating) return; // the pending termination's own finish() call owns the outcome
         finish({ error: `could not start glm: ${err.message}`, stdout, stderr });
       });
       child.on('close', (code) => {
-        if (killingReason) return; // ditto — this close is the kill taking effect, not a new fact
+        if (terminating) return; // ditto — this close is the kill taking effect, not a new fact
         if (code === 0) finish({ stdout, stderr });
         else finish({ error: `glm exited with code ${code}${stderr ? `: ${stderr.slice(-400).trim()}` : ''}`, stdout, stderr });
       });
@@ -826,8 +1191,15 @@ export async function runGlmTurn({
     // The fail-closed guard: a text-only turn that ZCode's own log says
     // invoked a tool anyway is discarded here, before the caller ever sees
     // it — see auditNoToolsRan()'s own note for why the static
-    // --disallowed-tools list alone is not enough.
-    auditNoToolsRan(sessionId, { env, zcodeLogDir });
+    // --disallowed-tools list and the pre-flight alone are not enough.
+    await auditNoToolsRan(sessionId, {
+      env,
+      zcodeLogDir,
+      startedAt: turnStartedAt,
+      endedAt: new Date(),
+      maxBytes: auditLogMaxBytes,
+      timeBudgetMs: auditTimeBudgetMs,
+    });
     return { ...parsed, durationMs: Date.now() - startedAt, rawLogPath };
   } finally {
     // The raw log stays (it is the one place a post-mortem can look); only

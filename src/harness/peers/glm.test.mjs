@@ -3,7 +3,7 @@
 // No real CLI is ever spawned: a peer turn costs a Coding Plan turn and needs
 // an account, so every test here drives a node script standing in for
 // zcode.cjs, the same way grok.test.mjs fakes the grok binary.
-import { test, expect, vi, afterEach } from 'vitest';
+import { test, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -13,10 +13,13 @@ import { spawn } from 'node:child_process';
 import {
   GLM_ATTACHMENT_MAX_BYTES,
   GLM_ATTACHMENT_MIN_BYTES,
+  GLM_AUDIT_LOG_MAX_BYTES,
   GLM_DISALLOWED_TOOLS,
   GLM_MAX_PROMPT_BYTES,
   GLM_TOOL_AUDIT_SKIP_ENV,
+  KNOWN_SAFE_MCP,
   buildGlmArgs,
+  buildGlmChildEnv,
   buildGlmInstruction,
   chunkPromptForZcode,
   defaultZcodeCjsPath,
@@ -25,8 +28,10 @@ import {
   killTree,
   parseGlmStdout,
   providerConfigPathFor,
+  resetGlmPreflightCacheForTests,
   resolveZcodeCli,
   runGlmTurn,
+  toolNamesForSession,
 } from './glm.mjs';
 import { PEER_MAX_STDOUT_BYTES, PEER_OUTPUT_SCHEMA, parsePeerAnswer } from './driver.mjs';
 
@@ -36,6 +41,13 @@ function tmpDir() {
   dirs.push(dir);
   return dir;
 }
+
+beforeEach(() => {
+  // A pre-flight cached by an EARLIER test would otherwise silently decide
+  // a LATER one — the cache is per-process, and vitest runs a file's tests
+  // in one process.
+  resetGlmPreflightCacheForTests();
+});
 
 afterEach(() => {
   for (const dir of dirs.splice(0)) {
@@ -61,9 +73,24 @@ function fakeCli(script) {
 const envelope = (status, message, extra = {}) =>
   JSON.stringify({ response: JSON.stringify({ status, message }), usage: { inputTokens: 5, outputTokens: 7, totalTokens: 12 }, sessionId: 'sess_x', turnId: 1, ...extra });
 
-/** A base env for tests that only care about the happy path, not the post-turn tool audit — see the dedicated audit describe block below for that. */
-function happyEnv(dir, extra = {}) {
-  return { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs'), [GLM_TOOL_AUDIT_SKIP_ENV]: '1', ...extra };
+/** A `plugins list`/turn-agnostic fake CLI: whatever it is asked (metadata call or real turn), it answers the same clean envelope — the pre-flight's own parser finds zero plugin blocks in that text, which passes trivially. */
+function fakeCliAnswering(status, message, extra = {}) {
+  return fakeCli(`process.stdout.write(${JSON.stringify(envelope(status, message, extra))})`);
+}
+
+/** A safe ZCode CLI config: no plugins enabled, no user-level MCP servers. */
+function writeSafeZcodeConfig(dir) {
+  const p = path.join(dir, 'zcode-config.json');
+  fs.writeFileSync(p, JSON.stringify({ plugins: { enabledPlugins: {} } }), 'utf8');
+  return p;
+}
+
+/** The options every "this should just succeed" test needs beyond cwd/prompt/logDir/spawnFn: a fake CLI path, the post-turn audit skipped (it has its own dedicated tests below), and a config.json that passes the pre-flight. */
+function happyOptions(dir, envExtra = {}) {
+  return {
+    env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs'), [GLM_TOOL_AUDIT_SKIP_ENV]: '1', ...envExtra },
+    zcodeConfigPath: writeSafeZcodeConfig(dir),
+  };
 }
 
 function writeSessionLog(dir, lines, { date = new Date() } = {}) {
@@ -101,7 +128,186 @@ test('effectiveDisallowedTools extends the base list from KAPREK_GLM_EXTRA_DISAL
   expect(effectiveDisallowedTools({ KAPREK_GLM_EXTRA_DISALLOWED: '  ' })).toBe(GLM_DISALLOWED_TOOLS);
 });
 
-// ---- chunking (point 7) ----
+// ---- minimal child env (P1a) ----
+
+test('buildGlmChildEnv passes only the allowlist plus ZCODE_* — secrets like tokens never reach the child', () => {
+  const child = buildGlmChildEnv({
+    PATH: 'C:/Windows;C:/Windows/System32',
+    SystemRoot: 'C:/Windows',
+    TEMP: 'C:/Temp',
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: 'C:/x/zcode-builtin.json',
+    ZCODE_SOMETHING_ELSE: 'ok',
+    GITHUB_TOKEN: 'ghp_secret',
+    ANTHROPIC_API_KEY: 'sk-ant-secret',
+    OPENAI_API_KEY: 'sk-secret',
+    KAPREK_ZCODE_PATH: 'C:/somewhere/zcode.cjs',
+    HOME: '/home/x',
+  });
+  expect(child).toMatchObject({
+    PATH: 'C:/Windows;C:/Windows/System32',
+    SystemRoot: 'C:/Windows',
+    TEMP: 'C:/Temp',
+    ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: 'C:/x/zcode-builtin.json',
+    ZCODE_SOMETHING_ELSE: 'ok',
+    HOME: '/home/x',
+  });
+  expect(child).not.toHaveProperty('GITHUB_TOKEN');
+  expect(child).not.toHaveProperty('ANTHROPIC_API_KEY');
+  expect(child).not.toHaveProperty('OPENAI_API_KEY');
+  // KAPREK_ zcode-side control vars are for THIS driver's own logic, not for
+  // the child process — they must not leak through either.
+  expect(child).not.toHaveProperty('KAPREK_ZCODE_PATH');
+});
+
+test('the actually spawned child env is the minimal allowlist, not process.env', async () => {
+  const dir = tmpDir();
+  const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: JSON.stringify(Object.keys(process.env).sort()) }), sessionId: 'sess_x' }));`;
+  let seenOptions = null;
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'plugins-list-noise')(command, args, options);
+    seenOptions = options;
+    return fakeCli(script)(command, args, options);
+  };
+  const result = await runGlmTurn({
+    cwd: dir,
+    prompt: 'go',
+    logDir: dir,
+    ...happyOptions(dir, { GITHUB_TOKEN: 'ghp_secret', ANTHROPIC_API_KEY: 'sk-ant-secret' }),
+    spawnFn,
+  });
+  const keys = JSON.parse(result.message);
+  expect(keys).not.toContain('GITHUB_TOKEN');
+  expect(keys).not.toContain('ANTHROPIC_API_KEY');
+  expect(seenOptions.env).not.toHaveProperty('GITHUB_TOKEN');
+});
+
+// ---- pre-flight: plugins list + config.json (P1a) ----
+
+test('parsePluginsList / auditPluginsList: an enabled plugin with a non-none MCP id not in KNOWN_SAFE_MCP refuses the turn', async () => {
+  const dir = tmpDir();
+  const pluginsListing = [
+    '- android-emulator@zcode-plugins-official [enabled]',
+    '  skills: 1, commands: 1, hooks: 0, mcp: plugin:android-emulator:android-emulator',
+  ].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(
+    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn }),
+  ).rejects.toThrow(/pre-flight refused.*android-emulator.*MCP/s);
+});
+
+test('an enabled plugin with hooks > 0 refuses the turn even with mcp: none', async () => {
+  const dir = tmpDir();
+  const pluginsListing = ['- some-plugin@src [enabled]', '  skills: 0, commands: 0, hooks: 2, mcp: none'].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/pre-flight refused.*some-plugin.*hook/s);
+});
+
+test('a disabled plugin with mcp and hooks is not inspected — nothing enabled can run it', async () => {
+  const dir = tmpDir();
+  const pluginsListing = ['- android-emulator@zcode-plugins-official [disabled]', '  skills: 1, commands: 1, hooks: 3, mcp: plugin:android-emulator:android-emulator'].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn });
+  expect(result.status).toBe('done');
+});
+
+test('KNOWN_SAFE_MCP is empty by default, and an explicitly allowed mcp id passes', async () => {
+  expect(KNOWN_SAFE_MCP).toEqual([]);
+  const dir = tmpDir();
+  const pluginsListing = ['- vetted-plugin@src [enabled]', '  skills: 1, commands: 0, hooks: 0, mcp: plugin:vetted:vetted'].join('\n');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify(pluginsListing)})`)(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn, knownSafeMcp: ['plugin:vetted:vetted'] });
+  expect(result.status).toBe('done');
+});
+
+test('the pre-flight is cached for the process — two turns within the cache window spawn "plugins list" only once', async () => {
+  const dir = tmpDir();
+  let pluginsListCalls = 0;
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) {
+      pluginsListCalls += 1;
+      return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    }
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const opts = happyOptions(dir);
+  await runGlmTurn({ cwd: dir, prompt: 'go 1', logDir: dir, ...opts, spawnFn });
+  await runGlmTurn({ cwd: dir, prompt: 'go 2', logDir: dir, ...opts, spawnFn });
+  expect(pluginsListCalls).toBe(1);
+});
+
+test('a refusal from config.json (not from plugins list) still surfaces even after a passing plugins-list cache entry from a DIFFERENT config path', async () => {
+  const dir = tmpDir();
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  const unsafeConfig = path.join(dir, 'unsafe-config.json');
+  fs.writeFileSync(unsafeConfig, JSON.stringify({ mcpServers: { evil: { command: 'node' } } }), 'utf8');
+  await expect(
+    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), zcodeConfigPath: unsafeConfig, spawnFn }),
+  ).rejects.toThrow(/mcpServers.*evil/s);
+});
+
+test('config.json defining mcpServers nested under an arbitrary key still refuses the turn', async () => {
+  const dir = tmpDir();
+  const nested = path.join(dir, 'nested-config.json');
+  fs.writeFileSync(nested, JSON.stringify({ some: { deeply: { nested: { mcpServers: { evil: {} } } } } }), 'utf8');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(
+    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), zcodeConfigPath: nested, spawnFn }),
+  ).rejects.toThrow(/mcpServers.*evil/s);
+});
+
+test('an unreadable config.json fails the pre-flight closed', async () => {
+  const dir = tmpDir();
+  const missing = path.join(dir, 'does-not-exist.json');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(
+    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), zcodeConfigPath: missing, spawnFn }),
+  ).rejects.toThrow(/could not read/);
+});
+
+test('a malformed config.json fails the pre-flight closed', async () => {
+  const dir = tmpDir();
+  const malformed = path.join(dir, 'malformed-config.json');
+  fs.writeFileSync(malformed, '{not json', 'utf8');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli(`process.stdout.write(${JSON.stringify('')})`)(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(
+    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), zcodeConfigPath: malformed, spawnFn }),
+  ).rejects.toThrow(/malformed/);
+});
+
+test('a "plugins list" call that itself fails refuses the turn rather than assuming it would have passed', async () => {
+  const dir = tmpDir();
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCli('process.stderr.write("boom"); process.exit(1);')(command, args, options);
+    return fakeCliAnswering('done', 'should not be reached')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/pre-flight exited with code 1/);
+});
+
+// ---- chunking (point 7 from round 1) ----
 
 test('chunkPromptForZcode packs the prompt into headered parts that fit the attachment cap', () => {
   const lines = [];
@@ -196,13 +402,11 @@ test('the provider config path sits next to the entry, one level up from resourc
 
 test('a well-formed turn comes back as status, message, usage and a null (never zero) cost', async () => {
   const dir = tmpDir();
-  const result = await runGlmTurn({
-    cwd: dir,
-    prompt: 'write something',
-    logDir: dir,
-    env: happyEnv(dir),
-    spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('handoff', 'here is the draft'))})`),
-  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'plugins-list-noise')(command, args, options);
+    return fakeCliAnswering('handoff', 'here is the draft')(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'write something', logDir: dir, ...happyOptions(dir), spawnFn });
 
   expect(result).toMatchObject({ status: 'handoff', message: 'here is the draft', costUsd: null });
   expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 7, totalTokens: 12 });
@@ -213,13 +417,11 @@ test('a well-formed turn comes back as status, message, usage and a null (never 
 
 test('the attachment files are cleaned up, so a draft does not linger in temp — the raw log is kept', async () => {
   const dir = tmpDir();
-  const result = await runGlmTurn({
-    cwd: dir,
-    prompt: 'secret draft',
-    logDir: dir,
-    env: happyEnv(dir),
-    spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok'))})`),
-  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'secret draft', logDir: dir, ...happyOptions(dir), spawnFn });
   const turnDir = path.dirname(result.rawLogPath);
   expect(fs.readdirSync(turnDir).filter((name) => name.startsWith('glm-prompt-'))).toEqual([]);
   expect(fs.existsSync(result.rawLogPath)).toBe(true);
@@ -229,25 +431,27 @@ test('the provider config env var is injected for the child unless the caller al
   const dir = tmpDir();
   const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || '' }), sessionId: 'sess_x' }));`;
   const entryPath = 'C:/fake/resources/glm/zcode.cjs';
-  const result = await runGlmTurn({
-    cwd: dir,
-    prompt: 'go',
-    logDir: dir,
-    env: happyEnv(dir, { KAPREK_ZCODE_PATH: entryPath }),
-    spawnFn: fakeCli(script),
-  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli(script)(command, args, options);
+  };
+  const result = await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir, { KAPREK_ZCODE_PATH: entryPath }), spawnFn });
   expect(result.message).toBe(providerConfigPathFor(entryPath));
 });
 
 test('an env var the caller already set is never overwritten', async () => {
   const dir = tmpDir();
   const script = `process.stdout.write(JSON.stringify({ response: JSON.stringify({ status: 'done', message: process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE || '' }), sessionId: 'sess_x' }));`;
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli(script)(command, args, options);
+  };
   const result = await runGlmTurn({
     cwd: dir,
     prompt: 'go',
     logDir: dir,
-    env: happyEnv(dir, { KAPREK_ZCODE_PATH: 'C:/fake/resources/glm/zcode.cjs', ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: 'C:/already/set.json' }),
-    spawnFn: fakeCli(script),
+    ...happyOptions(dir, { KAPREK_ZCODE_PATH: 'C:/fake/resources/glm/zcode.cjs', ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: 'C:/already/set.json' }),
+    spawnFn,
   });
   expect(result.message).toBe('C:/already/set.json');
 });
@@ -257,17 +461,12 @@ test('the actual spawned argv pins plan mode, json, the full disallowed-tools li
   let seenArgs = null;
   let seenOptions = null;
   const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
     seenArgs = args;
     seenOptions = options;
-    return fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok'))})`)(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
   };
-  await runGlmTurn({
-    cwd: 'C:/some/mission/tree',
-    prompt: 'go',
-    logDir: dir,
-    env: happyEnv(dir),
-    spawnFn,
-  });
+  await runGlmTurn({ cwd: 'C:/some/mission/tree', prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn });
 
   expect(seenArgs[seenArgs.indexOf('--mode') + 1]).toBe('plan');
   expect(seenArgs).toContain('--json');
@@ -287,16 +486,11 @@ test('KAPREK_GLM_EXTRA_DISALLOWED reaches the actual argv', async () => {
   const dir = tmpDir();
   let seenArgs = null;
   const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
     seenArgs = args;
-    return fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok'))})`)(command, args, options);
+    return fakeCliAnswering('done', 'ok')(command, args, options);
   };
-  await runGlmTurn({
-    cwd: dir,
-    prompt: 'go',
-    logDir: dir,
-    env: happyEnv(dir, { KAPREK_GLM_EXTRA_DISALLOWED: 'mcp__foo__bar' }),
-    spawnFn,
-  });
+  await runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir, { KAPREK_GLM_EXTRA_DISALLOWED: 'mcp__foo__bar' }), spawnFn });
   expect(seenArgs[seenArgs.indexOf('--disallowed-tools') + 1]).toBe(`${GLM_DISALLOWED_TOOLS} mcp__foo__bar`);
 });
 
@@ -314,17 +508,14 @@ test('a multibyte character split across two data events decodes correctly inste
   const full = Buffer.from(envelope('done', message), 'utf8');
   const text = full.toString('utf8');
   const emojiByteIndex = Buffer.byteLength(text.slice(0, text.indexOf('\u{1F600}')), 'utf8');
-  // Splits INSIDE the emoji's 4-byte UTF-8 sequence — the exact case naive
-  // Buffer-to-string concatenation corrupts.
-  const splitAt = emojiByteIndex + 2;
+  const splitAt = emojiByteIndex + 2; // inside the emoji's 4-byte UTF-8 sequence
 
-  const pending = runGlmTurn({
-    cwd: dir,
-    prompt: 'go',
-    logDir: dir,
-    env: happyEnv(dir),
-    spawnFn: () => child,
-  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return child;
+  };
+
+  const pending = runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn });
 
   stdout.write(full.subarray(0, splitAt));
   stdout.write(full.subarray(splitAt));
@@ -337,7 +528,7 @@ test('a multibyte character split across two data events decodes correctly inste
   expect(result.message).toBe(message);
 });
 
-// ---- envelope parsing (point 6) ----
+// ---- envelope parsing (point 6 from round 1) ----
 
 test('stdout is read via a balanced-brace scan, so a log line ahead of the JSON envelope does not break the parse', () => {
   const stdout = `ZCode Built-in skipped (not-due)\n${envelope('done', 'ignored the log line')}`;
@@ -393,29 +584,30 @@ test('a non-validating (council) parse takes the response as-is instead of enfor
 test('stdout past the cap ends the turn cleanly instead of buffering a runaway CLI', async () => {
   const dir = tmpDir();
   const script = `process.stdout.write('x'.repeat(2 * 1024 * 1024)); setInterval(() => {}, 1000);`;
-  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, env: happyEnv(dir), spawnFn: fakeCli(script) })).rejects.toThrow(
-    new RegExp(`more than ${PEER_MAX_STDOUT_BYTES} bytes`),
-  );
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli(script)(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(new RegExp(`more than ${PEER_MAX_STDOUT_BYTES} bytes`));
 });
 
 test('a peer that never answers is killed at the timeout rather than held forever', async () => {
   const dir = tmpDir();
-  await expect(
-    runGlmTurn({ cwd: dir, prompt: 'go', timeoutMs: 1_000, logDir: dir, env: happyEnv(dir), spawnFn: fakeCli('setInterval(() => {}, 1000)') }),
-  ).rejects.toThrow(/did not answer within 1000ms/);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli('setInterval(() => {}, 1000)')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', timeoutMs: 1_000, logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/did not answer within 1000ms/);
 });
 
 test('an abort signal ends the turn at once', async () => {
   const dir = tmpDir();
   const controller = new AbortController();
-  const pending = runGlmTurn({
-    cwd: dir,
-    prompt: 'go',
-    logDir: dir,
-    signal: controller.signal,
-    env: happyEnv(dir),
-    spawnFn: fakeCli('setTimeout(() => {}, 30000)'),
-  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli('setTimeout(() => {}, 30000)')(command, args, options);
+  };
+  const pending = runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn });
   controller.abort();
   await expect(pending).rejects.toThrow(/stopped/);
 });
@@ -427,15 +619,20 @@ test('an already-aborted signal is refused before any scratch directory is creat
   const spawnFn = () => {
     throw new Error('must not spawn');
   };
-  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, signal: controller.signal, env: happyEnv(dir), spawnFn })).rejects.toThrow(/stopped/);
-  expect(fs.readdirSync(dir)).toEqual([]);
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn })).rejects.toThrow(/stopped/);
+  // happyOptions() itself drops a zcode-config.json fixture into `dir` for
+  // the pre-flight to read — what must be absent is a TURN directory, since
+  // that is the artifact runGlmTurn's own abort check must have skipped.
+  expect(fs.readdirSync(dir).filter((name) => name.startsWith('kaprek-glm-turn-'))).toEqual([]);
 });
 
 test('a non-zero exit is reported with what the CLI said on stderr', async () => {
   const dir = tmpDir();
-  await expect(
-    runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, env: happyEnv(dir), spawnFn: fakeCli('process.stderr.write("not authenticated"); process.exit(3)') }),
-  ).rejects.toThrow(/exited with code 3.*not authenticated/s);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli('process.stderr.write("not authenticated"); process.exit(3)')(command, args, options);
+  };
+  await expect(runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, ...happyOptions(dir), spawnFn })).rejects.toThrow(/exited with code 3.*not authenticated/s);
 });
 
 test('an empty prompt is refused before anything is spawned', async () => {
@@ -462,7 +659,7 @@ test('the driver declares the same prompt limit consult.mjs trims to, mirroring 
   expect(glmDriver.id).toBe('glm');
 });
 
-// ---- killTree order (point 1) ----
+// ---- killTree order (round 1, point 1) ----
 
 test.skipIf(process.platform !== 'win32')('killTree runs taskkill BEFORE child.kill(), windowsHide, and awaits it', async () => {
   const order = [];
@@ -500,22 +697,114 @@ test.skipIf(process.platform !== 'win32')('killTree still calls child.kill() whe
   expect(child.kill).toHaveBeenCalled();
 });
 
-// ---- post-turn tool audit (point 9B) ----
+// ---- termination idempotency (round 2, P2) ----
 
-test('a clean session (log has no toolName for it) passes the post-turn audit', async () => {
+test('an abort that beats a short timeout keeps "stopped" as the reason, even once the timeout also fires', async () => {
+  const dir = tmpDir();
+  const controller = new AbortController();
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli('setTimeout(() => {}, 30000)')(command, args, options);
+  };
+  const pending = runGlmTurn({ cwd: dir, prompt: 'go', timeoutMs: 50, logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn });
+  controller.abort();
+  await expect(pending).rejects.toThrow(/stopped/);
+});
+
+test('overflow and abort arriving together only terminate once — no second killTree call', async () => {
+  const dir = tmpDir();
+  let killCount = 0;
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const child = new EventEmitter();
+  child.stdout = stdout;
+  child.stderr = stderr;
+  child.pid = 4242;
+  child.kill = () => {
+    killCount += 1;
+  };
+
+  const controller = new AbortController();
+  let resolveSpawned;
+  const spawned = new Promise((resolve) => {
+    resolveSpawned = resolve;
+  });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    resolveSpawned();
+    return child;
+  };
+  const pending = runGlmTurn({ cwd: dir, prompt: 'go', logDir: dir, signal: controller.signal, ...happyOptions(dir), spawnFn });
+
+  // Wait until the main turn's child actually exists (the pre-flight's own
+  // spawn happens first) before racing overflow against abort — otherwise
+  // both would-be triggers fire before there is even a child to terminate.
+  await spawned;
+  stdout.write(Buffer.alloc(PEER_MAX_STDOUT_BYTES + 10, 'x'));
+  controller.abort();
+
+  await expect(pending).rejects.toThrow(/stopped|more than/);
+  expect(killCount).toBe(1);
+});
+
+// ---- attachment cleanup on partial write failure (round 2, P2) ----
+
+test('a failure writing the 2nd attachment leaves nothing behind — the 1st is still cleaned up', async () => {
+  const dir = tmpDir();
+  const prompt = 'y'.repeat(3000);
+  let writeCount = 0;
+  const realWriteFileSync = fs.writeFileSync;
+  const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation((...args) => {
+    if (String(args[0]).includes('glm-prompt-')) {
+      writeCount += 1;
+      if (writeCount === 2) throw new Error('disk full (simulated)');
+    }
+    return realWriteFileSync(...args);
+  });
+  try {
+    await expect(
+      runGlmTurn({
+        cwd: dir,
+        prompt,
+        logDir: dir,
+        attachmentMaxBytes: GLM_ATTACHMENT_MIN_BYTES,
+        ...happyOptions(dir),
+        spawnFn: (command, args, options) => {
+          if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+          throw new Error('must not spawn — the 2nd attachment write fails before any spawn for the main turn');
+        },
+      }),
+    ).rejects.toThrow(/disk full/);
+    const created = fs.readdirSync(dir).filter((name) => name.startsWith('kaprek-glm-turn-'));
+    expect(created).toHaveLength(1);
+    const turnDir = path.join(dir, created[0]);
+    expect(fs.readdirSync(turnDir).filter((name) => name.startsWith('glm-prompt-'))).toEqual([]);
+  } finally {
+    spy.mockRestore();
+  }
+});
+
+// ---- post-turn tool audit (round 1 point 9B, hardened round 2 P1b) ----
+
+test('a clean session (log has a line for it, none with a toolName) passes the post-turn audit', async () => {
   const dir = tmpDir();
   const logDir = tmpDir();
   writeSessionLog(logDir, [
     { sessionId: 'sess_clean', event: 'turn.start' },
     { sessionId: 'sess_other', toolName: 'Bash' }, // a different session's tool call must not taint this one
   ]);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_clean' })(command, args, options);
+  };
   const result = await runGlmTurn({
     cwd: dir,
     prompt: 'go',
     logDir: dir,
     zcodeLogDir: logDir,
     env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
-    spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok', { sessionId: 'sess_clean' }))})`),
+    zcodeConfigPath: writeSafeZcodeConfig(dir),
+    spawnFn,
   });
   expect(result.status).toBe('done');
 });
@@ -527,6 +816,10 @@ test('a session whose log shows a tool call fails the turn — the answer is dis
     { sessionId: 'sess_bad', toolName: 'Bash' },
     { sessionId: 'sess_bad', toolName: 'ExitPlanMode' },
   ]);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_bad' })(command, args, options);
+  };
   await expect(
     runGlmTurn({
       cwd: dir,
@@ -534,14 +827,20 @@ test('a session whose log shows a tool call fails the turn — the answer is dis
       logDir: dir,
       zcodeLogDir: logDir,
       env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
-      spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok', { sessionId: 'sess_bad' }))})`),
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
     }),
   ).rejects.toThrow(/invoked tools: Bash, ExitPlanMode/);
 });
 
-test('a missing session log fails the turn closed rather than trusting the answer', async () => {
+test('a log file that exists but never mentions this sessionId fails closed — a file is not the same as evidence', async () => {
   const dir = tmpDir();
-  const logDir = tmpDir(); // empty — no log file for any nearby day
+  const logDir = tmpDir();
+  writeSessionLog(logDir, [{ sessionId: 'sess_someone_else', event: 'turn.start' }]);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_absent' })(command, args, options);
+  };
   await expect(
     runGlmTurn({
       cwd: dir,
@@ -549,15 +848,112 @@ test('a missing session log fails the turn closed rather than trusting the answe
       logDir: dir,
       zcodeLogDir: logDir,
       env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
-      spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok', { sessionId: 'sess_missing' }))})`),
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
     }),
-  ).rejects.toThrow(/session log was not found/);
+  ).rejects.toThrow(/no evidence for session/);
+});
+
+test('a malformed JSON line that mentions the sessionId fails the audit closed rather than being skipped', async () => {
+  const dir = tmpDir();
+  const logDir = tmpDir();
+  const y = new Date().getFullYear();
+  const m = String(new Date().getMonth() + 1).padStart(2, '0');
+  const d = String(new Date().getDate()).padStart(2, '0');
+  fs.writeFileSync(path.join(logDir, `zcode-${y}-${m}-${d}.jsonl`), 'this line mentions sess_garbled but is not json\n', 'utf8');
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_garbled' })(command, args, options);
+  };
+  await expect(
+    runGlmTurn({
+      cwd: dir,
+      prompt: 'go',
+      logDir: dir,
+      zcodeLogDir: logDir,
+      env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
+    }),
+  ).rejects.toThrow(/not valid JSON/);
+});
+
+test('a missing session log fails the turn closed rather than trusting the answer', async () => {
+  const dir = tmpDir();
+  const logDir = tmpDir(); // empty — no log file for either relevant date
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_missing' })(command, args, options);
+  };
+  await expect(
+    runGlmTurn({
+      cwd: dir,
+      prompt: 'go',
+      logDir: dir,
+      zcodeLogDir: logDir,
+      env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
+    }),
+  ).rejects.toThrow(/no evidence for session/);
+});
+
+test('a log file over the byte cap fails the audit closed rather than being streamed regardless', async () => {
+  const dir = tmpDir();
+  const logDir = tmpDir();
+  const filePath = writeSessionLog(logDir, [{ sessionId: 'sess_big', event: 'ok' }]);
+  fs.appendFileSync(filePath, `${'x'.repeat(200)}\n`.repeat(50), 'utf8');
+  const oversizeCap = fs.statSync(filePath).size - 1;
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_big' })(command, args, options);
+  };
+  await expect(
+    runGlmTurn({
+      cwd: dir,
+      prompt: 'go',
+      logDir: dir,
+      zcodeLogDir: logDir,
+      auditLogMaxBytes: oversizeCap,
+      env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
+    }),
+  ).rejects.toThrow(/over the .*-byte audit cap/);
+});
+
+test('an audit that runs out of its time budget fails closed', async () => {
+  const dir = tmpDir();
+  const logDir = tmpDir();
+  const lines = Array.from({ length: 500 }, (_, i) => ({ sessionId: `sess_other_${i}`, event: 'noise' }));
+  lines.push({ sessionId: 'sess_slow', event: 'ok' });
+  writeSessionLog(logDir, lines);
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_slow' })(command, args, options);
+  };
+  await expect(
+    runGlmTurn({
+      cwd: dir,
+      prompt: 'go',
+      logDir: dir,
+      zcodeLogDir: logDir,
+      auditTimeBudgetMs: 0,
+      env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
+    }),
+  ).rejects.toThrow(/exceeded its .*ms budget/);
 });
 
 test('an envelope with no sessionId fails the turn closed', async () => {
   const dir = tmpDir();
   const logDir = tmpDir();
   const envelopeWithoutSessionId = JSON.stringify({ response: JSON.stringify({ status: 'done', message: 'ok' }) });
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCli(`process.stdout.write(${JSON.stringify(envelopeWithoutSessionId)})`)(command, args, options);
+  };
   await expect(
     runGlmTurn({
       cwd: dir,
@@ -565,7 +961,8 @@ test('an envelope with no sessionId fails the turn closed', async () => {
       logDir: dir,
       zcodeLogDir: logDir,
       env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
-      spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelopeWithoutSessionId)})`),
+      zcodeConfigPath: writeSafeZcodeConfig(dir),
+      spawnFn,
     }),
   ).rejects.toThrow(/no sessionId/);
 });
@@ -573,29 +970,42 @@ test('an envelope with no sessionId fails the turn closed', async () => {
 test('KAPREK_GLM_SKIP_TOOL_AUDIT=1 bypasses the audit entirely', async () => {
   const dir = tmpDir();
   const logDir = tmpDir(); // still empty — would fail closed otherwise
+  const spawnFn = (command, args, options) => {
+    if (args.includes('plugins')) return fakeCliAnswering('done', 'noise')(command, args, options);
+    return fakeCliAnswering('done', 'ok', { sessionId: 'sess_whatever' })(command, args, options);
+  };
   const result = await runGlmTurn({
     cwd: dir,
     prompt: 'go',
     logDir: dir,
     zcodeLogDir: logDir,
     env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs'), [GLM_TOOL_AUDIT_SKIP_ENV]: '1' },
-    spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok', { sessionId: 'sess_whatever' }))})`),
+    zcodeConfigPath: writeSafeZcodeConfig(dir),
+    spawnFn,
   });
   expect(result.status).toBe('done');
 });
 
-test('a session logged under yesterday\'s file (a midnight boundary) is still found', async () => {
-  const dir = tmpDir();
+test('toolNamesForSession checks the turn\'s own start AND end calendar dates — a session only in YESTERDAY\'s file is still found for a turn that started yesterday', async () => {
   const logDir = tmpDir();
   const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000);
-  writeSessionLog(logDir, [{ sessionId: 'sess_y', event: 'ok' }], { date: yesterday });
-  const result = await runGlmTurn({
-    cwd: dir,
-    prompt: 'go',
-    logDir: dir,
-    zcodeLogDir: logDir,
-    env: { ...process.env, KAPREK_ZCODE_PATH: path.join(dir, 'zcode.cjs') },
-    spawnFn: fakeCli(`process.stdout.write(${JSON.stringify(envelope('done', 'ok', { sessionId: 'sess_y' }))})`),
-  });
-  expect(result.status).toBe('done');
+  writeSessionLog(logDir, [{ sessionId: 'sess_midnight', event: 'ok' }], { date: yesterday });
+  // startedAt is yesterday, endedAt is "now" (today) — a turn that ran right
+  // across local midnight. Only yesterday's file exists; today's file is
+  // absent, which must not by itself cause a false "no evidence" failure as
+  // long as the OTHER relevant date has the evidence.
+  const result = await toolNamesForSession('sess_midnight', { zcodeLogDir: logDir, startedAt: yesterday, endedAt: new Date() });
+  expect(result.anyFound).toBe(true);
+  expect(result.names).toEqual([]);
+});
+
+test('toolNamesForSession does NOT check a blanket window around "now" — only the two dates it is given', async () => {
+  const logDir = tmpDir();
+  const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+  writeSessionLog(logDir, [{ sessionId: 'sess_old', event: 'ok' }], { date: twoDaysAgo });
+  // Both startedAt and endedAt are "now" — two days ago is neither, so this
+  // must report no evidence even though a (correctly dated, but irrelevant)
+  // file exists on disk.
+  const result = await toolNamesForSession('sess_old', { zcodeLogDir: logDir, startedAt: new Date(), endedAt: new Date() });
+  expect(result.anyFound).toBe(false);
 });
