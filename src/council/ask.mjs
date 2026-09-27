@@ -2,19 +2,21 @@
 // either a full engine (claude-code, codex) or a peer driver (grok).
 //
 // Since 0.9.0 a peer sees NO files: the consultation embeds redacted
-// snapshots in the prompt (src/council/snapshot.mjs), grok runs with no
-// tools at all, and every peer stands in an empty scratch directory instead
-// of the mission's — a peer that starts next to a .env has the .env, prompt
-// wording notwithstanding. Engines still run in plan mode as the write
-// barrier; their harnesses can read, but from the scratch directory there
-// is nothing to read, and the package tells them not to try. Klaus' own
-// rule stays enforced: never two writers in one working tree.
+// snapshots in the prompt (src/council/snapshot.mjs), grok and glm run with
+// no tools at all, and every peer stands in an empty scratch directory
+// instead of the mission's — a peer that starts next to a .env has the
+// .env, prompt wording notwithstanding. Engines still run in plan mode as
+// the write barrier; their harnesses can read, but from the scratch
+// directory there is nothing to read, and the package tells them not to
+// try. Klaus' own rule stays enforced: never two writers in one working
+// tree.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getEngine } from '../harness/registry.mjs';
 import { getPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs'; // registers the grok driver
+import '../harness/peers/glm.mjs'; // registers the glm driver
 
 /**
  * How long a peer may be silent before kaprek gives up on it. Generous
@@ -158,7 +160,7 @@ async function askInScratch({ peerId, prompt, signal, timeoutMs, cwd }) {
  */
 export function availablePeerIds({ engineIds = [], env = process.env } = {}) {
   const drivers = [];
-  for (const driver of [getPeerDriver('grok')].filter(Boolean)) {
+  for (const driver of [getPeerDriver('grok'), getPeerDriver('glm')].filter(Boolean)) {
     try {
       if (driver.available?.(env) !== false) drivers.push(driver.id);
     } catch {

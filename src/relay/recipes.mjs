@@ -18,12 +18,12 @@ import { RELAY_MAX_TURNS, RELAY_ROUNDS_PER_GATE } from './dispatcher.mjs';
 /**
  * Agents a step may name.
  *
- * 'grok' is a text peer driver; 'claude' and 'codex' are full harnesses that
- * run with tools. The dispatcher decides what that means at run time — this
- * list exists so a typo is caught while the user is still looking at their
- * file, not three minutes into a run.
+ * 'grok' and 'glm' are text peer drivers; 'claude' and 'codex' are full
+ * harnesses that run with tools. The dispatcher decides what that means at
+ * run time — this list exists so a typo is caught while the user is still
+ * looking at their file, not three minutes into a run.
  */
-export const RECIPE_AGENTS = ['grok', 'claude', 'codex'];
+export const RECIPE_AGENTS = ['grok', 'glm', 'claude', 'codex'];
 
 /** What kaprek does when a budget runs out or a peer keeps failing. */
 export const ESCALATION_LEVELS = ['notify', 'question', 'stop'];

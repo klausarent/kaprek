@@ -61,6 +61,32 @@ export const KNOWN_CLIS = Object.freeze([
     loginHints: ['.gemini/oauth_creds.json'],
     mcpConfigs: ['.gemini/settings.json'],
   },
+  {
+    id: 'glm',
+    // No bare `zcode` sits on PATH — ZCode is an Electron app, not an npm
+    // install — so this is the command worth showing someone, not one
+    // findOnPath could ever resolve. `resolveCommandPath` below is what
+    // actually decides `installed`.
+    command: 'zcode login',
+    label: 'GLM (ZCode)',
+    configDirs: ['.zcode'],
+    loginHints: ['.zcode/v2/credentials.json'],
+    mcpConfigs: [],
+    /**
+     * ZCode's headless entry is a plain script bundled inside the app,
+     * `<install dir>\resources\glm\zcode.cjs` — the same path
+     * src/harness/peers/glm.mjs resolves for an actual turn, including the
+     * same `KAPREK_ZCODE_PATH` override. Built from `home` (the injected,
+     * test-overridable one), never `os.homedir()` directly: this module's
+     * whole contract is that a fake `home` in a test never leaks the real
+     * machine's install in through a fallback.
+     */
+    resolveCommandPath({ env, home }) {
+      const localAppData = env.LOCALAPPDATA || path.join(home, 'AppData', 'Local');
+      const entryPath = env.KAPREK_ZCODE_PATH || path.join(localAppData, 'Programs', 'ZCode', 'resources', 'glm', 'zcode.cjs');
+      return exists(entryPath) ? entryPath : null;
+    },
+  },
 ]);
 
 /** Files worth reporting the KEY NAMES of. Never the values. */
@@ -155,7 +181,9 @@ function exists(target) {
 
 /** One CLI's situation on this machine. */
 function scanCli(entry, { home, env }) {
-  const commandPath = findOnPath(entry.command, env);
+  // Most CLIs are found on PATH; a few (ZCode/glm today) have no PATH entry
+  // at all and say so themselves via a custom resolver instead.
+  const commandPath = typeof entry.resolveCommandPath === 'function' ? entry.resolveCommandPath({ env, home }) : findOnPath(entry.command, env);
   const configDirs = entry.configDirs.map((rel) => path.join(home, rel)).filter(exists);
   // Existence only. Opening a credentials file to check whether it looks
   // valid would be reading exactly the thing this module must not read.

@@ -87,6 +87,7 @@ import { InvalidScopeError, visibleScopes, parseScopeId } from '../memory/scopes
 import { openPolicy, ProposalNotFoundError } from '../memory/policy.mjs';
 import { getPeerDriver as getRegisteredPeerDriver } from '../harness/peers/driver.mjs';
 import '../harness/peers/grok.mjs';
+import '../harness/peers/glm.mjs';
 import { checkLimits } from '../triggers/limits.mjs';
 import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token.mjs';
 import { createResumeHandler } from './resume-routes.mjs';

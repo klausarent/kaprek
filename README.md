@@ -376,6 +376,12 @@ add to. `GET /api/recipes` lists what is available; the relay panel picks one.
   far side runs, which is the only moment the answer can still change
   anything. The approval buys exactly one passage of that edge and no extra
   round; the same edge asks again next time round.
+- **Two text peers ship today.** `grok` (Grok Build CLI) and `glm` (ZCode
+  CLI, GLM-5.3 via the GLM Coding Plan) both speak the same one-turn, no-tools
+  contract — a step names either the same way it names `claude` or `codex`.
+  `glm` needs a one-time `zcode login`; kaprek looks for `zcode.cjs` at
+  ZCode's default install path and reads `KAPREK_ZCODE_PATH` to override that
+  if it lives somewhere else.
 - **Tools are per step and fail-closed.** A step gets none unless it says
   `"tools": "full"`, and only `claude` and `codex` steps can — a text peer has
   no tools to give. A step that has them runs in the mission's own directory,
