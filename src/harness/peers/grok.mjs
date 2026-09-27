@@ -353,15 +353,6 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
     let stderr = '';
     let overflowed = false;
     let settled = false;
-    // Set the moment a DELIBERATE kill starts (timeout/abort/overflow), to
-    // the value that kill must resolve with. Killing the child necessarily
-    // makes it exit, which fires its own 'close' — a race the OLD
-    // fire-and-forget killTree() never had (it called finish() synchronously,
-    // before the kill could possibly have taken effect). Now that killTree()
-    // is properly awaited, the natural 'close'/'error' below has to be told
-    // to stand down rather than racing to resolve with a generic "exited
-    // with code N" that hides the real reason.
-    let killingReason = null;
     const finish = (value) => {
       if (settled) return;
       settled = true;
@@ -370,17 +361,30 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
       resolve(value);
     };
 
-    // Each of these awaits killTree() before reporting completion — the turn
-    // is not "over" merely because a kill was requested, but once the kill
-    // attempt has actually settled (see killTree's own note).
+    // The single, idempotent path into a deliberate kill. `terminating` is
+    // the lock: the FIRST caller's reason is the one that wins, full stop —
+    // not "whichever finish() call resolve() sees first", which a shared
+    // mutable `killingReason` variable got wrong (a second trigger firing
+    // while the first kill was still in flight could overwrite it before
+    // the first one's own .then() ever read it back). A second trigger here
+    // is a no-op: no second killTree() call, no reason swap.
+    let terminating = null;
+    const terminate = (reason) => {
+      if (terminating) return terminating;
+      terminating = killTree(child).then(() => finish(reason));
+      return terminating;
+    };
+
+    // Each of these goes through terminate() — the turn is not "over" merely
+    // because a kill was requested, but once the kill attempt has actually
+    // settled (see killTree's own note), and only the first of the three to
+    // fire decides why.
     const timer = setTimeout(() => {
-      killingReason = { error: `grok did not answer within ${timeoutMs}ms`, stdout, stderr };
-      killTree(child).then(() => finish(killingReason));
+      terminate({ error: `grok did not answer within ${timeoutMs}ms`, stdout, stderr });
     }, timeoutMs);
 
     const onAbort = () => {
-      killingReason = { error: 'the relay run was stopped', stdout, stderr };
-      killTree(child).then(() => finish(killingReason));
+      terminate({ error: 'the relay run was stopped', stdout, stderr });
     };
     signal?.addEventListener?.('abort', onAbort, { once: true });
 
@@ -389,8 +393,7 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
       stdout += chunk;
       if (Buffer.byteLength(stdout, 'utf8') > PEER_MAX_STDOUT_BYTES) {
         overflowed = true;
-        killingReason = { error: `grok printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr };
-        killTree(child).then(() => finish(killingReason));
+        terminate({ error: `grok printed more than ${PEER_MAX_STDOUT_BYTES} bytes`, stdout, stderr });
       }
     });
     child.stderr?.on('data', (chunk) => {
@@ -399,11 +402,11 @@ export async function runGrokTurn({ cwd, prompt, timeoutMs = PEER_TIMEOUT_MS, si
     });
 
     child.on('error', (err) => {
-      if (killingReason) return; // the pending kill's own finish() call owns the outcome
+      if (terminating) return; // the pending termination's own finish() call owns the outcome
       finish({ error: `could not start grok: ${err.message}`, stdout, stderr });
     });
     child.on('close', (code) => {
-      if (killingReason) return; // ditto — this close is the kill taking effect, not a new fact
+      if (terminating) return; // ditto — this close is the kill taking effect, not a new fact
       if (code === 0) finish({ stdout, stderr });
       else finish({ error: `grok exited with code ${code}${stderr ? `: ${stderr.slice(-400).trim()}` : ''}`, stdout, stderr });
     });

@@ -152,6 +152,30 @@ test('an abort signal ends the turn at once', async () => {
   await expect(pending).rejects.toThrow(/stopped/);
 });
 
+// Council review round 2 (27.09.2026): a shared mutable `killingReason`
+// variable let a SECOND trigger overwrite the reason a FIRST trigger's
+// still-in-flight killTree() would eventually read back — so an abort
+// followed shortly by the timeout could resolve as the timeout's message
+// instead of the abort's. terminate()'s lock fixes that: whichever of
+// abort/timeout/overflow claims it first is the one that decides, and a
+// short timeoutMs here means the timer WILL also fire during this test —
+// proving the abort (which wins the race, since its listener runs
+// synchronously) is not later clobbered by it.
+test('an abort that beats the timeout keeps "stopped" as the reason, even once the timeout also fires', async () => {
+  const dir = tmpDir();
+  const controller = new AbortController();
+  const pending = runGrokTurn({
+    cwd: dir,
+    prompt: 'go',
+    timeoutMs: 50,
+    logDir: dir,
+    signal: controller.signal,
+    spawnFn: fakeCli('setTimeout(() => {}, 30000)'),
+  });
+  controller.abort();
+  await expect(pending).rejects.toThrow(/stopped/);
+});
+
 test('a non-zero exit is reported with what the CLI said on stderr', async () => {
   const dir = tmpDir();
   await expect(
