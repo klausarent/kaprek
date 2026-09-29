@@ -73,7 +73,11 @@ function changedFiles(copyDir) {
 describe('legacy datadir fixtures', () => {
   it('reads approvals.json without runId/cancelled — decided stays decided, pending-interactive is refused as expired, not crashed on', async () => {
     const dataDir = copyFixture();
-    const store = createApprovalStore({ dataDir });
+    // The clock is pinned to a day after the fixture's decision: with the real
+    // clock the entry (decided 2026-08-31) fell out of the 7-day history
+    // retention on the open's write-back from 2026-09-07 on, and this test
+    // started failing by the calendar alone.
+    const store = createApprovalStore({ dataDir, now: () => Date.parse('2026-09-01T12:00:00Z') });
     const decided = await store.get('legacy-chat:1');
     expect(decided?.status).toBe('decided');
     expect(decided?.decision).toEqual({ behavior: 'allow' });
