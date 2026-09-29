@@ -4,7 +4,7 @@
 // nicht von der Maschinen-Uhr abhängt. localDayBounds kommt WIEDERVERWENDET
 // aus dem Digest (nicht neu gebaut); die Geld- und Gnaden-Helfer aus
 // budget.mjs.
-import { describe, expect, test } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -193,10 +193,10 @@ describe('lokale Tagesgrenze — dieselbe DST-feste Zerlegung wie der Digest', (
 
 describe('Gnaden-Tag — Reset über die lokale Tagesgrenze, ohne Cron', () => {
   let dataDir;
-  test.beforeEach(() => {
+  beforeEach(() => {
     dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-budget-test-'));
   });
-  test.afterEach(() => {
+  afterEach(() => {
     fs.rmSync(dataDir, { recursive: true, force: true });
   });
 
