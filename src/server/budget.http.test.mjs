@@ -43,8 +43,12 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
-  for (const { server } of servers) {
+  for (const { server, closed } of servers) {
     await new Promise((resolve) => server.close(resolve));
+    // The close withdraws the budget questions still pending and writes
+    // approvals.json AFTER the callback above — deleting dataDir before that
+    // write lands raced its temp file (sporadic ENOTEMPTY on Windows).
+    await closed;
   }
   fs.rmSync(tmpDir, { recursive: true, force: true });
   fs.rmSync(dataDir, { recursive: true, force: true });

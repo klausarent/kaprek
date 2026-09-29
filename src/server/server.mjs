@@ -5581,29 +5581,43 @@ export function startServer({
     });
   });
 
+  // The shutdown work below is asynchronous (the approval store's write, the
+  // council and relay recording how their runs ended), while 'close' and
+  // server.close()'s callback fire synchronously, before any of it lands.
+  // `closed` settles once it has: whoever deletes the data directory after a
+  // close (every test's afterEach) awaits it, or races the store's temp-file
+  // write — on Windows that surfaced as a sporadic ENOTEMPTY. Never rejects.
+  let settleClosed;
+  const closed = new Promise((resolve) => {
+    settleClosed = resolve;
+  });
+
   // The runner's own tick timer is unref()'d (see runner.mjs::start()), so
   // it never keeps this process alive on its own — but it must still be
   // stopped when the server closes, so a test's afterEach (which always
   // closes the server) leaves no dangling interval behind either.
   server.on('close', () => {
     if (runner) runner.stop();
+    const shutdownWork = [];
     // A consultation is a pair of CLI processes reading a repo. Left alone
     // they outlive the server that started them, invisibly — so the shutdown
     // aborts them and each records how it ended.
-    if (council) council.stopAll('kaprek is shutting down').catch(() => {});
+    if (council) shutdownWork.push(council.stopAll('kaprek is shutting down').catch(() => {}));
     // Same for a relay mid-handoff. Without this it kept dispatching after
     // the server closed — in the suite that showed up as a run writing its
     // gate question into a directory the test had already deleted, which is
     // the same bug wearing a test's clothes.
-    if (relay) relay.stopAll('kaprek is shutting down').catch(() => {});
+    if (relay) shutdownWork.push(relay.stopAll('kaprek is shutting down').catch(() => {}));
     // P1: a graceful shutdown withdraws every question still open, over the
     // store's own list of pending ids — with `cancelled/shutdown` on the
     // record instead of a pending entry that only the NEXT start could
     // mark dead. That next-start marking (interactive pending -> expired
     // 'process gone' in loadFromDisk) stays exactly as it is: it is what a
-    // CRASH leaves behind, where no shutdown code ran. Not awaited — 'close'
-    // is synchronous; the store queues the write and logs if it fails.
-    if (approvalStore) approvalStore.cancelOpen({ reason: 'shutdown' }).catch(() => {});
+    // CRASH leaves behind, where no shutdown code ran. Not awaited here —
+    // 'close' is synchronous; the store queues the write and logs if it
+    // fails, and `closed` is how a caller waits for it.
+    if (approvalStore) shutdownWork.push(approvalStore.cancelOpen({ reason: 'shutdown' }).catch(() => {}));
+    Promise.all(shutdownWork).then(() => settleClosed());
   });
 
   return new Promise((resolve, reject) => {
@@ -5645,6 +5659,10 @@ export function startServer({
         // else. Null without --lan, because there is no phone to give it to.
         approvalToken,
         runner: getRunner(),
+        // Settles after a close once the shutdown's own writes have landed
+        // (see the 'close' handler above) — the point after which the data
+        // directory is safe to delete.
+        closed,
       });
     });
   });
