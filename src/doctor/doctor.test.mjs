@@ -158,6 +158,20 @@ describe('doctor checks', () => {
     expect(result.status).toBe('warn');
   });
 
+  it('transcript-drift: the session markers newer Claude Code versions write are known, not drift', async () => {
+    const rootDir = writeScanRoot({ okLines: 4 });
+    const markers = [
+      { type: 'atis-latch', sessionId: 's1', atis: true },
+      { type: 'custom-title', sessionId: 's1', customTitle: 'x' },
+      { type: 'agent-name', sessionId: 's1', agentName: 'x' },
+      { type: 'cost-state', sessionId: 's1', totalCostUSD: 0 },
+    ];
+    fs.appendFileSync(path.join(rootDir, 'proj', 'session-1.jsonl'), `${markers.map((m) => JSON.stringify(m)).join('\n')}\n`, 'utf8');
+    const result = await checkTranscriptDrift({ rootDir });
+    expect(result.status).toBe('ok');
+    expect(result.message).toContain('0 of 8 sampled lines unusable');
+  });
+
   it('transcript-drift: 10%+ unusable lines fail (threshold)', async () => {
     const result = await checkTranscriptDrift({ rootDir: writeScanRoot({ okLines: 80, broken: 20 }) });
     expect(result.status).toBe('fail');

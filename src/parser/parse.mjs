@@ -164,7 +164,9 @@ async function collect(jsonlPath) {
     }
     if (!obj.timestamp || !obj.uuid) {
       // mode, permission-mode, queue-operation,
-      // file-history-snapshot, file-history-delta, ...
+      // file-history-snapshot, file-history-delta, atis-latch,
+      // custom-title, agent-name, cost-state, ...
+      // (keep in step with KNOWN_TYPES in src/doctor/checks.mjs)
       continue;
     }
 

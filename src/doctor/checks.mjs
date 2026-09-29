@@ -39,6 +39,9 @@ const KNOWN_TYPES = new Set([
   // marker lines the parser skips without an event, but knows:
   'summary', 'mode', 'permission-mode', 'queue-operation',
   'file-history-snapshot', 'file-history-delta',
+  // session-keyed markers newer Claude Code versions write (no uuid, no
+  // timestamp): {type, sessionId} plus their payload fields
+  'atis-latch', 'custom-title', 'agent-name', 'cost-state',
 ]);
 
 function check(id, status, message, detail) {
