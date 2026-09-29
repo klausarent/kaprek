@@ -35,19 +35,25 @@ import { appendRun } from '../orchestrator/runs.mjs';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = path.join(__dirname, '..', 'testdata', 'legacy-datadir');
 
+const TRANSIENT_RM_CODES = new Set(['EBUSY', 'EPERM', 'ENOTEMPTY']);
 const tmpDirs = [];
 afterAll(() => {
   // Windows can hold a just-closed sqlite handle (AV scan, WAL teardown) for
-  // seconds after close() — even with retries the unlink can lose. A temp dir
-  // that survives is the OS temp cleaner's job, never a test failure: every
-  // assertion above ran against the copies, not these directories.
+  // a moment after close(), and depending on the Node version that shows up
+  // as EBUSY, EPERM or ENOTEMPTY — all three get a short retry (rmSync's own
+  // maxRetries does not wait on Node 24, hence the loop). A dir still EBUSY
+  // after that is the OS temp cleaner's job, never a test failure: every
+  // assertion above ran against the copies, not these directories. EPERM or
+  // ENOTEMPTY that outlasts the retries is NOT swallowed: on Windows that is
+  // what a handle a test forgot to close looks like, and it must stay loud.
   for (const dir of tmpDirs) {
     for (let attempt = 0; ; attempt++) {
       try {
         fs.rmSync(dir, { recursive: true, force: true });
         break;
       } catch (err) {
-        if (attempt >= 4 || err.code !== 'EBUSY') {
+        if (!TRANSIENT_RM_CODES.has(err.code)) throw err;
+        if (attempt >= 4) {
           if (err.code === 'EBUSY') break; // give up quietly; temp cleaner wins
           throw err;
         }
@@ -397,6 +403,7 @@ describe('doctor report, fix surface and json', () => {
   it('--fix never rebuilds a NEWER search index, and without a fix target it changes nothing', async () => {
     const probe = await openSearchDb({ dataDir: tmpdir() });
     if (probe.unavailable) return;
+    probe.db.close(); // an open handle keeps Windows from deleting the tmpdir (EPERM in afterAll)
     const dataDir = tmpdir();
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(path.join(dataDir, 'search.db'));
