@@ -5,13 +5,14 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
 import { readLedgerIndex } from '../ledger/sessions.mjs';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 export const HOME = os.homedir();
 // The four engines' session stores, read at call time (never captured once
 // at import time) so a test — or --dir / a resume-home option — can point
 // them elsewhere before the first scan. setStoreRoots() is the only writer.
 export const STORES = {
-  claudeProjects: path.join(HOME, '.claude', 'projects'),
+  claudeProjects: path.join(claudeConfigDir(), 'projects'),
   kimiHome: path.join(HOME, '.kimi-code'),
   codexSessions: path.join(HOME, '.codex', 'sessions'),
   grokSessions: path.join(HOME, '.grok', 'sessions'),

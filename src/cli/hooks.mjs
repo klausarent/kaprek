@@ -13,11 +13,11 @@
 // temp settings.json (real ~/.claude/settings.json is never touched by
 // tests; settingsPath is always overridable).
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadPolicy } from '../policy/policy.mjs';
 import { getAppDir, getPackageName } from '../lib/appdir.mjs';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const HOOK_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-stop.mjs');
@@ -31,7 +31,7 @@ export const HOOK_EVENTS = Object.freeze({ Stop: 'hookScriptPath', SessionStart:
 const MANAGED_BY_PREFIX = '--managed-by=';
 
 function defaultSettingsPath() {
-  return path.join(os.homedir(), '.claude', 'settings.json');
+  return path.join(claudeConfigDir(), 'settings.json');
 }
 
 function timestamp(date = new Date()) {

@@ -1,10 +1,10 @@
 // `kaprek doctor` — CLI front end. Owns argv parsing, printing and the exit
 // code (always 0: doctor is a report, not a gate); src/doctor/doctor.mjs
 // owns the checks and the two --fix effects.
-import os from 'node:os';
 import path from 'node:path';
 import { runDoctor } from '../doctor/doctor.mjs';
 import { getAppDir } from '../lib/appdir.mjs';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 export const DOCTOR_USAGE = `Usage: kaprek doctor [--fix] [--json]
 
@@ -41,7 +41,7 @@ Hooks are NOT fixed by --fix in this version (kaprek hooks uninstall/install
 does that).`;
 
 function defaultScanRoot() {
-  return path.join(os.homedir(), '.claude', 'projects');
+  return path.join(claudeConfigDir(), 'projects');
 }
 
 /** Parses `kaprek doctor [...]` argv. Throws on unknown flags. */

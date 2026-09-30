@@ -27,6 +27,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 /** Strict to open. The index IS the rank. */
 export const POSTURES = Object.freeze(['ask', 'edits', 'auto']);
@@ -172,8 +173,20 @@ export function validateHardDenials(raw) {
 }
 
 /** Built-ins first, then what the person added. */
-export function hardDenialsOf(policy) {
-  return [...BUILTIN_HARD_DENIALS, ...(Array.isArray(policy?.hardDenials) ? policy.hardDenials : [])];
+export function hardDenialsOf(policy, { env = process.env } = {}) {
+  return [...BUILTIN_HARD_DENIALS, ...configDirDenials(env), ...(Array.isArray(policy?.hardDenials) ? policy.hardDenials : [])];
+}
+
+/**
+ * Claude Code may run with CLAUDE_CONFIG_DIR pointing outside ~/.claude (a
+ * second config on a shared machine). That directory is the agent's own
+ * configuration just the same, so the agent-config-write denial covers it too.
+ */
+export function configDirDenials(env = process.env) {
+  const dir = claudeConfigDir({ env });
+  if (dir === path.join(os.homedir(), '.claude')) return [];
+  const base = BUILTIN_HARD_DENIALS[0];
+  return [Object.freeze({ id: `${base.id}-config-dir`, why: base.why, tools: base.tools, paths: Object.freeze([`/${posixPath(path.resolve(dir))}/**`]) })]; // posixPath starts with `/`, so this is the `//absolute` form
 }
 
 /**

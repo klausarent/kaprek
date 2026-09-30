@@ -18,6 +18,7 @@ import crypto from 'node:crypto';
 import { openMemory } from './store.mjs';
 import { visibleScopes } from './scopes.mjs';
 import { looksLikeSecret } from './import.mjs';
+import { claudeConfigDir, claudeUserHome } from '../lib/claude-home.mjs';
 
 /** A description longer than this is truncated with an ellipsis rather than remembered whole — this block is a session-start line, not a briefing. */
 export const MAX_TEXT_CHARS = 400;
@@ -33,8 +34,10 @@ const KNOWN_TYPE_PREFIXES = ['project', 'feedback', 'reference', 'user'];
  */
 export function defaultMemoryDir({ homedir = os.homedir(), env = process.env } = {}) {
   if (typeof env.KAPREK_MEMORY_DIR === 'string' && env.KAPREK_MEMORY_DIR.trim() !== '') return env.KAPREK_MEMORY_DIR;
-  const slug = homedir.replace(/[:\\/]/g, '-');
-  return path.join(homedir, '.claude', 'projects', slug, 'memory');
+  // CLAUDE_CONFIG_DIR (a second Claude config) moves both the config dir and
+  // the home whose slug names the memory folder — see lib/claude-home.mjs.
+  const slug = claudeUserHome({ env, homedir }).replace(/[:\\/]/g, '-');
+  return path.join(claudeConfigDir({ env, homedir }), 'projects', slug, 'memory');
 }
 
 function statePath(dataDir) {

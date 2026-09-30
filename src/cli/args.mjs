@@ -1,12 +1,12 @@
 // Pure argv parser for the kaprek CLI. No I/O, no process.exit — bin/cli.mjs
 // owns all side effects and decides how to react to what this returns/throws.
-import os from 'node:os';
 import path from 'node:path';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 const DEFAULT_PORT = 4900;
 
 function defaultDir() {
-  return path.join(os.homedir(), '.claude', 'projects');
+  return path.join(claudeConfigDir(), 'projects');
 }
 
 /**
