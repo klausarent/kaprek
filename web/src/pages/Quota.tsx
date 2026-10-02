@@ -38,13 +38,18 @@ function when(iso: string): string {
 
 function emptyText(p: QuotaProvider): string {
   if (p.limitId) return `Codex meldet keine Fenster mehr (limit_id ${p.limitId}).`;
+  if (p.credential === "missing") return "Kein Token hinterlegt. `claude setup-token` mit diesem Konto, dann in ~/.env eintragen.";
+  if (p.account) return "Noch keine Daten. Die erste Session auf diesem Konto misst es.";
   return p.id === "claude" ? "Noch keine Daten. Eine Claude-Code-Session über den Proxy starten." : "Noch keine Daten. Einmal codex benutzen.";
 }
 
 export function ProviderCard({ p, now }: { p: QuotaProvider; now: number }) {
   return (
-    <section className="quota-card">
-      <h2>{p.label}</h2>
+    <section className={`quota-card${p.next ? " quota-card-next" : ""}`}>
+      <h2>
+        {p.label}
+        {p.next ? <span className="quota-next">Nächste Session</span> : null}
+      </h2>
       {p.windows.length === 0 ? (
         <p className="setup-note">{emptyText(p)}</p>
       ) : (
@@ -81,7 +86,7 @@ export function QuotaView({ report, now }: { report: QuotaReport; now: number })
       <p className="setup-note">{proxyLine + lastLine}</p>
       <div className="quota-cards">
         {report.providers.map((p) => (
-          <ProviderCard key={p.id} p={p} now={now} />
+          <ProviderCard key={`${p.id}:${p.account ?? ""}`} p={p} now={now} />
         ))}
       </div>
       <h2>Verbrauch je Projekt, letzte 7 Tage</h2>

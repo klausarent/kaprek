@@ -82,3 +82,29 @@ describe("QuotaView", () => {
     expect(text).toContain("Noch keine Anfragen über den Proxy");
   });
 });
+
+describe("QuotaView with several accounts", () => {
+  test("one card per account, the next pick marked, a missing token said plainly", () => {
+    const base = { id: "claude" as const, limitId: null, source: "proxy" as const, seenAt: "2026-10-02T09:59:00Z", status: "allowed", plan: null };
+    const text = textOf(
+      render(
+        <QuotaView
+          now={NOW}
+          report={{
+            ...report,
+            providers: [
+              { ...base, label: "Claude · Haupt", account: "konto1", credential: "login", next: false, windows: [{ name: "5h", usedPercent: 93, resetsAt: null }] },
+              { ...base, label: "Claude · Konto 2", account: "konto2", credential: "token", next: true, windows: [{ name: "5h", usedPercent: 12, resetsAt: null }] },
+              { ...base, label: "Claude · Konto 3", account: "konto3", credential: "missing", next: false, source: "none", seenAt: null, windows: [] },
+            ],
+          }}
+        />,
+      ),
+    );
+    expect(text).toContain("Claude · Haupt");
+    expect(text).toContain("Claude · Konto 2");
+    expect(text).toContain("Nächste Session");
+    expect(text).toContain("Kein Token hinterlegt");
+    expect(text).toContain("93 %");
+  });
+});

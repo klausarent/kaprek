@@ -809,6 +809,12 @@ export type QuotaProvider = {
   id: "claude" | "codex";
   label: string;
   limitId: string | null;
+  /** The account from accounts.json (Claude), or null. */
+  account?: string | null;
+  /** login = /login, token = setup-token found, missing = token variable empty. */
+  credential?: "login" | "token" | "missing" | null;
+  /** The account the next session starts on. */
+  next?: boolean;
   source: "proxy" | "runs" | "rollouts" | "none";
   seenAt: string | null;
   status: string | null;

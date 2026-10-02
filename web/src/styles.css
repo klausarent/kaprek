@@ -2873,3 +2873,18 @@ pre,
 .quota-table td:first-child {
   text-align: left;
 }
+
+.quota-card-next {
+  border-color: var(--accent);
+}
+
+.quota-next {
+  margin-left: 0.5rem;
+  font-size: 0.7rem;
+  font-weight: 600;
+  padding: 0.1rem 0.4rem;
+  border-radius: 4px;
+  background: var(--success-bg);
+  color: var(--success-text);
+  vertical-align: middle;
+}

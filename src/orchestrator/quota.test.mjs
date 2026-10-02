@@ -29,6 +29,27 @@ describe('buildQuotaReport', () => {
     expect(r.proxy.lastRequestAt).toBe('2026-10-02T08:30:00.000Z');
   });
 
+  it('with accounts.json: one Claude card per account, the next pick marked, missing tokens named', () => {
+    const dataDir = tmp('q-acc-');
+    fs.writeFileSync(
+      path.join(dataDir, 'accounts.json'),
+      JSON.stringify({ accounts: [{ id: 'konto1', label: 'Haupt', tokenEnv: null }, { id: 'konto2', tokenEnv: 'CLAUDE_TOKEN_KONTO2' }, { id: 'konto3', tokenEnv: 'CLAUDE_TOKEN_KONTO3' }] }),
+    );
+    const now = Date.parse('2026-10-02T12:00:00Z');
+    writeQuota(dataDir, { seenAt: '2026-10-02T11:00:00Z', windows: { '5h': { usedPercent: 95, resetsAt: '2026-10-02T14:00:00Z' } } }, 'h', 'konto1');
+    writeQuota(dataDir, { seenAt: '2026-10-02T11:00:00Z', windows: { '5h': { usedPercent: 20, resetsAt: '2026-10-02T14:00:00Z' } } }, 'h', 'konto2');
+    writeQuota(dataDir, { seenAt: '2026-10-02T11:00:00Z', windows: { '5h': { usedPercent: 5, resetsAt: null } } }, 'h', 'org-abcdef12');
+    const r = buildQuotaReport({ dataDir, home: tmp('q-h-'), now: () => now, env: { CLAUDE_TOKEN_KONTO2: 't' }, envFile: null });
+    const claude = r.providers.filter((p) => p.id === 'claude');
+    expect(claude.map((p) => [p.account, p.label, p.credential, p.next])).toEqual([
+      ['konto1', 'Claude · Haupt', 'login', false],
+      ['konto2', 'Claude · konto2', 'token', true],
+      ['konto3', 'Claude · konto3', 'missing', false],
+      ['org-abcdef12', 'Claude · org-abcdef12', null, false],
+    ]);
+    expect(claude[2].windows).toEqual([]);
+  });
+
   it('passes codex limitId through when codex reports no windows', () => {
     const home = tmp('q-home3-');
     const file = path.join(home, '.codex', 'sessions', '2026', '10', '02', 'rollout-x.jsonl');
