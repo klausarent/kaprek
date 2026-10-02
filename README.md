@@ -684,6 +684,43 @@ without windows, and the card says so instead of showing nothing. Claude
 Code's fast-mode check and WebFetch domain check still go to
 `api.anthropic.com` directly, by Anthropic's design.
 
+### Several Claude subscriptions (`kaprek accounts`, `kaprek claude`)
+
+If you hold more than one Claude subscription yourself, kaprek can start each
+session on the one with the most room left, so a long run does not begin at
+97 % and die halfway. Claude Code does the authenticating, with Anthropic's own
+mechanisms: the `/login` credential, or a long-lived token from
+`claude setup-token` passed as `CLAUDE_CODE_OAUTH_TOKEN`
+([authentication docs](https://code.claude.com/docs/en/authentication)).
+Accounts are never switched mid-session, the proxy never holds or swaps a
+token, and sessions under a token have no claude.ai connectors or Remote
+Control (Anthropic's limitation for such tokens).
+
+1. For each extra account: `claude setup-token`, sign in with that account,
+   copy the token into `~/.env`, e.g. `CLAUDE_TOKEN_KONTO2=…`.
+2. Describe the accounts in `<dataDir>/accounts.json` (no secrets in it):
+   ```json
+   {"accounts": [
+     {"id": "konto1", "label": "Konto 1", "tokenEnv": null, "org": "1fc3f5a5"},
+     {"id": "konto2", "label": "Konto 2", "tokenEnv": "CLAUDE_TOKEN_KONTO2"},
+     {"id": "konto3", "label": "Konto 3", "tokenEnv": "CLAUDE_TOKEN_KONTO3"}]}
+   ```
+   `tokenEnv: null` is the machine's `/login` account; `org` (a prefix of its
+   organization id) binds it to that login when several machines share the
+   data dir but are logged in to different accounts.
+3. `kaprek accounts` shows each account's 5h/7d windows and the next pick;
+   `kaprek claude [args]` starts Claude Code on it. kaprek's own chat and
+   trigger turns pick the same way. Scripts ask `kaprek accounts pick --json`
+   (the account id and the name of its token variable, never the token).
+
+An account is picked while its 5-hour window is under 90 % and its 7-day
+window under 95 % (`thresholds` in accounts.json); the least loaded wins, a
+window past its reset counts as empty, accounts never measured go first.
+When every account is at 99 %, nothing starts and the pick says when the
+first one frees up. The numbers come from the proxy (and from the bridge
+watcher's own run logs), filed per account by the `anthropic-organization-id`
+each response carries.
+
 ## Starting and stopping
 
 kaprek starts itself: once its SessionStart hook is installed (see [Claude Code hook](#claude-code-hook-optional)), opening your first Claude Code session of the day brings it up in the background, with no browser tab and no command to remember (`KAPREK_NO_AUTOSTART=1` turns this off). Running `kaprek` yourself afterwards opens the browser on the instance that is already up instead of erroring. `kaprek stop` ends it.
