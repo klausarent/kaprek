@@ -47,6 +47,22 @@ function asPercent(value) {
  */
 export function summarizeRateLimit(info, { now = Date.now } = {}) {
   if (!info || typeof info !== 'object') return { usedPercent: null, resetsAt: null, window: null, status: null, plan: null };
+  // Claude Code's rate_limit_event carries every window in unifiedWindows
+  // (ratio 0–1). The fullest one is the one that binds.
+  if (info.unifiedWindows && typeof info.unifiedWindows === 'object') {
+    const list = Object.entries(info.unifiedWindows)
+      .filter(([, w]) => w && typeof w === 'object')
+      .map(([name, w]) => ({ name, usedPercent: asPercent(w.utilization), resetsAt: asIso(w.resetsAt) }));
+    const binding = list.reduce((a, b) => ((b.usedPercent ?? -1) > (a?.usedPercent ?? -1) ? b : a), null);
+    return {
+      usedPercent: binding?.usedPercent ?? null,
+      resetsAt: asIso(info.resetsAt ?? info.resets_at) ?? binding?.resetsAt ?? null,
+      window: typeof info.rateLimitType === 'string' ? info.rateLimitType : (binding?.name ?? null),
+      status: typeof info.status === 'string' ? info.status : null,
+      plan: null,
+      windows: list,
+    };
+  }
   // codex: the window that is fuller is the one that binds.
   const windows = ['primary', 'secondary'].map((key) => info[key]).filter((w) => w && typeof w === 'object');
   if (windows.length > 0) {

@@ -45,3 +45,18 @@ test('the latest signal per harness is read back from runs.jsonl, newest first, 
   expect(latest[1].info).toEqual({ utilization: 0.5, rateLimitType: 'five_hour', resetsAt: 1756310400 });
   expect(latestRateLimits(path.join(dataDir, 'nowhere'))).toEqual([]);
 });
+
+test('reads Claude unifiedWindows as percent per window', () => {
+  const s = summarizeRateLimit({
+    status: 'allowed',
+    rateLimitType: 'five_hour',
+    resetsAt: 1788617400,
+    unifiedWindows: { five_hour: { utilization: 0.58, resetsAt: 1788617400 }, seven_day: { utilization: 0.1, resetsAt: 1788994800 } },
+  });
+  expect(s.usedPercent).toBe(58);
+  expect(s.window).toBe('five_hour');
+  expect(s.windows).toEqual([
+    { name: 'five_hour', usedPercent: 58, resetsAt: new Date(1788617400 * 1000).toISOString() },
+    { name: 'seven_day', usedPercent: 10, resetsAt: new Date(1788994800 * 1000).toISOString() },
+  ]);
+});
