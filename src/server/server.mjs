@@ -53,6 +53,7 @@ import { findRepeats } from '../triggers/repeats.mjs';
 import { openPlans, PlanNotFoundError, PlanFileMissingError, PlanOutsideRootError, PlanNotConvergedError, PLAN_STATUSES } from '../plans/store.mjs';
 import { loadPolicyFailOpen, policyVersion } from '../policy/policy.mjs';
 import { latestRateLimits } from '../orchestrator/usage.mjs';
+import { buildQuotaReport } from '../orchestrator/quota.mjs';
 import { effectivePosture, postureAllows, POSTURES, stricterPosture, hardDenialsHashOf } from '../policy/guards.mjs';
 import { parseQuiz } from '../plans/quiz.mjs';
 import { readCouncil, writeCouncil, InvalidCouncilError, DEFAULT_LEVEL } from '../council/config.mjs';
@@ -4505,6 +4506,16 @@ async function handleRequest(
         return;
       }
       sendJson(res, 200, { usage: latestRateLimits(dataDir) });
+      return;
+    }
+    // /api/quota — subscription windows (proxy, runs, codex rollouts) and
+    // token usage per project from the proxy log. All local files.
+    if (segments.length === 2 && segments[1] === 'quota') {
+      if (req.method !== 'GET') {
+        sendJson(res, 405, { error: 'method not allowed' });
+        return;
+      }
+      sendJson(res, 200, buildQuotaReport({ dataDir }));
       return;
     }
 

@@ -4590,6 +4590,17 @@ test('GET /api/usage reads the latest subscription-window signal per harness bac
   expect(usage[0].info).toMatchObject({ utilization: 0.8 });
 });
 
+test('GET /api/quota reports providers and per-project usage from local files only', async () => {
+  const { url } = await boot();
+  const res = await fetch(`${url}/api/quota`);
+  expect(res.status).toBe(200);
+  const body = await res.json();
+  expect(body.providers.map((p) => p.id)).toEqual(['claude', 'codex']);
+  expect(Array.isArray(body.projects)).toBe(true);
+  expect(body.proxy).toHaveProperty('running');
+  expect((await postJson(`${url}/api/quota`, {})).status).toBe(405);
+});
+
 // ------------------------------------------------- approval lifecycle wiring (P1)
 //
 // A harness whose turn raises one approval, walks away from it, and ends.
