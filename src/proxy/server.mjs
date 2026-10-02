@@ -11,6 +11,7 @@ import { openUpstream } from './upstream.mjs';
 import { parseUnifiedHeaders } from './ratelimit.mjs';
 import { createUsageTap } from './usage-tap.mjs';
 import { appendRequest, writeQuota } from './store.mjs';
+import { createAccountResolver } from './accounts.mjs';
 
 const HOP_BY_HOP = new Set(['connection', 'keep-alive', 'proxy-connection', 'proxy-authorization', 'proxy-authenticate', 'te', 'trailer', 'transfer-encoding', 'upgrade', 'host']);
 
@@ -30,12 +31,16 @@ function header(req, name) {
 // black-holed upstream must not hang a turn forever.)
 const UPSTREAM_IDLE_MS = 6 * 60 * 1000;
 
-export function createProxyServer({ dataDir, requestUpstream = openUpstream, now = Date.now, upstreamIdleMs = UPSTREAM_IDLE_MS } = {}) {
+export function createProxyServer({ dataDir, requestUpstream = openUpstream, now = Date.now, upstreamIdleMs = UPSTREAM_IDLE_MS, resolveAccount = createAccountResolver({ dataDir }) } = {}) {
   const server = http.createServer((req, res) => {
     const started = now();
     const pathOnly = (req.url ?? '/').split('?')[0];
     const recordable = pathOnly === '/v1/messages';
+    // x-kaprek-account is kaprek's own tag for the session (see accounts.mjs);
+    // it is read here and not forwarded.
+    const accountTag = header(req, 'x-kaprek-account');
     const headers = { ...forwardHeaders(req.headers), 'accept-encoding': 'identity' };
+    delete headers['x-kaprek-account'];
     let done = false;
     let clientGone = false;
 
@@ -76,15 +81,22 @@ export function createProxyServer({ dataDir, requestUpstream = openUpstream, now
 
     upReq.on('response', (upRes) => {
       const limits = parseUnifiedHeaders(upRes.headers);
+      const orgId = typeof upRes.headers['anthropic-organization-id'] === 'string' ? upRes.headers['anthropic-organization-id'] : null;
+      let who = { account: accountTag ?? 'unbekannt', mismatch: null };
+      try {
+        who = resolveAccount({ headerAccount: accountTag, orgId });
+      } catch {
+        // an unreadable org map must not break the session
+      }
       if (limits) {
         try {
-          writeQuota(dataDir, { seenAt: new Date(now()).toISOString(), ...limits });
+          writeQuota(dataDir, { seenAt: new Date(now()).toISOString(), ...limits }, undefined, who.account);
         } catch {
           // same as above
         }
       }
       const tap = createUsageTap(upRes.headers['content-type']);
-      const tail = () => ({ status: upRes.statusCode, ...tap.result(), rateLimit: limits?.windows ?? null });
+      const tail = () => ({ status: upRes.statusCode, ...tap.result(), rateLimit: limits?.windows ?? null, account: who.account, orgId, mismatch: who.mismatch });
       if (clientGone) {
         upRes.destroy();
         finish({ ...tail(), aborted: true });

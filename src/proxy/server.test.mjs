@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createProxyServer } from './server.mjs';
-import { readRequests, readQuota, proxyDir } from './store.mjs';
+import { readRequests, readQuota, readQuotas, proxyDir } from './store.mjs';
 
 let dataDir, upstream, proxy, proxyPort, seen;
 
@@ -79,6 +79,22 @@ describe('proxy server', () => {
     const onDisk = fs.readFileSync(path.join(proxyDir(dataDir), 'requests.jsonl'), 'utf8');
     expect(onDisk).not.toContain('SECRET-TOKEN');
     expect(onDisk).not.toContain('claude-opus-5-5"}'); // no request body
+  });
+
+  it('strips the kaprek account tag, files the windows under that account and learns its organization', async () => {
+    await start((req, res) => {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'anthropic-organization-id': 'org-two',
+        'anthropic-ratelimit-unified-5h-utilization': '0.3',
+      });
+      res.end('{"model":"m","usage":{"input_tokens":1,"output_tokens":2}}');
+    });
+    const r = await call('/v1/messages', { headers: { 'x-kaprek-account': 'konto2' } });
+    expect(r.status).toBe(200);
+    expect(seen.headers['x-kaprek-account']).toBeUndefined();
+    expect(readQuotas(dataDir).get('konto2').windows['5h'].usedPercent).toBe(30);
+    expect(readRequests(dataDir)[0]).toMatchObject({ account: 'konto2', orgId: 'org-two', mismatch: null });
   });
 
   it('records the windows of a 429 too', async () => {

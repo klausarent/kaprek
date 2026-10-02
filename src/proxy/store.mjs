@@ -118,18 +118,76 @@ function readJson(file) {
   }
 }
 
-export function writeQuota(dataDir, quota, host = os.hostname()) {
-  writeAtomic(path.join(ensure(dataDir, host), 'quota.json'), JSON.stringify(quota, null, 2));
+function accountKey(account) {
+  return typeof account === 'string' && /^[A-Za-z0-9._-]{1,64}$/.test(account) ? account : 'unbekannt';
 }
 
-/** The newest snapshot any machine saw: the windows belong to the account, not the host. */
-export function readQuota(dataDir) {
-  let best = null;
+/**
+ * The latest windows of one account, as seen from this host:
+ * <dataDir>/proxy/<host>/quota/<account>.json. Written by the proxy on every
+ * response and by the bridge watcher from its own stream log.
+ */
+export function writeQuota(dataDir, quota, host = os.hostname(), account = null) {
+  const key = accountKey(account ?? quota?.account);
+  const dir = path.join(ensure(dataDir, host), 'quota');
+  fs.mkdirSync(dir, { recursive: true });
+  writeAtomic(path.join(dir, `${key}.json`), JSON.stringify({ ...quota, account: key }, null, 2));
+}
+
+/** Newest snapshot per account over every host: the windows belong to the account, not the machine. */
+export function readQuotas(dataDir) {
+  const best = new Map();
   for (const dir of hostDirs(dataDir)) {
-    const q = readJson(path.join(dir, 'quota.json'));
-    if (q && typeof q === 'object' && (!best || String(q.seenAt) > String(best.seenAt))) best = q;
+    let files = [];
+    try {
+      files = fs.readdirSync(path.join(dir, 'quota')).filter((f) => f.endsWith('.json'));
+    } catch {
+      // no quota dir on this host yet
+    }
+    const snaps = files.map((f) => readJson(path.join(dir, 'quota', f)));
+    // quota.json from before accounts existed: one unnamed snapshot.
+    snaps.push(readJson(path.join(dir, 'quota.json')));
+    for (const q of snaps) {
+      if (!q || typeof q !== 'object') continue;
+      const key = accountKey(q.account);
+      const prev = best.get(key);
+      if (!prev || String(q.seenAt) > String(prev.seenAt)) best.set(key, { ...q, account: key });
+    }
   }
   return best;
+}
+
+/** The newest snapshot of any account. */
+export function readQuota(dataDir) {
+  let best = null;
+  for (const q of readQuotas(dataDir).values()) if (!best || String(q.seenAt) > String(best.seenAt)) best = q;
+  return best;
+}
+
+/** organization id -> account id, merged over every host (first entry wins on a clash). */
+export function readOrgMap(dataDir) {
+  const out = {};
+  for (const dir of hostDirs(dataDir)) {
+    const m = readJson(path.join(dir, 'orgs.json'));
+    if (!m || typeof m !== 'object') continue;
+    for (const [org, acc] of Object.entries(m)) if (!(org in out) && typeof acc === 'string') out[org] = acc;
+  }
+  return out;
+}
+
+/**
+ * Remember that `orgId` answered for `accountId`. Never overwrites: if the
+ * organization is already known as another account, that one stands, and
+ * the caller learns about the clash from the return value.
+ */
+export function learnOrg(dataDir, orgId, accountId, host = os.hostname()) {
+  const known = readOrgMap(dataDir);
+  if (orgId in known) return { learned: false, account: known[orgId] };
+  const file = path.join(ensure(dataDir, host), 'orgs.json');
+  const mine = readJson(file) ?? {};
+  mine[orgId] = accountId;
+  writeAtomic(file, JSON.stringify(mine, null, 2));
+  return { learned: true, account: accountId };
 }
 
 export function writePid(dataDir, { pid, port }) {
