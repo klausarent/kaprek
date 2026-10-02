@@ -420,6 +420,7 @@ export async function startTurn({
   requireAskCoverage,
   strictAskCoverage = false,
   learnUnknownTools,
+  env,
 } = {}) {
   if (signal?.aborted) {
     return { sessionId: sessionId ?? null, costUsd: null, usage: null, stopReason: 'aborted', error: null, droppedLines: 0, warnings: [] };
@@ -433,6 +434,9 @@ export async function startTurn({
   try {
     child = spawnFn(command, args, {
       cwd,
+      // The account kaprek picked for this turn (src/accounts/session.mjs):
+      // a full environment, or nothing — then the CLI inherits ours.
+      ...(env ? { env } : {}),
       // shell is only needed for .cmd/.bat shims (npm-style installs). A native
       // executable is spawned directly — using a shell there breaks in
       // environments where COMSPEC cannot be resolved (e.g. some MSYS shells).

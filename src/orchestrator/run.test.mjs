@@ -1178,3 +1178,23 @@ test('a hard denial answers the approval request itself — the caller is never 
   expect(settings.permissions.deny).toContain('Edit(~/.claude/**)');
   expect(settings.permissions.deny).toContain('Edit(**/.mcp.json)');
 });
+
+test('with accounts.json, a claude-code turn starts on the picked account; without it nothing changes', async () => {
+  const seen = [];
+  const harness = {
+    startTurn: async (options) => {
+      seen.push(options.env ?? null);
+      options.onEvent({ type: 'text', text: 'ok' });
+      return { sessionId: 's', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'one', harness, harnessName: 'claude-code', cwd: tmpDir });
+  expect(seen[0]).toBeNull();
+
+  fs.writeFileSync(path.join(tmpDir, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: null }] }));
+  await runTurn({ dataDir: tmpDir, text: 'two', harness, harnessName: 'claude-code', cwd: tmpDir });
+  expect(seen[1]).toMatchObject({ KAPREK_ACCOUNT: 'konto1', ANTHROPIC_CUSTOM_HEADERS: expect.stringContaining('x-kaprek-account: konto1') });
+
+  await runTurn({ dataDir: tmpDir, text: 'three', harness, harnessName: 'fake', cwd: tmpDir });
+  expect(seen[2]).toBeNull();
+});

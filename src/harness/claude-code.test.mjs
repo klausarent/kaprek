@@ -326,3 +326,30 @@ test('A15: a duplicated assistant line re-announcing an open tool_use id does no
   expect(result.timeoutClock).toBe('idle');
   expect(result.warnings.some((w) => w.includes('already-open id'))).toBe(true);
 }, 10000);
+
+test('an env option reaches the spawned CLI; without it the parent env is inherited', async () => {
+  const { startTurn } = await import('./claude-code.mjs');
+  const { EventEmitter } = await import('node:events');
+  const { PassThrough } = await import('node:stream');
+  const calls = [];
+  const spawnFn = (command, args, opts) => {
+    calls.push(opts);
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.pid = 1;
+    child.kill = () => true;
+    setImmediate(() => {
+      child.stdout.end();
+      child.stderr.end();
+      child.emit('exit', 0, null);
+      child.emit('close', 0, null);
+    });
+    return child;
+  };
+  await startTurn({ cwd: '.', prompt: 'x', spawnFn, env: { KAPREK_ACCOUNT: 'konto2' } });
+  await startTurn({ cwd: '.', prompt: 'x', spawnFn });
+  expect(calls[0].env).toEqual({ KAPREK_ACCOUNT: 'konto2' });
+  expect('env' in calls[1]).toBe(false);
+});

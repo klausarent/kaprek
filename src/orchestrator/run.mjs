@@ -26,6 +26,8 @@ import { buildCheckpoint, buildRehydrationPrompt, readCheckpoint, shouldCheckpoi
 import { buildRulesPrompt, openPolicy } from '../memory/policy.mjs';
 import { loadPolicyFailOpen } from '../policy/policy.mjs';
 import { evaluateHardDenials, hardDenialsOf, cliDenyRules } from '../policy/guards.mjs';
+import { loadAccounts } from '../accounts/config.mjs';
+import { chooseSession } from '../accounts/session.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -672,10 +674,22 @@ export async function runTurn({
   const combined = [rulesPrompt, externalPrompt, guidedPrompt, memoryPrompt, rehydration].filter((part) => part !== '').join('\n\n');
   const appendSystemPrompt = combined === '' ? undefined : combined;
 
+  // Several own Claude subscriptions (accounts.json): start this turn on the
+  // one with the most room left. Without accounts.json nothing changes.
+  let accountEnv = null;
+  if (harnessName === 'claude-code') {
+    try {
+      if (loadAccounts(dataDir).configured) accountEnv = chooseSession({ dataDir }).env;
+    } catch {
+      accountEnv = null;
+    }
+  }
+
   let turnResult;
   try {
     turnResult = await harness.startTurn({
       cwd,
+      ...(accountEnv ? { env: accountEnv } : {}),
       prompt: text,
       sessionId: priorSessionId,
       permissionMode: effectivePermissionMode,
