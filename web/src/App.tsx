@@ -27,6 +27,7 @@ import Apps from "./pages/Apps";
 import Plans from "./pages/Plans";
 import CouncilPage from "./pages/Council";
 import Setup from "./pages/Setup";
+import Quota from "./pages/Quota";
 import Memory from "./pages/Memory";
 import Home from "./pages/Home";
 import Start from "./pages/Start";
@@ -50,6 +51,7 @@ export type Route =
   | { name: "plans" }
   | { name: "council" }
   | { name: "setup" }
+  | { name: "quota" }
   | { name: "memory"; scopeId?: string }
   | { name: "home" }
   | { name: "experiments" };
@@ -96,6 +98,9 @@ export function parseRoute(hash: string): Route {
   }
   if (parts[0] === "setup") {
     return { name: "setup" };
+  }
+  if (parts[0] === "quota") {
+    return { name: "quota" };
   }
   if (parts[0] === "council") {
     return { name: "council" };
@@ -223,6 +228,10 @@ export function navigateToMemoryWithScope(scopeId: string) {
 
 export function navigateToSetup() {
   window.location.hash = "#/setup";
+}
+
+export function navigateToQuota() {
+  window.location.hash = "#/quota";
 }
 
 export function navigateToExperiments() {
@@ -448,6 +457,7 @@ export const MORE_ITEMS: { href: string; label: string; navigate: () => void }[]
       window.location.hash = "#/search";
     },
   },
+  { href: "#/quota", label: "Kontingent", navigate: navigateToQuota },
   { href: "#/setup", label: "Setup", navigate: navigateToSetup },
   { href: "#/experiments", label: "Experimente", navigate: navigateToExperiments },
   { href: "#/home", label: "Home-Assistent", navigate: navigateToHome },
@@ -498,6 +508,8 @@ export default function App() {
               <Memory initialScopeId={route.scopeId} />
             ) : route.name === "setup" ? (
               <Setup />
+            ) : route.name === "quota" ? (
+              <Quota />
             ) : route.name === "council" ? (
               <CouncilPage />
             ) : route.name === "plans" ? (

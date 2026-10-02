@@ -804,6 +804,38 @@ export function fetchUsage(): Promise<UsageEntry[]> {
   return getJson<{ usage: UsageEntry[] }>("/api/usage").then((r) => r.usage);
 }
 
+export type QuotaWindow = { name: string; usedPercent: number | null; resetsAt: string | null };
+export type QuotaProvider = {
+  id: "claude" | "codex";
+  label: string;
+  limitId: string | null;
+  source: "proxy" | "runs" | "rollouts" | "none";
+  seenAt: string | null;
+  status: string | null;
+  plan: string | null;
+  windows: QuotaWindow[];
+};
+export type ProjectUsage = {
+  project: string;
+  sessions: number;
+  requests: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  lastAt: string;
+};
+export type QuotaReport = {
+  generatedAt: string;
+  proxy: { running: boolean; port: number | null; lastRequestAt: string | null };
+  providers: QuotaProvider[];
+  projects: ProjectUsage[];
+};
+
+export function fetchQuota(): Promise<QuotaReport> {
+  return getJson<QuotaReport>("/api/quota");
+}
+
 export function fetchEngines(): Promise<Engine[]> {
   return getJson<{ engines: Engine[] }>("/api/engines").then((r) => r.engines);
 }

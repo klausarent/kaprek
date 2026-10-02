@@ -73,6 +73,7 @@ test("the primary nav is the five-entry surface; everything else sits in the rai
     "Apps",
     "Board",
     "Suche",
+    "Kontingent",
     "Setup",
     "Experimente",
     "Home-Assistent",

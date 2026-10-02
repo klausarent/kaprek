@@ -2782,3 +2782,94 @@ pre,
   color: var(--muted);
   font-size: 11px;
 }
+
+/* Kontingent (#/quota) */
+.quota-page h1 {
+  margin-bottom: 0.3rem;
+}
+
+.quota-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 16px;
+  margin: 1rem 0 1.5rem;
+}
+
+.quota-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 0.9rem 1rem;
+  min-width: 0;
+}
+
+.quota-card h2 {
+  font-size: 1rem;
+  margin: 0 0 0.6rem;
+}
+
+.quota-window {
+  margin-bottom: 0.7rem;
+}
+
+.quota-window-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: 0.9rem;
+}
+
+.quota-window-head strong {
+  font-size: 1.3rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--border);
+  overflow: hidden;
+  margin: 0.3rem 0 0.1rem;
+}
+
+.quota-bar span {
+  display: block;
+  height: 100%;
+  background: var(--muted);
+}
+
+.quota-bar-green span {
+  background: var(--success-text);
+}
+
+.quota-bar-amber span {
+  background: var(--warn);
+}
+
+.quota-bar-red span {
+  background: var(--danger-text);
+}
+
+.quota-table-wrap {
+  overflow-x: auto;
+}
+
+.quota-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85rem;
+}
+
+.quota-table th,
+.quota-table td {
+  padding: 0.35rem 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: right;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.quota-table th:first-child,
+.quota-table td:first-child {
+  text-align: left;
+}
