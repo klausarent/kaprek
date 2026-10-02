@@ -24,6 +24,7 @@ import {
   LOCK_PORT_RANGE,
 } from '../src/lib/instance-lock.mjs';
 import { runCouncilCommand, COUNCIL_USAGE } from '../src/cli/council.mjs';
+import { runProxyCommand } from '../src/cli/proxy.mjs';
 import { runDoctorCommand, DOCTOR_USAGE } from '../src/cli/doctor.mjs';
 import { readCouncil } from '../src/council/config.mjs';
 import { suggestAssignment, councilStatus } from '../src/council/roles.mjs';
@@ -56,6 +57,7 @@ const USAGE = `Usage: kaprek [options]
        kaprek doctor [--fix] [--json]
        kaprek council "<q>"
        kaprek resume [key|--all]
+       kaprek proxy [start|status] [--port N]
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -78,6 +80,11 @@ Autostart (start kaprek when you log in — off unless you ask):
   autostart install    Write one file to this machine's startup folder
   autostart uninstall  Delete exactly that file
   autostart status     Show whether it is there, and print its path
+
+Proxy (Claude Code through kaprek — off unless you point a terminal at it):
+  proxy [start]  Relay Claude Code to api.anthropic.com on 127.0.0.1:4911 and
+                 record plan windows + token usage (never tokens or bodies)
+  proxy status   Is it running, and the last windows it saw
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop + SessionStart + SessionEnd + UserPromptSubmit hooks to ~/.claude/settings.json
@@ -304,6 +311,11 @@ async function main() {
 
   if (argv[0] === 'autostart') {
     runAutostartCommand(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'proxy') {
+    process.exitCode = await runProxyCommand(argv.slice(1), { dataDir: ensureAppDir() });
     return;
   }
 
