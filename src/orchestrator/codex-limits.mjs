@@ -56,8 +56,13 @@ function toWindow(w) {
 
 // 1 MB: tool outputs make single rollout lines large, and a window that
 // only holds half of one would hide the token_count lines before it.
+//
+// Since 30.09.2026 codex logs `limit_id: "premium"` with both windows null.
+// The newest window-less event is still returned (windows: []), so the page
+// can say "codex reports no windows" instead of "no data".
 export function latestCodexLimits({ home = os.homedir(), maxFiles = 20, tailBytes = 1024 * 1024 } = {}) {
   const root = path.join(home, '.codex', 'sessions');
+  let newestEmpty = null;
   for (const file of newestRollouts(root, maxFiles)) {
     let text;
     try {
@@ -75,11 +80,17 @@ export function latestCodexLimits({ home = os.homedir(), maxFiles = 20, tailByte
         continue;
       }
       const rl = e?.payload?.rate_limits;
-      const windows = [toWindow(rl?.primary), toWindow(rl?.secondary)].filter(Boolean);
-      if (windows.length === 0) continue;
+      if (!rl || typeof rl !== 'object') continue;
       const ts = Date.parse(e.timestamp);
-      return { seenAt: Number.isFinite(ts) ? new Date(ts).toISOString() : null, plan: typeof rl.plan_type === 'string' ? rl.plan_type : null, windows };
+      const found = {
+        seenAt: Number.isFinite(ts) ? new Date(ts).toISOString() : null,
+        plan: typeof rl.plan_type === 'string' ? rl.plan_type : null,
+        limitId: typeof rl.limit_id === 'string' ? rl.limit_id : null,
+        windows: [toWindow(rl.primary), toWindow(rl.secondary)].filter(Boolean),
+      };
+      if (found.windows.length > 0) return found;
+      newestEmpty ??= found;
     }
   }
-  return null;
+  return newestEmpty;
 }

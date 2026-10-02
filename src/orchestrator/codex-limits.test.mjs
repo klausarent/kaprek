@@ -27,10 +27,18 @@ describe('latestCodexLimits', () => {
     const out = latestCodexLimits({ home });
     expect(out.seenAt).toBe('2026-10-01T08:00:00.000Z');
     expect(out.plan).toBe('plus');
+    expect(out.limitId).toBe('codex');
     expect(out.windows).toEqual([
       { name: '5h', usedPercent: 12, resetsAt: new Date(1790715474 * 1000).toISOString(), windowMinutes: 300 },
       { name: '7d', usedPercent: 40, resetsAt: new Date(1791000000 * 1000).toISOString(), windowMinutes: 10080 },
     ]);
+  });
+
+  it('says so when codex logs only window-less limits (limit_id premium since 30.09.2026)', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-premium-'));
+    const prem = { timestamp: '2026-10-02T09:00:00Z', type: 'event_msg', payload: { type: 'token_count', rate_limits: { limit_id: 'premium', primary: null, secondary: null, plan_type: null } } };
+    rollout(home, '2026/10/02/rollout-p.jsonl', [prem]);
+    expect(latestCodexLimits({ home })).toEqual({ seenAt: '2026-10-02T09:00:00.000Z', plan: null, limitId: 'premium', windows: [] });
   });
 
   it('returns null without a sessions dir', () => {
