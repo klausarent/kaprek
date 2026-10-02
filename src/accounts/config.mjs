@@ -13,6 +13,7 @@ import path from 'node:path';
 export const DEFAULT_THRESHOLDS = { fiveHour: 90, sevenDay: 95, full: 99 };
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+const ORG_RE = /^[0-9a-f][0-9a-f-]{3,35}$/;
 
 export function accountsPath(dataDir) {
   return path.join(dataDir, 'accounts.json');
@@ -37,7 +38,12 @@ export function loadAccounts(dataDir) {
     const tokenEnv = a.tokenEnv === null || a.tokenEnv === undefined ? null : a.tokenEnv;
     if (tokenEnv !== null && (typeof tokenEnv !== 'string' || !ENV_NAME_RE.test(tokenEnv))) continue;
     seen.add(a.id);
-    accounts.push({ id: a.id, label: typeof a.label === 'string' && a.label.trim() ? a.label.trim() : a.id, tokenEnv });
+    const entry = { id: a.id, label: typeof a.label === 'string' && a.label.trim() ? a.label.trim() : a.id, tokenEnv };
+    // org: the organization id (or a prefix of it) this account is. Needed for
+    // /login accounts when the data dir is shared between machines that are
+    // logged in to different accounts.
+    if (typeof a.org === 'string' && ORG_RE.test(a.org.toLowerCase())) entry.org = a.org.toLowerCase();
+    accounts.push(entry);
   }
   if (accounts.length === 0) return fallback;
   const t = raw?.thresholds ?? {};
@@ -87,4 +93,34 @@ export function resolveToken(account, { env = process.env, envFile = defaultEnvF
     }
   }
   return token ? { usable: true, token } : { usable: false, token: null };
+}
+
+/** Where Claude Code keeps .claude.json: in CLAUDE_CONFIG_DIR when set, else the home dir. */
+export function defaultClaudeJsonPath({ env = process.env, homedir = os.homedir() } = {}) {
+  const dir = typeof env.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR.trim() : '';
+  return dir ? path.join(path.resolve(dir), '.claude.json') : path.join(homedir, '.claude.json');
+}
+
+/** The organization the /login credential of this machine belongs to, or null. */
+export function loginOrgFrom(claudeJsonPath = defaultClaudeJsonPath()) {
+  try {
+    const org = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'))?.oauthAccount?.organizationUuid;
+    return typeof org === 'string' && org ? org.toLowerCase() : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Can this machine start a session on `account`? A token account needs its
+ * token; a /login account bound to an organization only counts where that
+ * organization is the one logged in.
+ */
+export function resolveCredential(account, { env = process.env, envFile = defaultEnvFile(), loginOrg = loginOrgFrom() } = {}) {
+  if (!account?.tokenEnv) {
+    if (account?.org && loginOrg && !loginOrg.startsWith(account.org)) return { usable: false, token: null, reason: 'other-login' };
+    return { usable: true, token: null, reason: null };
+  }
+  const t = resolveToken(account, { env, envFile });
+  return t.usable ? { ...t, reason: null } : { ...t, reason: 'no-token' };
 }

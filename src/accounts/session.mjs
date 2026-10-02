@@ -4,7 +4,7 @@
 // no inherited token) for the /login account. The tag lets the proxy file the
 // windows under the right account; the base URL points at the proxy only
 // when one is running and nobody set a base URL on purpose.
-import { loadAccounts, resolveToken, defaultEnvFile } from './config.mjs';
+import { loadAccounts, resolveCredential, defaultEnvFile, loginOrgFrom } from './config.mjs';
 import { pickAccount } from './pick.mjs';
 import { readQuotas, readPid, isAlive } from '../proxy/store.mjs';
 
@@ -24,13 +24,13 @@ export function sessionEnv({ base = process.env, account, token, proxyPort }) {
 }
 
 /** Load accounts, check credentials, read the windows, pick, and build the env. */
-export function chooseSession({ dataDir, env = process.env, envFile = defaultEnvFile(), now = Date.now() } = {}) {
+export function chooseSession({ dataDir, env = process.env, envFile = defaultEnvFile(), now = Date.now(), loginOrg = loginOrgFrom() } = {}) {
   const { accounts, thresholds } = loadAccounts(dataDir);
   const tokens = new Map();
   const usable = new Set();
   const unusable = [];
   for (const a of accounts) {
-    const t = resolveToken(a, { env, envFile });
+    const t = resolveCredential(a, { env, envFile, loginOrg });
     if (t.usable) {
       usable.add(a.id);
       tokens.set(a.id, t.token);

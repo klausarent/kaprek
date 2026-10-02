@@ -10,39 +10,27 @@
 // A tag that disagrees with an organization already known (CLAUDE_TOKEN_KONTO2
 // missing, so Claude Code fell back to /login) is reported as a mismatch and
 // never learned: a wrong mapping would mislabel that account for good.
-import fs from 'node:fs';
 import os from 'node:os';
-import path from 'node:path';
 import { learnOrg, readOrgMap } from './store.mjs';
-import { loadAccounts } from '../accounts/config.mjs';
+import { loadAccounts, defaultClaudeJsonPath, loginOrgFrom } from '../accounts/config.mjs';
 
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
-/** Where Claude Code keeps .claude.json: in CLAUDE_CONFIG_DIR when set, else the home dir. */
-export function defaultClaudeJsonPath({ env = process.env, homedir = os.homedir() } = {}) {
-  const dir = typeof env.CLAUDE_CONFIG_DIR === 'string' ? env.CLAUDE_CONFIG_DIR.trim() : '';
-  return dir ? path.join(path.resolve(dir), '.claude.json') : path.join(homedir, '.claude.json');
-}
-
-export function loginOrgFrom(claudeJsonPath) {
-  try {
-    const org = JSON.parse(fs.readFileSync(claudeJsonPath, 'utf8'))?.oauthAccount?.organizationUuid;
-    return typeof org === 'string' && org ? org : null;
-  } catch {
-    return null;
-  }
-}
+export { defaultClaudeJsonPath, loginOrgFrom };
 
 export function createAccountResolver({
   dataDir,
   loginOrg = loginOrgFrom(defaultClaudeJsonPath()),
-  loginAccount = loadAccounts(dataDir).accounts.find((a) => a.tokenEnv === null)?.id ?? null,
+  // The /login account of THIS machine: bound to its organization when
+  // accounts.json says so, else the first /login account.
+  loginAccount = loadAccounts(dataDir).accounts.find((a) => a.tokenEnv === null && (!a.org || (loginOrg && loginOrg.startsWith(a.org))))?.id ?? null,
   host = os.hostname(),
 } = {}) {
+  const login = loginOrg ? String(loginOrg).toLowerCase() : null;
   const known = (orgId) => {
     const map = readOrgMap(dataDir);
     if (orgId in map) return map[orgId];
-    return loginOrg && orgId === loginOrg ? loginAccount : null;
+    return login && String(orgId).toLowerCase() === login ? loginAccount : null;
   };
 
   return function resolve({ headerAccount, orgId }) {

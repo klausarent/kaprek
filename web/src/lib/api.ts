@@ -811,8 +811,8 @@ export type QuotaProvider = {
   limitId: string | null;
   /** The account from accounts.json (Claude), or null. */
   account?: string | null;
-  /** login = /login, token = setup-token found, missing = token variable empty. */
-  credential?: "login" | "token" | "missing" | null;
+  /** login = /login, token = setup-token found, missing = token variable empty, elsewhere = /login of another machine. */
+  credential?: "login" | "token" | "missing" | "elsewhere" | null;
   /** The account the next session starts on. */
   next?: boolean;
   source: "proxy" | "runs" | "rollouts" | "none";

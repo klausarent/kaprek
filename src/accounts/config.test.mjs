@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { loadAccounts, parseEnvFile, resolveToken, accountsPath } from './config.mjs';
+import { loadAccounts, parseEnvFile, resolveToken, resolveCredential, accountsPath } from './config.mjs';
 
 let dir;
 beforeEach(() => {
@@ -69,5 +69,24 @@ describe('resolveToken', () => {
 
   it('a named but missing token makes the account unusable', () => {
     expect(resolveToken({ tokenEnv: 'CLAUDE_TOKEN_KONTO3' }, { env: {}, envFile: path.join(dir, 'missing.env') })).toEqual({ usable: false, token: null });
+  });
+});
+
+describe('accounts bound to an organization', () => {
+  it('keeps an org prefix and ignores a malformed one', () => {
+    fs.writeFileSync(accountsPath(dir), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: null, org: '1fc3f5a5' }, { id: 'konto2', tokenEnv: null, org: 'not hex!' }] }));
+    expect(loadAccounts(dir).accounts).toEqual([
+      { id: 'konto1', label: 'konto1', tokenEnv: null, org: '1fc3f5a5' },
+      { id: 'konto2', label: 'konto2', tokenEnv: null },
+    ]);
+  });
+
+  it('a /login account bound to another organization is not usable on this machine', () => {
+    const opts = { env: {}, envFile: null, loginOrg: '7e8a128d-aaaa' };
+    expect(resolveCredential({ tokenEnv: null, org: '1fc3f5a5' }, opts)).toEqual({ usable: false, token: null, reason: 'other-login' });
+    expect(resolveCredential({ tokenEnv: null, org: '7e8a128d' }, opts)).toEqual({ usable: true, token: null, reason: null });
+    expect(resolveCredential({ tokenEnv: null }, opts)).toEqual({ usable: true, token: null, reason: null });
+    expect(resolveCredential({ tokenEnv: 'T' }, { ...opts, env: { T: 'x' } })).toEqual({ usable: true, token: 'x', reason: null });
+    expect(resolveCredential({ tokenEnv: 'T' }, opts)).toEqual({ usable: false, token: null, reason: 'no-token' });
   });
 });

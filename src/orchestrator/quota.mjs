@@ -7,7 +7,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { readQuota, readQuotas, readRequests, readPid, isAlive } from '../proxy/store.mjs';
-import { loadAccounts, resolveToken, defaultEnvFile } from '../accounts/config.mjs';
+import { loadAccounts, resolveCredential, defaultEnvFile, loginOrgFrom } from '../accounts/config.mjs';
 import { pickAccount } from '../accounts/pick.mjs';
 import { latestCodexLimits } from './codex-limits.mjs';
 import { latestRateLimits } from './usage.mjs';
@@ -35,16 +35,16 @@ const BASE = { id: 'claude', limitId: null, plan: null, account: null, credentia
  * but no account claims), the next pick marked. Without accounts.json: the
  * single card from before.
  */
-function claudeProviders(dataDir, { env, envFile, now }) {
+function claudeProviders(dataDir, { env, envFile, now, loginOrg }) {
   const { accounts, thresholds, configured } = loadAccounts(dataDir);
   if (!configured) return [claudeProvider(dataDir)];
   const quotas = readQuotas(dataDir);
   const usable = new Set();
   const credential = new Map();
   for (const a of accounts) {
-    const ok = resolveToken(a, { env, envFile }).usable;
-    if (ok) usable.add(a.id);
-    credential.set(a.id, !ok ? 'missing' : a.tokenEnv ? 'token' : 'login');
+    const c = resolveCredential(a, { env, envFile, loginOrg });
+    if (c.usable) usable.add(a.id);
+    credential.set(a.id, c.reason === 'other-login' ? 'elsewhere' : !c.usable ? 'missing' : a.tokenEnv ? 'token' : 'login');
   }
   const next = pickAccount({ accounts, usable, quotas, thresholds, now }).account?.id ?? null;
   const card = (id, label) => {
@@ -99,13 +99,13 @@ function projectsFrom(dataDir, sinceMs) {
   return { projects, lastRequestAt };
 }
 
-export function buildQuotaReport({ dataDir, home = os.homedir(), now = Date.now, days = 7, env = process.env, envFile = defaultEnvFile(home) } = {}) {
+export function buildQuotaReport({ dataDir, home = os.homedir(), now = Date.now, days = 7, env = process.env, envFile = defaultEnvFile(home), loginOrg = loginOrgFrom() } = {}) {
   const pid = readPid(dataDir);
   const { projects, lastRequestAt } = projectsFrom(dataDir, now() - days * 86400000);
   return {
     generatedAt: new Date(now()).toISOString(),
     proxy: { running: Boolean(pid && isAlive(pid.pid)), port: pid?.port ?? null, lastRequestAt },
-    providers: [...claudeProviders(dataDir, { env, envFile, now: now() }), codexProvider(home)],
+    providers: [...claudeProviders(dataDir, { env, envFile, now: now(), loginOrg }), codexProvider(home)],
     projects,
   };
 }

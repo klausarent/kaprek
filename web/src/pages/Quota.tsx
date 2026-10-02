@@ -38,6 +38,7 @@ function when(iso: string): string {
 
 function emptyText(p: QuotaProvider): string {
   if (p.limitId) return `Codex meldet keine Fenster mehr (limit_id ${p.limitId}).`;
+  if (p.credential === "elsewhere") return "Auf diesem Rechner nicht angemeldet (das /login eines anderen Rechners).";
   if (p.credential === "missing") return "Kein Token hinterlegt. `claude setup-token` mit diesem Konto, dann in ~/.env eintragen.";
   if (p.account) return "Noch keine Daten. Die erste Session auf diesem Konto misst es.";
   return p.id === "claude" ? "Noch keine Daten. Eine Claude-Code-Session über den Proxy starten." : "Noch keine Daten. Einmal codex benutzen.";
