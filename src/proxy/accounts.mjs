@@ -21,8 +21,9 @@ export { defaultClaudeJsonPath, loginOrgFrom };
 /** This machine's /login account: an exact org binding first, else the first unbound /login account. */
 function pickLoginAccount(accounts, loginOrg) {
   const login = loginOrg ? String(loginOrg).toLowerCase() : null;
-  const logins = accounts.filter((a) => a.tokenEnv === null);
-  return (login && logins.find((a) => a.org && login.startsWith(a.org)))?.id ?? logins.find((a) => !a.org)?.id ?? null;
+  // Any account bound to the logged-in organization (with or without a token
+  // for other machines) first, else the first unbound /login account.
+  return (login && accounts.find((a) => a.org && login.startsWith(a.org)))?.id ?? accounts.find((a) => a.tokenEnv === null && !a.org)?.id ?? null;
 }
 
 export function createAccountResolver({

@@ -61,3 +61,11 @@ describe('council fixes: resolver', () => {
     expect(r({ headerAccount: null, orgId: 'abcdef' })).toEqual({ account: 'konto3', mismatch: null });
   });
 });
+
+describe('token account bound to an organization', () => {
+  it('is this machine's /login account where its organization is logged in', () => {
+    fs.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: 'CLAUDE_TOKEN_KONTO1', org: 'abcd1234' }, { id: 'konto2', tokenEnv: 'CLAUDE_TOKEN_KONTO2', org: 'ef567890' }] }));
+    const r = createAccountResolver({ dataDir, loginOrg: 'ef567890-0000', host: 'srv' });
+    expect(r({ headerAccount: null, orgId: 'ef567890-0000' })).toEqual({ account: 'konto2', mismatch: null });
+  });
+});

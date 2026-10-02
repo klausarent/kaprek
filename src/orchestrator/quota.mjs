@@ -44,7 +44,7 @@ function claudeProviders(dataDir, { env, envFile, now, loginOrg }) {
   for (const a of accounts) {
     const c = resolveCredential(a, { env, envFile, loginOrg });
     if (c.usable) usable.add(a.id);
-    credential.set(a.id, c.reason === 'other-login' ? 'elsewhere' : !c.usable ? 'missing' : a.tokenEnv ? 'token' : 'login');
+    credential.set(a.id, c.reason === 'other-login' ? 'elsewhere' : !c.usable ? 'missing' : c.token ? 'token' : 'login');
   }
   const next = pickAccount({ accounts, usable, quotas, thresholds, now }).account?.id ?? null;
   const card = (id, label) => {

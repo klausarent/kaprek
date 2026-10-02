@@ -42,3 +42,11 @@ describe('kaprek accounts', () => {
     expect(JSON.parse(lines.join(''))).toMatchObject({ id: null, exhausted: true, retryAt: '2999-01-01T00:00:00.000Z' });
   });
 });
+
+describe('pick --json reports how this machine reaches the account', () => {
+  it('tokenEnv is null when the account is this machine\'s /login', async () => {
+    fs.writeFileSync(accountsPath(dataDir), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: 'CLAUDE_TOKEN_KONTO1', org: '1fc3f5a5' }] }));
+    await runAccountsCommand(['pick', '--json'], { dataDir, env: {}, envFile: null, log, loginOrg: '1fc3f5a5-0000' });
+    expect(JSON.parse(lines.join(''))).toMatchObject({ id: 'konto1', tokenEnv: null });
+  });
+});

@@ -109,3 +109,14 @@ describe('council fixes: config edge cases', () => {
     expect(loadAccounts(dir).accounts.map((a) => a.id)).toEqual(['konto1']);
   });
 });
+
+describe('an account with both org and token', () => {
+  const acc = { tokenEnv: 'CLAUDE_TOKEN_KONTO1', org: '1fc3f5a5' };
+  it('uses the /login where its organization is logged in, even without the token', () => {
+    expect(resolveCredential(acc, { env: {}, envFile: null, loginOrg: '1fc3f5a5-xxxx' })).toEqual({ usable: true, token: null, reason: null });
+  });
+  it('uses the token on a machine logged in to another account', () => {
+    expect(resolveCredential(acc, { env: { CLAUDE_TOKEN_KONTO1: 't1' }, envFile: null, loginOrg: '7e8a128d-xxxx' })).toEqual({ usable: true, token: 't1', reason: null });
+    expect(resolveCredential(acc, { env: {}, envFile: null, loginOrg: '7e8a128d-xxxx' })).toEqual({ usable: false, token: null, reason: 'no-token' });
+  });
+});

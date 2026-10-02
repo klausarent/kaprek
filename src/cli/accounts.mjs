@@ -35,10 +35,12 @@ export async function runAccountsCommand(args, { dataDir, env = process.env, env
   const { accounts, thresholds, configured } = loadAccounts(dataDir);
   const quotas = readQuotas(dataDir);
   const usable = new Set();
+  const viaToken = new Set();
   const missing = new Map();
   for (const a of accounts) {
     const c = resolveCredential(a, { env, envFile, loginOrg });
     if (c.usable) usable.add(a.id);
+    if (c.token) viaToken.add(a.id);
     else missing.set(a.id, c.reason === 'other-login' ? `anderer Login (Org ${a.org}…)` : `kein Token (${a.tokenEnv})`);
   }
   const pick = pickAccount({ accounts, usable, quotas, thresholds, now });
@@ -47,7 +49,8 @@ export async function runAccountsCommand(args, { dataDir, env = process.env, env
     const out = {
       id: pick.account?.id ?? null,
       label: pick.account?.label ?? null,
-      tokenEnv: pick.account?.tokenEnv ?? null,
+      // How THIS machine reaches the account: null when it is the local /login.
+      tokenEnv: pick.account && viaToken.has(pick.account.id) ? pick.account.tokenEnv : null,
       exhausted: pick.exhausted,
       overThreshold: Boolean(pick.overThreshold),
       retryAt: pick.retryAt ?? null,
@@ -63,7 +66,7 @@ export async function runAccountsCommand(args, { dataDir, env = process.env, env
   for (const a of accounts) {
     const load = accountLoad(quotas.get(a.id), now);
     const seen = quotas.get(a.id)?.seenAt;
-    const cred = missing.has(a.id) ? missing.get(a.id) : a.tokenEnv ? `Token ${a.tokenEnv}` : '/login';
+    const cred = missing.has(a.id) ? missing.get(a.id) : viaToken.has(a.id) ? `Token ${a.tokenEnv}` : '/login';
     log(`${a.id.padEnd(10)} ${a.label.padEnd(12)} 5h ${pct(load.fiveHour).padStart(5)}  7d ${pct(load.sevenDay).padStart(5)}  ${cred}${seen ? `  Stand ${seen}` : '  noch nie gemessen'}`);
   }
   if (pick.account) log(`Nächste Session: ${pick.account.id}${pick.overThreshold ? ' (über der Schwelle, aber nicht voll)' : ''}`);

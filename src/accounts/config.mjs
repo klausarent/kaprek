@@ -129,6 +129,10 @@ export function resolveCredential(account, { env = process.env, envFile = defaul
     if (account?.org && !(loginOrg && loginOrg.toLowerCase().startsWith(account.org))) return { usable: false, token: null, reason: 'other-login' };
     return { usable: true, token: null, reason: null };
   }
+  // Token account bound to an organization: on the machine logged in to that
+  // organization the /login is used (claude.ai connectors and all), the token
+  // only elsewhere.
+  if (account.org && loginOrg && loginOrg.toLowerCase().startsWith(account.org)) return { usable: true, token: null, reason: null };
   const t = resolveToken(account, { env, envFile });
   return t.usable ? { ...t, reason: null } : { ...t, reason: 'no-token' };
 }
