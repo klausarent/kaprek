@@ -67,6 +67,12 @@ describe('resolveToken', () => {
     expect(resolveToken({ tokenEnv: 'CLAUDE_TOKEN_KONTO2' }, { env: {}, envFile })).toEqual({ usable: true, token: 'from-file' });
   });
 
+  it('strips only a matching pair of quotes', () => {
+    expect(resolveToken({ tokenEnv: 'T' }, { env: { T: '"abc"' }, envFile: null }).token).toBe('abc');
+    expect(resolveToken({ tokenEnv: 'T' }, { env: { T: "'abc'" }, envFile: null }).token).toBe('abc');
+    expect(resolveToken({ tokenEnv: 'T' }, { env: { T: 'abc"' }, envFile: null }).token).toBe('abc"');
+  });
+
   it('a named but missing token makes the account unusable', () => {
     expect(resolveToken({ tokenEnv: 'CLAUDE_TOKEN_KONTO3' }, { env: {}, envFile: path.join(dir, 'missing.env') })).toEqual({ usable: false, token: null });
   });

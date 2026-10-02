@@ -32,6 +32,7 @@ function header(req, name) {
 const UPSTREAM_IDLE_MS = 6 * 60 * 1000;
 
 export function createProxyServer({ dataDir, requestUpstream = openUpstream, now = Date.now, upstreamIdleMs = UPSTREAM_IDLE_MS, resolveAccount = createAccountResolver({ dataDir }) } = {}) {
+  const warned = new Set();
   const server = http.createServer((req, res) => {
     const started = now();
     const pathOnly = (req.url ?? '/').split('?')[0];
@@ -87,6 +88,10 @@ export function createProxyServer({ dataDir, requestUpstream = openUpstream, now
         who = resolveAccount({ headerAccount: accountTag, orgId });
       } catch {
         // an unreadable org map must not break the session
+      }
+      if (who.mismatch && !warned.has(who.mismatch)) {
+        warned.add(who.mismatch);
+        console.warn(`kaprek proxy: a session started as ${who.mismatch} answered as ${who.account}; is its token missing or expired?`);
       }
       if (limits) {
         try {

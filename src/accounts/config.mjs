@@ -83,7 +83,12 @@ export function defaultEnvFile(home = os.homedir()) {
  */
 export function resolveToken(account, { env = process.env, envFile = defaultEnvFile() } = {}) {
   if (!account?.tokenEnv) return { usable: true, token: null };
-  const clean = (v) => (typeof v === 'string' ? v.replace(/[\r\n]/g, '').trim().replace(/^["']|["']$/g, '') : '');
+  const clean = (v) => {
+    if (typeof v !== 'string') return '';
+    const s = v.replace(/[\r\n]/g, '').trim();
+    // Only a matching pair of quotes is quoting; a lone one belongs to the value.
+    return s.length >= 2 && /^(["']).*\1$/.test(s) ? s.slice(1, -1) : s;
+  };
   let token = clean(env[account.tokenEnv]);
   if (!token && envFile) {
     try {
