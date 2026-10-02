@@ -25,6 +25,8 @@ import {
 } from '../src/lib/instance-lock.mjs';
 import { runCouncilCommand, COUNCIL_USAGE } from '../src/cli/council.mjs';
 import { runProxyCommand } from '../src/cli/proxy.mjs';
+import { runAccountsCommand } from '../src/cli/accounts.mjs';
+import { launchClaude } from '../src/harness/launch-claude.mjs';
 import { runDoctorCommand, DOCTOR_USAGE } from '../src/cli/doctor.mjs';
 import { readCouncil } from '../src/council/config.mjs';
 import { suggestAssignment, councilStatus } from '../src/council/roles.mjs';
@@ -58,6 +60,8 @@ const USAGE = `Usage: kaprek [options]
        kaprek council "<q>"
        kaprek resume [key|--all]
        kaprek proxy [start|status] [--port N]
+       kaprek accounts [pick [--json]]
+       kaprek claude [claude args…]
 
 Options:
   --port <n>    Port to listen on (default: 4900; if taken, tries up to 10 higher)
@@ -87,6 +91,11 @@ Proxy (Claude Code through kaprek — off unless you point a terminal at it):
   proxy status   Is it running, and the last windows it saw
   proxy autostart <install|uninstall|status>
                  Start the proxy at login (its own startup file, kaprek-proxy)
+
+Accounts (several own Claude subscriptions, see <dataDir>/accounts.json):
+  accounts       Every account, its 5h/7d windows, and the next pick
+  accounts pick  The account the next session would start on (--json for scripts)
+  claude [args]  Start Claude Code on the account with the most room left
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop + SessionStart + SessionEnd + UserPromptSubmit hooks to ~/.claude/settings.json
@@ -313,6 +322,16 @@ async function main() {
 
   if (argv[0] === 'autostart') {
     runAutostartCommand(argv.slice(1));
+    return;
+  }
+
+  if (argv[0] === 'accounts') {
+    process.exitCode = await runAccountsCommand(argv.slice(1), { dataDir: ensureAppDir() });
+    return;
+  }
+
+  if (argv[0] === 'claude') {
+    process.exitCode = await launchClaude(argv.slice(1), { dataDir: ensureAppDir() });
     return;
   }
 
