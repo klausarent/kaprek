@@ -50,3 +50,11 @@ describe('pick --json reports how this machine reaches the account', () => {
     expect(JSON.parse(lines.join(''))).toMatchObject({ id: 'konto1', tokenEnv: null });
   });
 });
+
+it('lists the local /login of an org-bound token account as /login, not as a missing token', async () => {
+  fs.writeFileSync(accountsPath(dataDir), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: 'CLAUDE_TOKEN_KONTO1', org: '1fc3f5a5' }, { id: 'konto2', tokenEnv: 'CLAUDE_TOKEN_KONTO2', org: '7e8a128d' }] }));
+  await runAccountsCommand([], { dataDir, env: {}, envFile: null, log, loginOrg: '1fc3f5a5-0000' });
+  const text = lines.join('\n');
+  expect(text).toMatch(/konto1.*\/login/);
+  expect(text).toMatch(/konto2.*kein Token \(CLAUDE_TOKEN_KONTO2\)/);
+});

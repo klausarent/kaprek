@@ -39,8 +39,8 @@ export async function runAccountsCommand(args, { dataDir, env = process.env, env
   const missing = new Map();
   for (const a of accounts) {
     const c = resolveCredential(a, { env, envFile, loginOrg });
-    if (c.usable) usable.add(a.id);
     if (c.token) viaToken.add(a.id);
+    if (c.usable) usable.add(a.id);
     else missing.set(a.id, c.reason === 'other-login' ? `anderer Login (Org ${a.org}…)` : `kein Token (${a.tokenEnv})`);
   }
   const pick = pickAccount({ accounts, usable, quotas, thresholds, now });
