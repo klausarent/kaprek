@@ -35,12 +35,21 @@ function desktopExec(parts) {
   return parts.map((part) => `"${String(part).replace(/(["\\`$])/g, '\\$1').replace(/%/g, '%%')}"`).join(' ');
 }
 
-/** What the entry is called on each platform, so status/uninstall can find it. */
-const ENTRY_NAME = {
-  win32: 'kaprek.cmd',
-  darwin: 'com.kaprek.server.plist',
-  linux: 'kaprek.desktop',
-};
+/**
+ * What the entry is called on each platform, so status/uninstall can find
+ * it. `entry` names a second entry beside kaprek's own (`kaprek-proxy`);
+ * the default keeps the names every existing install already has.
+ */
+function launchdLabel(entry) {
+  return entry === 'kaprek' ? 'com.kaprek.server' : `com.kaprek.${entry}`;
+}
+
+function entryFile(platform, entry) {
+  if (platform === 'win32') return `${entry}.cmd`;
+  if (platform === 'darwin') return `${launchdLabel(entry)}.plist`;
+  if (platform === 'linux') return `${entry}.desktop`;
+  return null;
+}
 
 /** Where an autostart entry belongs on this platform, or null when kaprek does not know. */
 export function autostartDir(platform = process.platform, home = os.homedir(), env = process.env) {
@@ -53,9 +62,9 @@ export function autostartDir(platform = process.platform, home = os.homedir(), e
   return null;
 }
 
-export function autostartPath(platform = process.platform, home = os.homedir(), env = process.env) {
+export function autostartPath(platform = process.platform, home = os.homedir(), env = process.env, entry = 'kaprek') {
   const dir = autostartDir(platform, home, env);
-  return dir ? path.join(dir, ENTRY_NAME[platform]) : null;
+  return dir ? path.join(dir, entryFile(platform, entry)) : null;
 }
 
 /**
@@ -69,8 +78,10 @@ export function autostartPath(platform = process.platform, home = os.homedir(), 
  *   CLI, or just `kaprek` for a global install)
  * @param {string[]} [options.args]
  */
-export function autostartFile({ platform = process.platform, command, args = [] }) {
-  const argv = ['--no-open', ...args];
+export function autostartFile({ platform = process.platform, command, args = [], entry = 'kaprek', noOpen = true }) {
+  // A subcommand such as `proxy` has to come first, so the proxy entry
+  // passes noOpen: false — it opens no browser anyway.
+  const argv = noOpen ? ['--no-open', ...args] : [...args];
   if (platform === 'win32') {
     // start "" /min so the console window does not sit in the way; the empty
     // title argument is start's own quirk and not optional.
@@ -87,7 +98,7 @@ export function autostartFile({ platform = process.platform, command, args = [] 
       '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
       '<plist version="1.0">',
       '<dict>',
-      '  <key>Label</key><string>com.kaprek.server</string>',
+      `  <key>Label</key><string>${launchdLabel(entry)}</string>`,
       '  <key>ProgramArguments</key>',
       '  <array>',
       programArgs,
@@ -99,7 +110,7 @@ export function autostartFile({ platform = process.platform, command, args = [] 
       '',
     ].join('\n');
   }
-  return ['[Desktop Entry]', 'Type=Application', 'Name=kaprek', `Exec=${desktopExec([command, ...argv])}`, 'X-GNOME-Autostart-enabled=true', `Comment=${OWNERSHIP_MARKER}`, ''].join('\n');
+  return ['[Desktop Entry]', 'Type=Application', `Name=${entry}`, `Exec=${desktopExec([command, ...argv])}`, 'X-GNOME-Autostart-enabled=true', `Comment=${OWNERSHIP_MARKER}`, ''].join('\n');
 }
 
 /** How this machine would launch kaprek, given how it is installed right now. */
@@ -112,18 +123,18 @@ export function launchCommand({ platform = process.platform, execPath = process.
   return { command: execPath, args: [scriptPath] };
 }
 
-export function install({ platform = process.platform, home = os.homedir(), env = process.env, scriptPath, extraArgs = [] } = {}) {
-  const target = autostartPath(platform, home, env);
+export function install({ platform = process.platform, home = os.homedir(), env = process.env, scriptPath, extraArgs = [], entry = 'kaprek', noOpen = true } = {}) {
+  const target = autostartPath(platform, home, env, entry);
   if (!target) throw new Error(`kaprek does not know where autostart entries live on ${platform}`);
   const { command, args } = launchCommand({ platform, scriptPath });
   fs.mkdirSync(path.dirname(target), { recursive: true });
-  fs.writeFileSync(target, autostartFile({ platform, command, args: [...args, ...extraArgs] }), 'utf8');
+  fs.writeFileSync(target, autostartFile({ platform, command, args: [...args, ...extraArgs], entry, noOpen }), 'utf8');
   if (platform !== 'win32') fs.chmodSync(target, 0o755);
   return { path: target };
 }
 
-export function uninstall({ platform = process.platform, home = os.homedir(), env = process.env } = {}) {
-  const target = autostartPath(platform, home, env);
+export function uninstall({ platform = process.platform, home = os.homedir(), env = process.env, entry = 'kaprek' } = {}) {
+  const target = autostartPath(platform, home, env, entry);
   if (!target || !fs.existsSync(target)) return { removed: false, path: target };
   // Only kaprek's own file. Something else at that path belongs to somebody
   // else, and deleting it because it shares a name is not an uninstall.
@@ -141,8 +152,8 @@ export function uninstall({ platform = process.platform, home = os.homedir(), en
   return { removed: true, path: target };
 }
 
-export function status({ platform = process.platform, home = os.homedir(), env = process.env } = {}) {
-  const target = autostartPath(platform, home, env);
+export function status({ platform = process.platform, home = os.homedir(), env = process.env, entry = 'kaprek' } = {}) {
+  const target = autostartPath(platform, home, env, entry);
   return {
     supported: target !== null,
     installed: target !== null && fs.existsSync(target),

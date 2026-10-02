@@ -647,6 +647,43 @@ Claude Code writes scratchpad work products (scripts, data files, images) under 
 
 kaprek sweeps every session's scratchpad into `<dataDir>/artifacts/<projectSlug>/<sessionId>/` in two ways: automatically (best-effort, small byte budget) when the Stop hook fires for that session, and fully (no budget beyond the caps below) whenever the search index is rebuilt (`POST /api/search/reindex`, including the button in `#/search`). A per-session `manifest.json` makes repeat sweeps idempotent — unchanged files are neither re-hashed nor re-copied. Two caps bound disk usage: a single file over 25 MB is skipped (recorded in the manifest as `too-large`), and once a session's preserved total crosses 100 MB (20 MB for the hook's own smaller sweep) further files are skipped as `session-budget`. A session's preserved artifacts, if any, show up under an "Artifacts" section on its thread view.
 
+## Plan windows and usage (`kaprek proxy`, `#/quota`)
+
+The **Kontingent** page (`#/quota`) shows where each subscription stands: the
+5-hour and 7-day window per provider, when each resets, and the tokens each
+project used in the last 7 days.
+
+Claude's numbers come from `kaprek proxy`, a pass-through you opt into:
+
+```
+kaprek proxy                                   # 127.0.0.1:4911, until Ctrl+C
+set ANTHROPIC_BASE_URL=http://127.0.0.1:4911   # in the terminal you start claude from
+```
+
+Only `ANTHROPIC_BASE_URL` is set, so your saved claude.ai login stays the
+credential and your plan's limits apply unchanged (Anthropic's gateway docs,
+"Subscriptions and gateways"). The proxy forwards every header and body as it
+is, streams responses unbuffered, and writes one line per request to
+`<dataDir>/proxy/<hostname>/requests.jsonl` plus the latest windows to
+`quota.json` beside it. One folder per machine, because the data dir is often
+synced. What it never does: pool accounts, switch between them, route Claude
+Code to other models, or store a token or a prompt.
+
+- `kaprek proxy status` — running or not, and the last windows.
+- `kaprek proxy autostart install` — start it at login (`kaprek-proxy.cmd` in
+  the startup folder, beside kaprek's own entry). Only then is it safe to set
+  `ANTHROPIC_BASE_URL` globally (for example in `~/.claude/settings.json`
+  under `env`): with the variable set and the proxy down, Claude Code cannot
+  reach Anthropic.
+- **Undo:** remove `ANTHROPIC_BASE_URL`; `kaprek proxy autostart uninstall`.
+
+Without the proxy, the Claude card falls back to the last `rate_limit_event`
+a kaprek turn logged. Codex' card reads codex' own rollout files
+(`~/.codex/sessions`); since 30 Sep 2026 codex logs `limit_id: "premium"`
+without windows, and the card says so instead of showing nothing. Claude
+Code's fast-mode check and WebFetch domain check still go to
+`api.anthropic.com` directly, by Anthropic's design.
+
 ## Starting and stopping
 
 kaprek starts itself: once its SessionStart hook is installed (see [Claude Code hook](#claude-code-hook-optional)), opening your first Claude Code session of the day brings it up in the background, with no browser tab and no command to remember (`KAPREK_NO_AUTOSTART=1` turns this off). Running `kaprek` yourself afterwards opens the browser on the instance that is already up instead of erroring. `kaprek stop` ends it.
@@ -768,6 +805,12 @@ npm registry which version is newest — an update command that cannot do that
 would be a button that does nothing. It runs only when asked, prints what it
 is about to do first, and the same guard test pins it to
 `registry.npmjs.org` and nothing else. There is no check on start.
+
+**The second one, also opt-in: `kaprek proxy`.** When you start it and point
+Claude Code at it, it relays those requests to `api.anthropic.com` — the host
+Claude Code would have called anyway — and nowhere else; the guard test pins
+`src/proxy/upstream.mjs` to that host. It keeps the plan-window headers and the
+token counts, never your login or a message body. Not started, it does nothing.
 
 **Goes to Anthropic.** Everything an agent actually processes. kaprek starts your local `claude` CLI as a subprocess, and that CLI talks to Anthropic under your account and your agreement with them — kaprek neither adds to nor removes from what the CLI sends. That includes:
 

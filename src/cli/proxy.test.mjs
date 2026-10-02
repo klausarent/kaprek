@@ -13,6 +13,13 @@ describe('kaprek proxy cli', () => {
     expect(parseProxyArgs(['--port', 'abc'], {}).sub).toBe('help');
   });
 
+  it('knows the autostart subcommand and rejects unknown actions', () => {
+    expect(parseProxyArgs(['autostart', 'install'], {})).toEqual({ sub: 'autostart', action: 'install', port: 4911 });
+    expect(parseProxyArgs(['autostart', 'status'], {}).action).toBe('status');
+    expect(parseProxyArgs(['autostart', 'nuke'], {}).sub).toBe('help');
+    expect(parseProxyArgs(['autostart'], {}).sub).toBe('help');
+  });
+
   it('reports a stale pid file as not running', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-'));
     expect(proxyStatus(dir)).toMatchObject({ running: false, pid: null });

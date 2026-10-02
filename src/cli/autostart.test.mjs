@@ -118,3 +118,24 @@ describe('what Codex found', () => {
     expect(uninstall({ platform: 'linux', home, env: {} }).removed).toBe(true);
   });
 });
+
+describe('a second, named entry (kaprek proxy)', () => {
+  test('lives next to kaprek.cmd under its own name and leaves kaprek.cmd alone', () => {
+    install({ platform: 'win32', home, env: env(), scriptPath: 'x' });
+    const proxy = install({ platform: 'win32', home, env: env(), scriptPath: 'x', extraArgs: ['proxy'], entry: 'kaprek-proxy', noOpen: false });
+    expect(path.basename(proxy.path)).toBe('kaprek-proxy.cmd');
+    const text = fs.readFileSync(proxy.path, 'utf8');
+    // The subcommand must come first, or the CLI never sees `proxy`.
+    expect(text).toContain('start "" /min "kaprek" "proxy"');
+    expect(text).not.toContain('--no-open');
+    expect(status({ platform: 'win32', home, env: env(), entry: 'kaprek-proxy' }).installed).toBe(true);
+    expect(uninstall({ platform: 'win32', home, env: env(), entry: 'kaprek-proxy' }).removed).toBe(true);
+    expect(status({ platform: 'win32', home, env: env() }).installed).toBe(true);
+  });
+
+  test('gets its own launchd label on macOS', () => {
+    const proxy = install({ platform: 'darwin', home, env: {}, scriptPath: '/x/cli.mjs', extraArgs: ['proxy'], entry: 'kaprek-proxy', noOpen: false });
+    expect(path.basename(proxy.path)).toBe('com.kaprek.kaprek-proxy.plist');
+    expect(fs.readFileSync(proxy.path, 'utf8')).toContain('<string>com.kaprek.kaprek-proxy</string>');
+  });
+});

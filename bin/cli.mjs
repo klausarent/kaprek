@@ -85,6 +85,8 @@ Proxy (Claude Code through kaprek — off unless you point a terminal at it):
   proxy [start]  Relay Claude Code to api.anthropic.com on 127.0.0.1:4911 and
                  record plan windows + token usage (never tokens or bodies)
   proxy status   Is it running, and the last windows it saw
+  proxy autostart <install|uninstall|status>
+                 Start the proxy at login (its own startup file, kaprek-proxy)
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):
   hooks install    Add the kaprek Stop + SessionStart + SessionEnd + UserPromptSubmit hooks to ~/.claude/settings.json
