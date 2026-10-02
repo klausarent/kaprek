@@ -211,3 +211,15 @@ describe('proxy server', () => {
     expect(readRequests(dataDir)).toEqual([]);
   });
 });
+
+describe('council fixes: auth errors', () => {
+  it('a 401 for a tagged account is filed as auth error for that account', async () => {
+    await start((req, res) => {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired"}}');
+    });
+    const r = await call('/v1/messages', { headers: { 'x-kaprek-account': 'konto2' } });
+    expect(r.status).toBe(401);
+    expect(readQuotas(dataDir).get('konto2')).toMatchObject({ authError: true });
+  });
+});

@@ -58,3 +58,20 @@ describe('chooseSession', () => {
     expect(s.pick).toMatchObject({ exhausted: true, retryAt: '2026-10-02T13:00:00.000Z' });
   });
 });
+
+describe('council fixes: foreign credentials', () => {
+  it('drops API keys and the other accounts token variables from the child env', () => {
+    const env = sessionEnv({
+      base: { ANTHROPIC_API_KEY: 'k', ANTHROPIC_AUTH_TOKEN: 'a', CLAUDE_TOKEN_KONTO3: 'other', PATH: 'p' },
+      account: { id: 'konto2' },
+      token: 'tok',
+      proxyPort: null,
+      strip: ['CLAUDE_TOKEN_KONTO2', 'CLAUDE_TOKEN_KONTO3'],
+    });
+    expect(env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(env.CLAUDE_TOKEN_KONTO3).toBeUndefined();
+    expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok');
+    expect(env.PATH).toBe('p');
+  });
+});

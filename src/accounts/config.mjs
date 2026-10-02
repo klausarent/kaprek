@@ -14,6 +14,8 @@ export const DEFAULT_THRESHOLDS = { fiveHour: 90, sevenDay: 95, full: 99 };
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 const ORG_RE = /^[0-9a-f][0-9a-f-]{3,35}$/;
+// Windows device names: quota/<id>.json must be a creatable file.
+const RESERVED_RE = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/;
 
 export function accountsPath(dataDir) {
   return path.join(dataDir, 'accounts.json');
@@ -34,7 +36,7 @@ export function loadAccounts(dataDir) {
   const seen = new Set();
   const accounts = [];
   for (const a of Array.isArray(raw?.accounts) ? raw.accounts : []) {
-    if (!a || typeof a.id !== 'string' || !ID_RE.test(a.id) || seen.has(a.id)) continue;
+    if (!a || typeof a.id !== 'string' || !ID_RE.test(a.id) || RESERVED_RE.test(a.id) || seen.has(a.id)) continue;
     const tokenEnv = a.tokenEnv === null || a.tokenEnv === undefined ? null : a.tokenEnv;
     if (tokenEnv !== null && (typeof tokenEnv !== 'string' || !ENV_NAME_RE.test(tokenEnv))) continue;
     seen.add(a.id);
@@ -123,7 +125,8 @@ export function loginOrgFrom(claudeJsonPath = defaultClaudeJsonPath()) {
  */
 export function resolveCredential(account, { env = process.env, envFile = defaultEnvFile(), loginOrg = loginOrgFrom() } = {}) {
   if (!account?.tokenEnv) {
-    if (account?.org && loginOrg && !loginOrg.startsWith(account.org)) return { usable: false, token: null, reason: 'other-login' };
+    // Fail closed: an org-bound account is only usable where that org is known to be logged in.
+    if (account?.org && !(loginOrg && loginOrg.toLowerCase().startsWith(account.org))) return { usable: false, token: null, reason: 'other-login' };
     return { usable: true, token: null, reason: null };
   }
   const t = resolveToken(account, { env, envFile });

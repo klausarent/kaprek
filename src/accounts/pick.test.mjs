@@ -88,3 +88,14 @@ describe('pickAccount', () => {
     expect(pickAccount({ accounts: A, usable: new Set(), quotas: new Map(), thresholds: T, now: NOW })).toMatchObject({ account: null, exhausted: false, reason: 'no-credential' });
   });
 });
+
+describe('council fixes', () => {
+  it('an account whose last answer was an auth error is skipped until it answers again', () => {
+    const quotas = new Map([
+      ['konto1', snap('2026-10-02T11:00:00Z', 50, 50)],
+      ['konto2', { seenAt: '2026-10-02T11:30:00Z', authError: true, windows: {} }],
+    ]);
+    const r = pickAccount({ accounts: A.slice(0, 2), usable: all, quotas, thresholds: T, now: NOW });
+    expect(r.account.id).toBe('konto1');
+  });
+});

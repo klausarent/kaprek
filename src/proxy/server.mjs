@@ -93,7 +93,15 @@ export function createProxyServer({ dataDir, requestUpstream = openUpstream, now
         warned.add(who.mismatch);
         console.warn(`kaprek proxy: a session started as ${who.mismatch} answered as ${who.account}; is its token missing or expired?`);
       }
-      if (limits) {
+      if (upRes.statusCode === 401 && accountTag) {
+        // Expired or revoked setup-token: take the account out of the pick
+        // until a request on it succeeds again (that overwrites this).
+        try {
+          writeQuota(dataDir, { seenAt: new Date(now()).toISOString(), status: 'auth-error', authError: true, windows: {} }, undefined, accountTag);
+        } catch {
+          // same as below
+        }
+      } else if (limits) {
         try {
           writeQuota(dataDir, { seenAt: new Date(now()).toISOString(), ...limits }, undefined, who.account);
         } catch {

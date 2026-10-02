@@ -48,3 +48,16 @@ describe('loginOrgFrom', () => {
     expect(loginOrgFrom(path.join(dataDir, 'nope.json'))).toBeNull();
   });
 });
+
+describe('council fixes: resolver', () => {
+  it('an exact org match beats an unbound /login account listed first', () => {
+    fs.writeFileSync(path.join(dataDir, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: null }, { id: 'konto2', tokenEnv: null, org: 'abcd1234' }] }));
+    const r = createAccountResolver({ dataDir, loginOrg: 'abcd1234-0000', host: 'laptop' });
+    expect(r({ headerAccount: null, orgId: 'ABCD1234-0000' })).toEqual({ account: 'konto2', mismatch: null });
+  });
+  it('learns organizations in lower case', () => {
+    const r = createAccountResolver({ dataDir, loginOrg: null, loginAccount: null, host: 'laptop' });
+    r({ headerAccount: 'konto3', orgId: 'ABCDEF' });
+    expect(r({ headerAccount: null, orgId: 'abcdef' })).toEqual({ account: 'konto3', mismatch: null });
+  });
+});

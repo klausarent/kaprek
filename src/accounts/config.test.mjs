@@ -96,3 +96,16 @@ describe('accounts bound to an organization', () => {
     expect(resolveCredential({ tokenEnv: 'T' }, opts)).toEqual({ usable: false, token: null, reason: 'no-token' });
   });
 });
+
+describe('council fixes: config edge cases', () => {
+  it('an org-bound /login account is not usable when the login org cannot be read', () => {
+    expect(resolveCredential({ tokenEnv: null, org: '1fc3f5a5' }, { env: {}, envFile: null, loginOrg: null })).toEqual({ usable: false, token: null, reason: 'other-login' });
+  });
+  it('strips a UTF-8 BOM from .env', () => {
+    expect(parseEnvFile('﻿CLAUDE_TOKEN_KONTO2=abc\n')).toEqual({ CLAUDE_TOKEN_KONTO2: 'abc' });
+  });
+  it('rejects Windows device names as account ids', () => {
+    fs.writeFileSync(accountsPath(dir), JSON.stringify({ accounts: [{ id: 'con', tokenEnv: null }, { id: 'nul' }, { id: 'com1' }, { id: 'konto1' }] }));
+    expect(loadAccounts(dir).accounts.map((a) => a.id)).toEqual(['konto1']);
+  });
+});

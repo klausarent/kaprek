@@ -10,8 +10,12 @@ import { readQuotas, readPid, isAlive } from '../proxy/store.mjs';
 
 const TAG = 'x-kaprek-account';
 
-export function sessionEnv({ base = process.env, account, token, proxyPort }) {
+export function sessionEnv({ base = process.env, account, token, proxyPort, strip = [] }) {
   const env = { ...base };
+  // An API key or bearer token outranks every subscription credential in
+  // Claude Code, and the other accounts' tokens have no business in this
+  // session: none of them reach the child.
+  for (const name of ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', ...strip]) delete env[name];
   if (token) env.CLAUDE_CODE_OAUTH_TOKEN = token;
   else delete env.CLAUDE_CODE_OAUTH_TOKEN;
   const others = String(env.ANTHROPIC_CUSTOM_HEADERS ?? '')
@@ -39,6 +43,7 @@ export function chooseSession({ dataDir, env = process.env, envFile = defaultEnv
   const pick = pickAccount({ accounts, usable, quotas: readQuotas(dataDir), thresholds, now });
   const pid = readPid(dataDir);
   const proxyPort = pid && isAlive(pid.pid) ? pid.port : null;
-  const sessionEnvironment = pick.account ? sessionEnv({ base: env, account: pick.account, token: tokens.get(pick.account.id), proxyPort }) : null;
+  const strip = accounts.map((a) => a.tokenEnv).filter(Boolean);
+  const sessionEnvironment = pick.account ? sessionEnv({ base: env, account: pick.account, token: tokens.get(pick.account.id), proxyPort, strip }) : null;
   return { pick, env: sessionEnvironment, unusable, proxyPort };
 }

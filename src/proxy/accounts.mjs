@@ -18,12 +18,19 @@ const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 
 export { defaultClaudeJsonPath, loginOrgFrom };
 
+/** This machine's /login account: an exact org binding first, else the first unbound /login account. */
+function pickLoginAccount(accounts, loginOrg) {
+  const login = loginOrg ? String(loginOrg).toLowerCase() : null;
+  const logins = accounts.filter((a) => a.tokenEnv === null);
+  return (login && logins.find((a) => a.org && login.startsWith(a.org)))?.id ?? logins.find((a) => !a.org)?.id ?? null;
+}
+
 export function createAccountResolver({
   dataDir,
   loginOrg = loginOrgFrom(defaultClaudeJsonPath()),
   // The /login account of THIS machine: bound to its organization when
   // accounts.json says so, else the first /login account.
-  loginAccount = loadAccounts(dataDir).accounts.find((a) => a.tokenEnv === null && (!a.org || (loginOrg && loginOrg.startsWith(a.org))))?.id ?? null,
+  loginAccount = pickLoginAccount(loadAccounts(dataDir).accounts, loginOrg),
   host = os.hostname(),
 } = {}) {
   const login = loginOrg ? String(loginOrg).toLowerCase() : null;
@@ -33,8 +40,9 @@ export function createAccountResolver({
     return login && String(orgId).toLowerCase() === login ? loginAccount : null;
   };
 
-  return function resolve({ headerAccount, orgId }) {
+  return function resolve({ headerAccount, orgId: rawOrg }) {
     const tag = typeof headerAccount === 'string' && ID_RE.test(headerAccount) ? headerAccount : null;
+    const orgId = rawOrg ? String(rawOrg).toLowerCase() : null;
     if (!orgId) return { account: tag ?? 'unbekannt', mismatch: null };
     const mapped = known(orgId);
     if (tag) {

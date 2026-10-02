@@ -52,7 +52,8 @@ export function pickAccount({ accounts, usable, quotas, thresholds, now = Date.n
         load,
         score: Math.max(f, s),
         seenAt: Number.isFinite(seen) ? seen : -Infinity,
-        usable: usable.has(account.id),
+        // Last answer was an auth error (expired or revoked setup-token): out until it answers again.
+        usable: usable.has(account.id) && !snap?.authError,
         eligible: f < thresholds.fiveHour && s < thresholds.sevenDay,
         full: f >= thresholds.full || s >= thresholds.full,
         fullUntil: Math.max(f >= thresholds.full ? resetOf(snap, 'fiveHour') : -Infinity, s >= thresholds.full ? resetOf(snap, 'sevenDay') : -Infinity),
