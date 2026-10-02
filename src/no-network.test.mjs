@@ -121,6 +121,12 @@ const ALLOWED_LOOPBACK_CONNECT_FILES = [path.join(ROOT, 'src', 'lib', 'instance-
 // an intention.
 const ALLOWED_REGISTRY_FILE = path.join(ROOT, 'src', 'cli', 'update.mjs');
 
+// The proxy's single outbound file (`kaprek proxy`, off unless started). It
+// relays Claude Code to the host Claude Code would have called anyway,
+// api.anthropic.com, and nowhere else — pinned by the test below so the
+// exemption cannot widen into "the proxy can forward anywhere".
+const ALLOWED_PROXY_UPSTREAM_FILE = path.join(ROOT, 'src', 'proxy', 'upstream.mjs');
+
 /** Recursively collects all .mjs file paths under `dir`. */
 function collectMjsFiles(dir) {
   const files = [];
@@ -157,6 +163,8 @@ test('static guard: no network-client or subprocess APIs outside test files (exc
       // The update command's registry call. Confined by the test below to
       // registry.npmjs.org and nothing else.
       if (file === ALLOWED_REGISTRY_FILE && NETWORK_PATTERNS.includes(pattern)) continue;
+      // The proxy's upstream: https.request to api.anthropic.com only.
+      if (file === ALLOWED_PROXY_UPSTREAM_FILE && String(pattern) === String(/\bhttps\.request\(/)) continue;
       if (pattern.test(content)) {
         violations.push(`${path.relative(ROOT, file)}: matches ${pattern}`);
       }
@@ -202,6 +210,15 @@ test('the update command talks to the npm registry and to nothing else', () => {
   // stays exactly one address.
   const urls = [...content.matchAll(/https?:\/\/[^'"`\s)]+/g)].map((match) => match[0]);
   expect(urls).toEqual(['https://registry.npmjs.org/kaprek/latest']);
+});
+
+test('the proxy upstream is pinned to api.anthropic.com', () => {
+  const src = fs.readFileSync(ALLOWED_PROXY_UPSTREAM_FILE, 'utf8');
+  expect(src).toMatch(/export const UPSTREAM_HOST = 'api\.anthropic\.com';/);
+  expect(src).toMatch(/https\.request\(\{ host: UPSTREAM_HOST, port: 443,/);
+  expect(src).not.toMatch(/process\.env|\bfetch\(|http\.request\(/);
+  const hosts = [...src.matchAll(/'([a-z0-9-]+(?:\.[a-z0-9-]+)+)'/g)].map((m) => m[1]);
+  expect([...new Set(hosts)]).toEqual(['api.anthropic.com']);
 });
 
 test('the instance lock only ever talks to 127.0.0.1', () => {
