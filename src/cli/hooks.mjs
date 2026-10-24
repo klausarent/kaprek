@@ -18,8 +18,11 @@ import { fileURLToPath } from 'node:url';
 import { loadPolicy } from '../policy/policy.mjs';
 import { getAppDir, getPackageName } from '../lib/appdir.mjs';
 import { claudeConfigDir } from '../lib/claude-home.mjs';
+import { installKind as detectInstallKind } from './update.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** The directory holding this copy's package.json — what installKind() reads. */
+export const PACKAGE_ROOT = path.resolve(__dirname, '..', '..');
 export const HOOK_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-stop.mjs');
 export const SESSION_START_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-session-start.mjs');
 export const SESSION_END_SCRIPT_PATH = path.resolve(__dirname, '..', 'policy', 'hook-session-end.mjs');
@@ -148,6 +151,11 @@ function upsertEntry(settings, event, command, packageName) {
  * updated in place rather than adding a duplicate; an install from before
  * SessionStart, SessionEnd or UserPromptSubmit existed gains that entry and
  * keeps the others.
+ *
+ * The result also names how this copy got onto the machine (`installKind`,
+ * see src/cli/update.mjs). Writing is the same for every kind; the caller
+ * decides whether to warn — an npx copy lives in a cache npm may clear,
+ * taking the recorded hook paths with it.
  */
 export function install({
   settingsPath = defaultSettingsPath(),
@@ -156,6 +164,8 @@ export function install({
   sessionEndScriptPath = SESSION_END_SCRIPT_PATH,
   userPromptScriptPath = USER_PROMPT_SCRIPT_PATH,
   packageName = getPackageName(),
+  packageRoot = PACKAGE_ROOT,
+  installKind = detectInstallKind(packageRoot),
 } = {}) {
   const settings = readSettings(settingsPath);
   const backupPath = backupSettings(settingsPath);
@@ -175,7 +185,7 @@ export function install({
     .map(([event]) => event);
 
   writeSettings(settingsPath, settings);
-  return { installed: true, alreadyInstalled, added, settingsPath, backupPath, hookScriptPath, sessionStartScriptPath, sessionEndScriptPath, userPromptScriptPath, events: Object.keys(HOOK_EVENTS) };
+  return { installed: true, alreadyInstalled, added, settingsPath, backupPath, hookScriptPath, sessionStartScriptPath, sessionEndScriptPath, userPromptScriptPath, events: Object.keys(HOOK_EVENTS), installKind };
 }
 
 /**

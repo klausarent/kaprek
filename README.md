@@ -745,7 +745,7 @@ kaprek can install a Claude Code **Stop** hook that gently enforces the policy e
 
 Important: a Stop hook fires *after* the turn already ended — after any tool call in it, including a `git commit`, already ran. It cannot prevent a commit or require a task link "before" one happens; it can only look back at the transcript once the turn is over and react (log, warn, or refuse to end that particular Stop event) to what already occurred. Think of it as a nag, not a gate.
 
-- `kaprek hooks install` adds four entries to `~/.claude/settings.json` — the Stop hook, the SessionStart hook below, the SessionEnd hook, and the UserPromptSubmit hook (backs up the file first, leaves any other hooks untouched).
+- `kaprek hooks install` adds four entries to `~/.claude/settings.json` — the Stop hook, the SessionStart hook below, the SessionEnd hook, and the UserPromptSubmit hook (backs up the file first, leaves any other hooks untouched). The entries record the path of the copy you ran, so `npx kaprek hooks install` points them into npm's npx cache, which npm may clear; it installs anyway and prints a warning on stderr. For hooks that last, install globally first: `npm i -g kaprek && kaprek hooks install`.
 - `kaprek hooks uninstall` removes only those entries, at any time, identified by a stable `--managed-by` marker so a later reinstall never creates a duplicate.
 - `kaprek hooks status` shows whether each of the four is installed (one line per hook) and which policy mode is active.
 
