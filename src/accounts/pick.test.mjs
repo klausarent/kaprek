@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { pickAccount, accountLoad } from './pick.mjs';
+import { pickAccount, accountLoad, AUTH_HOLD_MS } from './pick.mjs';
 
 const NOW = Date.parse('2026-10-02T12:00:00Z');
 const T = { fiveHour: 90, sevenDay: 95, full: 99 };
@@ -47,9 +47,28 @@ describe('pickAccount', () => {
     expect(pickAccount({ accounts: A.slice(0, 2), usable: all, quotas, thresholds: T, now: NOW }).account.id).toBe('konto2');
   });
 
-  it('accounts nobody has seen yet go first, so they get measured', () => {
-    const quotas = new Map([['konto1', snap('2026-10-02T11:00:00Z', 0, 0)]]);
-    expect(pickAccount({ accounts: A, usable: all, quotas, thresholds: T, now: NOW }).account.id).toBe('konto2');
+  it('a measured account with room goes before one nobody has measured (19.10.2026: unmeasured konto1 was at 100 %)', () => {
+    const quotas = new Map([['konto1', snap('2026-10-02T11:00:00Z', 60, 70)]]);
+    const r = pickAccount({ accounts: A, usable: all, quotas, thresholds: T, now: NOW });
+    expect(r.account.id).toBe('konto1');
+    expect(r.unmeasured).toBeUndefined();
+  });
+
+  it('an unmeasured account still goes before one over the thresholds, flagged', () => {
+    const quotas = new Map([
+      ['konto1', snap('t', 93, 20)],
+      ['konto3', snap('t', 50, 97)],
+    ]);
+    expect(pickAccount({ accounts: A, usable: all, quotas, thresholds: T, now: NOW })).toMatchObject({ account: { id: 'konto2' }, unmeasured: true, overThreshold: false });
+  });
+
+  it('flags readings older than staleMs and missing ones as stale', () => {
+    const quotas = new Map([
+      ['konto1', snap('2026-10-02T11:50:00Z', 10, 10)],
+      ['konto2', snap('2026-10-02T11:00:00Z', 10, 10)],
+    ]);
+    const { rows } = pickAccount({ accounts: A, usable: all, quotas, thresholds: T, now: NOW, staleMs: 30 * 60_000 });
+    expect(rows.map((r) => [r.account.id, r.stale])).toEqual([['konto1', false], ['konto2', true], ['konto3', true]]);
   });
 
   it('on equal load the account seen longest ago wins', () => {
@@ -97,5 +116,13 @@ describe('council fixes', () => {
     ]);
     const r = pickAccount({ accounts: A.slice(0, 2), usable: all, quotas, thresholds: T, now: NOW });
     expect(r.account.id).toBe('konto1');
+  });
+
+  it('an auth error holds for AUTH_HOLD_MS, then the account gets another try (a renewed token must not stay locked out)', () => {
+    const quotas = new Map([['konto2', { seenAt: '2026-10-02T09:00:00Z', authError: true, windows: {} }]]);
+    const held = pickAccount({ accounts: [A[1]], usable: all, quotas, thresholds: T, now: Date.parse('2026-10-02T09:00:00Z') + AUTH_HOLD_MS - 1 });
+    expect(held).toMatchObject({ account: null, reason: 'no-credential' });
+    const retry = pickAccount({ accounts: [A[1]], usable: all, quotas, thresholds: T, now: Date.parse('2026-10-02T09:00:00Z') + AUTH_HOLD_MS });
+    expect(retry).toMatchObject({ account: { id: 'konto2' }, unmeasured: true });
   });
 });

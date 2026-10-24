@@ -28,6 +28,8 @@ import { loadPolicyFailOpen } from '../policy/policy.mjs';
 import { evaluateHardDenials, hardDenialsOf, cliDenyRules } from '../policy/guards.mjs';
 import { loadAccounts } from '../accounts/config.mjs';
 import { chooseSession } from '../accounts/session.mjs';
+import { snapshotFromRateLimit } from '../harness/probe-account.mjs';
+import { writeQuota } from '../proxy/store.mjs';
 
 // Same defaults as src/parser/parse.mjs::digestSession() — a live chat turn
 // must never persist or stream more content, or leak a secret a reloaded
@@ -677,11 +679,17 @@ export async function runTurn({
   // Several own Claude subscriptions (accounts.json): start this turn on the
   // one with the most room left. Without accounts.json nothing changes.
   let accountEnv = null;
+  let accountId = null;
   if (harnessName === 'claude-code') {
     try {
-      if (loadAccounts(dataDir).configured) accountEnv = chooseSession({ dataDir }).env;
+      if (loadAccounts(dataDir).configured) {
+        const session = chooseSession({ dataDir });
+        accountEnv = session.env;
+        accountId = session.env ? (session.pick.account?.id ?? null) : null;
+      }
     } catch {
       accountEnv = null;
+      accountId = null;
     }
   }
 
@@ -740,6 +748,18 @@ export async function runTurn({
   pendingTools.clear();
 
   if (turnResult.sessionId) cliSessionId = turnResult.sessionId;
+
+  // The windows this turn saw are the freshest reading of its account. Filed
+  // here, the next turn does not start blind on a full account when no proxy
+  // runs (a running proxy has filed the same numbers already).
+  if (accountId && rateLimit) {
+    try {
+      const snap = snapshotFromRateLimit(rateLimit, { seenAt: new Date().toISOString(), source: 'turn' });
+      if (snap) writeQuota(dataDir, snap, undefined, accountId);
+    } catch {
+      // best-effort, like appendRun() below
+    }
+  }
 
   if (cliSessionId) {
     writeHarnessMeta(dataDir, effectiveChatId, {

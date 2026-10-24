@@ -714,12 +714,22 @@ Control (Anthropic's limitation for such tokens).
    (the account id and the name of its token variable, never the token).
 
 An account is picked while its 5-hour window is under 90 % and its 7-day
-window under 95 % (`thresholds` in accounts.json); the least loaded wins, a
-window past its reset counts as empty, accounts never measured go first.
-When every account is at 99 %, nothing starts and the pick says when the
-first one frees up. The numbers come from the proxy (and from the bridge
-watcher's own run logs), filed per account by the `anthropic-organization-id`
-each response carries.
+window under 95 % (`thresholds` in accounts.json); the least loaded wins and
+a window past its reset counts as empty. An account never measured is not
+taken for empty: it comes after every measured account with room, before
+one over the thresholds. When every account is at 99 %, nothing starts and
+the pick says when the first one frees up. An account whose last answer was
+an auth error sits out for two hours, then gets another try.
+
+The numbers come from answers: the proxy, the bridge watcher's run logs,
+and the windows each kaprek turn reports. Anything else on the same
+subscription (another machine, other agents) uses it unseen, so
+`kaprek accounts [pick] --probe` first re-measures every account whose
+reading is missing or older than `staleMinutes` (default 30): one haiku turn
+per account, no tools, no settings, no MCP, nothing persisted. A full
+account is rejected at no cost, one with room costs a few thousand haiku
+tokens and about three seconds. Accounts known to be full until a later
+reset are not probed.
 
 ## Starting and stopping
 

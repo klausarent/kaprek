@@ -26,8 +26,8 @@ describe('kaprek accounts', () => {
   });
 
   it('pick --json names the account and the token variable, never the token', async () => {
-    // konto1 measured, konto2 never: the unmeasured one goes first.
-    writeQuota(dataDir, { seenAt: new Date().toISOString(), windows: { '5h': { usedPercent: 1, resetsAt: null } } }, 'h', 'konto1');
+    // konto1 over the 5h threshold, konto2 never measured: the unmeasured one goes first.
+    writeQuota(dataDir, { seenAt: new Date().toISOString(), windows: { '5h': { usedPercent: 95, resetsAt: null } } }, 'h', 'konto1');
     const code = await runAccountsCommand(['pick', '--json'], { dataDir, env: { CLAUDE_TOKEN_KONTO2: 'sk-ant-oat01-SECRET' }, envFile: null, log });
     expect(code).toBe(0);
     const out = JSON.parse(lines.join(''));
@@ -40,6 +40,22 @@ describe('kaprek accounts', () => {
     const code = await runAccountsCommand(['pick', '--json'], { dataDir, env: {}, envFile: null, log });
     expect(code).toBe(4);
     expect(JSON.parse(lines.join(''))).toMatchObject({ id: null, exhausted: true, retryAt: '2999-01-01T00:00:00.000Z' });
+  });
+
+  it('pick --probe --json measures stale accounts first and says so', async () => {
+    writeQuota(dataDir, { seenAt: new Date(Date.now() - 3 * 3600_000).toISOString(), windows: { '5h': { usedPercent: 10, resetsAt: null } } }, 'h', 'konto1');
+    const probeFn = () => ({ seenAt: new Date().toISOString(), status: 'rejected', windows: { '5h': { usedPercent: 100, resetsAt: '2999-01-01T00:00:00Z' } }, source: 'probe' });
+    const code = await runAccountsCommand(['pick', '--probe', '--json'], { dataDir, env: {}, envFile: null, log, probeFn });
+    expect(code).toBe(4);
+    expect(JSON.parse(lines.join(''))).toMatchObject({ id: null, exhausted: true, probed: [{ id: 'konto1', result: 'ok' }] });
+  });
+
+  it('marks old readings and rejects unknown flags', async () => {
+    writeQuota(dataDir, { seenAt: new Date(Date.now() - 3 * 3600_000).toISOString(), windows: { '5h': { usedPercent: 10, resetsAt: null } } }, 'h', 'konto1');
+    await runAccountsCommand([], { dataDir, env: {}, envFile: null, log });
+    expect(lines.join('\n')).toMatch(/konto1.*Stand .*\(alt\)/);
+    lines = [];
+    expect(await runAccountsCommand(['pick', '--jsn'], { dataDir, env: {}, envFile: null, log })).toBe(1);
   });
 });
 

@@ -222,4 +222,14 @@ describe('council fixes: auth errors', () => {
     expect(r.status).toBe(401);
     expect(readQuotas(dataDir).get('konto2')).toMatchObject({ authError: true });
   });
+
+  it('a 401 from a side endpoint says nothing about inference and marks nothing', async () => {
+    await start((req, res) => {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end('{"type":"error","error":{"type":"permission_error","message":"scope"}}');
+    });
+    const r = await call('/api/oauth/usage', { method: 'GET', body: '', headers: { 'x-kaprek-account': 'konto2' } });
+    expect(r.status).toBe(401);
+    expect(readQuotas(dataDir).get('konto2')).toBeUndefined();
+  });
 });

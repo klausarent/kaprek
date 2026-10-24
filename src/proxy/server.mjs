@@ -93,9 +93,11 @@ export function createProxyServer({ dataDir, requestUpstream = openUpstream, now
         warned.add(who.mismatch);
         console.warn(`kaprek proxy: a session started as ${who.mismatch} answered as ${who.account}; is its token missing or expired?`);
       }
-      if (upRes.statusCode === 401 && accountTag) {
+      if (upRes.statusCode === 401 && accountTag && recordable) {
         // Expired or revoked setup-token: take the account out of the pick
-        // until a request on it succeeds again (that overwrites this).
+        // until a request on it succeeds again (that overwrites this) or
+        // AUTH_HOLD_MS passes. Only /v1/messages counts: a side endpoint
+        // that wants a scope the token lacks says nothing about inference.
         try {
           writeQuota(dataDir, { seenAt: new Date(now()).toISOString(), status: 'auth-error', authError: true, windows: {} }, undefined, accountTag);
         } catch {

@@ -6,7 +6,8 @@
 // when one is running and nobody set a base URL on purpose.
 import { loadAccounts, resolveCredential, defaultEnvFile, loginOrgFrom } from './config.mjs';
 import { pickAccount } from './pick.mjs';
-import { readQuotas, readPid, isAlive } from '../proxy/store.mjs';
+import { probeAccount } from '../harness/probe-account.mjs';
+import { readQuotas, writeQuota, readPid, isAlive } from '../proxy/store.mjs';
 
 const TAG = 'x-kaprek-account';
 
@@ -27,9 +28,7 @@ export function sessionEnv({ base = process.env, account, token, proxyPort, stri
   return env;
 }
 
-/** Load accounts, check credentials, read the windows, pick, and build the env. */
-export function chooseSession({ dataDir, env = process.env, envFile = defaultEnvFile(), now = Date.now(), loginOrg = loginOrgFrom() } = {}) {
-  const { accounts, thresholds } = loadAccounts(dataDir);
+function credentials(accounts, { env, envFile, loginOrg }) {
   const tokens = new Map();
   const usable = new Set();
   const unusable = [];
@@ -40,10 +39,45 @@ export function chooseSession({ dataDir, env = process.env, envFile = defaultEnv
       tokens.set(a.id, t.token);
     } else unusable.push(a.id);
   }
+  return { tokens, usable, unusable };
+}
+
+/**
+ * Probe every usable account whose reading is missing or older than
+ * staleMinutes, and file what came back. An account known to be full until
+ * a reset still ahead is left alone: there is nothing new to learn.
+ * Returns [{id, result: 'ok' | 'auth-error' | 'none'}].
+ */
+export function refreshStale({ dataDir, env = process.env, envFile = defaultEnvFile(), now = Date.now(), loginOrg = loginOrgFrom(), probeFn = probeAccount } = {}) {
+  const { accounts, thresholds, staleMinutes } = loadAccounts(dataDir);
+  const { tokens, usable } = credentials(accounts, { env, envFile, loginOrg });
+  const { rows } = pickAccount({ accounts, usable, quotas: readQuotas(dataDir), thresholds, now, staleMs: staleMinutes * 60_000 });
+  const strip = accounts.map((a) => a.tokenEnv).filter(Boolean);
+  const probed = [];
+  for (const row of rows.filter((r) => r.stale && !r.full)) {
+    const id = row.account.id;
+    const snap = probeFn({ env: sessionEnv({ base: env, account: row.account, token: tokens.get(id), proxyPort: null, strip }) });
+    if (snap) {
+      try {
+        writeQuota(dataDir, snap, undefined, id);
+      } catch {
+        // an unwritable data dir only costs the fresh reading
+      }
+    }
+    probed.push({ id, result: !snap ? 'none' : snap.authError ? 'auth-error' : 'ok' });
+  }
+  return probed;
+}
+
+/** Load accounts, check credentials, read the windows (fresh ones with `probe`), pick, and build the env. */
+export function chooseSession({ dataDir, env = process.env, envFile = defaultEnvFile(), now = Date.now(), loginOrg = loginOrgFrom(), probe = false, probeFn } = {}) {
+  const probed = probe ? refreshStale({ dataDir, env, envFile, now, loginOrg, ...(probeFn ? { probeFn } : {}) }) : [];
+  const { accounts, thresholds } = loadAccounts(dataDir);
+  const { tokens, usable, unusable } = credentials(accounts, { env, envFile, loginOrg });
   const pick = pickAccount({ accounts, usable, quotas: readQuotas(dataDir), thresholds, now });
   const pid = readPid(dataDir);
   const proxyPort = pid && isAlive(pid.pid) ? pid.port : null;
   const strip = accounts.map((a) => a.tokenEnv).filter(Boolean);
   const sessionEnvironment = pick.account ? sessionEnv({ base: env, account: pick.account, token: tokens.get(pick.account.id), proxyPort, strip }) : null;
-  return { pick, env: sessionEnvironment, unusable, proxyPort };
+  return { pick, env: sessionEnvironment, unusable, proxyPort, probed };
 }

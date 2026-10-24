@@ -9,6 +9,7 @@ import { createFakeHarness } from '../harness/fake.mjs';
 import { ASK_TOOLS_CHAT, ASK_TOOLS_TRIGGER } from '../harness/settings.mjs';
 import { cliDenyRules } from '../policy/guards.mjs';
 import { readKnownTools } from '../harness/knownTools.mjs';
+import { readQuotas } from '../proxy/store.mjs';
 
 let tmpDir;
 
@@ -1197,4 +1198,17 @@ test('with accounts.json, a claude-code turn starts on the picked account; witho
 
   await runTurn({ dataDir: tmpDir, text: 'three', harness, harnessName: 'fake', cwd: tmpDir });
   expect(seen[2]).toBeNull();
+});
+
+test('the windows a claude-code turn saw are filed for its account, so the next pick is not blind', async () => {
+  fs.writeFileSync(path.join(tmpDir, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'konto1', tokenEnv: null }] }));
+  const harness = {
+    startTurn: async (options) => {
+      options.onEvent({ type: 'rate-limit', info: { status: 'allowed', unifiedWindows: { five_hour: { utilization: 0.42, resetsAt: 1792844400 }, seven_day: { utilization: 0.61, resetsAt: 1793228400 } } } });
+      options.onEvent({ type: 'text', text: 'ok' });
+      return { sessionId: 's', costUsd: null, usage: null, stopReason: 'result', error: null };
+    },
+  };
+  await runTurn({ dataDir: tmpDir, text: 'one', harness, harnessName: 'claude-code', cwd: tmpDir });
+  expect(readQuotas(tmpDir).get('konto1')).toMatchObject({ source: 'turn', windows: { '5h': { usedPercent: 42 }, '7d': { usedPercent: 61 } } });
 });

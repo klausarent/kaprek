@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const DEFAULT_THRESHOLDS = { fiveHour: 90, sevenDay: 95, full: 99 };
+// A reading older than this is re-measured by `kaprek accounts pick --probe`.
+export const DEFAULT_STALE_MINUTES = 30;
 const ID_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 const ORG_RE = /^[0-9a-f][0-9a-f-]{3,35}$/;
@@ -25,8 +27,12 @@ function percent(value, fallback) {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 100 ? value : fallback;
 }
 
+function minutes(value, fallback) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1 && value <= 1440 ? value : fallback;
+}
+
 export function loadAccounts(dataDir) {
-  const fallback = { thresholds: { ...DEFAULT_THRESHOLDS }, accounts: [{ id: 'konto1', label: 'Konto 1', tokenEnv: null }], configured: false };
+  const fallback = { thresholds: { ...DEFAULT_THRESHOLDS }, staleMinutes: DEFAULT_STALE_MINUTES, accounts: [{ id: 'konto1', label: 'Konto 1', tokenEnv: null }], configured: false };
   let raw;
   try {
     raw = JSON.parse(fs.readFileSync(accountsPath(dataDir), 'utf8'));
@@ -55,6 +61,7 @@ export function loadAccounts(dataDir) {
       sevenDay: percent(t.sevenDay, DEFAULT_THRESHOLDS.sevenDay),
       full: percent(t.full, DEFAULT_THRESHOLDS.full),
     },
+    staleMinutes: minutes(raw?.staleMinutes, DEFAULT_STALE_MINUTES),
     accounts,
     configured: true,
   };

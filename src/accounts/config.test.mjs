@@ -13,6 +13,7 @@ describe('loadAccounts', () => {
   it('returns one default /login account when accounts.json is missing', () => {
     expect(loadAccounts(dir)).toEqual({
       thresholds: { fiveHour: 90, sevenDay: 95, full: 99 },
+      staleMinutes: 30,
       accounts: [{ id: 'konto1', label: 'Konto 1', tokenEnv: null }],
       configured: false,
     });

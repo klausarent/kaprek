@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sessionEnv, chooseSession } from './session.mjs';
+import { sessionEnv, chooseSession, refreshStale } from './session.mjs';
 import { accountsPath } from './config.mjs';
 import { writeQuota, writePid } from '../proxy/store.mjs';
 
@@ -56,6 +56,36 @@ describe('chooseSession', () => {
     const s = chooseSession({ dataDir, env: {}, envFile: null, now });
     expect(s.env).toBeNull();
     expect(s.pick).toMatchObject({ exhausted: true, retryAt: '2026-10-02T13:00:00.000Z' });
+  });
+
+  it('with probe: old and missing readings are measured first, fresh and known-full ones are left alone', () => {
+    // 24.10.2026: konto3 read 23 % from two hours before and was at 100 %.
+    const now = Date.now();
+    const iso = (msAgo) => new Date(now - msAgo).toISOString();
+    const later = new Date(now + 3600_000).toISOString();
+    writeQuota(dataDir, { seenAt: iso(60_000), windows: { '5h': { usedPercent: 100, resetsAt: later } } }, 'h', 'konto1');
+    writeQuota(dataDir, { seenAt: iso(5 * 60_000), windows: { '5h': { usedPercent: 79, resetsAt: later } } }, 'h', 'konto2');
+    writeQuota(dataDir, { seenAt: iso(2 * 3600_000), windows: { '5h': { usedPercent: 23, resetsAt: later } } }, 'h', 'konto3');
+    const probedEnvs = [];
+    const probeFn = ({ env }) => {
+      probedEnvs.push(env);
+      return { seenAt: new Date().toISOString(), status: 'rejected', windows: { '5h': { usedPercent: 100, resetsAt: later } }, source: 'probe' };
+    };
+    const s = chooseSession({ dataDir, env: { CLAUDE_TOKEN_KONTO2: 'tok2', CLAUDE_TOKEN_KONTO3: 'tok3' }, envFile: null, now, probe: true, probeFn });
+    expect(s.probed).toEqual([{ id: 'konto3', result: 'ok' }]);
+    expect(probedEnvs[0]).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: 'tok3', KAPREK_ACCOUNT: 'konto3' });
+    expect(probedEnvs[0].CLAUDE_TOKEN_KONTO2).toBeUndefined();
+    expect(probedEnvs[0].ANTHROPIC_BASE_URL).toBeUndefined();
+    // Without the probe this would have been konto3.
+    expect(s.pick.account.id).toBe('konto2');
+  });
+
+  it('a probe that learns nothing keeps the old reading', () => {
+    const now = Date.now();
+    writeQuota(dataDir, { seenAt: new Date(now - 3 * 3600_000).toISOString(), windows: { '5h': { usedPercent: 40, resetsAt: null } } }, 'h', 'konto1');
+    const probed = refreshStale({ dataDir, env: {}, envFile: null, now, probeFn: () => null });
+    expect(probed).toEqual([{ id: 'konto1', result: 'none' }]);
+    expect(chooseSession({ dataDir, env: {}, envFile: null, now }).pick.load).toEqual({ fiveHour: 40, sevenDay: null });
   });
 });
 
