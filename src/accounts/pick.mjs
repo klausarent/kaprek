@@ -20,6 +20,10 @@
 // Readings older than `staleMs` are flagged `stale` so `--probe` can measure
 // them again (src/harness/probe-account.mjs); the pick itself does not distrust
 // them, because an account only kaprek uses stays accurate for hours.
+//
+// A reading with status 'rejected' (Claude refused the account, often filed by
+// `kaprek accounts exec` when a run died on the limit, without fresh windows)
+// counts as full until it goes stale; then a probe finds out how it stands.
 
 const ALIASES = { '5h': 'fiveHour', five_hour: 'fiveHour', '7d': 'sevenDay', seven_day: 'sevenDay' };
 
@@ -66,6 +70,7 @@ export function pickAccount({ accounts, usable, quotas, thresholds, now = Date.n
       const measured = load.fiveHour !== null || load.sevenDay !== null;
       // Last answer was an auth error (expired or revoked setup-token): out for AUTH_HOLD_MS.
       const authHeld = Boolean(snap?.authError) && (!Number.isFinite(seen) || now - seen < AUTH_HOLD_MS);
+      const rejected = snap?.status === 'rejected' && Number.isFinite(seen) && now - seen <= staleMs;
       return {
         account,
         order,
@@ -75,9 +80,13 @@ export function pickAccount({ accounts, usable, quotas, thresholds, now = Date.n
         measured,
         stale: !measured || now - seenAt > staleMs,
         usable: usable.has(account.id) && !authHeld,
-        eligible: f < thresholds.fiveHour && s < thresholds.sevenDay,
-        full: f >= thresholds.full || s >= thresholds.full,
-        fullUntil: Math.max(f >= thresholds.full ? resetOf(snap, 'fiveHour') : -Infinity, s >= thresholds.full ? resetOf(snap, 'sevenDay') : -Infinity),
+        eligible: !rejected && f < thresholds.fiveHour && s < thresholds.sevenDay,
+        full: rejected || f >= thresholds.full || s >= thresholds.full,
+        fullUntil: Math.max(
+          f >= thresholds.full ? resetOf(snap, 'fiveHour') : -Infinity,
+          s >= thresholds.full ? resetOf(snap, 'sevenDay') : -Infinity,
+          rejected ? seen + staleMs : -Infinity,
+        ),
       };
     })
     .filter((r) => r.usable);
@@ -88,7 +97,8 @@ export function pickAccount({ accounts, usable, quotas, thresholds, now = Date.n
   const eligible = rows.filter((r) => r.measured && r.eligible).sort(byLoad);
   if (eligible.length) return { account: eligible[0].account, exhausted: false, overThreshold: false, load: eligible[0].load, rows };
 
-  const unmeasured = rows.filter((r) => !r.measured).sort(byLoad);
+  // A fresh rejection without windows is no unknown: it is full.
+  const unmeasured = rows.filter((r) => !r.measured && !r.full).sort(byLoad);
   if (unmeasured.length) return { account: unmeasured[0].account, exhausted: false, overThreshold: false, unmeasured: true, load: unmeasured[0].load, rows };
 
   const notFull = rows.filter((r) => !r.full).sort(byLoad);

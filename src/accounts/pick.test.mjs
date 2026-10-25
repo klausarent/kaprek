@@ -126,3 +126,27 @@ describe('council fixes', () => {
     expect(retry).toMatchObject({ account: { id: 'konto2' }, unmeasured: true });
   });
 });
+
+describe('a rejected reading', () => {
+  const rejected = (seenAt, windows = {}) => ({ seenAt, status: 'rejected', windows });
+  it('counts as full while fresh, even with windows under the thresholds', () => {
+    const quotas = new Map([
+      ['konto2', rejected('2026-10-02T11:50:00Z', { '5h': { usedPercent: 40, resetsAt: '2026-10-02T14:00:00Z' } })],
+      ['konto3', snap('2026-10-02T11:50:00Z', 60, 60)],
+    ]);
+    const p = pickAccount({ accounts: [A[1], A[2]], usable: all, quotas, thresholds: T, now: NOW });
+    expect(p.account.id).toBe('konto3');
+    expect(p.rows.find((r) => r.account.id === 'konto2')).toMatchObject({ full: true, eligible: false });
+  });
+  it('leaves nothing to start when it was the last account, free again once it goes stale', () => {
+    const quotas = new Map([['konto2', rejected('2026-10-02T11:50:00Z')]]);
+    const p = pickAccount({ accounts: [A[1]], usable: all, quotas, thresholds: T, now: NOW, staleMs: 30 * 60_000 });
+    expect(p).toMatchObject({ account: null, exhausted: true, retryAt: '2026-10-02T12:20:00.000Z' });
+  });
+  it('an old rejection is just an old reading', () => {
+    const quotas = new Map([['konto2', rejected('2026-10-02T10:00:00Z', { '5h': { usedPercent: 40, resetsAt: '2026-10-02T14:00:00Z' } })]]);
+    const p = pickAccount({ accounts: [A[1]], usable: all, quotas, thresholds: T, now: NOW, staleMs: 30 * 60_000 });
+    expect(p.account.id).toBe('konto2');
+    expect(p.rows[0]).toMatchObject({ full: false, stale: true });
+  });
+});

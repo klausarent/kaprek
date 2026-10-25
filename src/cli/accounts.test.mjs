@@ -74,3 +74,31 @@ it('lists the local /login of an org-bound token account as /login, not as a mis
   expect(text).toMatch(/konto1.*\/login/);
   expect(text).toMatch(/konto2.*kein Token \(CLAUDE_TOKEN_KONTO2\)/);
 });
+
+describe('kaprek accounts exec', () => {
+  it('hands command, args and --probe to the runner and returns its exit code', async () => {
+    let call;
+    const execFn = async (command, args, opts) => ((call = { command, args, opts }), 7);
+    const code = await runAccountsCommand(['exec', '--probe', '--', 'node', 'agent.js', '--flag'], { dataDir, env: {}, envFile: null, log, execFn });
+    expect(code).toBe(7);
+    expect(call).toMatchObject({ command: 'node', args: ['agent.js', '--flag'], opts: { dataDir, probe: true } });
+    expect(lines).toEqual([]);
+  });
+
+  it('without a command, or with an unknown flag, prints usage to stderr, never to stdout', async () => {
+    const errors = [];
+    const execFn = async () => 0;
+    expect(await runAccountsCommand(['exec', '--probe'], { dataDir, env: {}, envFile: null, log, execFn, errorLog: (l) => errors.push(l) })).toBe(1);
+    expect(await runAccountsCommand(['exec', '--json', '--', 'node'], { dataDir, env: {}, envFile: null, log, execFn, errorLog: (l) => errors.push(l) })).toBe(1);
+    expect(lines).toEqual([]);
+    expect(errors.join('\n')).toMatch(/accounts exec/);
+  });
+});
+
+describe('a rejected account in the list', () => {
+  it('is marked', async () => {
+    writeQuota(dataDir, { seenAt: new Date().toISOString(), status: 'rejected', windows: {} }, 'h', 'konto1');
+    await runAccountsCommand([], { dataDir, env: {}, envFile: null, log });
+    expect(lines.find((l) => l.startsWith('konto1'))).toMatch(/abgelehnt/);
+  });
+});

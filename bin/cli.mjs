@@ -60,7 +60,8 @@ const USAGE = `Usage: kaprek [options]
        kaprek council "<q>"
        kaprek resume [key|--all]
        kaprek proxy [start|status] [--port N]
-       kaprek accounts [pick [--json]]
+       kaprek accounts [pick [--json]] [--probe]
+       kaprek accounts exec [--probe] -- <cmd> [args…]
        kaprek claude [claude args…]
 
 Options:
@@ -95,6 +96,7 @@ Proxy (Claude Code through kaprek — off unless you point a terminal at it):
 Accounts (several own Claude subscriptions, see <dataDir>/accounts.json):
   accounts       Every account, its 5h/7d windows, and the next pick
   accounts pick  The account the next session would start on (--json for scripts)
+  accounts exec  Run <cmd> (e.g. claude-agent-acp) on the picked account, file its limits
   claude [args]  Start Claude Code on the account with the most room left
 
 Hooks subcommands (Claude Code Stop hook for the policy engine):

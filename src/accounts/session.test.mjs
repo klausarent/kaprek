@@ -2,9 +2,9 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sessionEnv, chooseSession, refreshStale } from './session.mjs';
+import { sessionEnv, chooseSession, refreshStale, acquireProbeLock, PROBE_LOCK_STALE_MS } from './session.mjs';
 import { accountsPath } from './config.mjs';
-import { writeQuota, writePid } from '../proxy/store.mjs';
+import { writeQuota, writePid, proxyDir } from '../proxy/store.mjs';
 
 describe('sessionEnv', () => {
   it('a token account gets the token, the tag and the proxy', () => {
@@ -103,5 +103,58 @@ describe('council fixes: foreign credentials', () => {
     expect(env.CLAUDE_TOKEN_KONTO3).toBeUndefined();
     expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('tok');
     expect(env.PATH).toBe('p');
+  });
+});
+
+describe('probe lock', () => {
+  let dataDir;
+  beforeEach(() => {
+    dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-lock-'));
+    fs.writeFileSync(accountsPath(dataDir), JSON.stringify({ accounts: [{ id: 'konto2', tokenEnv: 'CLAUDE_TOKEN_KONTO2' }] }));
+  });
+  const lockFile = () => path.join(proxyDir(dataDir), 'probe.lock');
+
+  it('is taken and given back', () => {
+    const release = acquireProbeLock(dataDir);
+    expect(fs.existsSync(lockFile())).toBe(true);
+    expect(acquireProbeLock(dataDir, { waitMs: 0 })).toBeNull();
+    release();
+    expect(fs.existsSync(lockFile())).toBe(false);
+  });
+
+  it('a lock older than PROBE_LOCK_STALE_MS belongs to a crashed prober and is taken over', () => {
+    fs.mkdirSync(proxyDir(dataDir), { recursive: true });
+    fs.writeFileSync(lockFile(), '{}');
+    const old = (Date.now() - PROBE_LOCK_STALE_MS - 60_000) / 1000;
+    fs.utimesSync(lockFile(), old, old);
+    const release = acquireProbeLock(dataDir, { waitMs: 0 });
+    expect(release).toBeTypeOf('function');
+    release();
+  });
+
+  it('while someone else probes, refreshStale waits and then measures only what is still stale', () => {
+    let calls = 0;
+    const lock = () => {
+      // the other prober filed a fresh reading while we waited
+      writeQuota(dataDir, { seenAt: new Date().toISOString(), windows: { '5h': { usedPercent: 10, resetsAt: '2999-01-01T00:00:00Z' } } }, 'h', 'konto2');
+      return () => {};
+    };
+    const probed = refreshStale({ dataDir, env: { CLAUDE_TOKEN_KONTO2: 'tok2' }, envFile: null, probeFn: () => (calls++, null), lock });
+    expect(probed).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
+  it('gives up probing when the lock never comes free', () => {
+    let calls = 0;
+    const probed = refreshStale({ dataDir, env: { CLAUDE_TOKEN_KONTO2: 'tok2' }, envFile: null, probeFn: () => (calls++, null), lock: () => null });
+    expect(probed).toEqual([]);
+    expect(calls).toBe(0);
+  });
+
+  it('nothing stale, no lock taken', () => {
+    writeQuota(dataDir, { seenAt: new Date().toISOString(), windows: { '5h': { usedPercent: 10, resetsAt: '2999-01-01T00:00:00Z' } } }, 'h', 'konto2');
+    let taken = false;
+    refreshStale({ dataDir, env: { CLAUDE_TOKEN_KONTO2: 'tok2' }, envFile: null, probeFn: () => null, lock: () => ((taken = true), () => {}) });
+    expect(taken).toBe(false);
   });
 });
