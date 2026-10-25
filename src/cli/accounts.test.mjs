@@ -85,6 +85,13 @@ describe('kaprek accounts exec', () => {
     expect(lines).toEqual([]);
   });
 
+  it('--data-dir= overrides the data dir (Paperclip drops KAPREK_DATA_DIR from the agent env)', async () => {
+    let call;
+    const execFn = async (command, args, opts) => ((call = opts), 0);
+    await runAccountsCommand(['exec', '--data-dir=C:/x/.kaprek', '--', 'node'], { dataDir, env: {}, envFile: null, log, execFn });
+    expect(call).toMatchObject({ dataDir: 'C:/x/.kaprek', probe: false });
+  });
+
   it('without a command, or with an unknown flag, prints usage to stderr, never to stdout', async () => {
     const errors = [];
     const execFn = async () => 0;

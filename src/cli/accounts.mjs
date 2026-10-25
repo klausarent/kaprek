@@ -10,7 +10,7 @@
 //                                is missing or older than staleMinutes
 //                                (src/harness/probe-account.mjs), then list/pick.
 //   Exit codes of pick: 0 an account, 4 every account full, 5 none usable.
-//   kaprek accounts exec [--probe] -- <command> [args…]
+//   kaprek accounts exec [--probe] [--data-dir=<dir>] -- <command> [args…]
 //                                run <command> on the picked account and file
 //                                the windows it reports (src/harness/account-exec.mjs);
 //                                Paperclip's agentCommand for claude-agent-acp.
@@ -23,7 +23,7 @@ import { execWithAccount } from '../harness/account-exec.mjs';
 
 export const ACCOUNTS_USAGE = `Usage: kaprek accounts [--probe]
        kaprek accounts pick [--json] [--probe]
-       kaprek accounts exec [--probe] -- <command> [args…]
+       kaprek accounts exec [--probe] [--data-dir=<dir>] -- <command> [args…]
 
 Accounts are listed in <dataDir>/accounts.json, e.g.
   {"accounts": [{"id": "konto1", "label": "Konto 1", "tokenEnv": null},
@@ -45,11 +45,15 @@ export async function runAccountsCommand(args, { dataDir, env = process.env, env
     const sep = args.indexOf('--');
     const flags = sep === -1 ? args.slice(1) : args.slice(1, sep);
     const command = sep === -1 ? [] : args.slice(sep + 1);
-    if (!command.length || flags.some((f) => f !== '--probe')) {
+    // Paperclip passes only an allowlist of variables to its agents (no
+    // KAPREK_DATA_DIR), so the data dir can ride in the command itself.
+    const dirFlag = flags.find((f) => f.startsWith('--data-dir='));
+    const dir = dirFlag ? dirFlag.slice('--data-dir='.length) : dataDir;
+    if (!command.length || !dir || flags.some((f) => f !== '--probe' && f !== dirFlag)) {
       errorLog(ACCOUNTS_USAGE);
       return 1;
     }
-    return execFn(command[0], command.slice(1), { dataDir, env, envFile, loginOrg, probe: flags.includes('--probe'), ...(probeFn ? { probeFn } : {}) });
+    return execFn(command[0], command.slice(1), { dataDir: dir, env, envFile, loginOrg, probe: flags.includes('--probe'), ...(probeFn ? { probeFn } : {}) });
   }
   const positional = args.filter((a) => !a.startsWith('--'));
   const flags = args.filter((a) => a.startsWith('--'));

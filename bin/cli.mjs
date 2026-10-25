@@ -61,7 +61,7 @@ const USAGE = `Usage: kaprek [options]
        kaprek resume [key|--all]
        kaprek proxy [start|status] [--port N]
        kaprek accounts [pick [--json]] [--probe]
-       kaprek accounts exec [--probe] -- <cmd> [args…]
+       kaprek accounts exec [--probe] [--data-dir=<dir>] -- <cmd> [args…]
        kaprek claude [claude args…]
 
 Options:
