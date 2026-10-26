@@ -227,4 +227,26 @@ describe('kaprek resume', () => {
     expect(code).toBe(0);
     expect(d.launched.map(([k]) => k).sort()).toEqual(['claude:open1', 'codex:c']);
   });
+
+  it('--all never opens a headless session, not even with --unfiltered; the list shows it only with --unfiltered', async () => {
+    const mixed = [
+      { key: 'claude:mine', engine: 'claude', id: 'mine', cwd: 'C:\\p', title: 'Meine', lastTs: '2026-08-28T06:50:00.000Z', userMsgs: 2, hidden: false, crash: false },
+      { key: 'claude:print', engine: 'claude', id: 'print', cwd: 'C:\\p', title: 'claude -p', lastTs: '2026-08-28T06:55:00.000Z', userMsgs: 1, hidden: true, crash: false },
+      { key: 'codex:exec', engine: 'codex', id: 'exec', cwd: 'C:\\p', title: 'codex exec', lastTs: '2026-08-28T06:56:00.000Z', userMsgs: 1, hidden: true, crash: false },
+    ];
+    for (const argv of [['--all'], ['--all', '--unfiltered']]) {
+      const d = deps();
+      d.deps.scanAll = async () => ({ sessions: mixed, scannedAt: 'x' });
+      expect(await runResumeCommand(argv, d.deps)).toBe(0);
+      expect(d.launched.map(([k]) => k)).toEqual(['claude:mine']);
+    }
+    const plain = deps();
+    plain.deps.scanAll = async () => ({ sessions: mixed, scannedAt: 'x' });
+    await runResumeCommand([], plain.deps);
+    expect(plain.lines.join('\n')).not.toMatch(/claude:print|codex:exec/);
+    const loud = deps();
+    loud.deps.scanAll = async () => ({ sessions: mixed, scannedAt: 'x' });
+    await runResumeCommand(['--unfiltered'], loud.deps);
+    expect(loud.lines.join('\n')).toMatch(/claude:print.*\[headless\]/);
+  });
 });

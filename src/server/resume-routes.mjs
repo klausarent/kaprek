@@ -90,6 +90,12 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
           results.push({ engine: item?.engine, id: item?.id, ok: false, error: 'no such session' });
           continue;
         }
+        // The batch is "bring back everything of last night" — a headless
+        // run (claude -p, codex exec, grok -p, cron) never belongs in it.
+        if (session.hidden) {
+          results.push({ engine: session.engine, id: session.id, ok: false, error: 'not an interactive session' });
+          continue;
+        }
         const r = await resumeSession(session, { skip: body.data.skip !== false });
         results.push({ engine: session.engine, id: session.id, ...r });
         await sleep(BATCH_GAP_MS);

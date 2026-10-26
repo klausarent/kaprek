@@ -42,4 +42,9 @@ describe("resumableSessions", () => {
     const old = s({ lastTs: "2026-08-20T07:00:00.000Z", ledger: { open: true, lastType: "stop", endReason: null } });
     expect(resumableSessions([old], 24, now)).toEqual([]);
   });
+
+  it("drops a hidden (headless) session even when the ledger says open", () => {
+    const list = [s({ hidden: true, ledger: { open: true, lastType: "start", endReason: null } }), s({ key: "claude:b", id: "b" })];
+    expect(resumableSessions(list, 24, now).map((x) => x.id)).toEqual(["b"]);
+  });
 });

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir, setStoreRoots, scanAll, STORES, attachLedgerInfo, filterToLedgerSessions } from './scan.mjs';
+import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir, setStoreRoots, scanAll, STORES, attachLedgerInfo, filterToLedgerSessions, classify, classifyKimi, classifyCodex, classifyGrok } from './scan.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -164,5 +164,52 @@ describe('ledger filtering', () => {
     expect(ended.sessions.find((s) => s.id === FIXTURE_ID)?.ledger).toEqual({ open: false, lastType: 'end', endReason: 'clear' });
 
     fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+});
+
+describe('only sessions a person opened', () => {
+  it('parseClaudeFile reads the entrypoint, and classify() marks claude -p (sdk-*) as automated', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-scan-entry-'));
+    const file = path.join(dir, 'x.jsonl');
+    const line = (entrypoint) => JSON.stringify({ type: 'user', entrypoint, cwd: 'C:\\p', timestamp: '2026-10-26T08:00:00.000Z', message: { role: 'user', content: 'Mach was' } });
+    fs.writeFileSync(file, `${line('sdk-cli')}\n`);
+    const headless = await parseClaudeFile(file);
+    expect(headless.entrypoint).toBe('sdk-cli');
+    expect(classify(headless)).toMatchObject({ kind: 'automated' });
+    fs.writeFileSync(file, `${line('cli')}\n`);
+    expect(classify(await parseClaudeFile(file))).toEqual({ kind: 'interactive', reason: '' });
+    // A -p run later continued in a terminal (`claude -r`) counts as interactive.
+    fs.writeFileSync(file, `${line('sdk-cli')}\n${line('cli')}\n`);
+    expect(classify(await parseClaudeFile(file)).kind).toBe('interactive');
+    // Fail closed: no entrypoint at all is no proof of a terminal.
+    expect(classify({ userMsgs: 1, first: 'Hallo', cwd: 'C:\\p' })).toMatchObject({ kind: 'automated', reason: 'ohne entrypoint' });
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('classifyGrok hides session_kind "headless" (grok -p) in any directory, keeps a TUI session', () => {
+    expect(classifyGrok({ sessionKind: 'headless', cwd: 'C:\\Users\\k\\Documents\\repo', userMsgs: 3 }).kind).toBe('automated');
+    expect(classifyGrok({ sessionKind: '', cwd: 'C:\\Users\\k\\Documents\\repo', userMsgs: 1 }).kind).toBe('interactive');
+  });
+
+  it('classifyKimi treats Temp/.kaprek working dirs as headless', () => {
+    expect(classifyKimi({ cwd: 'C:\\Users\\k\\AppData\\Local\\Temp\\claude\\x' }).kind).toBe('automated');
+    expect(classifyKimi({ cwd: 'C:\\Users\\k\\.kaprek\\council' }).kind).toBe('automated');
+    expect(classifyKimi({ cwd: 'C:\\Users\\k\\Documents\\Software\\repo' }).kind).toBe('interactive');
+  });
+
+  it('publicSession hides every non-interactive kind, keeps interactive and kind-less sessions visible', () => {
+    const base = { engine: 'codex', id: 'x', lastTs: '2026-10-26T08:00:00.000Z' };
+    expect(publicSession({ ...base, ...classifyCodex({ source: 'exec', userMsgs: 1 }) }).hidden).toBe(true);
+    expect(publicSession({ ...base, kind: 'empty' }).hidden).toBe(true);
+    expect(publicSession({ ...base, kind: 'interactive' }).hidden).toBe(false);
+    expect(publicSession(base).hidden).toBe(false);
+  });
+
+  it('codex counts only the terminal TUI (source "cli"); imports, Desktop, kaprek and exec are hidden', () => {
+    expect(classifyCodex({ originator: 'Codex Desktop', source: 'vscode', userMsgs: 1, imported: true })).toMatchObject({ kind: 'automated', reason: 'Import (Codex Desktop)' });
+    expect(classifyCodex({ originator: 'Codex Desktop', source: 'vscode', userMsgs: 2 }).kind).toBe('automated');
+    expect(classifyCodex({ originator: 'kaprek', source: 'vscode', userMsgs: 1 }).kind).toBe('automated');
+    expect(classifyCodex({ originator: 'codex_cli_rs', source: 'cli', userMsgs: 1 }).kind).toBe('interactive');
+    expect(classifyCodex({ originator: 'codex_cli_rs', source: 'cli', userMsgs: 1, imported: true }).kind).toBe('automated');
   });
 });

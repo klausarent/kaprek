@@ -123,6 +123,15 @@ describe('resume routes', () => {
     expect(launched).toEqual(['claude:a', 'claude:a']);
   });
 
+  it('POST batch refuses a hidden (headless) session but still opens the rest', async () => {
+    const { h, launched } = handler();
+    const { out, res } = fakeRes();
+    await h({ method: 'POST', body: { items: [{ engine: 'grok', id: 'h' }, { engine: 'claude', id: 'a' }] } }, res, ['api', 'resume', 'batch'], new URL('http://x/api/resume/batch'));
+    expect(out.body.ok).toBe(false);
+    expect(out.body.results[0]).toMatchObject({ id: 'h', ok: false, error: 'not an interactive session' });
+    expect(launched).toEqual(['claude:a']);
+  });
+
   it('answers 405 for wrong methods', async () => {
     const { h } = handler();
     const { out, res } = fakeRes();

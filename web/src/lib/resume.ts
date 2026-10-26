@@ -71,7 +71,7 @@ export function recentSessions(sessions: ResumeSession[], hours: number, nowMs =
  * `kaprek resume --all` (see src/cli/resume.mjs).
  */
 export function resumableSessions(sessions: ResumeSession[], hours: number, nowMs = Date.now()): ResumeSession[] {
-  return recentSessions(sessions, hours, nowMs).filter((s) => !s.ledger || s.ledger.open);
+  return recentSessions(sessions, hours, nowMs).filter((s) => !s.hidden && (!s.ledger || s.ledger.open));
 }
 
 /**

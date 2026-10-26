@@ -39,7 +39,7 @@ export function setStoreRoots({ home, claudeProjects, kimiHome, codexSessions, g
 // Where scan results are cached between runs. The server sets this to
 // <dataDir>/resume-cache; tests point it at a temp dir. Never the repo.
 let CACHE_DIR = path.join(os.tmpdir(), 'kaprek-resume-cache');
-const CACHE_VERSION = 3;
+const CACHE_VERSION = 4; // 4: Claude-Meta trägt `entrypoint`/`terminal`, Codex-Meta `imported`
 export function setCacheDir(dir) {
   CACHE_DIR = dir;
 }
@@ -74,7 +74,19 @@ const AUTOMATED_PATTERNS = [
   /^kiklaus-daily\b/i,
 ];
 
+// Headless-Läufe der Peers (kaprek council, Reviews) laufen in Temp- oder
+// .kaprek-Verzeichnissen. Kimi schreibt kein eigenes Headless-Merkmal, das
+// Verzeichnis ist dort der einzige Hinweis.
+const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const AUTOMATED_CWD = new RegExp(`\\\\AppData\\\\Local\\\\Temp\\\\|^${escapeRe(os.tmpdir())}([\\\\/]|$)|[\\\\/]\\.kaprek([\\\\/]|$)`, 'i');
+
 export function classify(meta) {
+  // `claude -p` und Agent-SDK schreiben entrypoint "sdk-cli"/"sdk-ts"/…,
+  // das interaktive Terminal "cli". Der SessionStart-Hook feuert auch
+  // headless, der Ledger allein trennt die beiden also nicht. Interaktiv
+  // ist eine Session nur mit belegter Terminal-Herkunft (fail closed): ein
+  // -p-Lauf, der später per `claude -r` im Terminal weiterlief, zählt.
+  if (!meta.terminal) return { kind: 'automated', reason: meta.entrypoint ? `${meta.entrypoint} (claude -p)` : 'ohne entrypoint' };
   if (!meta.userMsgs) return { kind: 'empty', reason: 'keine Nutzer-Nachricht' };
   const first = meta.first || '';
   for (const re of AUTOMATED_PATTERNS) {
@@ -118,13 +130,17 @@ export function markCrashGroups(sessions, { windowMs = 120_000, minMembers = 2, 
 
 export async function parseClaudeFile(file) {
   const rl = readline.createInterface({ input: fs.createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  const meta = { first: '', summary: '', cwd: '', firstTs: '', lastTs: '', userMsgs: 0, version: '', gitBranch: '', compacted: 0 };
+  const meta = { first: '', summary: '', cwd: '', firstTs: '', lastTs: '', userMsgs: 0, version: '', gitBranch: '', compacted: 0, entrypoint: '', terminal: false };
   for await (const line of rl) {
     if (!line) continue;
     let o;
     try { o = JSON.parse(line); } catch { continue; }
     if (o.type === 'summary' && o.summary && !meta.summary) meta.summary = String(o.summary).slice(0, 200);
     if (o.cwd && !meta.cwd) meta.cwd = o.cwd;
+    if (o.entrypoint) {
+      if (!meta.entrypoint) meta.entrypoint = o.entrypoint;
+      if (!/^sdk-/.test(o.entrypoint)) meta.terminal = true;
+    }
     if (o.version && !meta.version) meta.version = o.version;
     if (o.gitBranch && !meta.gitBranch) meta.gitBranch = o.gitBranch;
     if (o.timestamp) { if (!meta.firstTs) meta.firstTs = o.timestamp; meta.lastTs = o.timestamp; }
@@ -249,6 +265,11 @@ async function kimiFirstPrompt(sessionDir) {
   return '';
 }
 
+export function classifyKimi(meta) {
+  if (AUTOMATED_CWD.test(meta.cwd || '')) return { kind: 'automated', reason: 'Temp/kaprek-Lauf (kimi -p?)' };
+  return { kind: 'interactive', reason: '' };
+}
+
 export async function scanKimi() {
   const sessionsRoot = path.join(STORES.kimiHome, 'sessions');
   let workspaces = {};
@@ -278,8 +299,7 @@ export async function scanKimi() {
       try { lastMs = (await fsp.stat(path.join(dir, 'agents', 'main', 'wire.jsonl'))).mtimeMs; } catch {}
       out.push({
         engine: 'kimi',
-        kind: 'interactive',
-        reason: '',
+        ...classifyKimi({ cwd: cwd.replace(/\//g, '\\') }),
         id: e.name,
         project: wd.name,
         file: dir,
@@ -311,13 +331,19 @@ export function classifyCodex(meta) {
   if (meta.source === 'exec' || CODEX_AUTOMATED_ORIGINATORS.has(meta.originator)) {
     return { kind: 'automated', reason: `${meta.originator || 'exec'} (headless)` };
   }
+  // Codex Desktop importiert Claude-Sessions als eigene Threads
+  // (turn_id "external-import-…") — ein Duplikat der Claude-Session.
+  if (meta.imported) return { kind: 'automated', reason: 'Import (Codex Desktop)' };
+  // Fail closed: nur das Terminal-TUI schreibt source "cli". kaprek und
+  // Codex Desktop laufen über den App-Server ("vscode"), exec über "exec".
+  if (meta.source !== 'cli') return { kind: 'automated', reason: `${meta.originator || '?'}/${meta.source || '?'} (kein Terminal)` };
   if (!meta.userMsgs) return { kind: 'empty', reason: 'keine Nutzer-Nachricht' };
   return { kind: 'interactive', reason: '' };
 }
 
 export async function parseCodexFile(file) {
   const rl = readline.createInterface({ input: fs.createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  const meta = { sessionId: '', cwd: '', originator: '', source: '', parentThreadId: '', firstTs: '', lastTs: '', userMsgs: 0, first: '' };
+  const meta = { sessionId: '', cwd: '', originator: '', source: '', parentThreadId: '', firstTs: '', lastTs: '', userMsgs: 0, first: '', imported: false };
   for await (const line of rl) {
     if (!line) continue;
     let o;
@@ -331,6 +357,9 @@ export async function parseCodexFile(file) {
       meta.source = typeof p.source === 'string' ? p.source : (p.source ? 'sub' : '');
       meta.parentThreadId = p.parent_thread_id || '';
       continue;
+    }
+    if (o.type === 'event_msg' && p.type === 'task_started') {
+      if (/^external-import/.test(p.turn_id || '')) meta.imported = true;
     }
     if (o.type === 'response_item' && p.type === 'message' && p.role === 'user') {
       let t = (Array.isArray(p.content) ? p.content : []).map((c) => c?.text || '').join(' ');
@@ -391,10 +420,10 @@ export async function scanCodex({ force = false, onProgress } = {}) {
 // ~/.grok/sessions/<url-encodierter cwd>/<uuid>/summary.json (+ signals.json)
 
 export function classifyGrok(meta) {
-  if (/\\AppData\\Local\\Temp\\|[\\/]\.kaprek([\\/]|$)/i.test(meta.cwd || '')) return { kind: 'automated', reason: 'Temp/kaprek-Lauf' };
+  // `grok -p` schreibt session_kind "headless" in summary.json; dem TUI fehlt das Feld.
+  if (meta.sessionKind === 'headless') return { kind: 'automated', reason: 'grok -p (headless)' };
+  if (AUTOMATED_CWD.test(meta.cwd || '')) return { kind: 'automated', reason: 'Temp/kaprek-Lauf' };
   if (!meta.userMsgs) return { kind: 'empty', reason: 'keine Nutzer-Nachricht' };
-  // Headless `grok -p` (Peer-Reviews) hinterlässt genau einen Turn; echte Sitzungen haben mehrere.
-  if (meta.turns != null && meta.turns <= 1) return { kind: 'automated', reason: 'Einzel-Turn (grok -p?)' };
   return { kind: 'interactive', reason: '' };
 }
 
@@ -419,7 +448,7 @@ export async function scanGrok() {
       if (!sum && !fs.existsSync(path.join(dir, 'chat_history.jsonl'))) continue;
       const cwd = sum?.info?.cwd || cwdFromDir || HOME;
       const lastTs = isoFix(sum?.last_active_at || sum?.updated_at) || new Date(st.mtimeMs).toISOString();
-      const meta = { cwd, userMsgs: sig?.userMessageCount ?? (sum?.num_chat_messages ? 1 : 0), turns: sum?.next_trace_turn ?? sig?.turnCount ?? null };
+      const meta = { cwd, userMsgs: sig?.userMessageCount ?? (sum?.num_chat_messages ? 1 : 0), sessionKind: sum?.session_kind ?? '' };
       const s = {
         engine: 'grok', id: sum?.info?.id || e.name, project: path.basename(cwd), file: dir, cwd,
         cwdExists: fs.existsSync(cwd), sizeBytes: 0, mtimeMs: st.mtimeMs,
@@ -446,7 +475,12 @@ export function publicSession(s) {
     firstTs: s.firstTs ?? s.lastTs ?? '',
     lastTs: s.lastTs ?? '',
     userMsgs: Number.isFinite(s.userMsgs) ? s.userMsgs : 0,
-    hidden: s.hidden === true,
+    // Nur Sessions, die ein Mensch im Terminal geöffnet hat, sind sichtbar:
+    // `claude -p`, codex exec, grok -p, Cron-/Skill-Läufe und leere Sessions
+    // (kind "automated"/"empty") bleiben aus Liste und `--all` draußen.
+    // Handgebaute Sessions ohne `kind` (Tests) gelten als interaktiv.
+    hidden: s.hidden === true || (s.kind != null && s.kind !== 'interactive'),
+    kind: s.kind ?? null,
     // markCrashGroups() stamps the group's timestamp onto `crashGroup`
     // (not a boolean) — a real value there means "part of a crash group".
     crash: Boolean(s.crashGroup),

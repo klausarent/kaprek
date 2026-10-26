@@ -15,16 +15,18 @@ export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hou
   kaprek resume claude:<id>  open that session as a new Windows Terminal tab
                              (a unique prefix of <engine>:<id> also works)
   kaprek resume --all        open every OPEN session active in the last 24 hours
-                             (a claude session the ledger already marked "end" is
-                             never opened by --all, even inside the window)
+                             that a person opened in a terminal — never a headless
+                             run (claude -p, codex exec, grok -p, cron), and never
+                             a claude session the ledger already marked "end"
   --hours N                  window for --all (default 24)
   --days N                   window for the list (default 7)
   --limit N                  show at most N sessions in the list, newest first
                               (default 40; 0 shows all of them)
   --no-skip                  do not pass the permission-skipping flags to the CLIs
-  --unfiltered               also list/resume claude sessions that never showed up
-                             in the terminal-session ledger (headless/cron runs) —
-                             hidden by default; see \`kaprek hooks status\`
+  --unfiltered               also list headless runs and claude sessions that never
+                             showed up in the terminal-session ledger — hidden by
+                             default, and --all skips them even with this flag;
+                             see \`kaprek hooks status\`
 `;
 
 function parse(argv) {
@@ -115,10 +117,12 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   }
 
   if (opts.all) {
-    // A claude session the ledger already marked "end" is never opened here,
-    // even inside the window — beendete Sessions nie automatisch. Other
-    // engines, and a claude session with no ledger info at all (unfiltered
-    // mode's whole point), carry no `ledger` and stay eligible.
+    // Only sessions a person opened: `hidden` (headless/cron/empty, see
+    // publicSession in src/resume/scan.mjs) is never opened here, not even
+    // with --unfiltered. A claude session the ledger already marked "end" is
+    // never opened either — beendete Sessions nie automatisch. Other
+    // engines, and a claude session with no ledger info at all, carry no
+    // `ledger` and stay eligible.
     const picked = sessions
       .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS && (!s.ledger || s.ledger.open))
       .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
@@ -138,7 +142,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   }
 
   const listed = sessions
-    .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.days * DAY_MS)
+    .filter((s) => (opts.unfiltered || !s.hidden) && nowMs - Date.parse(s.lastTs) <= opts.days * DAY_MS)
     .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
   if (listed.length === 0) {
     stdout(`no sessions in the last ${opts.days} days`);
@@ -147,7 +151,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   const cap = opts.limit === 0 ? listed.length : opts.limit;
   const shown = listed.slice(0, cap);
   for (const s of shown) {
-    const flag = s.crash ? ' [crash]' : '';
+    const flag = `${s.crash ? ' [crash]' : ''}${s.hidden ? (s.kind === 'empty' ? ' [leer]' : ' [headless]') : ''}`;
     stdout(`${s.key.padEnd(48)} ${ago(s.lastTs, nowMs).padStart(6)}  ${ledgerStatus(s).padEnd(18)}${path.basename(s.cwd || '') || '-'}  ${redactSecrets(s.title)}${flag}`);
   }
   if (shown.length < listed.length) {
