@@ -32,6 +32,16 @@ afterEach(() => {
   fs.rmSync(cwdB, { recursive: true, force: true });
 });
 
+/** Wall time of a bare `node -e ''` start: the floor under every runHook(). */
+function nodeStartMs() {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    child.on('error', reject);
+    child.on('close', () => resolve(Date.now() - start));
+  });
+}
+
 function runHook(stdinPayload) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
@@ -73,10 +83,15 @@ test('first prompt with no state yet, in a mission directory, gets the mission a
 test('same directory as last time: no output, and measurably fast (fast path, no store import)', async () => {
   openMissions(dataDir).create({ title: 'Prompt me', goal: 'g', cwd: cwdA });
   await runHook(payload({ sessionId: 's-same', cwd: cwdA })); // sets state
+  // Bare node start right before, so the budget measures what the hook adds
+  // on top of process start. Idle that start costs tens of ms and the bound
+  // stays close to the old flat 800 ms; on the loaded server node alone took
+  // seconds (KAP-35: the whole hook measured 1004 ms and 3943 ms).
+  const baselineMs = await nodeStartMs();
   const { code, stdout, elapsedMs } = await runHook(payload({ sessionId: 's-same', cwd: cwdA }));
   expect(code).toBe(0);
   expect(stdout).toBe('');
-  expect(elapsedMs).toBeLessThan(SMOKE_BUDGET_MS);
+  expect(elapsedMs - baselineMs).toBeLessThan(SMOKE_BUDGET_MS);
 });
 
 test('directory change: the new directory\'s context is sent, even though the old one had already been seen', async () => {

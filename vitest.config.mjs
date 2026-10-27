@@ -4,7 +4,7 @@ import { defineConfig } from 'vitest/config';
 // shared Windows server (KAP-35, 27.10.2026, full run with 60 s limits): they
 // spawn processes, boot an HTTP server or replay data files, and under load
 // they take 4-42 s per test (idle: under 1.6 s). Everything else keeps the
-// stock 5 s / 10 s limits, so a unit test that hangs still fails fast.
+// unit-tier limit below, so a test that hangs there still fails fast.
 const SLOW_FILES = [
   'src/relay/dispatcher.test.mjs',
   'src/legacy-datadir.test.mjs',
@@ -36,31 +36,6 @@ const SLOW_FILES = [
   'src/memory/sync.test.mjs',
 ];
 
-// Slowest green test 2.5-4 s with 4 workers (same run). harvest and
-// search/index went past 5 s in a later check while other suites ran.
-const MEDIUM_FILES = [
-  'src/plans/store.test.mjs',
-  'src/harness/settings.test.mjs',
-  'src/memory/harvest.test.mjs',
-  'src/cli/accounts.test.mjs',
-  'src/policy/hook-stop.test.mjs',
-  'src/harness/approval.test.mjs',
-  'src/search/index.test.mjs',
-  'src/server/ensure.test.mjs',
-  'src/missions/store.test.mjs',
-  'src/cli/council.test.mjs',
-  'src/triggers/limits.test.mjs',
-  'src/cli/autostart.test.mjs',
-  'src/apps/mcp-config.test.mjs',
-  'src/chats/store.test.mjs',
-  'src/e2e.test.mjs',
-  'src/parser/parse.test.mjs',
-  'src/memory/store.test.mjs',
-];
-
-// About 8x the slowest green test of this group (3.9 s).
-const MEDIUM_TIMEOUT_MS = 30_000;
-
 // Slowest green test measured: 41.5 s (relay/dispatcher); single tests in
 // server.test and triggers/runner reached 64-70 s. 120 s leaves room for a
 // load spike and still ends a real hang.
@@ -73,14 +48,15 @@ export default defineConfig({
     // took 2671 s and 412 tests timed out while the CPU sat at 4-19 %: the
     // workers starve each other on file and module access. 4 workers: 886 s.
     maxWorkers: 4,
+    // Stock limits are 5 s / 10 s. In a full run with the fix above, nine files
+    // outside SLOW_FILES had one test each take 5.0-12.0 s under load (idle:
+    // milliseconds). 20 s covers that with room; a real hang still fails.
+    testTimeout: 20_000,
+    hookTimeout: 20_000,
     projects: [
       {
         extends: true,
-        test: { name: 'unit', include: ['src/**/*.test.mjs'], exclude: [...SLOW_FILES, ...MEDIUM_FILES] },
-      },
-      {
-        extends: true,
-        test: { name: 'medium', include: MEDIUM_FILES, testTimeout: MEDIUM_TIMEOUT_MS, hookTimeout: MEDIUM_TIMEOUT_MS },
+        test: { name: 'unit', include: ['src/**/*.test.mjs'], exclude: SLOW_FILES },
       },
       {
         extends: true,

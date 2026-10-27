@@ -55,6 +55,11 @@ beforeEach(() => {
   servers = [];
 });
 
+// These tests used to carry their own 25-30 s limits. On the loaded server
+// the relay ones failed at exactly 25 s (KAP-35, two runs), so they now use
+// the same 120 s as the rest of this file (vitest.config.mjs, slow tier).
+const LOADED_TEST_TIMEOUT_MS = 120_000;
+
 afterEach(async () => {
   for (const { server } of servers) {
     await new Promise((resolve) => server.close(resolve));
@@ -3176,7 +3181,7 @@ test('relay: a run started from a chat hands off along its route and files one g
   const events = (await (await fetch(`${url}/api/chat/${chatId}`)).json()).events.filter((event) => event.kind === 'relay');
   expect(events.filter((event) => event.eventType === 'message').map((event) => event.from)).toEqual(['grok', 'claude', 'grok', 'claude']);
   expect(events.filter((event) => event.eventType === 'gate.requested')).toHaveLength(1);
-}, 25_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('relay: approving the gate buys one more round; denying stops the run', async () => {
   const { url } = await bootRelay({ harness: relayReviewHarness(['handoff', 'handoff', 'handoff']), harnessName: 'fake' });
@@ -3212,7 +3217,7 @@ test('relay: approving the gate buys one more round; denying stops the run', asy
   expect(await denied.json()).toMatchObject({ relay: 'stopped' });
   const { chat } = await (await fetch(`${url}/api/chat/${chatId}`)).json();
   expect(chat.relay.status).toBe('stopped');
-}, 25_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('relay: a chat that is handing off refuses a typed turn, and an unknown run cannot be stopped', async () => {
   const { url } = await bootRelay({ harness: relayReviewHarness(['handoff', 'handoff']), harnessName: 'fake' });
@@ -3227,7 +3232,7 @@ test('relay: a chat that is handing off refuses a typed turn, and an unknown run
 
   const stopUnknown = await postJson(`${url}/api/relay/does-not-exist/stop`, {});
   expect(stopUnknown.status).toBe(404);
-}, 25_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('relay: a run without a goal is refused, and the routes need the instance token like everything else', async () => {
   const { url } = await bootRelay({ harness: relayReviewHarness(['handoff']), harnessName: 'fake' });
@@ -3237,7 +3242,7 @@ test('relay: a run without a goal is refused, and the routes need the instance t
   expect((await postJson(`${url}/api/chat/${chatId}/relay`, {})).status).toBe(400);
   // rawFetch sends no token; every /api route answers 401 to that.
   expect((await rawFetch(`${url}/api/chat/${chatId}/relay`, { method: 'POST', headers: APP_JSON_HEADERS, body: '{}' })).status).toBe(401);
-}, 25_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('relay: a turn that a reviewer cannot answer in the agreed shape parks the run instead of guessing', async () => {
   // The local Claude harness is not schema-constrained, so its answer is
@@ -3554,7 +3559,7 @@ test('repeats: a request typed three times is offered as an automation, twice is
   expect(repeats).toHaveLength(1);
   expect(repeats[0].count).toBe(3);
   expect(repeats[0].sample).toContain('deployment logs');
-}, 30_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 // --- plans: guided planning's own routes (Klaus, 02.08.: "man findet den Plan
 // unter einem eigenen Bereich des Projektes wieder") ---
@@ -3991,7 +3996,7 @@ test('recipes: a codex step takes a real handoff, in the mission directory, with
   expect(fs.realpathSync(codexRun.cwd)).toBe(fs.realpathSync(missionDir));
   // 'full' means the CLI's own default tool set, expressed as "no allowlist".
   expect(codexRun.allowedTools).not.toEqual([]);
-}, 30_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('recipes: a step that did not ask for tools gets none', async () => {
   const registry = recipeRegistry();
@@ -4024,7 +4029,7 @@ test('recipes: a step that did not ask for tools gets none', async () => {
   );
   // v1's rule, now per step: no tools unless the recipe says so.
   expect(registry.ran.find((entry) => entry.id === 'codex').allowedTools).toEqual([]);
-}, 30_000);
+}, LOADED_TEST_TIMEOUT_MS);
 
 test('environment: reports what is on this machine, and never a value from it', async () => {
   const { url } = await boot();
