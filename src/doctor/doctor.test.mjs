@@ -21,6 +21,7 @@ import {
   checkContextState,
   checkGrants,
   checkTriggersDegraded,
+  checkProxyRoute,
   DRIFT_SAMPLE_SIZE,
 } from './checks.mjs';
 import { parseDoctorArgs, printDoctorReport, runDoctorCommand } from '../cli/doctor.mjs';
@@ -31,6 +32,7 @@ import { writeContextState, STATE_MAX_AGE_MS } from '../policy/prompt-context-st
 import { openSearchDb, SCHEMA_VERSION } from '../search/index.mjs';
 import { openTriggers } from '../triggers/registry.mjs';
 import { appendRun } from '../orchestrator/runs.mjs';
+import { writePid } from '../proxy/store.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_DIR = path.join(__dirname, '..', 'testdata', 'legacy-datadir');
@@ -124,7 +126,7 @@ function byId(report, id) {
   return report.checks.find((c) => c.id === id);
 }
 
-const ALL_CHECK_IDS = ['transcript-drift', 'hooks', 'search-index', 'policy', 'presets', 'ledger', 'context-state', 'grants', 'triggers-degraded'];
+const ALL_CHECK_IDS = ['transcript-drift', 'hooks', 'search-index', 'policy', 'presets', 'ledger', 'context-state', 'grants', 'triggers-degraded', 'proxy-route'];
 
 /** Writes a session jsonl with `okLines` well-formed lines and `broken` junk lines. Returns the scan root. */
 function writeScanRoot({ okLines = 10, broken = 0, unknownType = 0 } = {}) {
@@ -380,6 +382,91 @@ describe('doctor checks', () => {
   });
 });
 
+describe('proxy-route', () => {
+  // Only temp dirs and a test settings file — never the real ~/.claude, never a real proxy.
+  const installed = () => ({ supported: true, installed: true });
+  const notInstalled = () => ({ supported: true, installed: false });
+  function routedSettings(url) {
+    const settingsPath = path.join(tmpdir(), 'settings.json');
+    fs.writeFileSync(settingsPath, JSON.stringify({ env: { ANTHROPIC_BASE_URL: url, OTHER_SETTING: 'never-printed' } }), 'utf8');
+    return settingsPath;
+  }
+
+  it('no ANTHROPIC_BASE_URL in settings or env: ok, nothing to check', () => {
+    const result = checkProxyRoute({ dataDir: tmpdir(), settingsPath: path.join(tmpdir(), 'settings.json'), env: {}, autostartStatus: installed });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/nothing to check/);
+  });
+
+  it('routed to 127.0.0.1:4911 in the settings, no pid file: fail, names kaprek proxy and ANTHROPIC_BASE_URL', () => {
+    const settingsPath = routedSettings('http://127.0.0.1:4911');
+    const result = checkProxyRoute({ dataDir: tmpdir(), settingsPath, env: {}, autostartStatus: installed });
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/kaprek proxy/);
+    expect(result.message).toMatch(/ANTHROPIC_BASE_URL/);
+    expect(result.detail.join('\n')).toContain(settingsPath);
+    expect(result.detail.join('\n')).toContain('http://127.0.0.1:4911');
+    expect(JSON.stringify(result)).not.toMatch(/OTHER_SETTING|never-printed/);
+  });
+
+  it('routed, proxy alive on the same port, autostart installed: ok', () => {
+    const settingsPath = routedSettings('http://127.0.0.1:4911');
+    const dataDir = tmpdir();
+    writePid(dataDir, { pid: process.pid, port: 4911 });
+    const result = checkProxyRoute({ dataDir, settingsPath, env: {}, autostartStatus: installed });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/port 4911, and it is running/);
+  });
+
+  it('routed in the settings, proxy alive, autostart missing: warn with the install command', () => {
+    const settingsPath = routedSettings('http://127.0.0.1:4911');
+    const dataDir = tmpdir();
+    writePid(dataDir, { pid: process.pid, port: 4911 });
+    const result = checkProxyRoute({ dataDir, settingsPath, env: {}, autostartStatus: notInstalled });
+    expect(result.status).toBe('warn');
+    expect(result.message).toMatch(/kaprek proxy autostart install/);
+  });
+
+  it('proxy alive on 4912, route points at 4911: fail naming both ports', () => {
+    const settingsPath = routedSettings('http://127.0.0.1:4911');
+    const dataDir = tmpdir();
+    writePid(dataDir, { pid: process.pid, port: 4912 });
+    const result = checkProxyRoute({ dataDir, settingsPath, env: {}, autostartStatus: installed });
+    expect(result.status).toBe('fail');
+    expect(result.message).toMatch(/4911/);
+    expect(result.message).toMatch(/4912/);
+  });
+
+  it('a non-local gateway is none of its business: ok, nothing to check', () => {
+    const settingsPath = routedSettings('https://gateway.example.com');
+    const result = checkProxyRoute({ dataDir: tmpdir(), settingsPath, env: {}, autostartStatus: installed });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/nothing to check/);
+  });
+
+  it('settings file is broken JSON and env has no variable: ok, never throws', () => {
+    const settingsPath = path.join(tmpdir(), 'settings.json');
+    fs.writeFileSync(settingsPath, '{ not json', 'utf8');
+    const result = checkProxyRoute({ dataDir: tmpdir(), settingsPath, env: {}, autostartStatus: installed });
+    expect(result.status).toBe('ok');
+    expect(result.message).toMatch(/nothing to check/);
+  });
+
+  it('falls back to the process environment when the settings have no route', () => {
+    const result = checkProxyRoute({ dataDir: tmpdir(), settingsPath: path.join(tmpdir(), 'settings.json'), env: { ANTHROPIC_BASE_URL: 'http://localhost:4911' }, autostartStatus: notInstalled });
+    expect(result.status).toBe('fail');
+    expect(result.detail.join('\n')).toMatch(/process environment/);
+  });
+
+  it('runDoctor includes proxy-route and counts it in summary.total', async () => {
+    const report = await runDoctor({ dataDir: tmpdir(), rootDir: tmpdir(), settingsPath: path.join(tmpdir(), 'settings.json'), env: {}, autostartStatus: installed });
+    const proxy = report.checks.find((c) => c.id === 'proxy-route');
+    expect(proxy).toMatchObject({ id: 'proxy-route', status: 'ok' });
+    expect(report.summary.total).toBe(ALL_CHECK_IDS.length);
+    expect(ALL_CHECK_IDS.length).toBe(10);
+  });
+});
+
 describe('doctor report, fix surface and json', () => {
   it('without --fix the doctor runs all checks and mutates NOTHING — the fixture copy stays byte-identical', async () => {
     const dataDir = copyFixture();
@@ -440,7 +527,7 @@ describe('doctor report, fix surface and json', () => {
       expect(['ok', 'warn', 'fail']).toContain(c.status);
       expect(typeof c.message).toBe('string');
     }
-    expect(json.summary).toEqual({ total: 9, ok: json.summary.ok, warn: json.summary.warn, fail: json.summary.fail });
+    expect(json.summary).toEqual({ total: 10, ok: json.summary.ok, warn: json.summary.warn, fail: json.summary.fail });
     expect(printDoctorReport(report, { json: true })).toBe(0);
   });
 

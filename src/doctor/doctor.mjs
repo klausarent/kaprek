@@ -9,6 +9,8 @@
 // Nothing else is touched. Hooks are NOT fixed in this version. The result
 // is a report: { checks: [...], fix, summary } — the CLI owns all printing,
 // and the exit code is always 0 (doctor is a report, not a gate).
+// The proxy-route check (Claude Code routed through a kaprek proxy that is
+// not running) only reads; it has no fix.
 import { sweepOldContextState } from '../policy/prompt-context-state.mjs';
 import { buildSearchIndex, SCHEMA_VERSION } from '../search/index.mjs';
 import {
@@ -21,6 +23,7 @@ import {
   checkContextState,
   checkGrants,
   checkTriggersDegraded,
+  checkProxyRoute,
   staleContextStateFiles,
   readSearchSchemaVersion,
 } from './checks.mjs';
@@ -30,7 +33,7 @@ import {
  * Returns { checks, fix, summary } — `fix` is { applied: [], skipped: [] }
  * (both empty without `fix`), `summary` counts statuses.
  */
-export async function runDoctor({ dataDir, rootDir, settingsPath, fix = false } = {}) {
+export async function runDoctor({ dataDir, rootDir, settingsPath, env, autostartStatus, fix = false } = {}) {
   // The fix plan is computed BEFORE anything changes, and printed/reported
   // as what WAS done — a fix that lists itself after the fact is a fix
   // nobody can check against what they were told.
@@ -70,6 +73,7 @@ export async function runDoctor({ dataDir, rootDir, settingsPath, fix = false } 
     Promise.resolve(checkContextState({ dataDir })),
     Promise.resolve(checkGrants({ dataDir })),
     checkTriggersDegraded({ dataDir }),
+    Promise.resolve(checkProxyRoute({ dataDir, settingsPath, env, autostartStatus })),
   ])) {
     checks.push(result);
   }

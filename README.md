@@ -927,6 +927,7 @@ What is checked:
 - **context-state** — per-session cwd state files: stale ones (older than the 7-day sweep age) and unreadable ones are counted.
 - **grants** — the number of active grants; grants unused for over 30 days are named as cleanup candidates with their idle age. **Grants never expire on their own** — doctor advises, you decide, nothing is revoked by a clock.
 - **triggers-degraded** — per-trigger condition-error streaks from `runs.jsonl`; streaks past the degraded threshold warn. Skipped (as ok) when the feature is not present in this build.
+- **proxy-route** — whether Claude Code is routed through the local kaprek proxy (`ANTHROPIC_BASE_URL` on `127.0.0.1` or `localhost`, read from the `env` block of the Claude Code settings first, then from the process environment). Fails when the proxy is not running or runs on another port; warns when the route is set in the settings but the proxy does not start at login (`kaprek proxy autostart install`). Reads the pid file only, opens no connection, has no fix.
 
 `--fix` does **exactly two things**, lists them before they happen, and nothing else:
 
