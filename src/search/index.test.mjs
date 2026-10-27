@@ -22,8 +22,9 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(rootDir, { recursive: true, force: true });
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  // Windows: the SQLite file can stay locked for a moment after close (EPERM).
+  fs.rmSync(rootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 /** Copies a fixture .jsonl file into `rootDir/<projectSlug>/<sessionId>.jsonl`. */

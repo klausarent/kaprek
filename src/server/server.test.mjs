@@ -59,9 +59,12 @@ afterEach(async () => {
   for (const { server } of servers) {
     await new Promise((resolve) => server.close(resolve));
   }
-  fs.rmSync(tmpDir, { recursive: true, force: true });
-  fs.rmSync(dataDir, { recursive: true, force: true });
-  fs.rmSync(tmpRootDir, { recursive: true, force: true });
+  // Windows: a file the server or the virus scanner still holds makes rmSync
+  // fail with EPERM/ENOTEMPTY for a moment after close. Retry instead of
+  // failing the test that just passed.
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(tmpRootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
 /** Starts a server for this test and registers it for teardown. Always uses
@@ -2785,8 +2788,10 @@ test('deferred: an unattended question is filed and the turn is told to carry on
   const result = await runner.fireTrigger('ask-me', { cause: { origin: 'schedule' } });
 
   expect(result.fired).toBe(true);
-  // No parking: the turn did not wait for anybody.
-  expect(Date.now() - startedAt).toBeLessThan(3_000);
+  // No parking: the turn did not wait for anybody. A parked question waits
+  // for the approval deadline (a minute and more), so 15 s still tells the two
+  // apart; 3 s did not hold on the loaded server (measured 5.1 s and 6.9 s).
+  expect(Date.now() - startedAt).toBeLessThan(15_000);
   expect(seen[0].behavior).toBe('deny');
   expect(seen[0].message).toBe(DEFERRAL_MESSAGE);
   // The wording has to keep the agent working rather than reading a refusal.

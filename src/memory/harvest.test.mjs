@@ -10,6 +10,11 @@ function line(role, text) {
   return `${JSON.stringify({ type: role, message: { role, content }, timestamp: '2026-08-28T06:00:00.000Z' })}\n`;
 }
 const block = (text) => '```kaprek-remember\n' + JSON.stringify({ text, kind: 'fact', confidence: 0.9 }) + '\n```';
+// The hook's own 1.5 s deadline also covers openMemory(); on a loaded server
+// that alone took longer and the harvest wrote nothing. Tests that are not
+// about the deadline pass a roomy one; the deadline itself is pinned below
+// with an injected clock.
+const ROOMY_DEADLINE_MS = 60_000;
 
 function setup() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-harvest-'));
@@ -29,7 +34,7 @@ function fillerLines(targetBytes) {
 describe('harvestRemember', () => {
   it('writes a remember block from a terminal transcript into the project scope', () => {
     const { dataDir, transcriptPath, cwd } = setup();
-    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd });
+    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(r).toMatchObject({ written: 1, skipped: 0, scopeId: 'project:meinprojekt' });
     const facts = openMemory(dataDir).list({ scopeId: 'project:meinprojekt' });
     expect(facts.map((f) => f.text)).toEqual(['Deploy nur über deploy.ps1']);
@@ -38,12 +43,12 @@ describe('harvestRemember', () => {
 
   it('is idempotent across turns and only reads new bytes', () => {
     const { dataDir, transcriptPath, cwd } = setup();
-    harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd });
-    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd })).toMatchObject({ written: 0, skipped: 0 });
+    harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS });
+    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS })).toMatchObject({ written: 0, skipped: 0 });
     fs.appendFileSync(transcriptPath, line('assistant', block('Tests laufen mit vitest')));
-    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd })).toMatchObject({ written: 1 });
+    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS })).toMatchObject({ written: 1 });
     fs.appendFileSync(transcriptPath, line('assistant', block('Tests laufen mit vitest')));
-    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd })).toMatchObject({ written: 0, skipped: 1 });
+    expect(harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS })).toMatchObject({ written: 0, skipped: 1 });
     expect(openMemory(dataDir).list({ scopeId: 'project:meinprojekt' })).toHaveLength(2);
   });
 
@@ -58,7 +63,7 @@ describe('harvestRemember', () => {
     let t = 0;
     const now = () => (t += 1000); // every call costs a "second" → deadline hit after first line
     const first = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: 1500, now });
-    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd });
+    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(first.written + second.written).toBe(1);
   });
 
@@ -77,7 +82,7 @@ describe('harvestRemember', () => {
     const size = fs.statSync(transcriptPath).size;
     expect(size).toBeGreaterThan(maxChunkBytes);
 
-    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's-tail', cwd, maxChunkBytes, maxLineBytes });
+    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's-tail', cwd, maxChunkBytes, maxLineBytes, deadlineMs: ROOMY_DEADLINE_MS });
     expect(r).toMatchObject({ written: 1, skipped: 0, scopeId: 'project:meinprojekt' });
     const state = JSON.parse(fs.readFileSync(path.join(dataDir, 'memory', 'harvest', 's-tail.json'), 'utf8'));
     expect(state.offset).toBe(size);
@@ -105,13 +110,13 @@ describe('harvestRemember', () => {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({ offset: 0, hashes: [] }));
 
-    const first = harvestRemember({ dataDir, transcriptPath, sessionId: 's-two', cwd, maxChunkBytes, maxLineBytes });
+    const first = harvestRemember({ dataDir, transcriptPath, sessionId: 's-two', cwd, maxChunkBytes, maxLineBytes, deadlineMs: ROOMY_DEADLINE_MS });
     expect(first.written).toBe(1);
     const afterFirst = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
     expect(afterFirst.offset).toBeGreaterThan(0);
     expect(afterFirst.offset).toBeLessThan(size);
 
-    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's-two', cwd, maxChunkBytes, maxLineBytes });
+    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's-two', cwd, maxChunkBytes, maxLineBytes, deadlineMs: ROOMY_DEADLINE_MS });
     expect(second.written).toBe(1);
     expect(openMemory(dataDir).list({ scopeId: 'project:meinprojekt' })).toHaveLength(2);
   });
@@ -128,7 +133,7 @@ describe('harvestRemember', () => {
     const { dataDir, transcriptPath, cwd } = setup();
     fs.mkdirSync(path.join(dataDir, 'memory'), { recursive: true });
     fs.writeFileSync(path.join(dataDir, 'memory', 'harvest'), 'blocked — not a directory');
-    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd });
+    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(r).toEqual({ written: 0, skipped: 0, scopeId: null });
   });
 
@@ -145,11 +150,11 @@ describe('harvestRemember', () => {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({ offset: 0, hashes: [] }));
 
-    const first = harvestRemember({ dataDir, transcriptPath, sessionId: 's-oversized', cwd });
+    const first = harvestRemember({ dataDir, transcriptPath, sessionId: 's-oversized', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(first.written).toBe(0);
     expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).offset).toBe(MAX_CHUNK_BYTES);
 
-    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's-oversized', cwd });
+    const second = harvestRemember({ dataDir, transcriptPath, sessionId: 's-oversized', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(second.written).toBe(1);
     expect(JSON.parse(fs.readFileSync(stateFile, 'utf8')).offset).toBe(size);
   });
@@ -166,7 +171,7 @@ describe('harvestRemember', () => {
     const size = fs.statSync(transcriptPath).size;
     expect(size).toBeGreaterThan(maxChunkBytes);
 
-    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's-biglast', cwd, maxChunkBytes, maxLineBytes });
+    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's-biglast', cwd, maxChunkBytes, maxLineBytes, deadlineMs: ROOMY_DEADLINE_MS });
     expect(r).toMatchObject({ written: 1, scopeId: 'project:meinprojekt' });
   });
 
@@ -184,7 +189,7 @@ describe('harvestRemember', () => {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
     fs.writeFileSync(stateFile, JSON.stringify({ offset: size + 5000, hashes: [] }));
 
-    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd });
+    const r = harvestRemember({ dataDir, transcriptPath, sessionId: 's1', cwd, deadlineMs: ROOMY_DEADLINE_MS });
     expect(r).toMatchObject({ written: 1, scopeId: 'project:meinprojekt' });
   });
 });

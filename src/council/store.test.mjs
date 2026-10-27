@@ -51,8 +51,14 @@ describe('openConsultations', () => {
 
   it('lists newest first and only for the chat that was asked about', () => {
     const store = openConsultations(dir);
+    // startedAt has millisecond resolution and list() sorts by it alone; two
+    // entries from the same millisecond keep insertion order (oldest first).
+    // Let the clock move so this test pins "newest first", not a tie.
+    const nextMs = () => { const t = Date.now(); while (Date.now() === t) { /* spin */ } };
     queued(store, { chatId: 'c1', question: 'first' });
+    nextMs();
     queued(store, { chatId: 'c2', question: 'other chat' });
+    nextMs();
     const third = queued(store, { chatId: 'c1', question: 'second' });
 
     const listed = store.list({ chatId: 'c1' });
