@@ -378,3 +378,26 @@ test('status reports UserPromptSubmit as missing before install and installed af
   const after = status({ settingsPath, dataDir: tmpDir, packageName: 'kaprek' });
   expect(after.events.UserPromptSubmit).toMatchObject({ installed: true, recordedPath: USER_PROMPT_SCRIPT_PATH, recordedPathMissing: false });
 });
+
+test('install from an npx cache copy reports installKind npx and still writes all four entries', () => {
+  const packageRoot = path.join(tmpDir, '_npx', 'abc123', 'node_modules', 'kaprek');
+  const result = install({ settingsPath, packageName: 'kaprek', packageRoot });
+  expect(result.installKind).toBe('npx');
+  expect(result.installed).toBe(true);
+  const settings = readJson(settingsPath);
+  for (const event of ['Stop', 'SessionStart', 'SessionEnd', 'UserPromptSubmit']) {
+    expect(settings.hooks[event]).toHaveLength(1);
+    expect(settings.hooks[event][0].hooks[0].command).toContain('--managed-by=kaprek');
+  }
+});
+
+test('install from a repo checkout (no node_modules in the path) reports installKind repo', () => {
+  const packageRoot = path.join(tmpDir, 'src', 'kaprek');
+  const result = install({ settingsPath, packageName: 'kaprek', packageRoot });
+  expect(result.installKind).toBe('repo');
+});
+
+test('an injected installKind wins over the path', () => {
+  const result = install({ settingsPath, packageName: 'kaprek', installKind: 'global' });
+  expect(result.installKind).toBe('global');
+});

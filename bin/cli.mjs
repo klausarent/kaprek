@@ -195,6 +195,15 @@ function runHooksCommand(args) {
       console.log(`Installed Stop + SessionStart + SessionEnd + UserPromptSubmit hooks -> ${result.settingsPath}`);
       if (result.backupPath) console.log(`Backup: ${result.backupPath}`);
       if (result.alreadyInstalled) console.log(result.added?.length ? `(Stop hook was already installed; added: ${result.added.join(', ')})` : '(already installed, left unchanged)');
+      // An npx copy sits in a cache npm may clear; the hooks just recorded
+      // point into it. Still installed, still exit 0 — just say so now.
+      if (result.installKind === 'npx') {
+        console.error(
+          `warning: kaprek is running from the npx cache. The hooks now point at\n` +
+            `${result.hookScriptPath}, which npm may replace or delete. For hooks that last:\n` +
+            `  npm i -g kaprek && kaprek hooks install`,
+        );
+      }
     } else if (sub === 'uninstall') {
       const result = uninstallHook();
       if (result.uninstalled) {

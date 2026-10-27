@@ -187,3 +187,70 @@ test('a failed startServer() releases the instance lock instead of leaving the p
     await Promise.all(blockers.map((blocker) => new Promise((resolve) => blocker.close(resolve))));
   }
 });
+
+/**
+ * Runs `hooks install` from `cliPath` against a temp CLAUDE_CONFIG_DIR, so the
+ * real ~/.claude/settings.json is never read or written.
+ */
+function runHooksInstall(cliPath) {
+  tmpDir = tmpDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-hooks-'));
+  childDataDir = childDataDir ?? fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-data-'));
+  const configDir = path.join(tmpDir, 'claude-config');
+  const child = spawn(process.execPath, [cliPath, 'hooks', 'install'], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, [DATA_DIR_ENV]: childDataDir, CLAUDE_CONFIG_DIR: configDir },
+  });
+  children.push(child);
+  return collectRun(child).then((run) => ({ ...run, settingsPath: path.join(configDir, 'settings.json') }));
+}
+
+test('hooks install from a repo checkout prints no npx warning', async () => {
+  const { code, stdout, stderr, settingsPath } = await runHooksInstall(CLI_PATH);
+  expect(code).toBe(0);
+  expect(stdout).toContain('Installed Stop + SessionStart + SessionEnd + UserPromptSubmit hooks');
+  expect(stdout).toContain(settingsPath);
+  expect(stderr).not.toContain('npx cache');
+  expect(stderr).not.toContain('warning:');
+});
+
+test('hooks install from an npx cache copy warns once on stderr and still installs', async () => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-cli-hooks-'));
+  // A copy of this package at the path shape npx unpacks into. kaprek has
+  // no runtime dependencies, so bin/, src/ and package.json are enough.
+  // Hard links, not copies: a real copy of src/ takes many seconds on
+  // Windows, a link is instant. A hard link is its own path (unlike a
+  // symlink or junction, Node never resolves it back to the repo), and
+  // removing it in afterEach removes only the link. Falls back to copying
+  // when the temp dir sits on another volume.
+  const repoRoot = path.join(__dirname, '..', '..');
+  const npxRoot = path.join(tmpDir, '_npx', 'abc123', 'node_modules', 'kaprek');
+  const mirror = (rel) => {
+    const source = path.join(repoRoot, rel);
+    const target = path.join(npxRoot, rel);
+    if (fs.statSync(source).isDirectory()) {
+      fs.mkdirSync(target, { recursive: true });
+      for (const entry of fs.readdirSync(source)) {
+        if (entry.endsWith('.test.mjs') || entry === 'fixtures') continue;
+        mirror(path.join(rel, entry));
+      }
+      return;
+    }
+    try {
+      fs.linkSync(source, target);
+    } catch {
+      fs.copyFileSync(source, target);
+    }
+  };
+  fs.mkdirSync(npxRoot, { recursive: true });
+  for (const rel of ['package.json', 'bin', 'src']) mirror(rel);
+
+  const { code, stdout, stderr, settingsPath } = await runHooksInstall(path.join(npxRoot, 'bin', 'cli.mjs'));
+  expect(code).toBe(0);
+  expect(stdout).toContain('Installed Stop + SessionStart + SessionEnd + UserPromptSubmit hooks');
+  expect(stderr).toContain('npx cache');
+  expect(stderr).toContain('npm i -g kaprek');
+  expect(stderr).toContain(path.join(npxRoot, 'src', 'policy', 'hook-stop.mjs'));
+  expect(stderr.match(/warning:/g)).toHaveLength(1);
+  const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+  expect(Object.keys(settings.hooks).sort()).toEqual(['SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
+}, 20000);
