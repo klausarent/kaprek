@@ -36,6 +36,31 @@ const SLOW_FILES = [
   'src/memory/sync.test.mjs',
 ];
 
+// Slowest green test 2.5-4 s with 4 workers (same run). harvest and
+// search/index went past 5 s in a later check while other suites ran.
+const MEDIUM_FILES = [
+  'src/plans/store.test.mjs',
+  'src/harness/settings.test.mjs',
+  'src/memory/harvest.test.mjs',
+  'src/cli/accounts.test.mjs',
+  'src/policy/hook-stop.test.mjs',
+  'src/harness/approval.test.mjs',
+  'src/search/index.test.mjs',
+  'src/server/ensure.test.mjs',
+  'src/missions/store.test.mjs',
+  'src/cli/council.test.mjs',
+  'src/triggers/limits.test.mjs',
+  'src/cli/autostart.test.mjs',
+  'src/apps/mcp-config.test.mjs',
+  'src/chats/store.test.mjs',
+  'src/e2e.test.mjs',
+  'src/parser/parse.test.mjs',
+  'src/memory/store.test.mjs',
+];
+
+// About 8x the slowest green test of this group (3.9 s).
+const MEDIUM_TIMEOUT_MS = 30_000;
+
 // Slowest green test measured: 41.5 s (relay/dispatcher); single tests in
 // server.test and triggers/runner reached 64-70 s. 120 s leaves room for a
 // load spike and still ends a real hang.
@@ -51,7 +76,11 @@ export default defineConfig({
     projects: [
       {
         extends: true,
-        test: { name: 'unit', include: ['src/**/*.test.mjs'], exclude: SLOW_FILES },
+        test: { name: 'unit', include: ['src/**/*.test.mjs'], exclude: [...SLOW_FILES, ...MEDIUM_FILES] },
+      },
+      {
+        extends: true,
+        test: { name: 'medium', include: MEDIUM_FILES, testTimeout: MEDIUM_TIMEOUT_MS, hookTimeout: MEDIUM_TIMEOUT_MS },
       },
       {
         extends: true,

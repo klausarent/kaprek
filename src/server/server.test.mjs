@@ -62,9 +62,9 @@ afterEach(async () => {
   // Windows: a file the server or the virus scanner still holds makes rmSync
   // fail with EPERM/ENOTEMPTY for a moment after close. Retry instead of
   // failing the test that just passed.
-  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-  fs.rmSync(tmpRootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  fs.rmSync(tmpRootDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 });
 
 /** Starts a server for this test and registers it for teardown. Always uses
