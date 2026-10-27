@@ -13,8 +13,10 @@ const HOOK_PATH = path.join(__dirname, 'hook-stop.mjs');
 const PACKAGE_NAME = 'kaprek';
 const DATA_DIR_ENV = `${PACKAGE_NAME.toUpperCase()}_DATA_DIR`;
 // Each test spawns the hook (and some run git). On the loaded server one took
-// 10.7 s against the old 10 s limit (KAP-35); idle they take well under 4 s.
-const HOOK_TEST_TIMEOUT_MS = 30_000;
+// 10.7 s against the old 10 s limit and later more than 30 s (KAP-35); idle
+// they take well under 4 s. Git child processes can hold the repo dirs for a
+// moment after exit, hence the cleanup retries (EPERM seen in two runs).
+const HOOK_TEST_TIMEOUT_MS = 120_000;
 
 let dataDir;
 
@@ -23,7 +25,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function writePolicy(policy) {
@@ -193,7 +195,7 @@ test('Stop hook preserves the ending session\'s scratchpad into dataDir/artifact
     expect(fs.existsSync(preservedPath)).toBe(true);
     expect(fs.readFileSync(preservedPath, 'utf8')).toBe('work product');
   } finally {
-    fs.rmSync(tmpRootDir, { recursive: true, force: true });
+    fs.rmSync(tmpRootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, HOOK_TEST_TIMEOUT_MS);
 
@@ -316,7 +318,7 @@ test('council gate: 6 changed files with no review yet exits 2, writes the reaso
     expect(stderr).toMatch(/--diff/);
     expect(stderr).toMatch(/6 files/);
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, HOOK_TEST_TIMEOUT_MS);
 
@@ -332,7 +334,7 @@ test('council gate: a second Stop for the same session does not fire again (once
     expect(second.stdout).toBe('');
     expect(second.stderr).toBe('');
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, 15000);
 
@@ -346,7 +348,7 @@ test('council gate: stop_hook_active guard applies to the gate too — exits 0, 
     expect(stdout).toBe('');
     expect(stderr).toBe('');
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, HOOK_TEST_TIMEOUT_MS);
 
@@ -358,6 +360,6 @@ test('council gate: no git repo at cwd never fires — exits 0, no stderr', asyn
     expect(stdout).toBe('');
     expect(stderr).toBe('');
   } finally {
-    fs.rmSync(nonRepoDir, { recursive: true, force: true });
+    fs.rmSync(nonRepoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, HOOK_TEST_TIMEOUT_MS);
