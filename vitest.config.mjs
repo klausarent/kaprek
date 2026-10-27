@@ -34,6 +34,8 @@ const SLOW_FILES = [
   'src/accounts/session.test.mjs',
   'src/cli/hooks.test.mjs',
   'src/memory/sync.test.mjs',
+  // Reads every source file; 12.0 s and 26.1 s in two later full runs.
+  'src/no-network.test.mjs',
 ];
 
 // Slowest green test measured: 41.5 s (relay/dispatcher); single tests in
