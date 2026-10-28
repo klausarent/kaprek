@@ -6,7 +6,7 @@
 //        --json-schema '{"type":"object", ... status/message ... }'
 //        --tools "" --disallowed-tools <file, shell, web and task tools>
 //        --disable-web-search --no-subagents --no-memory
-//        --no-plan --permission-mode plan --max-turns 1 --cwd <cwd>
+//        --permission-mode plan --max-turns 1 --cwd <cwd>
 //
 // Every flag on that line is doing a specific job:
 //   --verbatim       the prompt reaches the model as written. Without it the
@@ -39,6 +39,8 @@
 //                    next one; the peer does not get to keep going.
 //   --permission-mode plan  belt and braces: even if a tool slipped into the
 //                    set, plan mode does not execute.
+//                    No --no-plan next to it: Grok Build 1.0.70 exits with
+//                    code 2 ("cannot be combined"), verified 28.10.2026.
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -192,7 +194,6 @@ export function buildGrokArgs({ promptPath, cwd, maxTurns = 1, tools = '', schem
     '--disable-web-search',
     '--no-subagents',
     '--no-memory',
-    '--no-plan',
     '--permission-mode',
     'plan',
     '--max-turns',
