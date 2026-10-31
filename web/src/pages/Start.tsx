@@ -1,4 +1,4 @@
-// #/start — der Leitstand (Startbild „was läuft gerade", ALMANAC-PLAN §1.1).
+// #/start — der Leitstand (Startbild „was läuft gerade").
 //
 // Die Seite Liest und aggregiert nur: EIN fetch von GET /api/leitstand beim
 // Laden, danach ein Refresh nach jeder eigenen Aktion (Allow/Deny, Abort).
@@ -283,7 +283,7 @@ export function Feed({ data }: { data: LeitstandResponse }) {
 /**
  * Der Leitstand-Inhalt: Arbeitsfläche (Mitte) plus Feed-Spalte (rechts) als
  * Fragment — die Shell (App.tsx) legt links die Rail davor, so entsteht die
- * Dreispaltung aus wireframes/variant-b.html. Die Rail selbst wohnt in der
+ * Dreispaltung mit Rail, Arbeitsfläche und Feed. Die Rail selbst wohnt in der
  * Shell und wird hier NICHT noch einmal gerendert (keine doppelte
  * Navigation). Hook-frei und exportiert, damit Render-Tests ohne DOM
  * begehen können, dass hier keine zweite Rail auftaucht.

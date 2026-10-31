@@ -3261,9 +3261,9 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
 }
 
 /**
- * ALM 2.5 — the daily-budget verdict for one TURN START, computed before any
+ * The daily-budget verdict for one TURN START, computed before any
  * turn begins (never mid-run: a hard cap in flight would leave a half state
- * behind — see ALMANAC-PLAN §2.5's trap). Runs beside the posture ceiling,
+ * behind). Runs beside the posture ceiling,
  * which is evaluated in the same call paths, never inside a running turn.
  *
  * Two buckets, one attribution rule (the chat union the detail and digest

@@ -386,7 +386,7 @@ function applyEvent(state, event) {
  * derivationVersion} — and NOT the whole policy hash: policyVersion also
  * covers mode and rules like requireTaskDoc, so a totally unrelated rule
  * edit would stale every shape grant at once and re-educate people into
- * clicking through the re-asks (see DESIGN-SPEC, Änderung 2).
+ * clicking through the re-asks.
  *
  * @param {object} grant - the matched shape grant (projected record)
  * @param {{ ceiling: string, denialsHash: string, missionId: string|null, derivationVersion: number }} current

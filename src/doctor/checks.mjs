@@ -437,9 +437,8 @@ export function staleContextStateFiles(dataDir) {
 /**
  * grants — how many active grants exist, and which have not been used for
  * over 30 days: cleanup CANDIDATES, named with their idle age. Grants have
- * NO expiry (a design decision — visibility replaces lifetime, see
- * ERWEITERUNGSPLAN R6): doctor advises, the operator decides, the clock
- * never revokes anything.
+ * NO expiry (visibility replaces lifetime): doctor advises, the operator
+ * decides, the clock never revokes anything.
  */
 export function checkGrants({ dataDir, now = Date.now() } = {}) {
   try {

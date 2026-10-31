@@ -1,4 +1,4 @@
-// Tagesbudget (ALMANAC-PLAN §2.5 + BRIDGE-PLAN I2-Pause-Reihenfolge).
+// Tagesbudget mit Vorrang für interaktive Anfragen vor Hintergrundläufen.
 //
 // Ein Budget ist eine GELD-Dimension neben den Stück-Z limits der Trigger
 // (src/triggers/limits.mjs), nicht deren Erweiterung: gezählt wird die Summe

@@ -133,8 +133,8 @@ export function parseRoute(hash: string): Route {
     return { name: "list", project: null };
   }
   // Empty hash (and anything unrecognized) is the Leitstand: the landing
-  // page for RETURNING users — "what is running right now", not a menu (see
-  // ALMANAC-PLAN §1.1). A first-time visitor comes from #/home, the guided
+  // page for RETURNING users — "what is running right now", not a menu.
+  // A first-time visitor comes from #/home, the guided
   // assistant, which stays reachable from "more".
   return { name: "start" };
 }
@@ -305,8 +305,8 @@ function StatusDot() {
 }
 
 /**
- * Die linke Rail der Shell — auf JEDER Seite sichtbar, im Variant-B-Stil
- * (wireframes/variant-b.html): Logo, die fünf Haupteinträge, darunter die
+ * Die linke Rail der Shell — auf JEDER Seite sichtbar: Logo, die fünf
+ * Haupteinträge, darunter die
  * "more"-Sektion, unten Platz für Statusanzeige und globale Suche.
  *
  * Hook-frei und nach außen exportiert, damit Render-Tests sie ohne DOM

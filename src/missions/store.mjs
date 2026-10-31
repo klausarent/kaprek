@@ -63,7 +63,7 @@ export class InvalidGoalError extends Error {
 }
 
 /**
- * The mission's own daily budget in USD (ALMANAC-PLAN §2.5), or null for
+ * The mission's own daily budget in USD, or null for
  * "no mission budget" — which is not 0 and never a limit by itself. Under a
  * policy default (budget.defaultDailyUsd) it only ever TIGHTENS the ceiling
  * in effect, same posture semantics as the mission's own posture dial — see

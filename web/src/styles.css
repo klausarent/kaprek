@@ -1,4 +1,4 @@
-/* Die Variant-B-Palette (wireframes/variant-b.html) ist DIE Palette der App:
+/* Die dunkle Palette ist DIE Palette der App:
    eine dunkle Operations-Konsole, ohne Media-Query-Ausnahme. Die bisherigen
    Variablennamen (--surface, --border, …) bleiben bestehen, damit der Swap
    alle Seiten auf einmal umfärbt; --warn und --blue kommen neu dazu. */
@@ -59,7 +59,7 @@ pre,
 }
 
 /* ---------------------------------------------------------------------------
-   Die globale Shell (Variant B, wireframes/variant-b.html): links die Rail,
+   Die globale Shell: links die Rail,
    rechts die Arbeitsfläche in VOLLER Breite — kein zentrierter
    max-width-Container mehr. Auf #/start kommt als drittes Grid-Feld die
    Feed-Spalte hinzu (Start liefert Arbeitsfläche + Feed als Fragment-Kinder).

@@ -369,11 +369,10 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   it, an approval whose turn died some other way would keep its auto-deny
  *   timer armed for the full unattended deadline — hours, with the inbox.
  * @param {() => {allowed: boolean, reason?: string, budgetUsd?: number, spentKnownUsd?: number, unknownRuns?: number}} [options.checkBudget] -
- *   the DAILY-BUDGET check for unattended turns (ALMANAC-PLAN §2.5 +
- *   BRIDGE-PLAN I2): the server wires a closure over policy.json's
- *   budget.defaultDailyUsd and runs.jsonl (src/budget/budget.mjs). Triggers
+ *   the DAILY-BUDGET check for unattended turns: the server wires a closure
+ *   over policy.json's budget.defaultDailyUsd and runs.jsonl (src/budget/budget.mjs). Triggers
  *   have no mission binding, so only the GLOBAL default applies to them. The
- *   I2 rule is decided HERE, not per trigger: a background run over budget is
+ *   priority rule is decided HERE, not per trigger: a background run over budget is
  *   SKIPPED (runs.jsonl line with skipped: 'budget', no turn, no question) —
  *   nobody is woken at 3am for a background check, and direct requests always
  *   have priority. Null (a runner built without it — tests, isolated use)
@@ -1252,7 +1251,7 @@ export function createTriggerRunner({
       reasonText = 'manual fire (saved prompt)';
     }
 
-    // P7 — skip-if precondition (see DESIGN-SPEC.md). Checked here, AFTER the
+    // Skip-if precondition. Checked here, AFTER the
     // window claim and BEFORE buildPrompt(): a skipped run must still spend
     // the slot (otherwise the next tick re-checks the same condition in the
     // same window forever), but must never become a turn.

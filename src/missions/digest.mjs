@@ -1,5 +1,5 @@
-// P8 — Morning digest, numbers core (DESIGN-SPEC "P8 — Morgen-Digest,
-// Zahlen-Kern"). One Markdown document per mission and window, built from
+// Morning digest, numbers core. One Markdown document per mission and
+// window, built from
 // what is already on disk: runs.jsonl (src/orchestrator/runs.mjs) and the
 // pending deferred questions (src/server/approval-store.mjs listPending).
 //
