@@ -294,7 +294,7 @@ export function MissionDigestCardBody({
 }
 
 /**
- * Der Tagesbudget-Block (ALM 2.5) unter dem Header: das Feld für das
+ * Der Tagesbudget-Block unter dem Header: das Feld für das
  * Mission-Budget (leer = kein Missions-Budget), der heutige Stand und der
  * Gnaden-Status. Ehrlich in beide Richtungen: ohne Budget steht da, dass
  * KEINS gilt — nie ein Fake-Limit — und ohne bekannte Kosten behauptet die

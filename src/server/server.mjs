@@ -1531,12 +1531,12 @@ async function decideDeferredApproval(res, { key, entry, behavior, message, appr
 }
 
 /**
- * Answers a BUDGET question (ALM 2.5, I2): unlike a deferred tool approval
+ * Answers a BUDGET question: unlike a deferred tool approval
  * there is no action to replay, so an allow records a GRACE DAY and starts
  * nothing — the next turn submission in this mission (or, for the global
  * bucket, any missionless turn) simply passes until the next local midnight.
  * A deny records the refusal; the mission stays capped and the next
- * submission asks again (only an allow suppresses re-asking — I2 names the
+ * submission asks again (only an allow suppresses re-asking — this grants the
  * grace, not the refusal).
  *
  * The grace is written AFTER the decision is recorded, so a grace-write
@@ -1826,7 +1826,7 @@ async function handleApprovalsList(res, approvalStore, query = null) {
     // gate is answered through a different path on the way back in.
     kind: entry.kind ?? null,
     // The mission the question belongs to (the daily-budget question files
-    // it, ALM 2.5) — a card can name the mission without resolving the chat.
+    // it) — a card can name the mission without resolving the chat.
     missionId: entry.missionId ?? null,
     triggerId: entry.triggerId ?? null,
     // How often the trigger has asked this same question (see the store's
@@ -1888,7 +1888,7 @@ async function handleApprovalsList(res, approvalStore, query = null) {
  *     byMission: [{ missionId, triggerId, title, ...same counters }],  // only runs attributable via the run's chat's mission
  *                                       // or the run's own triggerId; unattributable runs sit only in totals
  *   },
- *   budget: {                           // ALM 2.5 — only missions WITH an effective budget appear; no budget, no row
+ *   budget: {                           // Only missions WITH an effective budget appear; no budget, no row
  *     missions: [{ missionId, title, budgetUsd, spentKnownUsd, unknownRuns, graceToday, exceeded }],
  *     totals: { knownUsd, budgetUsd, unknownRuns } | null,  // the strip's aggregate, null when no mission has a budget
  *   },
@@ -2026,7 +2026,7 @@ async function handleLeitstand(res, { dataDir, getChats, getMissions, getApprova
     }
   }
 
-  // Daily budgets (ALM 2.5): one aggregate for the Start page's status
+  // Daily budgets: one aggregate for the Start page's status
   // strip. ONLY missions with an effective budget appear here — a mission
   // (and a day) without a budget is no data point, and inventing "$0 of $0"
   // for it would be the fake limit this page refuses to show.
@@ -3063,7 +3063,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
       .filter((task) => mission.tasks.includes(task.id));
     const pendingApprovals = (await getApprovalStore().listPending())
       .filter((entry) => entry.chatId && chats.some((chat) => chat.id === entry.chatId));
-    // The daily-budget view (ALM 2.5): the mission's own figure, the policy
+    // The daily-budget view: the mission's own figure, the policy
     // ceiling it tightens, the effective minimum, today's stand — and, when
     // no budget applies at all, nulls instead of a fake limit.
     const policyForBudget = loadPolicyFailOpen(dataDir);
@@ -3131,7 +3131,7 @@ async function handleMissionRoutes(req, res, segments, { getMissions, getChats, 
     const pendingQuestions = (await getApprovalStore().listPending()).filter(
       (entry) => entry.mode === 'deferred' && entry.chatId != null && chatIds.has(entry.chatId),
     );
-    // The budget line (ALM 2.5): only for a mission with an effective
+    // The budget line: only for a mission with an effective
     // budget; the spend itself is rendered from the same window runs the
     // rest of the document uses. graceToday is the CURRENT grace state.
     const policyForDigestBudget = loadPolicyFailOpen(dataDir);
@@ -3528,7 +3528,7 @@ async function handleChatTurn(
   // against one transcript, and its finally block's
   // cleanupApprovalsForChat(chatId) would deny the trigger's parked
   // question on the way out — an overnight approval destroyed by an unrelated
-  // message (panel Fix-Runde 1, I2). Hours-long parks are exactly what the
+  // message. Hours-long parks are exactly what the
   // inbox made possible, so this stopped being a theoretical race.
   if (getRunner && getRunner().isChatRunning(chatId)) {
     sendJson(res, 409, { error: 'chat busy: a trigger turn is running in this chat' });
@@ -3577,9 +3577,9 @@ async function handleChatTurn(
     }
   }
 
-  // ALM 2.5 — the daily budget, checked in the SAME path as the posture
+  // The daily budget, checked in the SAME path as the posture
   // ceiling above, BEFORE any turn starts (never mid-run). This route is the
-  // INTERACTIVE path, so the I2 rule applies in its question form: an
+  // INTERACTIVE path, so the budget rule applies in its question form: an
   // over-budget turn is not started and not silently dropped either — a
   // deferred question is filed to the inbox ("Tagesbudget … Heute
   // weiterfahren?") and the submission is refused with an honest message
@@ -4752,7 +4752,7 @@ async function handleRequest(
       await handleApprovalDecision(req, res, segments[2], pendingApprovals, getApprovalStore(), getRunner, getRelay, {
         decidedVia: viaPhoneToken ? 'phone-token' : 'web',
         grants: { store: getGrantStore(), resolveStanding },
-        // The grace-day writer for budget questions (ALM 2.5): today's local
+        // The grace-day writer for budget questions: today's local
         // day key decides validity, so no timer and no cron — the record
         // simply stops matching tomorrow (see budget.mjs::hasGrace).
         recordBudgetGrace: (missionId) =>
@@ -5231,7 +5231,7 @@ export function startServer({
         approvalDeadlineMs: unattendedApprovalTimeoutMs,
         releaseApprovals: (chatId) => cancelApprovalsForChat(pendingApprovals, chatId, getApprovalStore(), 'run-aborted'),
         makeUiApprovalHandler: uiApprovalHandlerFor,
-        // ALM 2.5 + I2: a trigger turn is BACKGROUND. When the daily budget
+        // A trigger turn is BACKGROUND. When the daily budget
         // is spent, this closure's verdict makes the runner SKIP the run
         // (runs.jsonl line with skipped: 'budget') — no question at 3am,
         // never a mid-run cap. Trigger runs have no mission binding, so only

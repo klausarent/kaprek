@@ -64,7 +64,7 @@ export function tokensLabel(counts: Pick<LeitstandCounts, "tokens" | "tokensUnkn
 }
 
 /**
- * Die Budget-Zeile des Status-Streifens (ALM 2.5). Ehrlich in beide
+ * Die Budget-Zeile des Status-Streifens. Ehrlich in beide
  * Richtungen: ohne Mission mit Budget erscheint sie gar nicht (kein
  * Fake-Limit), und ohne bekannte Kosten behauptet sie keine $0.00 — der
  * unknown-Zähler spricht. Gnade geht aus den Einzeltask-Zeilen hervor; hier

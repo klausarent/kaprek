@@ -245,7 +245,7 @@ export type LeitstandGrant = {
   lastUsedAt: string | null;
 };
 
-/** One mission's daily-budget stand (ALM 2.5). Only missions WITH an effective budget appear — no budget, no row, kein Fake-Limit. */
+/** One mission's daily-budget stand. Only missions WITH an effective budget appear — no budget, no row, kein Fake-Limit. */
 export type LeitstandBudgetMission = {
   missionId: string;
   title: string | null;
@@ -633,7 +633,7 @@ export type Mission = {
   preset: string | null;
   /** The mission's own posture ceiling; null = the global one from policy.json. In effect only ever stricter than global. */
   posture: Posture | null;
-  /** The mission's own daily budget in USD (ALM 2.5); null = kein Missions-Budget. Under a policy default it only ever tightens the ceiling. */
+  /** The mission's own daily budget in USD; null = kein Missions-Budget. Under a policy default it only ever tightens the ceiling. */
   budgetUsd: number | null;
   status: MissionStatus;
   createdAt: string;
@@ -658,7 +658,7 @@ export type MissionDetail = {
   chats: ChatSummary[];
   tasks: Task[];
   pendingApprovals: InboxApproval[];
-  /** The daily-budget view (ALM 2.5); null effectiveUsd means no budget applies — the page says so instead of showing a fake limit. */
+  /** The daily-budget view; null effectiveUsd means no budget applies — the page says so instead of showing a fake limit. */
   budget?: {
     missionBudgetUsd: number | null;
     policyDefaultUsd: number | null;
@@ -678,7 +678,7 @@ export function setMissionPosture(id: string, posture: Posture | null): Promise<
   return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/posture`, { posture }).then((r) => r.mission);
 }
 
-/** Sets (or clears, with null) a mission's own daily budget in USD (ALM 2.5). Empty input on the page sends null — kein Fake-Limit. */
+/** Sets (or clears, with null) a mission's own daily budget in USD. Empty input on the page sends null — kein Fake-Limit. */
 export function setMissionBudget(id: string, budgetUsd: number | null): Promise<Mission> {
   return postJson<{ mission: Mission }>(`/api/missions/${encodeURIComponent(id)}/budget`, { budgetUsd }).then((r) => r.mission);
 }

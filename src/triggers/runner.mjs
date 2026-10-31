@@ -401,7 +401,7 @@ export function createTriggerRunner({
   // P7: the condition-error notification, seam-injected so tests never spawn
   // a real notifier. Fire-and-forget by contract (see notify.mjs).
   notify = defaultNotify,
-  // Daily budget (ALM 2.5 + I2) — server-wired, see the doc comment above.
+  // Daily budget — server-wired, see the doc comment above.
   checkBudget = null,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
@@ -1102,7 +1102,7 @@ export function createTriggerRunner({
       return { fired: false, reason: globalCheck.reason };
     }
 
-    // Daily budget (ALM 2.5 + I2-Pause-Reihenfolge). A trigger turn is
+    // Daily budget. A trigger turn is
     // BACKGROUND: when the budget is spent, this run is skipped — never
     // asked about (nobody is woken at 3am for a background check), never
     // half-started (the check runs BEFORE any claim, any prompt, any
@@ -1603,8 +1603,8 @@ export function createTriggerRunner({
 
   /**
    * Whether a TRIGGER turn is currently writing into this chat. The chat-turn
-   * route needs it to refuse a second turn on the same chat (panel Fix-Runde
-   * 1, I2): a trigger turn parked on an inbox approval can sit there for
+   * route needs it to refuse a second turn on the same chat:
+   * a trigger turn parked on an inbox approval can sit there for
    * hours, and a chat turn started on its chat meanwhile would run a second
    * CLI against one transcript AND destroy the parked question on its way out
    * (handleChatTurn's finally calls cleanupApprovalsForChat for the whole

@@ -159,7 +159,7 @@ function runLine(run) {
     const cause = run.conditionError ? String(run.conditionError).split('\n')[0].slice(0, 120) : 'unknown';
     return `- übersprungen (condition-error) — Bedingung ${kind} konnte nicht geprüft werden: ${cause}${duration}`;
   }
-  // ALM 2.5: a budget skip is normal scarcity, said plainly — never "gelaufen
+  // A budget skip is normal scarcity, said plainly — never "gelaufen
   // ohne Kosten" (it never became a turn) and never a failure (it is not one).
   if (run.skipped === 'budget') {
     return `- übersprungen (Budget) — Tagesbudget erreicht${duration}`;
@@ -263,7 +263,7 @@ export function renderDigest({ mission, window, runs, openQuestions, nowMs = Dat
   }
   lines.push('');
 
-  // (c2) The daily budget line (ALM 2.5) — only for a mission that HAS a
+  // (c2) The daily budget line — only for a mission that HAS a
   // budget. Spend = this window's known sum, same numbers as the section
   // above; skipped runs are neither cost nor unknown (they never became a
   // turn). A day of ONLY unknown costs cannot exhaust the budget, and the
