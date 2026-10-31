@@ -726,6 +726,8 @@ Before an agent runs a tool it can be made to ask. What happens next depends on 
 
 This is a deliberate trade. The agent does not get to do the thing it asked for while you sleep, and a task that truly cannot continue without the answer will end unfinished. In exchange, nothing is held hostage to a question: no `claude` process parked overnight, no chat locked for hours, no trigger blocked behind one waiting for an answer that may never come.
 
+One night walked through end to end, with a made-up project: [The question at 03:00](https://github.com/klausarent/kaprek/blob/main/docs/the-question-at-0300.md).
+
 **What survives what.** A filed question survives the turn that raised it, and it survives restarting kaprek — it hangs on no process, and approving starts a fresh turn. A question in a live chat dialog does not: the turn waiting on it dies with the server, so those are marked `process gone` on the next start and refused rather than answered.
 
 Two limits worth knowing. The action is replayed from the input kaprek stored, and inputs over 1 MiB are kept only as a preview — approving one of those starts a turn that asks again before it runs, with you there to answer. And a follow-up turn is a trigger turn like any other, so it is refused while another turn is running in that chat; approve again once it is done.
