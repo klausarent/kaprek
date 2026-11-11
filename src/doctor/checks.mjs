@@ -170,7 +170,7 @@ export function checkHooks({ dataDir, settingsPath } = {}) {
     if (report.settings === null) {
       return check('hooks', 'warn', `The Claude Code settings file at ${report.settingsPath} exists but is not valid JSON — the hook entries cannot be verified.`);
     }
-    if (!report.installed) {
+    if (!Object.values(report.events).some((entry) => entry.installed)) {
       return check('hooks', 'ok', 'No kaprek hooks installed in the Claude Code settings — nothing to verify (kaprek hooks install adds them).');
     }
     const problems = [];

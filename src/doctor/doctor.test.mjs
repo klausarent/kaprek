@@ -5,7 +5,7 @@
 // The legacy fixtures (src/testdata/legacy-datadir/) are COPIED into a
 // tmpdir per test, exactly like legacy-datadir.test.mjs does it — the
 // committed fixtures are never opened by any store.
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -120,6 +120,18 @@ function byId(report, id) {
 
 const ALL_CHECK_IDS = ['transcript-drift', 'hooks', 'search-index', 'policy', 'presets', 'ledger', 'context-state', 'grants', 'triggers-degraded'];
 
+const HOOK_EVENTS = ['Stop', 'SessionStart', 'SessionEnd', 'UserPromptSubmit'];
+
+function hookFixture(events, { missingScript = false, managed = true } = {}) {
+  const dir = tmpdir();
+  const script = path.join(dir, 'synthetic-hook.mjs');
+  if (!missingScript) fs.writeFileSync(script, '// synthetic hook\n', 'utf8');
+  const settingsPath = path.join(dir, 'synthetic-settings.json');
+  const command = `node "${script}"${managed ? ` --managed-by=${getPackageName()}` : ''}`;
+  fs.writeFileSync(settingsPath, `${JSON.stringify({ hooks: Object.fromEntries(events.map((event) => [event, [{ hooks: [{ type: 'command', command }] }]])) }, null, 2)}\n`, 'utf8');
+  return { dataDir: dir, settingsPath, script };
+}
+
 /** Writes a session jsonl with `okLines` well-formed lines and `broken` junk lines. Returns the scan root. */
 function writeScanRoot({ okLines = 10, broken = 0, unknownType = 0 } = {}) {
   const rootDir = tmpdir();
@@ -177,8 +189,61 @@ describe('doctor checks', () => {
     const script = path.join(tmpdir(), 'hook-stop.mjs');
     fs.writeFileSync(script, '// fake hook\n', 'utf8');
     installHook({ settingsPath, hookScriptPath: script, sessionStartScriptPath: script, sessionEndScriptPath: script, userPromptScriptPath: script });
+    const before = fs.readFileSync(settingsPath);
     const result = checkHooks({ dataDir, settingsPath });
     expect(result.status).toBe('ok');
+    expect(fs.readFileSync(settingsPath)).toEqual(before);
+  });
+
+  it.each(HOOK_EVENTS)('hooks: missing %s warns and names that event', (missing) => {
+    const fixture = hookFixture(HOOK_EVENTS.filter((event) => event !== missing));
+    const before = fs.readFileSync(fixture.settingsPath);
+    const result = checkHooks(fixture);
+    expect(result.status).toBe('warn');
+    expect(result.message).toContain(`${missing} is not installed`);
+    expect(result.message).toContain('kaprek hooks install');
+    expect(result.detail).toContain(`${missing}: not installed`);
+    expect(fs.readFileSync(fixture.settingsPath)).toEqual(before);
+  });
+
+  it.each(['SessionStart', 'SessionEnd', 'UserPromptSubmit'])('hooks: only %s warns about all three missing events', (installed) => {
+    const fixture = hookFixture([installed]);
+    const before = fs.readFileSync(fixture.settingsPath);
+    const result = checkHooks(fixture);
+    expect(result.status).toBe('warn');
+    for (const event of HOOK_EVENTS.filter((event) => event !== installed)) {
+      expect(result.message).toContain(`${event} is not installed`);
+      expect(result.detail).toContain(`${event}: not installed`);
+    }
+    expect(result.message).not.toContain(`${installed} is not installed`);
+    expect(fs.readFileSync(fixture.settingsPath)).toEqual(before);
+  });
+
+  it.each([false, true])('hooks: missing Stop and a broken path remain diagnosed without repair (fix=%s)', async (fix) => {
+    const fixture = hookFixture(['SessionStart'], { missingScript: true });
+    const before = fs.readFileSync(fixture.settingsPath);
+    const report = await runDoctor({ ...fixture, rootDir: tmpdir(), fix });
+    const result = byId(report, 'hooks');
+    expect(result.status).toBe('warn');
+    for (const event of ['Stop', 'SessionEnd', 'UserPromptSubmit']) {
+      expect(result.message).toContain(`${event} is not installed`);
+    }
+    expect(result.message).toContain(`SessionStart points at a missing script file (${fixture.script})`);
+    expect(result.message).toContain('kaprek hooks install');
+    expect(fs.readFileSync(fixture.settingsPath)).toEqual(before);
+    expect(fs.existsSync(fixture.script)).toBe(false);
+  });
+
+  it.each([
+    { events: [], managed: true },
+    { events: HOOK_EVENTS, managed: false },
+  ])('hooks: no managed entries is ok ($managed, $events)', ({ events, managed }) => {
+    const fixture = hookFixture(events, { managed });
+    const before = fs.readFileSync(fixture.settingsPath);
+    const result = checkHooks(fixture);
+    expect(result.status).toBe('ok');
+    expect(result.message).toContain('No kaprek hooks installed');
+    expect(fs.readFileSync(fixture.settingsPath)).toEqual(before);
   });
 
   it('hooks: a missing script file at the recorded path warns', () => {
@@ -195,7 +260,10 @@ describe('doctor checks', () => {
   it('hooks: not installed is ok, and a malformed command warns', () => {
     const dataDir = tmpdir();
     const settingsPath = path.join(tmpdir(), 'no-settings.json');
-    expect(checkHooks({ dataDir, settingsPath }).status).toBe('ok');
+    const absent = checkHooks({ dataDir, settingsPath });
+    expect(absent.status).toBe('ok');
+    expect(absent.message).toContain('No kaprek hooks installed');
+    expect(fs.existsSync(settingsPath)).toBe(false);
 
     const malformedPath = path.join(tmpdir(), 'settings-malformed.json');
     fs.writeFileSync(malformedPath, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `garbled --managed-by=${getPackageName()}` }] }] } }), 'utf8');
@@ -397,6 +465,7 @@ describe('doctor report, fix surface and json', () => {
   it('--fix never rebuilds a NEWER search index, and without a fix target it changes nothing', async () => {
     const probe = await openSearchDb({ dataDir: tmpdir() });
     if (probe.unavailable) return;
+    probe.db.close(); // Release the synthetic probe before Windows cleanup.
     const dataDir = tmpdir();
     const { DatabaseSync } = await import('node:sqlite');
     const db = new DatabaseSync(path.join(dataDir, 'search.db'));
@@ -428,10 +497,16 @@ describe('doctor report, fix surface and json', () => {
     expect(opts).toMatchObject({ fix: true, json: true, dir: 'X:\\scan', dataDir: 'X:\\data' });
     expect(() => parseDoctorArgs(['--lan'])).toThrow(/Unknown argument/);
 
-    const dataDir = copyFixture();
-    const code = await runDoctorCommand(['--json', '--data-dir', dataDir, '--dir', tmpdir()], { dataDir });
-    expect(code).toBe(0);
-    const codeFix = await runDoctorCommand(['--data-dir', dataDir, '--dir', tmpdir()], { dataDir });
-    expect(codeFix).toBe(0);
+    // The CLI has no settings-path flag: isolate its default lookup too.
+    const home = vi.spyOn(os, 'homedir').mockReturnValue(tmpdir());
+    try {
+      const dataDir = copyFixture();
+      const code = await runDoctorCommand(['--json', '--data-dir', dataDir, '--dir', tmpdir()], { dataDir });
+      expect(code).toBe(0);
+      const codeFix = await runDoctorCommand(['--data-dir', dataDir, '--dir', tmpdir()], { dataDir });
+      expect(codeFix).toBe(0);
+    } finally {
+      home.mockRestore();
+    }
   });
 });
