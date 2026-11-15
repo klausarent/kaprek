@@ -31,6 +31,7 @@ import Quota from "./pages/Quota";
 import Memory from "./pages/Memory";
 import Home from "./pages/Home";
 import Start from "./pages/Start";
+import Handover from "./pages/Handover";
 import { Experiments } from "./pages/Experiments";
 import { hasInstanceToken } from "./lib/api";
 import { statusSummary, useAppStatus } from "./lib/status";
@@ -54,7 +55,8 @@ export type Route =
   | { name: "quota" }
   | { name: "memory"; scopeId?: string }
   | { name: "home" }
-  | { name: "experiments" };
+  | { name: "experiments" }
+  | { name: "handover" };
 
 export function parseRoute(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
@@ -130,6 +132,9 @@ export function parseRoute(hash: string): Route {
   }
   if (parts[0] === "experiments") {
     return { name: "experiments" };
+  }
+  if (parts[0] === "handover") {
+    return { name: "handover" };
   }
   if (parts[0] === "start") {
     return { name: "start" };
@@ -236,6 +241,10 @@ export function navigateToQuota() {
 
 export function navigateToExperiments() {
   window.location.hash = "#/experiments";
+}
+
+export function navigateToHandover() {
+  window.location.hash = "#/handover";
 }
 
 /**
@@ -518,6 +527,8 @@ export default function App() {
               <Apps />
             ) : route.name === "experiments" ? (
               <Experiments />
+            ) : route.name === "handover" ? (
+              <Handover />
             ) : route.name === "chats" ? (
               <ChatList triggerId={route.triggerId} includeSilent={route.includeSilent} />
             ) : route.name === "missions" ? (

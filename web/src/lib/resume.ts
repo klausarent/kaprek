@@ -23,6 +23,15 @@ export type ResumeSession = {
   hidden: boolean;
   crash: boolean;
   ledger: SessionLedgerInfo | null;
+  /**
+   * Set when this session took part in an account-switch handover (see
+   * lib/handover.ts): "old" is the session a handover was written FROM (its
+   * own transcript ends there — a batch reopen must not resume it, since
+   * that would re-read the whole thing on the new account), "new" is the
+   * fresh session a handover start spawned. Optional/nullable because older
+   * servers, and sessions no handover ever touched, carry no such field.
+   */
+  handover?: { handoverId: string; role: "old" | "new" } | null;
 };
 
 // `ok` is optional: the server's 404 branch (unknown engine:id) answers with
@@ -69,9 +78,16 @@ export function recentSessions(sessions: ResumeSession[], hours: number, nowMs =
  * the window. Other engines, and a claude session the ledger has no entry
  * for at all, carry no `ledger` and stay eligible — same as the CLI's
  * `kaprek resume --all` (see src/cli/resume.mjs).
+ *
+ * A session a handover already carried to a new account ("old" role) is
+ * excluded too, for the same reason an ended ledger entry is: resuming it in
+ * a batch would re-read its whole transcript on the account it was handed
+ * OFF of, which is exactly what the handover was meant to avoid.
  */
 export function resumableSessions(sessions: ResumeSession[], hours: number, nowMs = Date.now()): ResumeSession[] {
-  return recentSessions(sessions, hours, nowMs).filter((s) => !s.hidden && (!s.ledger || s.ledger.open));
+  return recentSessions(sessions, hours, nowMs).filter(
+    (s) => !s.hidden && (!s.ledger || s.ledger.open) && (s.handover ?? null)?.role !== "old",
+  );
 }
 
 /**

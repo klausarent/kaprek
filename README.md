@@ -749,6 +749,38 @@ Windows Terminal dies, twenty sessions with it. kaprek reads the session stores 
 
 The same list and buttons sit at the top of `#/list` (`GET /api/resume/sessions`, `POST /api/resume`, `POST /api/resume/batch`) — each row shows the same open/ended badge, and "Alle der letzten 24 h fortsetzen" only ever reopens open ones. Resuming a specific session by `engine:id` (the two `POST` routes) always works regardless of the ledger filter — it is the *list* that is filtered, not the ability to jump straight to a session you already know the id of. Scan results are cached under `<dataDir>/resume-cache/`; a session is never opened by a test.
 
+## Switching the Claude account (`kaprek handover`)
+
+The prompt cache belongs to one account. A session that keeps running after `/login` to another subscription makes the new account read its whole transcript again. So before the switch every session writes down where it stands, and afterwards kaprek starts one **fresh** session per handover — never a resume.
+
+1. A session opens a switch: `kaprek handover open --note "limit"` prints its id and remembers which sessions are open right now (and which account is logged in).
+2. Every session reports the file a fresh session has to read: `kaprek handover add --switch <id> --file <absolute path> --section "<heading>"`, or `--nothing` when it has nothing open. The session id comes from `CLAUDE_CODE_SESSION_ID`, the start folder from the session's first ledger entry. Reporting again replaces the earlier report until a tab was opened from it (a start that was refused — folder or file gone — does not count); after that a new report is a new handover, so write an afterthought into the handover file instead.
+3. You log in to the other account and press "Alle neu starten" on `#/handover` — or run `kaprek handover start --all` in a terminal of your own. Each handover opens a Windows Terminal tab in its folder with a new Claude session.
+
+`kaprek handover` lists the current switch: every handover with its status, and the sessions that were open when it began and have not reported.
+
+| Status | Meaning |
+|---|---|
+| `pending` | reported, not started |
+| `nothing` | the session had nothing to hand over; listed, never started |
+| `failed` | no tab could be opened (folder or file gone, CLI missing) and every attempt says so; the next start tries again |
+| `unknown` | a start was requested and its outcome never written (a crash in between); stays unknown until a later attempt opens a tab, and is started again only on request |
+| `spawned` | a tab opened; the new session has not been seen yet |
+| `running` | the new session's transcript was found |
+
+What it does and what it deliberately does not:
+
+- **Only kaprek's words reach the command line.** The fresh session gets one short first prompt — `Übergabe <title> (<key>): Lies <start file> …` — made of fixed text, a title reduced to letters, digits, space and `._-`, and the path of a start file kaprek wrote (`<dataDir>/handover/start/<key>.md`, one per attempt, never rewritten). What the old session reported (file, section, instruction, note) is in that file. Windows PowerShell 5.1 does not escape quotes in arguments to native programs; free text from a session never goes there.
+- **The tab does not inherit the old session.** kaprek's server is often started by the SessionStart hook and carries Claude Code's markers (`CLAUDE_CODE_CHILD_SESSION` and friends); a `claude` that inherits them saves no transcript. The start script removes them inside the tab, and for a start on the logged-in account also `CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN` and the proxy route and account tag of a `kaprek claude` session. This applies to `kaprek resume` tabs too.
+- **`--account login` or `auto`.** `login` (default) is whatever `/login` says now; if that is still the organization the switch was opened under, kaprek warns — on `#/handover` and in the terminal (two subscriptions in one organization look the same to it). `auto` runs `kaprek claude`, which picks the account with the most room and sets its token inside its own process; where `kaprek claude` would start a `.cmd` shim instead of `claude.exe`, `auto` refuses, because a shell would split the prompt.
+- **A tab is not a session.** `spawned` turns into `running` when the scanner finds a Claude session whose first prompt carries the attempt key. A tab in which Claude died stays `spawned` and keeps its "Nochmal starten" button; after half an hour kaprek stops looking for its session.
+- **One writer that decides at a time.** A start run and every report (`add`, `open`) take the same lock file, and read the protocol only once they hold it. A second start gets 409 / exit 3; a report waits for a running start (up to 90 s, then exit 3). The lock names its owner: it is taken over at once when that process is gone, and after fifteen minutes without a refresh when it still runs (a run refreshes after every tab); taking over and releasing happen under a second lock, so a run that was taken over cannot delete its successor's lock. Intent is written before a tab opens and the outcome after; a tab counts as opened only once the terminal process exists.
+- **The old sessions stay out of the batch reopen.** A session that reported a handover (or "nothing open") is marked `handed over`: `kaprek resume --all`, `POST /api/resume/batch` and the button on `#/list` skip it, because reopening it is exactly the re-read the handover exists to avoid. Reopening it one at a time still works. Once a fresh session was started from the handover the mark stays; before that it lapses as soon as the old transcript grows more than half an hour past the report — the switch was called off and somebody works on there.
+- **Started by the person.** `kaprek handover start` refuses inside a Claude Code session unless `--dry-run` or `--from-agent`; `POST /api/handover/start` takes ids and three options, nothing that becomes a command or an instruction, and answers 403 to anything but loopback — also with `--lan`.
+- **Trust.** Whoever can write `<dataDir>/handover/log.jsonl` or the handover file decides what a fresh session is told to do, and that session starts with `--dangerously-skip-permissions` unless you untick it (`--no-skip`). Both are files of your own user account; kaprek adds no boundary beyond that.
+
+kaprek does not run `/login`, does not close the old windows and does not hand over codex, grok or kimi sessions (their quotas are their own). The log is append-only: `<dataDir>/handover/log.jsonl`, earlier switches with `kaprek handover list --all`. Handovers an earlier switch still holds stay on `#/handover` with their buttons (`kaprek handover start <id> --switch <id>` in the terminal), so a newer switch cannot bury them.
+
 ## Claude Code hook (optional)
 
 kaprek can install a Claude Code **Stop** hook that gently enforces the policy engine's rules (e.g. flagging a session that made a commit without a linked board task). It is opt-in only — nothing is installed by default.

@@ -16,8 +16,10 @@ export const RESUME_USAGE = `Usage: kaprek resume [<engine>:<id>] [--all] [--hou
                              (a unique prefix of <engine>:<id> also works)
   kaprek resume --all        open every OPEN session active in the last 24 hours
                              that a person opened in a terminal — never a headless
-                             run (claude -p, codex exec, grok -p, cron), and never
-                             a claude session the ledger already marked "end"
+                             run (claude -p, codex exec, grok -p, cron), never a
+                             claude session the ledger already marked "end", and
+                             never one that handed over before an account switch
+                             (see \`kaprek handover\`)
   --hours N                  window for --all (default 24)
   --days N                   window for the list (default 7)
   --limit N                  show at most N sessions in the list, newest first
@@ -123,8 +125,11 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
     // never opened either — beendete Sessions nie automatisch. Other
     // engines, and a claude session with no ledger info at all, carry no
     // `ledger` and stay eligible.
+    // And never a session that handed over before an account switch: its
+    // way back is `kaprek handover start`, a fresh session — reopening the
+    // old one would make the new account re-read the whole transcript.
     const picked = sessions
-      .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS && (!s.ledger || s.ledger.open))
+      .filter((s) => !s.hidden && nowMs - Date.parse(s.lastTs) <= opts.hours * HOUR_MS && (!s.ledger || s.ledger.open) && s.handover?.role !== 'old')
       .sort((a, b) => Date.parse(b.lastTs) - Date.parse(a.lastTs));
     let failed = 0;
     for (let i = 0; i < picked.length; i++) {
@@ -151,7 +156,7 @@ export async function runResumeCommand(argv, { scanAll, resumeSession, now = Dat
   const cap = opts.limit === 0 ? listed.length : opts.limit;
   const shown = listed.slice(0, cap);
   for (const s of shown) {
-    const flag = `${s.crash ? ' [crash]' : ''}${s.hidden ? (s.kind === 'empty' ? ' [leer]' : ' [headless]') : ''}`;
+    const flag = `${s.crash ? ' [crash]' : ''}${s.hidden ? (s.kind === 'empty' ? ' [leer]' : ' [headless]') : ''}${s.handover?.role === 'old' ? ' [handed over]' : ''}`;
     stdout(`${s.key.padEnd(48)} ${ago(s.lastTs, nowMs).padStart(6)}  ${ledgerStatus(s).padEnd(18)}${path.basename(s.cwd || '') || '-'}  ${redactSecrets(s.title)}${flag}`);
   }
   if (shown.length < listed.length) {

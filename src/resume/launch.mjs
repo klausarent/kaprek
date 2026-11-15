@@ -46,8 +46,42 @@ export function isElevated() {
   } catch { return false; }
 }
 
-function psQuote(s) {
-  return `'${String(s).replace(/'/g, "''")}'`;
+// PowerShell reads the typographic single quotes (U+2018, U+2019, U+201A,
+// U+201B) as string delimiters too, so a path or a title carrying one would
+// end a '…' literal early. Doubling works for all of them.
+export function psQuote(s) {
+  return `'${String(s).replace(/['‘’‚‛]/g, (q) => q + q)}'`;
+}
+
+// What Claude Code puts into the environment of everything it starts. A
+// `claude` that inherits CLAUDE_CODE_CHILD_SESSION runs as a child session:
+// no transcript is saved, so it cannot be resumed and is gone with its
+// window. kaprek's server is often started by the SessionStart hook and
+// inherits all of these, so no tab it opens may carry them.
+export const SESSION_ENV_MARKERS = [
+  'CLAUDECODE',
+  'CLAUDE_CODE_CHILD_SESSION',
+  'CLAUDE_CODE_ENTRYPOINT',
+  'CLAUDE_CODE_EXECPATH',
+  'CLAUDE_CODE_MESSAGING_SOCKET',
+  'CLAUDE_CODE_MESSAGING_TOKEN',
+  'CLAUDE_CODE_SESSION_ATTENDED',
+  'CLAUDE_CODE_SESSION_ID',
+  'CLAUDE_PID',
+  // set for hooks, and the server is usually started by one
+  'CLAUDE_PROJECT_DIR',
+  'CLAUDE_ENV_FILE',
+  'CLAUDE_PLUGIN_ROOT',
+];
+
+/** A copy of `env` without the markers of the session that started this process. */
+export function tabEnv(env = process.env) {
+  const out = { ...env };
+  const markers = new Set(SESSION_ENV_MARKERS);
+  for (const name of Object.keys(out)) {
+    if (markers.has(name.toUpperCase())) delete out[name];
+  }
+  return out;
 }
 
 // Shell-Befehl, den der Nutzer auch selbst kopieren kann.
@@ -58,8 +92,14 @@ export function buildKimiCommand(id) {
   return `kimi --yolo -S ${id}`;
 }
 
-export function buildScript({ cwd, header, exe, args }) {
+/** `preamble`: extra PowerShell lines run before the working directory is set — written by kaprek, never built from session text. */
+export function buildScript({ cwd, header, exe, args, preamble = [] }) {
   const lines = [
+    // Whatever environment the tab ends up with — the one of the `wt` call or
+    // one Windows Terminal built itself — the markers are dropped inside the
+    // tab as well as in the spawn (see tabEnv).
+    ...SESSION_ENV_MARKERS.map((name) => `Remove-Item -LiteralPath ${psQuote(`Env:${name}`)} -ErrorAction SilentlyContinue`),
+    ...preamble,
     `$Host.UI.RawUI.WindowTitle = ${psQuote(header)}`,
     `Set-Location -LiteralPath ${psQuote(cwd)}`,
     `Write-Host ${psQuote('[session-launcher] ' + header)} -ForegroundColor DarkCyan`,
@@ -75,25 +115,45 @@ function safeSlug(s) {
   return String(s).replace(/[^A-Za-z0-9_-]+/g, '_').slice(0, 60);
 }
 
-// Startet einen Tab. Gibt { ok, method, script } zurück.
-export async function openTab({ cwd, title, exe, args = [], launchDir = DEFAULT_LAUNCH_DIR }) {
+// Startet einen Tab. Gibt { ok, method, script } zurück. `env` is the
+// environment of the spawned terminal (default: this process's, minus the
+// session markers); `preamble` goes into the start script, see buildScript.
+export async function openTab({ cwd, title, exe, args = [], launchDir = DEFAULT_LAUNCH_DIR, env = tabEnv(), preamble = [] }) {
   if (!cwd || !fs.existsSync(cwd)) cwd = HOME;
   await fsp.mkdir(launchDir, { recursive: true });
   const script = path.join(launchDir, `${safeSlug(title)}_${process.pid}_${Date.now()}.ps1`);
-  await fsp.writeFile(script, buildScript({ cwd, header: title, exe, args }), 'utf8');
+  // With a BOM: Windows PowerShell 5.1 reads a script without one in the ANSI
+  // code page, which turns every umlaut in a path or a title into garbage.
+  await fsp.writeFile(script, `\uFEFF${buildScript({ cwd, header: title, exe, args, preamble })}`, 'utf8');
 
   const psArgs = ['-NoExit', '-NoLogo', '-ExecutionPolicy', 'Bypass', '-File', script];
   if (PATHS.wt) {
     // -w 0 = zuletzt benutztes Fenster (derselben Elevation); nt = neuer Tab
     const wtArgs = ['-w', '0', 'nt', '--title', title, '-d', cwd, PATHS.powershell, ...psArgs];
-    const child = spawn(PATHS.wt, wtArgs, { detached: true, stdio: 'ignore', windowsHide: true });
-    child.unref();
+    await started(spawn(PATHS.wt, wtArgs, { detached: true, stdio: 'ignore', windowsHide: true, env }));
     return { ok: true, method: 'wt-tab', script };
   }
   // Fallback ohne Windows Terminal: eigenes Fenster
-  const child = spawn(PATHS.powershell, psArgs, { detached: true, stdio: 'ignore', cwd });
-  child.unref();
+  await started(spawn(PATHS.powershell, psArgs, { detached: true, stdio: 'ignore', cwd, env }));
   return { ok: true, method: 'powershell-window', script };
+}
+
+// Resolves once the process exists, rejects when it could not be started.
+// spawn() reports a missing or inaccessible executable as an 'error' EVENT,
+// after it returned: without a listener that event is an uncaught exception
+// (it takes the server down), and "a tab opened" would be reported for a
+// terminal that never ran. Both events are emitted on a later tick, so
+// listening right after spawn() misses neither.
+function started(child) {
+  return new Promise((resolve, reject) => {
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.removeListener('error', reject);
+      child.on('error', () => {}); // a late error of a detached terminal is not this process's to die of
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 export function openClaudeSession(s, { skipPermissions = true, launchDir } = {}) {

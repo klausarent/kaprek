@@ -13,6 +13,9 @@ import * as autostart from '../src/cli/autostart.mjs';
 import { install as installHook, uninstall as uninstallHook, status as hookStatus } from '../src/cli/hooks.mjs';
 import { ensureAppDir, getAppDir } from '../src/lib/appdir.mjs';
 import { runResumeCommand, RESUME_USAGE } from '../src/cli/resume.mjs';
+import { runHandoverCommand, HANDOVER_USAGE } from '../src/cli/handover.mjs';
+import { readSessionEvents } from '../src/ledger/sessions.mjs';
+import { loginOrgFrom } from '../src/accounts/config.mjs';
 import { runStopCommand, STOP_USAGE } from '../src/cli/stop.mjs';
 import { readInstanceLock, defaultIsAlive } from '../src/server/ensure.mjs';
 import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir } from '../src/resume/scan.mjs';
@@ -59,6 +62,7 @@ const USAGE = `Usage: kaprek [options]
        kaprek doctor [--fix] [--json]
        kaprek council "<q>"
        kaprek resume [key|--all]
+       kaprek handover [list|open|add|start]
        kaprek proxy [start|status] [--port N]
        kaprek accounts [pick [--json]] [--probe]
        kaprek accounts exec [--probe] [--data-dir=<dir>] -- <cmd> [args…]
@@ -113,6 +117,10 @@ Doctor (read-only health report over kaprek's data dir — kaprek doctor --help 
 Resume (bring a session of claude/codex/grok/kimi back as a terminal tab):
   resume [key|--all]  List or reopen sessions of claude/codex/grok/kimi as
                        terminal tabs. Run \`kaprek resume --help\` for details.
+Handover (switch the Claude account without re-reading any transcript):
+  handover            Sessions report what they hand over, kaprek keeps the
+                       protocol and starts one fresh session per handover.
+                       Run \`kaprek handover --help\` for details.
 `;
 
 const HOOKS_USAGE = `Usage: kaprek hooks <install|uninstall|status>
@@ -400,6 +408,23 @@ async function main() {
       kill: (pid, signal) => process.kill(pid, signal),
       isAlive: (url) => defaultIsAlive(url),
       unlink: () => fs.unlinkSync(lockPath),
+    });
+    return;
+  }
+
+  if (argv[0] === 'handover') {
+    if (argv[1] === '-h' || argv[1] === '--help') {
+      console.log(HANDOVER_USAGE);
+      return;
+    }
+    const dataDir = ensureAppDir();
+    setResumeCacheDir(path.join(dataDir, 'resume-cache'));
+    process.exitCode = await runHandoverCommand(argv.slice(1), {
+      dataDir,
+      scanAll: (opts) => scanResumeSessions({ ...opts, dataDir }),
+      // The whole ledger: a session's first "start" may be weeks back.
+      ledgerEvents: () => readSessionEvents(dataDir, { limit: Number.MAX_SAFE_INTEGER }),
+      loginOrg: () => loginOrgFrom(),
     });
     return;
   }

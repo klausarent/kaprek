@@ -2613,6 +2613,154 @@ pre,
   white-space: nowrap;
 }
 
+/* Handover banner (#/list — points at #/handover when something waits) */
+
+.handover-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+
+/* Handover panel (#/handover — Kontowechsel) */
+
+.handover-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.handover-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.handover-panel-title {
+  margin: 0;
+  font-size: 15px;
+  flex: 1;
+}
+
+.handover-summary {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.handover-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.handover-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+.handover-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0;
+}
+
+.handover-status {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.handover-status-error {
+  color: var(--danger-text);
+}
+
+.handover-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.handover-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.handover-row-main {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.handover-title-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.handover-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex-shrink: 1;
+}
+
+.handover-meta {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.handover-note {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.handover-error {
+  color: var(--danger-text);
+  font-size: 12px;
+}
+
+.handover-missing-title {
+  margin: 0;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.handover-history-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  padding: 4px 0;
+}
+
+.handover-history-date {
+  color: var(--muted);
+  flex-shrink: 0;
+}
+
 /* ---------------------------------------------------------------------------
    #/start — der Leitstand-Inhalt (Variant B: dunkle Operations-Konsole).
    Nur noch der INHALT: Rail und Feed-Gerüst liefert die Shell (App.tsx),
@@ -2887,4 +3035,18 @@ pre,
   background: var(--success-bg);
   color: var(--success-text);
   vertical-align: middle;
+}
+
+.handover-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--danger-text);
+  border-radius: 6px;
+  color: var(--danger-text);
+  font-size: 13px;
+}
+
+.handover-note {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

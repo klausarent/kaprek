@@ -96,6 +96,14 @@ export function createResumeHandler({ scanAll, resumeSession, readJsonBody, send
           results.push({ engine: session.engine, id: session.id, ok: false, error: 'not an interactive session' });
           continue;
         }
+        // Nor a session that handed over before an account switch: reopened,
+        // it would make the new account re-read its whole transcript. Its way
+        // back is the handover (POST /api/handover/start), one at a time
+        // through POST /api/resume if somebody really wants the old one.
+        if (session.handover?.role === 'old') {
+          results.push({ engine: session.engine, id: session.id, ok: false, error: 'handed over at an account switch' });
+          continue;
+        }
         const r = await resumeSession(session, { skip: body.data.skip !== false });
         results.push({ engine: session.engine, id: session.id, ...r });
         await sleep(BATCH_GAP_MS);

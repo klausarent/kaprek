@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir, setStoreRoots, scanAll, STORES, attachLedgerInfo, filterToLedgerSessions, classify, classifyKimi, classifyCodex, classifyGrok } from './scan.mjs';
+import { parseClaudeFile, projectSlugToPath, markCrashGroups, publicSession, setCacheDir, setStoreRoots, scanAll, STORES, attachLedgerInfo, attachHandoverInfo, filterToLedgerSessions, classify, classifyKimi, classifyCodex, classifyGrok } from './scan.mjs';
 import { appendSessionEvent } from '../ledger/sessions.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -164,6 +164,53 @@ describe('ledger filtering', () => {
     expect(ended.sessions.find((s) => s.id === FIXTURE_ID)?.ledger).toEqual({ open: false, lastType: 'end', endReason: 'clear' });
 
     fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+});
+
+describe('account-switch handovers', () => {
+  const report = { handoverId: 'h-aaaa0001', recordedAt: '2026-11-15T12:00:00.000Z' };
+  const index = { bySession: new Map([['old', report]]), byAttempt: new Map([['h-aaaa0001.bbbb', { handoverId: 'h-aaaa0001', attemptId: 'bbbb', confirmed: false }]]) };
+  const s = (id, extra) => ({ engine: 'claude', id, lastTs: '2026-11-15T12:05:00.000Z', first: 'Hallo', ...extra });
+
+  it('marks the session that reported as old and the one started from the handover as new', () => {
+    const out = attachHandoverInfo([s('old'), s('fresh', { first: 'Übergabe Shop (h-aaaa0001.bbbb): Lies C:\\d\\h-aaaa0001.bbbb.md und mach dort weiter.' }), s('other')], index);
+    expect(out[0].handover).toEqual({ role: 'old', handoverId: 'h-aaaa0001' });
+    expect(out[1].handover).toEqual({ role: 'new', handoverId: 'h-aaaa0001', attemptKey: 'h-aaaa0001.bbbb' });
+    expect(out[2].handover).toBeUndefined();
+    expect(publicSession(out[0]).handover).toEqual({ role: 'old', handoverId: 'h-aaaa0001' });
+    expect(publicSession(out[2]).handover).toBeNull();
+  });
+
+  it('lets go of an old session somebody kept working in after the report', () => {
+    const out = attachHandoverInfo([s('old', { lastTs: '2026-11-15T12:29:00.000Z' }), s('old', { lastTs: '2026-11-15T13:00:00.000Z' })], index);
+    expect(out[0].handover?.role).toBe('old');
+    expect(out[1].handover).toBeUndefined();
+  });
+
+  it('keeps an old session handed over for good once a fresh session was started from its handover', () => {
+    const started = { bySession: new Map([['old', { ...report, started: true }]]), byAttempt: new Map() };
+    const out = attachHandoverInfo([s('old', { lastTs: '2026-11-16T09:00:00.000Z' })], started);
+    expect(out[0].handover).toEqual({ role: 'old', handoverId: 'h-aaaa0001' });
+  });
+
+  it('lets an old session go again when its handover was never started and somebody works on in it', () => {
+    const refused = { bySession: new Map([['old', { ...report, started: false }]]), byAttempt: new Map() };
+    const out = attachHandoverInfo([s('old', { lastTs: '2026-11-15T13:00:00.000Z' })], refused);
+    expect(out[0].handover).toBeUndefined();
+  });
+
+  it('treats the fresh session of one switch as the old session of the next: its own report comes first', () => {
+    const twice = { bySession: new Map([['fresh', { handoverId: 'h-cccc0002', recordedAt: '2026-11-15T12:04:00.000Z' }]]), byAttempt: index.byAttempt };
+    const out = attachHandoverInfo([s('fresh', { first: 'Übergabe Shop (h-aaaa0001.bbbb): Lies …' })], twice);
+    expect(out[0].handover).toEqual({ role: 'old', handoverId: 'h-cccc0002', attemptKey: 'h-aaaa0001.bbbb' });
+  });
+
+  it('ignores a key no start attempt wrote, other engines, and a missing index', () => {
+    const sessions = [s('x', { first: 'Übergabe (h-ffff0000.aaaa)' }), { engine: 'codex', id: 'old', lastTs: '2026-11-15T12:05:00.000Z' }];
+    const out = attachHandoverInfo(sessions, index);
+    expect(out[0].handover).toBeUndefined();
+    expect(out[1].handover).toBeUndefined();
+    expect(attachHandoverInfo(sessions, null)).toBe(sessions);
   });
 });
 

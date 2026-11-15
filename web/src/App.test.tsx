@@ -46,6 +46,10 @@ test("parses #/experiments", () => {
   expect(parseRoute("#/experiments")).toEqual({ name: "experiments" });
 });
 
+test("parses #/handover", () => {
+  expect(parseRoute("#/handover")).toEqual({ name: "handover" });
+});
+
 test("#/chat still parses to the chat route — the Leitstand landing does not remove the route", () => {
   expect(parseRoute("#/chat")).toEqual({ name: "chat", chatId: undefined, missionId: undefined });
 });

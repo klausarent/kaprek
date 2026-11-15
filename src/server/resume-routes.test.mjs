@@ -132,6 +132,19 @@ describe('resume routes', () => {
     expect(launched).toEqual(['claude:a']);
   });
 
+  it('POST batch leaves out a session that handed over at an account switch, but opens it one at a time', async () => {
+    const handedOver = { ...sessions[0], key: 'claude:gone', id: 'gone', handover: { role: 'old', handoverId: 'h-aaaa0001' } };
+    const { h, launched } = handler({ scanAll: async () => ({ sessions: [...sessions, handedOver], scannedAt: 'x' }) });
+    const batch = fakeRes();
+    await h({ method: 'POST', body: { items: [{ engine: 'claude', id: 'gone' }, { engine: 'claude', id: 'a' }] } }, batch.res, ['api', 'resume', 'batch'], new URL('http://x/api/resume/batch'));
+    expect(batch.out.body.results[0]).toMatchObject({ id: 'gone', ok: false, error: 'handed over at an account switch' });
+    expect(launched).toEqual(['claude:a']);
+    const single = fakeRes();
+    await h({ method: 'POST', body: { engine: 'claude', id: 'gone' } }, single.res, ['api', 'resume'], new URL('http://x/api/resume'));
+    expect(single.out.status).toBe(200);
+    expect(launched).toEqual(['claude:a', 'claude:gone']);
+  });
+
   it('answers 405 for wrong methods', async () => {
     const { h } = handler();
     const { out, res } = fakeRes();

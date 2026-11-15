@@ -11,6 +11,7 @@ const ITEMS: { href: string; label: string; note: string }[] = [
   { href: "#/council", label: "Council", note: "Rollen, Stufen, Konsultationen" },
   { href: "#/triggers", label: "Trigger", note: "geplante und Clipboard-Turns" },
   { href: "#/apps", label: "Apps", note: "sandboxed MCP-Tools" },
+  { href: "#/handover", label: "Kontowechsel", note: "Übergaben beim Konto-/Session-Wechsel verwalten" },
 ];
 
 export function Experiments() {

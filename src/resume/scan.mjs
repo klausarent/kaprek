@@ -5,6 +5,7 @@ import path from 'node:path';
 import os from 'node:os';
 import readline from 'node:readline';
 import { readLedgerIndex } from '../ledger/sessions.mjs';
+import { handoverIndex, ATTEMPT_KEY_RE } from '../handover/store.mjs';
 import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 export const HOME = os.homedir();
@@ -165,12 +166,21 @@ async function loadCache(name) {
   } catch { return {}; }
 }
 
+// Two scans can run at once (the session list and the handover page both
+// ask for one). A shared temp name let the slower one's rename fail, and a
+// scan that throws is answered with "no sessions" (see scanAll) — so the
+// temp file is the writer's own, and a cache that could not be written
+// costs the next scan some time, never this one its result.
 async function saveCache(name, entries) {
-  await fsp.mkdir(CACHE_DIR, { recursive: true });
   const file = cacheFile(name);
-  const tmp = file + '.tmp';
-  await fsp.writeFile(tmp, JSON.stringify({ version: CACHE_VERSION, entries }), 'utf8');
-  await fsp.rename(tmp, file);
+  const tmp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`;
+  try {
+    await fsp.mkdir(CACHE_DIR, { recursive: true });
+    await fsp.writeFile(tmp, JSON.stringify({ version: CACHE_VERSION, entries }), 'utf8');
+    await fsp.rename(tmp, file);
+  } catch {
+    await fsp.unlink(tmp).catch(() => {});
+  }
 }
 
 // ISO-Zeitstempel mit >3 Nachkommastellen (Grok: 9) auf JS-taugliche Form bringen
@@ -489,7 +499,54 @@ export function publicSession(s) {
     // ledger has never heard from (a headless/cron run, or one that ran
     // before the SessionStart hook was installed).
     ledger: s.ledger ?? null,
+    // Set by attachHandoverInfo() below: `role: "old"` for a claude session
+    // that handed over before an account switch (no "reopen everything"
+    // touches it again), `role: "new"` for the fresh session kaprek started
+    // from a handover. null for everything else.
+    handover: s.handover ?? null,
   };
+}
+
+// Once a fresh session was started from a handover, the old session stays
+// "handed over" for good: its work lives on elsewhere. Before that, it
+// stays so as long as nothing much happened in it afterwards — its report
+// is written during its last turn, the closing message follows minutes
+// later; any transcript line well after the report (the scanner knows no
+// finer grain) means the switch was called off and somebody works on here.
+const HANDOVER_SLACK_MS = 30 * 60 * 1000;
+
+/**
+ * Marks the two kinds of claude session an account switch leaves behind
+ * (see src/handover/store.mjs::handoverIndex):
+ *
+ * - `{ role: 'old', handoverId }` — the session reported a handover. Reopening
+ *   it would make the new account re-read its whole transcript, so the batch
+ *   reopen (CLI `--all`, POST /api/resume/batch, the web button) leaves it
+ *   out. This is its own field on purpose: the session did not end, and
+ *   `ledger.open` keeps saying so; reopening it one at a time still works.
+ * - `{ role: 'new', handoverId, attemptKey }` — the first prompt carries the
+ *   key of a start attempt: this is the fresh session of that handover.
+ *
+ * A session can be both (started from a handover, later handed over
+ * itself): then it is `old`, with the `attemptKey` it was started under.
+ */
+export function attachHandoverInfo(sessions, index) {
+  if (!index) return sessions;
+  return sessions.map((s) => {
+    if (s.engine !== 'claude') return s;
+    const found = ATTEMPT_KEY_RE.exec(s.first ?? '')?.[0];
+    const attemptKey = found && index.byAttempt.has(found) ? found : null;
+    // What the session reported itself comes first: the fresh session of one
+    // switch is the old session of the next, and must stay out of the batch
+    // reopen then. It keeps its attempt key — it is still the session that
+    // attempt started.
+    const report = index.bySession.get(s.id);
+    if (report && (report.started || (Date.parse(s.lastTs) || 0) <= (Date.parse(report.recordedAt) || 0) + HANDOVER_SLACK_MS)) {
+      return { ...s, handover: { role: 'old', handoverId: report.handoverId, ...(attemptKey ? { attemptKey } : {}) } };
+    }
+    if (attemptKey) return { ...s, handover: { role: 'new', handoverId: attemptKey.split('.')[0], attemptKey } };
+    return s;
+  });
 }
 
 /**
@@ -560,6 +617,7 @@ export async function scanAll({ force = false, dataDir, unfiltered = false } = {
       ledgerIndex = null;
     }
     all = filterToLedgerSessions(attachLedgerInfo(all, ledgerIndex), ledgerIndex, { unfiltered });
+    all = attachHandoverInfo(all, handoverIndex(dataDir));
   }
   markCrashGroups(all);
   const sessions = all.map(publicSession).sort((a, b) => (a.lastTs < b.lastTs ? 1 : -1));

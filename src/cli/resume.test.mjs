@@ -228,6 +228,22 @@ describe('kaprek resume', () => {
     expect(d.launched.map(([k]) => k).sort()).toEqual(['claude:open1', 'codex:c']);
   });
 
+  it('--all leaves out a session that handed over at an account switch and marks it in the list', async () => {
+    const sessions = [
+      { key: 'claude:kept', engine: 'claude', id: 'kept', cwd: 'C:\\p', title: 'Bleibt', lastTs: '2026-08-28T06:50:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: true, lastType: 'stop', endReason: null }, handover: null },
+      { key: 'claude:gone', engine: 'claude', id: 'gone', cwd: 'C:\\p', title: 'Übergeben', lastTs: '2026-08-28T06:55:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: true, lastType: 'stop', endReason: null }, handover: { role: 'old', handoverId: 'h-aaaa0001' } },
+      { key: 'claude:fresh', engine: 'claude', id: 'fresh', cwd: 'C:\\p', title: 'Frisch', lastTs: '2026-08-28T06:58:00.000Z', userMsgs: 1, hidden: false, crash: false, ledger: { open: true, lastType: 'stop', endReason: null }, handover: { role: 'new', handoverId: 'h-aaaa0001', attemptKey: 'h-aaaa0001.bbbb' } },
+    ];
+    const d = deps();
+    d.deps.scanAll = async () => ({ sessions, scannedAt: 'x' });
+    expect(await runResumeCommand(['--all'], d.deps)).toBe(0);
+    expect(d.launched.map(([k]) => k).sort()).toEqual(['claude:fresh', 'claude:kept']);
+    const list = deps();
+    list.deps.scanAll = async () => ({ sessions, scannedAt: 'x' });
+    await runResumeCommand([], list.deps);
+    expect(list.lines.join('\n')).toMatch(/claude:gone.*\[handed over\]/);
+  });
+
   it('--all never opens a headless session, not even with --unfiltered; the list shows it only with --unfiltered', async () => {
     const mixed = [
       { key: 'claude:mine', engine: 'claude', id: 'mine', cwd: 'C:\\p', title: 'Meine', lastTs: '2026-08-28T06:50:00.000Z', userMsgs: 2, hidden: false, crash: false },

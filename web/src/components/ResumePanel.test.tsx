@@ -95,6 +95,19 @@ describe("ResumePanel", () => {
     expect(text).toMatch(/ended \(clear\)/);
   });
 
+  it("shows an 'übergeben' badge for a session a handover already carried to the new account", () => {
+    const tree = render(
+      <ResumePanel
+        sessions={[s({ handover: { handoverId: "h1", role: "old" } }), s({ key: "claude:b", id: "b" })]}
+        onResume={() => {}}
+        onResumeAll={() => {}}
+        busy={false}
+        statusText=""
+      />,
+    );
+    expect(textOf(tree)).toContain("übergeben");
+  });
+
   it("resumableSessions excludes a claude session the ledger already marked ended, even within the window", () => {
     const now = Date.parse("2026-08-28T08:00:00.000Z");
     const list = [

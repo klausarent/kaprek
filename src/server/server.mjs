@@ -94,6 +94,9 @@ import { ensureInstanceToken, timingSafeTokenEqual, TOKEN_HEADER } from './token
 import { createResumeHandler } from './resume-routes.mjs';
 import { scanAll as scanResumeSessions, setCacheDir as setResumeCacheDir, setStoreRoots as setResumeStoreRoots } from '../resume/scan.mjs';
 import { resumeSession as launchResumeSession } from '../resume/launch.mjs';
+import { createHandoverHandler } from './handover-routes.mjs';
+import { overview as handoverOverview, startHandovers, confirmFromSessions } from '../handover/service.mjs';
+import { loginOrgFrom } from '../accounts/config.mjs';
 import {
   createApprovalStore,
   APPROVAL_DEADLINE_INTERACTIVE_MS,
@@ -4342,6 +4345,7 @@ async function handleRequest(
     getCouncil,
     getConsultations,
     handleResumeRoutes,
+    handleHandoverRoutes,
     memoryScopeForChat,
     lanAddress,
     approvalToken,
@@ -4468,6 +4472,17 @@ async function handleRequest(
     }
     if (segments[1] === 'resume') {
       await handleResumeRoutes(req, res, segments, url);
+      return;
+    }
+    if (segments[1] === 'handover') {
+      // Starting sessions opens terminal tabs on this machine; with --lan the
+      // instance token also reaches a phone, and that is not where this
+      // button belongs.
+      if (req.method === 'POST' && !isLoopbackRequest(req)) {
+        sendJson(res, 403, { error: 'handovers are started from this machine only' });
+        return;
+      }
+      await handleHandoverRoutes(req, res, segments);
       return;
     }
     if (segments.length === 2 && segments[1] === 'presets') {
@@ -4984,6 +4999,18 @@ export function startServer({
   const handleResumeRoutes = createResumeHandler({
     scanAll: (opts) => scanResumeSessions({ ...opts, dataDir }),
     resumeSession: (session, opts) => launchResumeSession(session, { ...opts, launchDir: path.join(dataDir, 'resume-cache', 'launch') }),
+    readJsonBody,
+    sendJson,
+  });
+
+  // /api/handover: the account-switch protocol, and the button that starts
+  // one fresh session per handover (see src/handover/service.mjs).
+  const handleHandoverRoutes = createHandoverHandler({
+    overview: (opts) => handoverOverview(dataDir, opts),
+    startHandovers: (opts) => startHandovers({ ...opts, dataDir }),
+    scanAll: (opts) => scanResumeSessions({ ...opts, dataDir }),
+    confirmFromSessions: (sessions) => confirmFromSessions(dataDir, sessions),
+    loginOrg: () => loginOrgFrom(),
     readJsonBody,
     sendJson,
   });
@@ -5556,6 +5583,7 @@ export function startServer({
       getCouncil,
       getConsultations,
       handleResumeRoutes,
+      handleHandoverRoutes,
       memoryScopeForChat,
       lanAddress,
       approvalToken,

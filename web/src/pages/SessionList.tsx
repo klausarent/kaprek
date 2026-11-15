@@ -3,9 +3,10 @@
 // project's sessions with client-side search over title/session id.
 import { useEffect, useMemo, useState } from "react";
 import { fetchProjects, fetchSessions, type ProjectSummary, type SessionMeta } from "../lib/api";
-import { navigateToProjects, navigateToSessions, navigateToThread } from "../App";
+import { navigateToHandover, navigateToProjects, navigateToSessions, navigateToThread } from "../App";
 import { ResumePanel } from "../components/ResumePanel";
 import { fetchResumeSessions, resumableSessions, resumeErrorText, resumeMany, resumeOne, type ResumeSession } from "../lib/resume";
+import { fetchHandover, type HandoverOverview } from "../lib/handover";
 
 function useDebounced<T>(value: T, delayMs: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -90,6 +91,8 @@ function ProjectGrid() {
   const [resumeBusy, setResumeBusy] = useState(false);
   const [resumeStatus, setResumeStatus] = useState("");
 
+  const [handoverOverview, setHandoverOverview] = useState<HandoverOverview | null>(null);
+
   useEffect(() => {
     let cancelled = false;
     fetchProjects()
@@ -112,6 +115,22 @@ function ProjectGrid() {
       })
       .catch((e) => {
         if (!cancelled) setResumeStatus(resumeErrorText(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchHandover()
+      .then((data) => {
+        if (!cancelled) setHandoverOverview(data);
+      })
+      .catch(() => {
+        // Silent on purpose: this banner is a hint, not a page of its own —
+        // a load failure here just means no banner, #/handover reports the
+        // real error if the user goes looking.
       });
     return () => {
       cancelled = true;
@@ -155,8 +174,37 @@ function ProjectGrid() {
     return projects.filter((p) => p.projectSlug.toLowerCase().includes(q) || (p.displayName ?? "").toLowerCase().includes(q));
   }, [projects, search]);
 
+  // Only what still needs a click: never started, failed, or started with an
+  // outcome nobody wrote down — in the current switch or left behind in an
+  // earlier one. A tab that opened ('spawned') does not count: one whose
+  // session died would otherwise keep this banner up for good.
+  const handoverOpenCount = handoverOverview
+    ? [handoverOverview.current, ...handoverOverview.history].reduce(
+        (n, v) => (v ? n + v.counts.pending + v.counts.failed + v.counts.unknown : n),
+        0,
+      )
+    : 0;
+
   return (
     <div className="page">
+      {handoverOpenCount > 0 && (
+        <div className="handover-banner">
+          <span>
+            Kontowechsel: {handoverOpenCount} Übergabe{handoverOpenCount === 1 ? "" : "n"} warten
+          </span>
+          <a
+            href="#/handover"
+            className="btn"
+            onClick={(e) => {
+              e.preventDefault();
+              navigateToHandover();
+            }}
+          >
+            Öffnen
+          </a>
+        </div>
+      )}
+
       <ResumePanel
         sessions={resumeList}
         onResume={(engine, id) => void handleResume(engine, id)}

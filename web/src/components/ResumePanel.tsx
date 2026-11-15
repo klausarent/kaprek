@@ -69,6 +69,10 @@ export function ResumePanel({
                         {s.ledger.open ? "open" : `ended (${s.ledger.endReason ?? "?"})`}
                       </span>
                     )}
+                    {/* A session a handover already moved to the new account — see
+                        resumableSessions()'s 'old' exclusion above this badge
+                        is the only place that session still shows up at all. */}
+                    {(s.handover ?? null)?.role === "old" && <span className="badge badge-muted">übergeben</span>}
                   </div>
                   <span className="resume-meta">
                     {s.cwd} · {ago(s.lastTs)} · {s.userMsgs} Nachricht{s.userMsgs === 1 ? "" : "en"}

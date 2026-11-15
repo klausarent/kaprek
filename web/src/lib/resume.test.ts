@@ -47,4 +47,13 @@ describe("resumableSessions", () => {
     const list = [s({ hidden: true, ledger: { open: true, lastType: "start", endReason: null } }), s({ key: "claude:b", id: "b" })];
     expect(resumableSessions(list, 24, now).map((x) => x.id)).toEqual(["b"]);
   });
+
+  it("drops a session a handover already carried to the new account ('old' role), keeps the 'new' side", () => {
+    const list = [
+      s({ key: "claude:old", id: "old", handover: { handoverId: "h1", role: "old" } }),
+      s({ key: "claude:new", id: "new", handover: { handoverId: "h1", role: "new" } }),
+      s({ key: "claude:c", id: "c" }),
+    ];
+    expect(resumableSessions(list, 24, now).map((x) => x.id).sort()).toEqual(["c", "new"]);
+  });
 });
