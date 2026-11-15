@@ -25,7 +25,7 @@ const report: QuotaReport = {
     { id: "codex", label: "Codex", limitId: null, source: "none", seenAt: null, status: null, plan: null, windows: [] },
   ],
   projects: [
-    { project: "meoluna", sessions: 2, requests: 40, inputTokens: 1000, outputTokens: 5000, cacheReadTokens: 90000, cacheCreationTokens: 3000, lastAt: "2026-10-02T09:59:00Z" },
+    { project: "demo-app", sessions: 2, requests: 40, inputTokens: 1000, outputTokens: 5000, cacheReadTokens: 90000, cacheCreationTokens: 3000, lastAt: "2026-10-02T09:59:00Z" },
   ],
 };
 
@@ -53,7 +53,7 @@ describe("QuotaView", () => {
     expect(text).toContain("Reset in 2 h 20 min");
     expect(text).toContain("live über den Proxy");
     expect(text).toContain("Proxy läuft auf Port 4911");
-    expect(text).toContain("meoluna");
+    expect(text).toContain("demo-app");
     expect(text).toContain("90.000");
   });
 

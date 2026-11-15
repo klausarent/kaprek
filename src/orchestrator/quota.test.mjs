@@ -15,7 +15,7 @@ describe('buildQuotaReport', () => {
     const home = tmp('q-home-');
     writeQuota(dataDir, { seenAt: '2026-10-02T09:00:00.000Z', status: 'allowed', representativeClaim: 'five_hour', windows: { '7d': { usedPercent: 69, resetsAt: null }, '5h': { usedPercent: 5, resetsAt: null }, overage: { usedPercent: 0, resetsAt: null } } });
     fs.mkdirSync(path.join(dataDir, 'ledger'), { recursive: true });
-    fs.writeFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'),JSON.stringify({ type: 'start', sessionId: 's1', cwd: 'C:\\Users\\karent\\Documents\\Software\\meoluna', ts: '2026-10-02T08:00:00Z' }) + '\n');
+    fs.writeFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'),JSON.stringify({ type: 'start', sessionId: 's1', cwd: 'C:\\Users\\alex\\Documents\\Software\\demo-app', ts: '2026-10-02T08:00:00Z' }) + '\n');
     appendRequest(dataDir, { ts: '2026-10-02T08:10:00.000Z', sessionId: 's1', inputTokens: 10, outputTokens: 20, cacheReadTokens: 100, cacheCreationTokens: 5 });
     appendRequest(dataDir, { ts: '2026-10-02T08:20:00.000Z', sessionId: 's1', inputTokens: 1, outputTokens: 2, cacheReadTokens: 0, cacheCreationTokens: 0 });
     appendRequest(dataDir, { ts: '2026-10-02T08:30:00.000Z', sessionId: 'unknown', inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0 });
@@ -24,7 +24,7 @@ describe('buildQuotaReport', () => {
     const claude = r.providers.find((p) => p.id === 'claude');
     expect(claude.source).toBe('proxy');
     expect(claude.windows.map((w) => w.name)).toEqual(['5h', '7d', 'overage']);
-    expect(r.projects[0]).toMatchObject({ project: 'meoluna', sessions: 1, requests: 2, inputTokens: 11, outputTokens: 22 });
+    expect(r.projects[0]).toMatchObject({ project: 'demo-app', sessions: 1, requests: 2, inputTokens: 11, outputTokens: 22 });
     expect(r.projects.find((p) => p.project === 'unbekannt').requests).toBe(1);
     expect(r.proxy.lastRequestAt).toBe('2026-10-02T08:30:00.000Z');
   });

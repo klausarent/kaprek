@@ -37,8 +37,8 @@ describe('proxy store', () => {
 
   it('writes under its own host and reads every host (the data dir is synced between machines)', () => {
     appendRequest(dir, { ts: '2026-10-02T10:00:00.000Z', sessionId: 'laptop' }, 'laptop');
-    appendRequest(dir, { ts: '2026-10-02T09:00:00.000Z', sessionId: 'server' }, 'strategiert-1');
-    writeQuota(dir, { seenAt: '2026-10-02T09:00:00.000Z', windows: { '5h': { usedPercent: 1, resetsAt: null } } }, 'strategiert-1');
+    appendRequest(dir, { ts: '2026-10-02T09:00:00.000Z', sessionId: 'server' }, 'server-1');
+    writeQuota(dir, { seenAt: '2026-10-02T09:00:00.000Z', windows: { '5h': { usedPercent: 1, resetsAt: null } } }, 'server-1');
     writeQuota(dir, { seenAt: '2026-10-02T10:00:00.000Z', windows: { '5h': { usedPercent: 7, resetsAt: null } } }, 'laptop');
     expect(fs.existsSync(path.join(dir, 'proxy', 'laptop', 'requests.jsonl'))).toBe(true);
     expect(readRequests(dir).map((r) => r.sessionId)).toEqual(['server', 'laptop']);
@@ -47,7 +47,7 @@ describe('proxy store', () => {
 
   it('keeps one snapshot per account and per host, newest per account wins', () => {
     writeQuota(dir, { seenAt: '2026-10-02T09:00:00.000Z', windows: { '5h': { usedPercent: 10, resetsAt: null } } }, 'laptop', 'konto1');
-    writeQuota(dir, { seenAt: '2026-10-02T10:00:00.000Z', windows: { '5h': { usedPercent: 30, resetsAt: null } } }, 'strategiert-1', 'konto1');
+    writeQuota(dir, { seenAt: '2026-10-02T10:00:00.000Z', windows: { '5h': { usedPercent: 30, resetsAt: null } } }, 'server-1', 'konto1');
     writeQuota(dir, { seenAt: '2026-10-02T08:00:00.000Z', windows: { '5h': { usedPercent: 50, resetsAt: null } } }, 'laptop', 'konto2');
     const q = readQuotas(dir);
     expect([...q.keys()].sort()).toEqual(['konto1', 'konto2']);
@@ -59,7 +59,7 @@ describe('proxy store', () => {
   it('learns which organization is which account, first answer wins, merged across hosts', () => {
     expect(learnOrg(dir, 'org-a', 'konto2', 'laptop')).toEqual({ learned: true, account: 'konto2' });
     expect(learnOrg(dir, 'org-a', 'konto3', 'laptop')).toEqual({ learned: false, account: 'konto2' });
-    learnOrg(dir, 'org-b', 'konto3', 'strategiert-1');
+    learnOrg(dir, 'org-b', 'konto3', 'server-1');
     expect(readOrgMap(dir)).toEqual({ 'org-a': 'konto2', 'org-b': 'konto3' });
   });
 

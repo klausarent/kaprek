@@ -60,7 +60,7 @@ function fakes(overrides = {}) {
 
 describe('what reaches the command line', () => {
   it('keeps only letters, digits, space and ._- of a title', () => {
-    expect(cleanTitle('urb.style "Black Week"; rm -rf\n`x` $y')).toBe('urb.style Black Week rm -rf x y');
+    expect(cleanTitle('shop.example "Black Week"; rm -rf\n`x` $y')).toBe('shop.example Black Week rm -rf x y');
     expect(cleanTitle('Übergabe Größe')).toBe('Übergabe Größe');
     expect(cleanTitle('  \'"; ')).toBe('Session');
     expect(cleanTitle('x'.repeat(200))).toHaveLength(60);
@@ -68,8 +68,8 @@ describe('what reaches the command line', () => {
 
   it('names a handover after its title, else the folder of its file, else the working directory', () => {
     expect(titleOf({ title: 'Shop', file: 'C:\\a\\b\\U.md' })).toBe('Shop');
-    expect(titleOf({ file: 'C:\\a\\klaus-os\\U.md' })).toBe('klaus-os');
-    expect(titleOf({ cwd: 'C:\\a\\autoalarm' })).toBe('autoalarm');
+    expect(titleOf({ file: 'C:\\a\\workbench\\U.md' })).toBe('workbench');
+    expect(titleOf({ cwd: 'C:\\a\\alarm-tool' })).toBe('alarm-tool');
   });
 
   it('redacts a secret a session put into its title before it reaches a window title or a command', () => {
