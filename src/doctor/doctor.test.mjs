@@ -292,6 +292,89 @@ describe('doctor checks', () => {
     expect(malformed.message).toMatch(/not well-formed/);
   });
 
+  it.each([false, true])('hooks: synthetic invalid settings JSON warns that hooks cannot be verified, without repair (fix=%s)', async (fix) => {
+    const dir = tmpdir();
+    const settingsPath = path.join(dir, 'synthetic-settings.json');
+    fs.writeFileSync(settingsPath, '{ "hooks": { "Stop": [ synthetic-broken', 'utf8');
+    const before = fs.readFileSync(settingsPath);
+    const direct = checkHooks({ dataDir: dir, settingsPath });
+    expect(direct.id).toBe('hooks');
+    expect(direct.status).toBe('warn');
+    expect(direct.message).toMatch(/cannot be verified/);
+    expect(direct.message).not.toContain('synthetic-broken');
+    expect(direct.message).not.toContain('No kaprek hooks installed');
+    const report = await runDoctor({ dataDir: dir, rootDir: tmpdir(), settingsPath, fix });
+    const result = byId(report, 'hooks');
+    expect(result).toEqual(direct);
+    expect(Object.keys(result).every((k) => ['id', 'status', 'message', 'detail'].includes(k))).toBe(true);
+    expect(fs.readFileSync(settingsPath)).toEqual(before);
+    expect(fs.readdirSync(dir)).toEqual(['synthetic-settings.json']);
+  });
+
+  it('hooks: a synthetic EACCES on the settings file warns without claiming a JSON syntax error', () => {
+    const dir = tmpdir();
+    const settingsPath = path.join(dir, 'synthetic-settings.json');
+    fs.writeFileSync(settingsPath, '{}', 'utf8');
+    const original = fs.readFileSync;
+    const spy = vi.spyOn(fs, 'readFileSync').mockImplementation((p, ...rest) => {
+      if (p === settingsPath) throw Object.assign(new Error('synthetic EACCES'), { code: 'EACCES' });
+      return original.call(fs, p, ...rest);
+    });
+    try {
+      const result = checkHooks({ dataDir: dir, settingsPath });
+      expect(result.id).toBe('hooks');
+      expect(result.status).toBe('warn');
+      expect(result.message).toMatch(/cannot be verified/);
+      expect(result.message).not.toMatch(/not valid JSON|invalid JSON|syntax/i);
+      expect(result.message).not.toContain('synthetic EACCES');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it.each([
+    ['empty', ''],
+    ['empty object', '{}'],
+  ])('hooks: an %s settings file stays ok with no hooks', (_label, content) => {
+    const dir = tmpdir();
+    const settingsPath = path.join(dir, 'synthetic-settings.json');
+    fs.writeFileSync(settingsPath, content, 'utf8');
+    const before = fs.readFileSync(settingsPath);
+    const result = checkHooks({ dataDir: dir, settingsPath });
+    expect(result.status).toBe('ok');
+    expect(result.message).toContain('No kaprek hooks installed');
+    expect(fs.readFileSync(settingsPath)).toEqual(before);
+  });
+
+  it('hooks: invalid settings JSON keeps the doctor --json envelope and exit code 0', async () => {
+    const home = tmpdir();
+    const claudeDir = path.join(home, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    const settingsPath = path.join(claudeDir, 'settings.json');
+    fs.writeFileSync(settingsPath, '{ synthetic-broken', 'utf8');
+    const before = fs.readFileSync(settingsPath);
+    const homeSpy = vi.spyOn(os, 'homedir').mockReturnValue(home);
+    vi.stubEnv('CLAUDE_CONFIG_DIR', claudeDir);
+    const printed = [];
+    const log = vi.spyOn(console, 'log').mockImplementation((line) => { printed.push(String(line)); });
+    try {
+      const dataDir = tmpdir();
+      const code = await runDoctorCommand(['--json', '--data-dir', dataDir, '--dir', tmpdir()], { dataDir });
+      expect(code).toBe(0);
+    } finally {
+      log.mockRestore();
+      vi.unstubAllEnvs();
+      homeSpy.mockRestore();
+    }
+    const json = JSON.parse(printed.find((line) => line.trimStart().startsWith('{')));
+    expect(Object.keys(json).sort()).toEqual(['checks', 'fix', 'summary']);
+    const hooks = json.checks.find((c) => c.id === 'hooks');
+    expect(hooks.status).toBe('warn');
+    expect(Object.keys(hooks).every((k) => ['id', 'status', 'message', 'detail'].includes(k))).toBe(true);
+    expect(JSON.stringify(json)).not.toContain('synthetic-broken');
+    expect(fs.readFileSync(settingsPath)).toEqual(before);
+  });
+
   it('search-index: missing index, current schema and older schema are ok; a newer schema warns', async () => {
     const probe = await openSearchDb({ dataDir: tmpdir() });
     if (probe.unavailable) return; // node:sqlite/FTS5 missing in this runtime — nothing to assert

@@ -233,10 +233,15 @@ export function uninstall({ settingsPath = defaultSettingsPath(), hookScriptPath
 export function status({ settingsPath = defaultSettingsPath(), hookScriptPath = HOOK_SCRIPT_PATH, dataDir = getAppDir(), packageName = getPackageName() } = {}) {
   const events = {};
   let settings = {};
+  // A missing or empty file is a legitimate empty state (readSettings returns
+  // {}). Only a file that exists but cannot be read or parsed sets the flag —
+  // deliberately just a boolean: no settings contents, no raw error text.
+  let settingsReadFailed = false;
   try {
     settings = readSettings(settingsPath);
   } catch {
     settings = null;
+    settingsReadFailed = true;
   }
   for (const event of Object.keys(HOOK_EVENTS)) {
     const report = { installed: false, recordedPath: undefined, recordedPathMissing: false };
@@ -258,5 +263,5 @@ export function status({ settingsPath = defaultSettingsPath(), hookScriptPath = 
     policyError = err.message;
   }
 
-  return { installed, settingsPath, hookScriptPath, dataDir, mode, policyError, recordedPath, recordedPathMissing, events };
+  return { installed, settingsPath, hookScriptPath, dataDir, mode, policyError, recordedPath, recordedPathMissing, events, settingsReadFailed };
 }

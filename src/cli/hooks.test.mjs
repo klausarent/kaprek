@@ -1,7 +1,7 @@
 // Tests for hooks install/uninstall/status. Always runs against a temp
 // settings.json (settingsPath is always passed explicitly) — never touches
 // the real ~/.claude/settings.json. Run: npx vitest run src/cli/hooks.test.mjs
-import { test, expect, beforeEach, afterEach } from 'vitest';
+import { test, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -144,6 +144,63 @@ test('status flags a recorded path that no longer exists on disk as stale', () =
   const result = status({ settingsPath });
   expect(result.installed).toBe(true);
   expect(result.recordedPathMissing).toBe(true);
+});
+
+test('status signals settingsReadFailed for synthetic invalid JSON, without settings contents', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
+  fs.writeFileSync(settingsPath, '{ "hooks": { "Stop": [ synthetic-broken', 'utf8');
+  const before = fs.readFileSync(settingsPath);
+  const result = status({ settingsPath, dataDir });
+  expect(result.settingsReadFailed).toBe(true);
+  expect(result.installed).toBe(false);
+  expect(Object.values(result.events).every((e) => e.installed === false)).toBe(true);
+  expect(JSON.stringify(result)).not.toContain('synthetic-broken');
+  expect(fs.readFileSync(settingsPath)).toEqual(before);
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('status signals settingsReadFailed for a synthetic EACCES on the settings path only', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
+  fs.writeFileSync(settingsPath, '{}', 'utf8');
+  const original = fs.readFileSync;
+  const spy = vi.spyOn(fs, 'readFileSync').mockImplementation((p, ...rest) => {
+    if (p === settingsPath) throw Object.assign(new Error('synthetic EACCES'), { code: 'EACCES' });
+    return original.call(fs, p, ...rest);
+  });
+  try {
+    const result = status({ settingsPath, dataDir });
+    expect(result.settingsReadFailed).toBe(true);
+    expect(JSON.stringify(result)).not.toContain('synthetic EACCES');
+  } finally {
+    spy.mockRestore();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ['missing', null],
+  ['empty', ''],
+  ['empty object', '{}'],
+])('status keeps settingsReadFailed false for a %s settings file', (_label, content) => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
+  if (content !== null) fs.writeFileSync(settingsPath, content, 'utf8');
+  const result = status({ settingsPath, dataDir });
+  expect(result.settingsReadFailed).toBe(false);
+  expect(result.installed).toBe(false);
+  expect(fs.existsSync(settingsPath)).toBe(content !== null);
+  fs.rmSync(dataDir, { recursive: true, force: true });
+});
+
+test('status keeps its existing fields and adds only settingsReadFailed', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hooks-status-'));
+  install({ settingsPath });
+  const result = status({ settingsPath, dataDir });
+  expect(Object.keys(result).sort()).toEqual(
+    ['installed', 'settingsPath', 'hookScriptPath', 'dataDir', 'mode', 'policyError', 'recordedPath', 'recordedPathMissing', 'events', 'settingsReadFailed'].sort(),
+  );
+  expect(result.settingsReadFailed).toBe(false);
+  expect(Object.keys(result.events).sort()).toEqual(['SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
+  fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
 // ------------------------------------------------------------- atomic write
