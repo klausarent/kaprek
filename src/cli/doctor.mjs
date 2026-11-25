@@ -31,6 +31,9 @@ Checks (one line each):
                      doctor never revokes
   triggers-degraded  condition-error streaks per trigger (skipped when the
                      feature is not present)
+  proxy-route        ANTHROPIC_BASE_URL points at a local kaprek proxy: fail
+                     when it is not running or on another port, warn when it
+                     is set in the settings but does not start at login
 
 --fix does EXACTLY TWO things, listed before they happen, and nothing else:
   1. deletes orphaned context state files (same 7-day condition as the

@@ -111,7 +111,8 @@ Hooks subcommands (Claude Code Stop hook for the policy engine):
   council "<q>"      Ask the peers (codex, grok) blind and in parallel from the terminal
 Doctor (read-only health report over kaprek's data dir — kaprek doctor --help for details):
   doctor            Check transcripts, hooks, search index, policy, presets,
-                    ledger, context state, grants, trigger degradation.
+                    ledger, context state, grants, trigger degradation,
+                    proxy route.
                     --fix does exactly two things: delete orphaned context
                     state files, trigger a search index rebuild. Exit 0 always.
 Resume (bring a session of claude/codex/grok/kimi back as a terminal tab):

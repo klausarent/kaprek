@@ -20,6 +20,9 @@ import { contextDir, STATE_MAX_AGE_MS, readContextState } from '../policy/prompt
 import { status as hookStatus } from '../cli/hooks.mjs';
 import { loadPresets } from '../missions/presets.mjs';
 import { createGrantStore } from '../policy/grants.mjs';
+import { readPid, isAlive } from '../proxy/store.mjs';
+import { status as autostartStatusOf } from '../cli/autostart.mjs';
+import { claudeConfigDir } from '../lib/claude-home.mjs';
 
 /** Number of most-recently-written transcripts the drift check samples. */
 export const DRIFT_SAMPLE_SIZE = 10;
@@ -202,6 +205,70 @@ export function checkHooks({ dataDir, settingsPath } = {}) {
     return check('hooks', 'ok', 'All four hook entries are installed, carry the --managed-by marker, and point at existing script files.', lines);
   } catch (err) {
     return check('hooks', 'warn', `The hooks check could not run: ${err.message}`);
+  }
+}
+
+// Hosts that count as "the local kaprek proxy". Anything else is a gateway
+// someone set up on purpose, and none of this check's business.
+const PROXY_HOSTS = new Set(['127.0.0.1', 'localhost']);
+
+/**
+ * proxy-route — Claude Code routed through the local kaprek proxy
+ * (ANTHROPIC_BASE_URL on 127.0.0.1/localhost) while that proxy is not
+ * running cannot reach Anthropic at all. Reads the URL from the Claude Code
+ * settings `env` first (the same file the hooks check reads), else from the
+ * process environment; the proxy state from its pid file plus a signal-0
+ * liveness probe. No socket is opened, nothing is written or started.
+ */
+export function checkProxyRoute({ dataDir, settingsPath = path.join(claudeConfigDir(), 'settings.json'), env = process.env, autostartStatus = () => autostartStatusOf({ entry: 'kaprek-proxy' }) } = {}) {
+  try {
+    let fromSettings;
+    try {
+      const value = JSON.parse(fs.readFileSync(settingsPath, 'utf8'))?.env?.ANTHROPIC_BASE_URL;
+      if (typeof value === 'string' && value.trim() !== '') fromSettings = value.trim();
+    } catch {
+      // missing or not JSON: treated as "not set in the settings"
+    }
+    const fromEnv = typeof env?.ANTHROPIC_BASE_URL === 'string' && env.ANTHROPIC_BASE_URL.trim() !== '' ? env.ANTHROPIC_BASE_URL.trim() : undefined;
+    const raw = fromSettings ?? fromEnv;
+    const nothing = 'Claude Code does not route through the kaprek proxy — nothing to check.';
+    if (raw === undefined) return check('proxy-route', 'ok', nothing);
+
+    const source = fromSettings !== undefined ? `source: ${settingsPath} (env.ANTHROPIC_BASE_URL)` : 'source: process environment (ANTHROPIC_BASE_URL)';
+    let url;
+    try {
+      url = new URL(raw);
+    } catch {
+      return check('proxy-route', 'ok', nothing, [source, 'ANTHROPIC_BASE_URL: (not a valid URL)']);
+    }
+    // Only scheme, host, port and path are ever printed — no userinfo, no query.
+    const shown = `${url.protocol}//${url.host}${url.pathname === '/' ? '' : url.pathname}`;
+    const detail = [source, `ANTHROPIC_BASE_URL: ${shown}`];
+    if (!PROXY_HOSTS.has(url.hostname)) return check('proxy-route', 'ok', nothing, detail);
+
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    const pid = readPid(dataDir);
+    if (!pid || !isAlive(pid.pid)) {
+      return check('proxy-route', 'fail', `Claude Code is routed to ${shown} but the kaprek proxy is not running — Claude Code cannot reach Anthropic. Start it with \`kaprek proxy\`, or remove ANTHROPIC_BASE_URL.`, detail);
+    }
+    detail.push(`proxy: pid ${pid.pid}, port ${pid.port}`);
+    if (Number(pid.port) !== port) {
+      return check('proxy-route', 'fail', `Claude Code is routed to ${shown}, which points at port ${port}, the proxy runs on port ${pid.port}.`, detail);
+    }
+    if (fromSettings !== undefined) {
+      let autostart = null;
+      try {
+        autostart = autostartStatus();
+      } catch {
+        // unreadable autostart state is not a finding of its own
+      }
+      if (autostart && autostart.supported !== false && !autostart.installed) {
+        return check('proxy-route', 'warn', `Claude Code routes through the kaprek proxy on port ${port}. That works now, but after the next login it will not: \`kaprek proxy autostart install\`.`, detail);
+      }
+    }
+    return check('proxy-route', 'ok', `Claude Code routes through the kaprek proxy on port ${port}, and it is running.`, detail);
+  } catch (err) {
+    return check('proxy-route', 'warn', `The proxy-route check could not run: ${err.message}`);
   }
 }
 
