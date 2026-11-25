@@ -7,6 +7,11 @@ import { syncMemoryDir, defaultMemoryDir, parseFrontmatter, resolveScopeId, MAX_
 
 let dataDir;
 let memoryDir;
+// syncMemoryDir() defaults to a 700 ms budget (the SessionStart hook's). On
+// the loaded server that ran out mid-test and the result came back
+// deferred: true. Tests not about the deadline pass a roomy one; the deadline
+// itself is pinned with an injected clock below.
+const ROOMY_DEADLINE_MS = 60_000;
 
 beforeEach(() => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-syncdata-'));
@@ -34,7 +39,7 @@ function readStateFiles() {
 
 test('no memory directory at all: scanned 0, nothing written', () => {
   fs.rmSync(memoryDir, { recursive: true, force: true });
-  expect(syncMemoryDir({ dataDir, memoryDir })).toEqual({ scanned: 0 });
+  expect(syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS })).toEqual({ scanned: 0 });
   expect(fs.existsSync(path.join(dataDir, 'memory'))).toBe(false);
 });
 
@@ -69,7 +74,7 @@ test('a new file becomes a fact in person:local by default', () => {
   openMemory(dataDir).addScope({ id: 'person:local' });
   writeMemoryFile('feedback_something.md', { description: 'Always run the tests before saying done' });
 
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result).toEqual({ scanned: 1, written: 1, confirmed: 0, skipped: 0, deferred: false });
 
   const memory = openMemory(dataDir);
@@ -85,7 +90,7 @@ test('metadata.type: user becomes a profile line, anything else a fact', () => {
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('user_klaus.md', { description: 'Klaus, hands-on, no bullshit', type: 'user' });
 
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
 
   const facts = openMemory(dataDir).list({ scopeId: 'person:local' });
   expect(facts[0].kind).toBe('profile');
@@ -95,7 +100,7 @@ test('a changed file is remembered again — same text confirms rather than dupl
   const memory = openMemory(dataDir);
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_x.md', { description: 'Same fact both times' });
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
 
   // Rewrite with the same text, then force the mtime strictly forward —
   // writeFileSync alone may or may not land on a different mtime at this
@@ -106,7 +111,7 @@ test('a changed file is remembered again — same text confirms rather than dupl
   const future = new Date(fs.statSync(filePath).mtime.getTime() + 60_000);
   fs.utimesSync(filePath, future, future);
 
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result.written).toBe(0);
   expect(result.confirmed).toBe(1);
 
@@ -120,11 +125,11 @@ test('unverändert: a file untouched since the last run is not reopened, and pro
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_stable.md', { description: 'This never changes' });
 
-  const first = syncMemoryDir({ dataDir, memoryDir });
+  const first = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(first).toEqual({ scanned: 1, written: 1, confirmed: 0, skipped: 0, deferred: false });
 
   const stateBefore = readStateFiles();
-  const second = syncMemoryDir({ dataDir, memoryDir });
+  const second = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(second).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 0, deferred: false });
   expect(readStateFiles()).toEqual(stateBefore);
 
@@ -137,11 +142,11 @@ test('gelöscht: a file removed from disk is dropped from the state, not un-reme
   const memory = openMemory(dataDir);
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_gone.md', { description: 'Will be deleted' });
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(Object.keys(readStateFiles())).toContain('feedback_gone.md');
 
   fs.rmSync(path.join(memoryDir, 'feedback_gone.md'));
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result.scanned).toBe(0);
   expect(Object.keys(readStateFiles())).not.toContain('feedback_gone.md');
 
@@ -155,7 +160,7 @@ test('a file with no description is skipped, not remembered as an empty fact', (
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_empty.md', { description: undefined });
 
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 1, deferred: false });
   expect(openMemory(dataDir).list({ scopeId: 'person:local' })).toEqual([]);
 });
@@ -165,7 +170,7 @@ test('a description that looks like a bare secret is skipped', () => {
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_secret.md', { description: 'token: sk-abcdefghijklmnopqrstuvwx' });
 
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result.skipped).toBe(1);
   expect(result.written).toBe(0);
   expect(openMemory(dataDir).list({ scopeId: 'person:local' })).toEqual([]);
@@ -178,7 +183,7 @@ test('MEMORY.md itself is never read, subdirectories are never recursed into', (
   fs.mkdirSync(path.join(memoryDir, 'nested'));
   writeMemoryFile(path.join('nested', 'inner.md'), { description: 'nested, must not be seen' });
 
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result.scanned).toBe(0);
   expect(openMemory(dataDir).list({ scopeId: 'person:local' })).toEqual([]);
 });
@@ -188,7 +193,7 @@ test('a description longer than 400 characters is truncated with an ellipsis', (
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_long.md', { description: 'x'.repeat(500) });
 
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   const facts = openMemory(dataDir).list({ scopeId: 'person:local' });
   expect(facts[0].text.length).toBe(MAX_TEXT_CHARS);
   expect(facts[0].text.endsWith('…')).toBe(true);
@@ -202,7 +207,7 @@ test('scope-map hit: a slug the map names goes to that scope even when it does n
   fs.writeFileSync(path.join(dataDir, 'memory', 'scope-map.json'), JSON.stringify({ memory_slug_to_scope: { kaprek: 'project:ccview' } }));
   writeMemoryFile('project_kaprek.md', { description: 'kaprek lives here' });
 
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   const facts = openMemory(dataDir).list({ scopeId: 'project:ccview' });
   expect(facts).toHaveLength(1);
   expect(facts[0].text).toBe('kaprek lives here');
@@ -215,7 +220,7 @@ test('heuristic: project_<x> maps to project:<x> (underscores to hyphens) when t
   memory.addScope({ id: 'project:my-thing', parent: 'person:local' });
   writeMemoryFile('project_my_thing.md', { description: 'about my thing' });
 
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   const facts = openMemory(dataDir).list({ scopeId: 'project:my-thing' });
   expect(facts).toHaveLength(1);
 });
@@ -225,7 +230,7 @@ test('heuristic misses (scope does not exist) falls back to person:local', () =>
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('project_nonexistent.md', { description: 'no such scope' });
 
-  syncMemoryDir({ dataDir, memoryDir });
+  syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   const facts = openMemory(dataDir).list({ scopeId: 'person:local' });
   expect(facts).toHaveLength(1);
 });
@@ -237,7 +242,7 @@ test('resolveScopeId: never invents a scope — person:local missing entirely me
 test('person:local missing entirely: the file is skipped rather than filed under an invented scope', () => {
   // No addScope call at all — an empty, freshly created memory store.
   writeMemoryFile('feedback_orphan.md', { description: 'nobody to own this yet' });
-  const result = syncMemoryDir({ dataDir, memoryDir });
+  const result = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(result.skipped).toBe(1);
   expect(result.written).toBe(0);
 });
@@ -245,7 +250,7 @@ test('person:local missing entirely: the file is skipped rather than filed under
 test('a scope-less skip is not recorded in the state: once the scope exists, the very same run of the file is written, not skipped again', () => {
   // No scope at all yet — the file has nowhere to go.
   writeMemoryFile('project_late_scope.md', { description: 'waiting for its scope to exist' });
-  const first = syncMemoryDir({ dataDir, memoryDir });
+  const first = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(first).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 1, deferred: false });
   expect(readStateFiles()).toEqual({}); // nothing recorded — the file itself never changed
 
@@ -254,7 +259,7 @@ test('a scope-less skip is not recorded in the state: once the scope exists, the
   memory.addScope({ id: 'person:local' });
   memory.addScope({ id: 'project:late-scope', parent: 'person:local' });
 
-  const second = syncMemoryDir({ dataDir, memoryDir });
+  const second = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(second).toEqual({ scanned: 1, written: 1, confirmed: 0, skipped: 0, deferred: false });
   const facts = openMemory(dataDir).list({ scopeId: 'project:late-scope' });
   expect(facts).toHaveLength(1);
@@ -266,12 +271,12 @@ test('a content skip (no description) IS recorded: the fast unchanged path takes
   memory.addScope({ id: 'person:local' });
   writeMemoryFile('feedback_no_desc.md', { description: undefined });
 
-  const first = syncMemoryDir({ dataDir, memoryDir });
+  const first = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(first).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 1, deferred: false });
   const stateAfterFirst = readStateFiles();
   expect(Object.keys(stateAfterFirst)).toContain('feedback_no_desc.md');
 
-  const second = syncMemoryDir({ dataDir, memoryDir });
+  const second = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(second).toEqual({ scanned: 1, written: 0, confirmed: 0, skipped: 0, deferred: false }); // unchanged path: not even reopened, so not counted as skipped again
   expect(readStateFiles()).toEqual(stateAfterFirst);
   expect(openMemory(dataDir).list({ scopeId: 'person:local' })).toEqual([]);
@@ -296,7 +301,7 @@ test('deadline: processes what it can before the budget runs out and reports def
 
   // The next run (real clock) visits all three again — the first is still
   // in the state and costs only a stat comparison, the other two are new.
-  const second = syncMemoryDir({ dataDir, memoryDir });
+  const second = syncMemoryDir({ dataDir, memoryDir, deadlineMs: ROOMY_DEADLINE_MS });
   expect(second.scanned).toBe(3);
   expect(second.written).toBe(2);
   expect(second.deferred).toBe(false);

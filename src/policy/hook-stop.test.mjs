@@ -12,6 +12,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const HOOK_PATH = path.join(__dirname, 'hook-stop.mjs');
 const PACKAGE_NAME = 'kaprek';
 const DATA_DIR_ENV = `${PACKAGE_NAME.toUpperCase()}_DATA_DIR`;
+// Each test spawns the hook (and some run git). On the loaded server one took
+// 10.7 s against the old 10 s limit and later more than 30 s (KAP-35); idle
+// they take well under 4 s. Git child processes can hold the repo dirs for a
+// moment after exit, hence the cleanup retries (EPERM seen in two runs).
+const HOOK_TEST_TIMEOUT_MS = 120_000;
 
 let dataDir;
 
@@ -20,7 +25,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  fs.rmSync(dataDir, { recursive: true, force: true });
+  fs.rmSync(dataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 function writePolicy(policy) {
@@ -105,7 +110,7 @@ test('block case: writes {"decision":"block",...} JSON to stdout and exits 0', a
   expect(parsed.decision).toBe('block');
   expect(typeof parsed.reason).toBe('string');
   expect(parsed.reason.length).toBeGreaterThan(0);
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('second run for the same session after a block produces no output (once-marker) and exits 0', async () => {
   writePolicy({ mode: 'block' });
@@ -119,7 +124,7 @@ test('second run for the same session after a block produces no output (once-mar
   const second = await runHook(stdinPayload);
   expect(second.code).toBe(0);
   expect(second.stdout.trim()).toBe('');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('malformed stdin: exits 0 with no stdout output (fail-open)', async () => {
   const { code, stdout, stderr } = await runHook('not json at all {{{');
@@ -129,7 +134,7 @@ test('malformed stdin: exits 0 with no stdout output (fail-open)', async () => {
   // Malformed JSON never even reaches the harvest/ledger code — no ledger
   // file gets created for a turn kaprek could not parse at all.
   expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('observe mode (default, no policy.json): exits 0 with no stdout output', async () => {
   const transcriptPath = writeTranscript('e2e-observe', { withGitCommit: true });
@@ -138,7 +143,7 @@ test('observe mode (default, no policy.json): exits 0 with no stdout output', as
   );
   expect(code).toBe(0);
   expect(stdout).toBe('');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('warn mode: exits 0, no stdout, but a warning is written to stderr', async () => {
   writePolicy({ mode: 'warn' });
@@ -149,7 +154,7 @@ test('warn mode: exits 0, no stdout, but a warning is written to stderr', async 
   expect(code).toBe(0);
   expect(stdout).toBe('');
   expect(stderr).toMatch(/policy warning/);
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('stop_hook_active guard: block mode still exits 0 with no output when stop_hook_active is true', async () => {
   writePolicy({ mode: 'block' });
@@ -166,7 +171,7 @@ test('stop_hook_active guard: block mode still exits 0 with no output when stop_
   expect(code).toBe(0);
   expect(stdout).toBe('');
   expect(stderr).toBe('');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('Stop hook preserves the ending session\'s scratchpad into dataDir/artifacts', async () => {
   const sessionId = 'e2e-artifacts';
@@ -190,9 +195,9 @@ test('Stop hook preserves the ending session\'s scratchpad into dataDir/artifact
     expect(fs.existsSync(preservedPath)).toBe(true);
     expect(fs.readFileSync(preservedPath, 'utf8')).toBe('work product');
   } finally {
-    fs.rmSync(tmpRootDir, { recursive: true, force: true });
+    fs.rmSync(tmpRootDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('a broken/unusable tmpRoot never breaks the hook\'s fail-open contract (still exits 0, normal decision output)', async () => {
   writePolicy({ mode: 'block' });
@@ -213,7 +218,7 @@ test('a broken/unusable tmpRoot never breaks the hook\'s fail-open contract (sti
   // still fires — the broken tmpRoot only affects artifact preservation.
   const parsed = JSON.parse(stdout);
   expect(parsed.decision).toBe('block');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('block mode allows silently when the session is linked to a board task', async () => {
   writePolicy({ mode: 'block' });
@@ -227,7 +232,7 @@ test('block mode allows silently when the session is linked to a board task', as
   );
   expect(code).toBe(0);
   expect(stdout).toBe('');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('harvests a kaprek-remember block from the transcript and writes a stop event to the ledger', async () => {
   const sessionId = 'e2e-harvest';
@@ -251,7 +256,7 @@ test('harvests a kaprek-remember block from the transcript and writes a stop eve
   const ledger = fs.readFileSync(path.join(dataDir, 'ledger', 'sessions.jsonl'), 'utf8');
   expect(ledger).toContain('"type":"stop"');
   expect(ledger).toContain(`"sessionId":"${sessionId}"`);
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('missing transcript_path still exits 0, harvests nothing, and still writes a stop event to the ledger', async () => {
   const sessionId = 'e2e-no-transcript';
@@ -267,7 +272,7 @@ test('missing transcript_path still exits 0, harvests nothing, and still writes 
   // No transcript to read from — nothing was harvested, and no memory store
   // was even created.
   expect(fs.existsSync(path.join(dataDir, 'memory', 'events.jsonl'))).toBe(false);
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('a 5 MB transcript is harvested well inside the hook\'s 3 s self-timeout', async () => {
   const sessionId = 'e2e-perf';
@@ -292,7 +297,7 @@ test('a 5 MB transcript is harvested well inside the hook\'s 3 s self-timeout', 
 
   const events = fs.readFileSync(path.join(dataDir, 'memory', 'events.jsonl'), 'utf8');
   expect(events).toContain('Perf-Test-Fakt');
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 // These two tests need the gate to actually fire (exit 2), which depends on
 // evaluateCouncilGate()'s internal git calls finishing inside its own
@@ -313,9 +318,9 @@ test('council gate: 6 changed files with no review yet exits 2, writes the reaso
     expect(stderr).toMatch(/--diff/);
     expect(stderr).toMatch(/6 files/);
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('council gate: a second Stop for the same session does not fire again (once-marker), exits 0', async () => {
   const repoDir = initGitRepoWithChanges(6);
@@ -329,7 +334,7 @@ test('council gate: a second Stop for the same session does not fire again (once
     expect(second.stdout).toBe('');
     expect(second.stderr).toBe('');
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 }, 15000);
 
@@ -343,9 +348,9 @@ test('council gate: stop_hook_active guard applies to the gate too — exits 0, 
     expect(stdout).toBe('');
     expect(stderr).toBe('');
   } finally {
-    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);
 
 test('council gate: no git repo at cwd never fires — exits 0, no stderr', async () => {
   const nonRepoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaprek-hookstop-nogit-'));
@@ -355,6 +360,6 @@ test('council gate: no git repo at cwd never fires — exits 0, no stderr', asyn
     expect(stdout).toBe('');
     expect(stderr).toBe('');
   } finally {
-    fs.rmSync(nonRepoDir, { recursive: true, force: true });
+    fs.rmSync(nonRepoDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
-}, 10000);
+}, HOOK_TEST_TIMEOUT_MS);

@@ -28,11 +28,11 @@ afterEach(() => {
   }
   children = [];
   if (tmpDir) {
-    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     tmpDir = undefined;
   }
   if (childDataDir) {
-    fs.rmSync(childDataDir, { recursive: true, force: true });
+    fs.rmSync(childDataDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     childDataDir = undefined;
   }
 });
@@ -63,8 +63,12 @@ function collectRun(child) {
   });
 }
 
-/** Resolves with the first stdout line matching `http://...`, for a long-running child. */
-function waitForUrl(child, timeoutMs = 10000) {
+/**
+ * Resolves with the first stdout line matching `http://...`, for a long-running child.
+ * 60 s: a cold `node bin/cli.mjs` start took about 22 s on the loaded server
+ * and the old 10 s wait failed twice in one run (KAP-35).
+ */
+function waitForUrl(child, timeoutMs = 60_000) {
   return new Promise((resolve, reject) => {
     let stdout = '';
     const timer = setTimeout(() => {
@@ -253,4 +257,4 @@ test('hooks install from an npx cache copy warns once on stderr and still instal
   expect(stderr.match(/warning:/g)).toHaveLength(1);
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
   expect(Object.keys(settings.hooks).sort()).toEqual(['SessionEnd', 'SessionStart', 'Stop', 'UserPromptSubmit']);
-}, 20000);
+}, 120_000);
