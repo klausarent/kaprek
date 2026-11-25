@@ -15,7 +15,26 @@ const DATA_DIR_ENV = 'KAPREK_DATA_DIR';
 // enough to prove this hook finishes on its own, not by hitting the
 // self-timeout — without flaking under load. Same margin hook-stop.test.mjs
 // uses for its own (3000 ms self-timeout, 2500 ms assertion) smoke test.
+// The budget is measured ON TOP of a bare node start spawned the same way
+// right before (bareNodeMs): SELF_TIMEOUT_MS only starts once node has
+// booted, and under heavy CPU load the spawn + bootstrap alone took up to
+// 750 ms on the server (KAP-100, 24.11.2026) — time the hook cannot influence.
 const SMOKE_BUDGET_MS = 800;
+
+function bareNodeMs() {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['-e', 'process.stdin.resume()'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    child.on('error', reject);
+    child.on('close', () => resolve(Date.now() - start));
+    child.stdin.end('{}');
+  });
+}
+
+async function expectWithinBudget(elapsedMs) {
+  const baselineMs = await bareNodeMs();
+  expect(elapsedMs - baselineMs).toBeLessThan(SMOKE_BUDGET_MS);
+}
 
 let dataDir;
 
@@ -50,21 +69,21 @@ test('empty JSON object: exit 0, no output, no ledger event, well within budget'
   expect(code).toBe(0);
   expect(stdout).toBe('');
   expect(fs.existsSync(path.join(dataDir, 'ledger', 'sessions.jsonl'))).toBe(false);
-  expect(elapsedMs).toBeLessThan(SMOKE_BUDGET_MS);
+  await expectWithinBudget(elapsedMs);
 });
 
 test('malformed JSON: exit 0, no output, fails open, well within budget', async () => {
   const { code, stdout, elapsedMs } = await runHook('{not json');
   expect(code).toBe(0);
   expect(stdout).toBe('');
-  expect(elapsedMs).toBeLessThan(SMOKE_BUDGET_MS);
+  await expectWithinBudget(elapsedMs);
 });
 
 test('empty stdin: exit 0, no output, well within budget', async () => {
   const { code, stdout, elapsedMs } = await runHook('');
   expect(code).toBe(0);
   expect(stdout).toBe('');
-  expect(elapsedMs).toBeLessThan(SMOKE_BUDGET_MS);
+  await expectWithinBudget(elapsedMs);
 });
 
 test('valid input: exit 0, no stdout, appends an "end" event with the reason, well within budget', async () => {
@@ -77,7 +96,7 @@ test('valid input: exit 0, no stdout, appends an "end" event with the reason, we
   expect(ledger).toContain('"type":"end"');
   expect(ledger).toContain('"sessionId":"s1"');
   expect(ledger).toContain('"reason":"clear"');
-  expect(elapsedMs).toBeLessThan(SMOKE_BUDGET_MS);
+  await expectWithinBudget(elapsedMs);
 });
 
 test('no session_id: exit 0, no ledger event written', async () => {

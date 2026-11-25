@@ -14,6 +14,9 @@ const DATA_DIR_ENV = 'KAPREK_DATA_DIR';
 // of that. 800 ms stays comfortably below SELF_TIMEOUT_MS (1000 ms) while
 // leaving room to actually see the fast path (unchanged cwd) come in well
 // under the slow path (directory changed, stores loaded) without flaking.
+// Measured on top of a bare node start (nodeStartMs below), as in
+// hook-session-end.test.mjs: under heavy load the spawn + bootstrap alone
+// took up to 750 ms (KAP-100) and seconds in the full suite (KAP-35).
 const SMOKE_BUDGET_MS = 800;
 
 let dataDir;
