@@ -5,6 +5,8 @@ meta-description: A nightly Claude Code turn hits a permission prompt at 03:00. 
 
 # The question at 03:00
 
+![A dark desk at night, laptop screen off, with the text "03:00" and "The question waits."](the-question-at-0300-cover.jpg)
+
 ## 03:00, and the agent has a question
 
 This is a made-up example. You work in a terminal with Claude Code all day. kaprek runs underneath: with its hooks installed, your first Claude Code session of the day starts the kaprek server in the background, and it stays up until you run `kaprek stop`.
