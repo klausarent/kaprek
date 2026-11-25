@@ -1,4 +1,4 @@
-// skip-if preconditions for tick-driven triggers (see DESIGN-SPEC.md, P7).
+// skip-if preconditions for tick-driven triggers.
 //
 // A schedule/heartbeat trigger may carry one condition; the runner checks it
 // AFTER the window claim and BEFORE buildPrompt(), so a condition that is
@@ -18,7 +18,7 @@
 // save button an exec surface, killing a child process cleanly needs Job
 // Object / process-group semantics, and the inherited env/PATH is unchecked
 // authority — it comes back as its own package if a use case appears that
-// the two file conditions do not cover (DESIGN-SPEC.md, Änderung 4).
+// the two file conditions do not cover.
 import fs from 'node:fs';
 import path from 'node:path';
 import { isInside } from '../lib/contain.mjs';

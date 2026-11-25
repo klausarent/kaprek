@@ -37,7 +37,7 @@ import { redactSecrets } from '../parser/parse.mjs';
  */
 export const MEMORY_KINDS = ['profile', 'fact', 'evidence'];
 
-/** Where a memory was learned. ALM 1.2: every line is quotable back to its source. */
+/** Where a memory was learned. Every line is quotable back to its source. */
 export const SOURCE_KINDS = ['turn', 'file', 'import', 'manual'];
 
 /** After this long without a verify, a fact comes back marked stale. */

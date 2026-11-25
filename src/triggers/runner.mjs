@@ -369,11 +369,10 @@ function buildPrompt(trigger, { reason, checklist, files, filesTruncated, clipbo
  *   it, an approval whose turn died some other way would keep its auto-deny
  *   timer armed for the full unattended deadline — hours, with the inbox.
  * @param {() => {allowed: boolean, reason?: string, budgetUsd?: number, spentKnownUsd?: number, unknownRuns?: number}} [options.checkBudget] -
- *   the DAILY-BUDGET check for unattended turns (ALMANAC-PLAN §2.5 +
- *   BRIDGE-PLAN I2): the server wires a closure over policy.json's
- *   budget.defaultDailyUsd and runs.jsonl (src/budget/budget.mjs). Triggers
+ *   the DAILY-BUDGET check for unattended turns: the server wires a closure
+ *   over policy.json's budget.defaultDailyUsd and runs.jsonl (src/budget/budget.mjs). Triggers
  *   have no mission binding, so only the GLOBAL default applies to them. The
- *   I2 rule is decided HERE, not per trigger: a background run over budget is
+ *   priority rule is decided HERE, not per trigger: a background run over budget is
  *   SKIPPED (runs.jsonl line with skipped: 'budget', no turn, no question) —
  *   nobody is woken at 3am for a background check, and direct requests always
  *   have priority. Null (a runner built without it — tests, isolated use)
@@ -402,7 +401,7 @@ export function createTriggerRunner({
   // P7: the condition-error notification, seam-injected so tests never spawn
   // a real notifier. Fire-and-forget by contract (see notify.mjs).
   notify = defaultNotify,
-  // Daily budget (ALM 2.5 + I2) — server-wired, see the doc comment above.
+  // Daily budget — server-wired, see the doc comment above.
   checkBudget = null,
 }) {
   // Loop guard (part 2 of 2 — part 1 is the cause.origin==='trigger' check
@@ -1103,7 +1102,7 @@ export function createTriggerRunner({
       return { fired: false, reason: globalCheck.reason };
     }
 
-    // Daily budget (ALM 2.5 + I2-Pause-Reihenfolge). A trigger turn is
+    // Daily budget. A trigger turn is
     // BACKGROUND: when the budget is spent, this run is skipped — never
     // asked about (nobody is woken at 3am for a background check), never
     // half-started (the check runs BEFORE any claim, any prompt, any
@@ -1252,7 +1251,7 @@ export function createTriggerRunner({
       reasonText = 'manual fire (saved prompt)';
     }
 
-    // P7 — skip-if precondition (see DESIGN-SPEC.md). Checked here, AFTER the
+    // Skip-if precondition. Checked here, AFTER the
     // window claim and BEFORE buildPrompt(): a skipped run must still spend
     // the slot (otherwise the next tick re-checks the same condition in the
     // same window forever), but must never become a turn.
@@ -1604,8 +1603,8 @@ export function createTriggerRunner({
 
   /**
    * Whether a TRIGGER turn is currently writing into this chat. The chat-turn
-   * route needs it to refuse a second turn on the same chat (panel Fix-Runde
-   * 1, I2): a trigger turn parked on an inbox approval can sit there for
+   * route needs it to refuse a second turn on the same chat:
+   * a trigger turn parked on an inbox approval can sit there for
    * hours, and a chat turn started on its chat meanwhile would run a second
    * CLI against one transcript AND destroy the parked question on its way out
    * (handleChatTurn's finally calls cleanupApprovalsForChat for the whole

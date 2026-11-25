@@ -28,7 +28,7 @@ export const DEFAULT_POLICY = Object.freeze({
   // Rules a person added on top of guards.mjs's built-ins. The built-ins
   // are not listed here because they cannot be switched off from here.
   hardDenials: Object.freeze([]),
-  // The default DAILY budget in USD (ALMANAC-PLAN §2.5). null = no limit —
+  // The default DAILY budget in USD. null = no limit —
   // which is what every install before this section had. It is a CEILING,
   // not a spend: a mission may only tighten it with its own budgetUsd
   // (posture semantics — src/budget/budget.mjs). Budget is part of the
