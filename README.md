@@ -684,6 +684,8 @@ without windows, and the card says so instead of showing nothing. Claude
 Code's fast-mode check and WebFetch domain check still go to
 `api.anthropic.com` directly, by Anthropic's design.
 
+One evening walked through before a long run, with made-up values: [Check your Claude plan window before the session starts](https://github.com/klausarent/kaprek/blob/main/docs/check-plan-window-before-session.md).
+
 ### Several Claude subscriptions (`kaprek accounts`, `kaprek claude`)
 
 If you hold more than one Claude subscription yourself, kaprek can start each
