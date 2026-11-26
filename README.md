@@ -663,7 +663,10 @@ set ANTHROPIC_BASE_URL=http://127.0.0.1:4911   # in the terminal you start claud
 Only `ANTHROPIC_BASE_URL` is set, so your saved claude.ai login stays the
 credential and your plan's limits apply unchanged (Anthropic's gateway docs,
 "Subscriptions and gateways"). The proxy forwards every header and body as it
-is, streams responses unbuffered, and writes one line per request to
+is, except that it asks upstream for an uncompressed response
+(`accept-encoding: identity`) so it can read usage, and drops its own
+`x-kaprek-account` tag. The `Authorization` header is never logged or stored.
+It streams responses unbuffered, and writes one line per request to
 `<dataDir>/proxy/<hostname>/requests.jsonl` plus the latest windows to
 `<dataDir>/proxy/<hostname>/quota/<account>.json`, one file per account. One
 folder per machine, because the data dir is often synced; kaprek reads the

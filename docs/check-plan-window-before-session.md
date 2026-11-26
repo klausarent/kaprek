@@ -43,7 +43,7 @@ In PowerShell:
 $env:ANTHROPIC_BASE_URL = "http://127.0.0.1:4911"
 ```
 
-Only the base URL changes. Your saved claude.ai login stays the credential, because the proxy passes every header through untouched. According to Anthropic's [gateway documentation](https://code.claude.com/docs/en/llm-gateway), section "Subscriptions and gateways", your plan's limits then apply as before.
+Only the base URL changes. Your saved claude.ai login stays the credential, because the proxy passes your login (the `Authorization` header) through unchanged. It only sets `accept-encoding` to `identity`, so it can read usage from the uncompressed response, and drops kaprek's own `x-kaprek-account` tag and the hop-by-hop headers. According to Anthropic's [gateway documentation](https://code.claude.com/docs/en/llm-gateway), section "Subscriptions and gateways", your plan's limits then apply as before.
 
 If you want this for every terminal, run `kaprek proxy autostart install` first. It puts a `kaprek-proxy.cmd` into your Windows startup folder, so the proxy starts at login. Only then is it safe to set `ANTHROPIC_BASE_URL` globally, for example under `env` in `~/.claude/settings.json`. The reason is in the Limits section below.
 
@@ -51,7 +51,7 @@ If you want this for every terminal, run `kaprek proxy autostart install` first.
 
 The proxy talks to `api.anthropic.com` and nowhere else. A test in the repo fails if that changes.
 
-For each `/v1/messages` request it writes one log line: time, duration, session id, status, model, token counts, stop reason, the plan windows and the account. Other endpoints are relayed without a log line. Message bodies are streamed through and scanned only for the usage fields. Neither the body nor your token ends up on disk. The log rotates at 20 MB. Data goes into `<dataDir>/proxy/<hostname>/`, one folder per machine. If you sync kaprek's data directory between computers, each one still writes to its own folder, and kaprek reads the newest windows per account across all of them.
+For each `/v1/messages` request it writes one log line: time, duration, session id, status, model, token counts, stop reason, the plan windows, the account and the organization id Anthropic returns. When a session carries kaprek's account tag, the proxy also notes which account an organization id belongs to, in `orgs.json`. Other endpoints are relayed without a log line. Message bodies are streamed through and scanned only for the usage fields. Neither the body nor your token ends up on disk. The log rotates at 20 MB. Data goes into `<dataDir>/proxy/<hostname>/`, one folder per machine. If you sync kaprek's data directory between computers, each one still writes to its own folder, and kaprek reads the newest windows per account across all of them.
 
 ## Read it from a second terminal: `kaprek proxy status`
 
@@ -130,4 +130,4 @@ No. It prints the windows from the last response that went through the proxy, to
 Claude Code cannot reach Anthropic until you start the proxy again or remove the variable.
 
 **Does the proxy keep my prompts or my login?**
-No. It relays both and records only timing, session id, model, token counts and the plan-window headers.
+No. It relays both and records timing, session id, status, model, token counts, stop reason, the plan windows, the account and the Anthropic organization id. Your login is forwarded but never logged or stored.
